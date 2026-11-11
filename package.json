@@ -1,0 +1,30 @@
+{
+  "name": "agent-loop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts",
+    "start": "tsx src/cli.ts",
+    "verify:codex": "tsx scripts/verify-codex.ts",
+    "verify:inputs": "tsx scripts/verify-inputs.ts",
+    "pair:feishu": "tsx scripts/pair-feishu.ts",
+    "verify:feishu": "tsx scripts/verify-feishu.ts",
+    "verify:runtime": "tsx scripts/verify-runtime.ts",
+    "verify:workspace-selection": "tsx scripts/verify-workspace-selection.ts"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "1.76.0",
+    "zod": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "~5.9.3"
+  }
+}

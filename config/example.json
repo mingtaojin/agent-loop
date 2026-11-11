@@ -1,0 +1,68 @@
+{
+  "dataDir": "./data",
+  "dashboard": {
+    "host": "127.0.0.1",
+    "port": 8787
+  },
+  "repositories": [
+    {
+      "name": "crysound/OpenTest-Internal",
+      "criteria": {
+        "states": [
+          "open"
+        ],
+        "assigneesAny": [
+          "mingtaojin"
+        ],
+        "taskTypes": [
+          "bug"
+        ],
+        "labelsAll": [],
+        "labelsAny": [],
+        "labelsNone": [],
+        "nativeTypes": {
+          "Bug": "bug",
+          "Feature": "feature"
+        },
+        "typeLabels": {
+          "bug": "bug",
+          "enhancement": "feature",
+          "类型:缺陷": "bug",
+          "类型:需求": "feature"
+        }
+      }
+    }
+  ],
+  "github": {
+    "tokenEnv": "GITHUB_TOKEN",
+    "apiUrl": "https://api.github.com",
+    "requestTimeoutMs": 30000
+  },
+  "feishu": {
+    "appIdEnv": "FEISHU_APP_ID",
+    "appSecretEnv": "FEISHU_APP_SECRET",
+    "userOpenId": "REPLACE_WITH_YOUR_OPEN_ID"
+  },
+  "codex": {
+    "command": [
+      "codex",
+      "app-server"
+    ],
+    "selectionModel": "deepseek/deepseek-v4.1-flash-1017",
+    "approvalPolicy": "on-request",
+    "sandbox": "workspace-write",
+    "requestTimeoutMs": 120000
+  },
+  "pollIntervalMs": 30000,
+  "executionPollMs": 2000,
+  "maxAttachmentBytes": 20971520,
+  "engineering": {
+    "promptPath": "./prompts/task.md",
+    "skillPath": "/Users/developer/.codex/packages/pstack/skills/poteto-mode/SKILL.md",
+    "projectRoot": "../projects"
+  },
+  "recovery": {
+    "maxAttempts": 3,
+    "retryDelayMs": 1000
+  }
+}

@@ -1,0 +1,28 @@
+# Dependencies and generated output
+node_modules/
+dist/
+
+# Local configuration and credentials
+config.json
+config.json.*
+.env
+.env.*
+
+# Runtime state
+.agent-loop/
+data/
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# Keep local tracker specs and issues, excluding investigation artifacts.
+.scratch/**
+!.scratch/*/
+!.scratch/*/spec.md
+!.scratch/*/issues/
+!.scratch/*/issues/*.md
+
+# Editor and operating system files
+.idea/
+.DS_Store
