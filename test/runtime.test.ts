@@ -8,7 +8,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout } from 'node:timers/promises';
 import { test, type TestContext } from 'node:test';
-import { z } from 'zod';
 import { configSchema } from '../src/config.js';
 import { AgentLoop } from '../src/loop.js';
 import { Store } from '../src/store.js';
@@ -169,11 +168,7 @@ for (const prefix of ['', ' \t\r\n', ' \t\r\n/new ']) test(`manual rich-post cre
   assert.equal(inputs[0]?.message.text, text); assert.deepEqual(inputs[0]?.message.attachments, message.attachments);
   const input = f.codex.starts[0]?.input; assert.ok(input);
   assert.deepEqual(input[0], { kind: 'text', text });
-  assert.ok(input.every(item => item.kind === 'text'));
-  const deliveredImages = input.flatMap(item => {
-    if (item.kind !== 'text' || !item.text.startsWith('Image attachment as data: ')) return [];
-    return [z.object({ path: z.string() }).parse(JSON.parse(item.text.slice('Image attachment as data: '.length).split('\n')[0] ?? ''))];
-  });
+  const deliveredImages = input.filter(item => item.kind === 'image');
   assert.equal(deliveredImages.length, 2);
   assert.deepEqual(await Promise.all(deliveredImages.map(item => readFile(item.path))), images);
   assert.deepEqual(f.feishu.downloads.map(download => [download.messageId, download.attachment.key]), [
