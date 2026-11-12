@@ -12,7 +12,8 @@ import { z } from 'zod';
 import { configSchema } from '../src/config.js';
 import { AgentLoop } from '../src/loop.js';
 import { Store } from '../src/store.js';
-import { parseFeishuEvent } from '../src/adapters/feishu.js';
+import { FeishuAdapter, parseFeishuEvent, type FeishuDependencies } from '../src/adapters/feishu.js';
+import type { EventDispatcher } from '@larksuiteoapi/node-sdk';
 import type { ApprovalAction, IncomingMessage, PendingRequest } from '../src/domain.js';
 import type { WorkspacePort } from '../src/ports.js';
 import { CodexFake, FeishuFake, GitHubFake, issue } from './fakes.js';
@@ -221,6 +222,65 @@ test('approval receipt is durable before native resolution and duplicate decisio
   await f.loop.control(f.task().id, 'status');
   assert.equal(f.codex.approvals.length, 1); assert.equal(f.loop.store.approvals(f.task().id)[0]?.status, 'confirmed');
 });
+
+for (const decision of ['approve', 'reject'] as const) {
+  test(`Feishu ${decision} callback acknowledges durable receipt before native resolution and never replays`, { timeout: 5000 }, async t => {
+    const f = await fixture(t); await f.manual();
+    const native = request(f); f.snapshot().requests = [native]; await f.loop.tick();
+    const entered = gate(), release = gate();
+    const respond = f.codex.respondApproval.bind(f.codex);
+    f.codex.respondApproval = async input => { entered.resolve(); await release.promise; return respond(input); };
+    let dispatcher: EventDispatcher | undefined;
+    let sentCard = '';
+    const unused = async (): Promise<never> => { throw new Error('Unexpected Feishu API call'); };
+    const api: NonNullable<FeishuDependencies['api']> = {
+      chat: { list: unused, get: unused, create: unused },
+      message: { list: unused, create: async input => {
+        sentCard = input?.data.content ?? '';
+        return { code: 0, data: { message_id: 'fixture-card' } };
+      } },
+      messageResource: { get: unused },
+    };
+    const adapter = new FeishuAdapter({ appId: 'fixture-app', appSecret: 'fixture-secret', userOpenId: 'owner' }, {
+      api, socket: { start: async input => { dispatcher = input.eventDispatcher; }, close() {} },
+    });
+    t.after(() => adapter.close());
+    const task = f.task(); assert.ok(task.chatId);
+    await adapter.sendApproval({ id: 'fixture-output', chatId: task.chatId, taskId: task.id, request: native });
+    const card = z.object({ elements: z.array(z.union([
+      z.object({ tag: z.literal('div') }),
+      z.object({ tag: z.literal('action'), actions: z.array(z.object({ value: z.object({ agent_loop_approval: z.string() }) })) }),
+    ])) }).parse(JSON.parse(sentCard));
+    const actions = card.elements.find(element => element.tag === 'action'); assert.ok(actions && actions.tag === 'action');
+    const errors: unknown[] = [];
+    await adapter.start(unused, error => errors.push(error), action => f.loop.approve(action));
+    assert.ok(dispatcher);
+    const callback = dispatcher;
+    const click = (index: number) => callback.invoke({ schema: '2.0', header: { event_type: 'card.action.trigger' },
+      event: { operator: { open_id: 'owner' }, context: { open_chat_id: task.chatId, open_message_id: 'fixture-card' },
+        action: { tag: 'button', value: actions.actions[index]?.value } } }, { needCheck: false });
+    const feedback = z.object({ toast: z.object({ type: z.string(), content: z.string() }) });
+    try {
+      const first = feedback.parse(await click(decision === 'approve' ? 0 : 1));
+      assert.equal(first.toast.type, 'info');
+      assert.match(first.toast.content, /已接收/);
+      assert.equal(f.loop.store.approvals(task.id).length, 1);
+      assert.equal(f.loop.store.approvals(task.id)[0]?.action.decision, decision);
+      await entered.promise;
+      assert.equal(f.loop.store.approvals(task.id)[0]?.status, 'processing');
+      assert.equal(f.codex.approvals.length, 0);
+      for (const index of [0, 1]) assert.equal(feedback.parse(await click(index)).toast.type, 'error');
+      assert.equal(f.loop.store.approvals(task.id).length, 1);
+    } finally { release.resolve(); }
+    await f.loop.control(task.id, 'status');
+    assert.equal(f.codex.approvals.length, 1);
+    assert.equal(f.codex.approvals[0]?.decision, decision);
+    assert.equal(f.loop.store.approvals(task.id)[0]?.status, 'confirmed');
+    assert.equal(feedback.parse(await click(0)).toast.type, 'error');
+    assert.equal(f.codex.approvals.length, 1);
+    assert.equal(errors.length, 3);
+  });
+}
 
 test('approval with lost native acknowledgement remains uncertain across restart', async t => {
   const f = await fixture(t); await f.manual(); const native = request(f); f.snapshot().requests = [native]; await f.loop.tick();

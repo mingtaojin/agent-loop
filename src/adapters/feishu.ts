@@ -396,12 +396,35 @@ export class FeishuAdapter implements FeishuPort, FeishuProgressPort {
   async start(onMessage: (message: IncomingMessage) => Promise<void>, onError: (error: unknown) => void, onAction?: (action: ApprovalAction) => Promise<void>): Promise<void> {
     const eventDispatcher = new EventDispatcher({ loggerLevel: LoggerLevel.error }).register({
       'card.action.trigger': async (raw: unknown) => {
+        const receivedAt = Date.now();
+        let action: ApprovalAction | null = null;
         try {
+          action = parseApproval(raw, this.options);
+          if (!action) return { toast: { type: 'warning', content: '此操作仅限任务所有者' } };
           if (!onAction) throw new Error('Feishu approval actions have no registered handler');
-          const action = parseApproval(raw, this.options);
-          if (action) await onAction(action);
-          return { toast: { type: 'info', content: action ? '操作已接收，等待执行器确认' : '此操作仅限任务所有者' } };
-        } catch (error) { onError(error); throw error; }
+          await onAction(action);
+          const receipt = `${action.decision === 'approve' ? '批准' : '拒绝'}决定已接收，等待执行器确认`;
+          return {
+            toast: { type: 'info', content: receipt },
+            card: { type: 'raw', data: {
+              config: { wide_screen_mode: true }, header: { title: { tag: 'plain_text', content: '工具审批决定已接收' } },
+              elements: [
+                { tag: 'div', text: { tag: 'plain_text', content: receipt } },
+                { tag: 'div', text: { tag: 'plain_text', content: '请查看执行进度，了解后续处理结果。' } },
+              ],
+            } },
+          };
+        } catch {
+          const event = z.object({ event_id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/).optional() }).safeParse(raw);
+          try {
+            onError(new Error(`Feishu approval callback failed: ${JSON.stringify({
+              receivedAt, durationMs: Date.now() - receivedAt, eventId: event.success ? event.data.event_id : undefined,
+              taskId: action?.taskId, threadId: action?.threadId, turnId: action?.turnId,
+              requestId: action?.requestId, decision: action?.decision,
+            })}`));
+          } catch {}
+          return { toast: { type: 'error', content: '此次点击未被接收，请查看最新审批状态。' } };
+        }
       },
       'im.message.receive_v1': async raw => {
         try {

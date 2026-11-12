@@ -2,7 +2,7 @@
 
 本机常驻执行服务和调试网页由同一个 `run` 进程提供，统一由 launchd 管理。后续启动、停止和重启均使用本文命令，避免另起独立后台进程争用同一数据目录。前台调试前先停止 launchd 服务。
 
-服务定义位于 `~/Library/LaunchAgents/com.local.agent-loop.run.plist`，标签为 `com.local.agent-loop.run`。工作目录是 `/Users/developer/IdeaProjects/agent-loop`，应用配置是该目录中的 `config.json`。运行参数和环境变量保留在服务定义与应用配置中，凭证由应用读取本地 `.env`。
+服务定义位于 `~/Library/LaunchAgents/com.local.agent-loop.run.plist`，标签为 `com.local.agent-loop.run`。工作目录和入口以定义中的 `WorkingDirectory`、`ProgramArguments` 为准；独立 worktree 部署可以使用该 worktree 的 `dist/src/cli.js`。应用配置继续使用绝对路径 `/Users/developer/IdeaProjects/agent-loop/config.json`，凭证文件通过 `--env-file` 指定，避免因工作目录变化而读取错误位置。运行参数和环境变量保留在服务定义与应用配置中。
 
 服务随当前用户登录加载。断开 SSH 不影响运行，进程退出后由 launchd 自动拉起。机器重启后，服务在该用户登录时启动。
 
@@ -38,7 +38,7 @@ launchctl bootout "gui/$(id -u)/com.local.agent-loop.run"
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.local.agent-loop.run.plist"
 ```
 
-已加载的服务使用重启命令。修改 plist 后，先停止服务，再重新加载该文件。
+已加载的服务使用重启命令。修改 plist 后，先停止服务，确认旧 PID 已退出且服务已卸载，再重新加载该文件。卸载尚未完成时立即执行 `bootstrap` 可能返回 `Input/output error`。
 
 ## 查看日志
 
