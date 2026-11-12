@@ -3,6 +3,7 @@ import { constants } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { z } from 'zod';
 import { collectionRepositorySchema } from './domain.js';
+import { projectConfigSchema } from './project.js';
 
 const environmentName = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'Use an environment variable name, not a credential');
 const positiveMilliseconds = z.number().int().positive();
@@ -26,6 +27,18 @@ export const configSchema = z.strictObject({
     'Repository names must be unique',
   ),
   engineering: z.strictObject({ projectRoot: z.string().trim().min(1).optional(), promptPath: z.string().min(1).optional(), skillPath: z.string().min(1).optional() }).optional(),
+  projects: z.array(projectConfigSchema).default([]).superRefine((projects, context) => {
+    const ids = new Set<string>(), repositories = new Set<string>();
+    for (const project of projects) {
+      if (ids.has(project.id)) context.addIssue({ code: 'custom', message: 'Project IDs must be unique' });
+      ids.add(project.id);
+      for (const repository of project.repositories) {
+        const name = repository.name.toLowerCase();
+        if (repositories.has(name)) context.addIssue({ code: 'custom', message: 'A repository can belong to only one coordinated project' });
+        repositories.add(name);
+      }
+    }
+  }),
   recovery: z.strictObject({ maxAttempts: z.number().int().nonnegative().default(3), retryDelayMs: positiveMilliseconds.default(1000) }).default({ maxAttempts: 3, retryDelayMs: 1000 }),
   github: z.strictObject({
     tokenEnv: environmentName.default('GITHUB_TOKEN'),
@@ -67,6 +80,10 @@ export async function loadConfig(path: string): Promise<Config> {
   const raw: unknown = JSON.parse(await readFile(configPath, 'utf8'));
   const config = configSchema.parse(raw);
   config.dataDir = resolve(directory, config.dataDir);
+  for (const project of config.projects) {
+    project.directory = resolve(directory, project.directory);
+    if (!(await stat(project.directory)).isDirectory()) throw new Error(`Project directory must exist: ${project.directory}`);
+  }
   config.repositories = config.repositories.map(repository => !('path' in repository) ? repository : ({ ...repository, path: resolve(directory, repository.path),
     ...(repository.workspace?.kind === 'project-directory'
       ? { workspace: { ...repository.workspace, path: resolve(directory, repository.workspace.path) } } : {}),

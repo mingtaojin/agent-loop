@@ -5,7 +5,7 @@ import { join, extname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WorkspaceBridge } from './workspace-bridge.js';
 import { z } from 'zod';
-import { discoveredProjectSchema, requestSchema, workspaceTargetSchema } from './domain.js';
+import { criteriaSchema, discoveredProjectSchema, requestSchema, workspaceTargetSchema } from './domain.js';
 import { discoverProjects } from './project-discovery.js';
 import type { Config } from './config.js';
 import { errorMessage, presentTaskSource, matchSource, normalizeManualTaskText, RejectedInputError, submissionReceipt, submissionSourceId, TurnChangedError, workspaceSelectionResponseSchema, type Submission, type SubmissionReceipt, type AgentInput, type ApprovalAction, type DiscoveredProject, type ExecutionSnapshot, type IncomingMessage, type Repository, type Source, type SourceComment, type Task, type TaskResource, type TaskSource, type WorkspaceCandidate, type WorkspaceTarget, type WorkspaceSelectionResponse } from './domain.js';
@@ -15,6 +15,8 @@ import { Store, type Inbox } from './store.js';
 import { FeishuProgressPublisher } from './feishu-progress.js';
 import { FeishuDocumentProgressPublisher } from './feishu-document-progress.js';
 import { taskProgressStatus } from './feishu-progress-view.js';
+import { ProjectRuntime } from './project-runtime.js';
+import type { ProjectAction } from './project.js';
 
 const digest = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex');
 const approvalOutputSchema = z.object({ taskId: z.string(), request: requestSchema });
@@ -39,9 +41,15 @@ export class AgentLoop {
   private closing: Promise<void> | null = null;
   private collecting: Promise<void> | null = null;
   private readonly selectionAbort = new AbortController();
+  readonly projects: ProjectRuntime;
   constructor(readonly config: Config, readonly ports: { github: GitHubPort; feishu: FeishuPort; codex: CodexPort; workspace: WorkspacePort }, store?: Store,
     private readonly invocation?: { configPath: string }) {
     this.store = store ?? new Store(config.dataDir);
+    this.projects = new ProjectRuntime(config.projects, this.store, {
+      makeTask: async (sourceId, prompt) => this.newTask(sourceId, { kind: 'cli', ...ProjectRuntime.submission(sourceId, prompt), submittedAt: Date.now() }),
+      releaseWorkspace: (taskId, resourceId) => this.releaseWorkspace(taskId, resourceId),
+      control: (taskId, action) => this.control(taskId, action),
+    });
     this.submissionService = new SubmissionService(config.dataDir, config.submission, input => this.submit(input));
     const progress = config.feishu.progress;
     this.progress = !progress.enabled ? null : progress.surface === 'document'
@@ -52,7 +60,8 @@ export class AgentLoop {
         intervalMs: progress.intervalMs, dashboardUrl: progress.dashboardUrl }) : null;
     ports.codex.setEventHandler?.(event => {
       try {
-        const task = this.store.taskForThread(event.threadId);
+        const archived = this.store.meta(`project-archived-thread:${event.threadId}`);
+        const task = this.store.taskForThread(event.threadId) ?? (archived ? this.store.task(archived) : null);
         if (task) this.store.recordExecutionEvent(task.id, event);
       } catch (error) { this.problem('debug:' + event.threadId, error); }
     });
@@ -62,12 +71,27 @@ export class AgentLoop {
       const snapshot = await ports.codex.inspect(task.threadId);
       if (snapshot.status !== 'running') throw new Error('Workspace capability requires an active turn');
       return this.ensureWorkspace(task.id, repository);
+    }, async (taskId, action) => {
+      const task = this.store.task(taskId);
+      if (this.stopping || ['paused', 'failed'].includes(task.status) || !task.threadId) throw new Error('Project capability requires an active conversation');
+      const snapshot = await ports.codex.inspect(task.threadId);
+      if (snapshot.status !== 'running') throw new Error('Project capability requires an active turn');
+      return this.projectAction(taskId, action);
     });
     ports.codex.setWorkspaceHandler(async request => {
       const task = this.store.taskForThread(request.threadId);
       if (!task || task.status === 'paused' || task.status === 'failed') throw new Error('Workspace request is not bound to an active task turn');
       return this.ensureWorkspace(task.id, 'projectId' in request ? { projectId: request.projectId } : { repository: request.repository });
     });
+    if (config.projects.length) ports.codex.setProjectHandler?.(async request => {
+      const task = this.store.taskForThread(request.threadId);
+      if (!task || this.stopping || ['paused', 'failed'].includes(task.status)) throw new Error('Project action requires an active task');
+      return this.projectAction(task.id, request.action);
+    });
+  }
+  async projectAction(taskId: string, action: ProjectAction): Promise<unknown> {
+    if (this.stopping) throw new Error('Runtime is stopping');
+    return this.projects.action(taskId, action);
   }
   tasks(): Task[] { return this.store.tasks(); }
   async submit(input: Submission): Promise<SubmissionReceipt> {
@@ -101,7 +125,8 @@ export class AgentLoop {
   private persist(task: Task): void {
     const latest = this.store.task(task.id);
     this.recordProgressStatus(task);
-    task.resources = [...new Map([...task.resources, ...latest.resources].map(resource => [resource.id, resource])).values()];
+    task.resources = [...new Map([...task.resources, ...latest.resources].map(resource => [resource.id, resource])).values()]
+      .filter(resource => this.store.meta(`released-resource:${task.id}:${resource.id}`) !== 'released');
     task.updatedAt = Date.now(); this.store.saveTask(task);
   }
   private notify(task: Task, text: string, key: string): void { this.store.enqueue(task.id, text, key); }
@@ -115,7 +140,17 @@ export class AgentLoop {
     return (await readFile(path, 'utf8')).trim();
   }
   private async instructions(task: Task): Promise<string> {
-    const prompt = (await this.currentPrompt()) + this.submissionInstructions();
+    const membership = this.projects.ledger.membership(task.id);
+    const rolePrompt = membership ? await readFile(new URL(`../${import.meta.url.endsWith('.ts') ? '' : '../'}prompts/${membership.role === 'coordinator' ? 'coordinator' : 'worker'}.md`, import.meta.url), 'utf8') : await this.currentPrompt();
+    let projectFallback = '';
+    if (membership) {
+      const capability = await this.workspaceBridge.grant(task.id);
+      const client = fileURLToPath(new URL(import.meta.url.endsWith('.ts') ? './project-client.ts' : './project-client.js', import.meta.url));
+      const quote = (text: string) => `'${text.replaceAll("'", "'\"'\"'")}'`;
+      const launcher = [process.execPath, ...(import.meta.url.endsWith('.ts') ? ['--import', fileURLToPath(import.meta.resolve('tsx'))] : []), client].map(quote).join(' ');
+      projectFallback = `\nIf project_action is absent in a retained Thread, write the action JSON to a file and run ${launcher} ${quote(capability)} '<absolute-action-json-file>' using your shell tool. This task-scoped capability uses the same project operations. Never read, copy or share the capability contents.`;
+    }
+    const prompt = rolePrompt + this.submissionInstructions() + this.projects.instructions(task.id) + projectFallback;
     const skill = this.config.engineering?.skillPath;
     let projects: DiscoveredProject[] = [];
     let discoveryError = '';
@@ -153,7 +188,7 @@ export class AgentLoop {
   private async inspect(threadId: string): Promise<ExecutionSnapshot> {
     const task = this.store.taskForThread(threadId);
     if (!task) throw new Error('Unbound Thread');
-    const snapshot = await this.ports.codex.inspect(threadId, await this.instructions(task));
+    const snapshot = await this.ports.codex.inspect(threadId, await this.instructions(task), this.store.meta(`project-task-model:${task.id}`) ?? undefined, this.projects.reasoningEffort(task.id));
     this.recordProgressStatus({ ...task, turnId: snapshot.turnId, executionStatus: snapshot.status, requests: snapshot.requests });
     return snapshot;
   }
@@ -183,12 +218,24 @@ export class AgentLoop {
     try { await work; } finally { this.collecting = null; }
   }
   private async collectSources(): Promise<void> {
+    await this.projects.ensure();
     const observed = new Set<string>();
-    for (const repository of this.config.repositories) {
+    const projectCriteria = criteriaSchema.parse({ states: ['open', 'closed'] });
+    const repositories = this.config.repositories.map(repository => this.projects.ownsRepository(repository.name)
+      ? { ...repository, criteria: projectCriteria } : repository);
+    for (const project of this.config.projects) for (const repository of project.repositories) {
+      if (!repositories.some(item => item.name.toLowerCase() === repository.name.toLowerCase())) repositories.push({ name: repository.name, criteria: projectCriteria });
+    }
+    for (const repository of repositories) {
       try {
         for await (const source of this.ports.github.list(repository)) {
           observed.add(source.id);
           const existing = this.store.taskForSource(source.id);
+          if (this.projects.ownsRepository(source.repository)) {
+            await this.projects.collect(source, existing);
+            if (existing && !this.projects.ledger.membership(existing.id)) await this.serial(existing.id, () => this.updateSource(existing.id, source));
+            continue;
+          }
           if (existing) { await this.serial(existing.id, () => this.updateSource(existing.id, source)); continue; }
           const match = matchSource(source, repository.criteria);
           if (!match.matches) { this.store.saveSource(source, match.reason); continue; }
@@ -200,6 +247,7 @@ export class AgentLoop {
     }
     await Promise.all(this.store.tasks().map(async task => {
       if (task.source.kind !== 'github') return;
+      if (this.projects.ledger.membership(task.id)) return;
       try {
         if (!observed.has(task.sourceId)) {
           const source = await this.ports.github.get(task.source.issue.repository, task.source.issue.number);
@@ -210,6 +258,7 @@ export class AgentLoop {
         }
       } catch (error) { this.problem(`source:${task.id}`, error); }
     }));
+    await this.projects.refresh(this.ports.github, observed);
     if (this.running) await this.backfill();
   }
   private async updateSource(id: string, source: Source): Promise<void> {
@@ -244,6 +293,7 @@ export class AgentLoop {
   }
   async tick(): Promise<void> {
     if (this.running) this.heartbeat('running');
+    this.projects.supervise();
     await Promise.all(this.store.tasks().filter(task => !this.lanes.has(task.id)).map(task => this.serial(task.id, () => this.advance(task.id))));
   }
   private executionDirectory(task: Task): string {
@@ -352,7 +402,10 @@ export class AgentLoop {
       this.selectionAbort.signal.throwIfAborted();
       task = this.store.task(task.id);
       if (!this.selectionInputsCurrent(task)) return false;
-      task.threadId = await this.effect(task, 'thread', false, () => this.ports.codex.createThread({ cwd: this.executionDirectory(task), instructions })); this.persist(task);
+      const generation = this.store.meta(`project-generation:${task.id}`);
+      task.threadId = await this.effect(task, generation ? `thread:${generation}` : 'thread', false, () => this.ports.codex.createThread({ cwd: this.executionDirectory(task), instructions,
+        ...(this.projects.reasoningEffort(task.id) ? { reasoningEffort: this.projects.reasoningEffort(task.id) } : {}),
+        ...(this.store.meta(`project-task-model:${task.id}`) ? { model: this.store.meta(`project-task-model:${task.id}`) ?? undefined } : {}) })); this.persist(task);
       this.selectionAbort.signal.throwIfAborted();
     }
     return true;
@@ -369,6 +422,24 @@ export class AgentLoop {
   async ensureWorkspace(taskId: string, target: string | WorkspaceTarget): Promise<TaskResource> {
     return this.acquireWorkspace(taskId, workspaceTargetSchema.parse(typeof target === 'string' ? { repository: target } : target));
   }
+  private async releaseWorkspace(taskId: string, resourceId: string): Promise<unknown> {
+    const task = this.store.task(taskId);
+    const key = `released-resource:${taskId}:${resourceId}`;
+    if (this.store.meta(key) === 'released') return { released: true, resourceId };
+    const resource = task.resources.find(item => item.id === resourceId);
+    if (!resource || resource.kind !== 'git-worktree') throw new Error('Only task-owned registered Git worktrees can be released');
+    if (!this.ports.workspace.release) throw new Error('Workspace release is unavailable');
+    if (this.executionDirectory(task) === resource.workspace) throw new Error('Cannot release the active conversation directory');
+    if (this.store.tasks().some(other => other.id !== taskId && other.resources.some(item => item.workspace === resource.workspace))) throw new Error('Workspace is still associated with another task');
+    this.store.setMeta(key, 'releasing');
+    await this.ports.workspace.release({ taskId, resourceId, workspace: resource.workspace, repository: resource.repository, branch: resource.branch });
+    this.store.transaction(() => {
+      this.store.setMeta(key, 'released');
+      task.resources = task.resources.filter(item => item.id !== resourceId);
+      this.store.saveTask(task);
+    });
+    return { released: true, resourceId };
+  }
   private async acquireWorkspace(taskId: string, target: WorkspaceTarget, snapshot?: Repository | DiscoveredProject): Promise<TaskResource> {
     const key = JSON.stringify([taskId, 'projectId' in target ? ['project', target.projectId] : ['repository', target.repository.toLowerCase()]]);
     const active = this.resourceLanes.get(key);
@@ -381,6 +452,7 @@ export class AgentLoop {
       let resource: TaskResource;
       if (existing) {
         await this.restoreWorkspace(taskId, existing);
+        if (this.store.meta(`released-resource:${taskId}:${existing.id}`) === 'released') throw new Error('Workspace was released; use a new task for new development');
         resource = existing;
       } else {
         if ('projectId' in target) {
@@ -415,6 +487,9 @@ export class AgentLoop {
     try { return await work; } finally { this.resourceLanes.delete(key); }
   }
   private async restoreWorkspace(taskId: string, resource: TaskResource): Promise<void> {
+    const releaseState = this.store.meta(`released-resource:${taskId}:${resource.id}`);
+    if (releaseState === 'released') return;
+    if (releaseState === 'releasing') { await this.releaseWorkspace(taskId, resource.id); return; }
     const common = { taskId, resourceId: resource.id, workspace: resource.workspace };
     if (resource.kind === 'project' && resource.workspace !== resource.project.canonicalPath) throw new Error('Project workspace snapshot identity changed');
     const actual = await this.ports.workspace.ensure(resource.kind === 'project'
@@ -462,6 +537,7 @@ export class AgentLoop {
         const snapshot = await this.inspect(task.threadId);
         await this.processApprovals(task, snapshot);
         await this.observe(task, snapshot); task = this.store.task(id);
+        if (this.projects.rotateIfReady(task)) return;
         if (['interrupted', 'failed'].includes(snapshot.status) && task.status === 'running' && snapshot.turnId && !this.hasUnknownInput(task)
           && !this.store.inputs(task.id).some(input => input.origin === 'user' && input.status === 'pending')) {
           if (task.recovery.interruptedTurnId !== snapshot.turnId) this.fault(task, new Error('已确认原执行中断，等待有限恢复'), snapshot.turnId);
@@ -488,10 +564,12 @@ export class AgentLoop {
       if (output.phase !== 'final') continue;
       if (task.legacy && this.store.hasOutput(task.id, `turn:${output.turnId}`)) continue;
       if (output.text.trim()) this.notify(task, output.text, `agent-output:${output.id}`);
+      if (output.text.trim()) this.projects.observe(task, `output:${output.id}`, output.text, 'final_answer');
     }
     for (const request of snapshot.requests) {
       if (oldRequests.has(request.id)) continue;
       const key = this.store.enqueue(task.id, request.prompt, `request:${request.id}`);
+      this.projects.observe(task, `request:${request.id}`, `${request.kind}: ${request.prompt}`, request.kind === 'question' ? 'question' : 'native_request');
       if (request.kind === 'approval' || request.kind === 'permissions') this.store.setMeta(`approval-output:${key}`, JSON.stringify({ taskId: task.id, request }));
     }
     if (task.status === 'paused') { this.persist(task); return; }
@@ -505,6 +583,8 @@ export class AgentLoop {
       task.status = 'running'; task.reason = snapshot.error ?? 'Agent execution failed';
     }
     this.persist(task);
+    if (snapshot.status === 'failed' || snapshot.status === 'interrupted') this.projects.observe(task,
+      `execution:${snapshot.turnId}:${snapshot.status}`, snapshot.error ?? snapshot.status, 'execution_status');
   }
   async receive(message: IncomingMessage): Promise<void> {
     if (this.stopping) throw new Error('Agent Loop is closing');
@@ -529,8 +609,15 @@ export class AgentLoop {
       return;
     }
     const task = this.store.taskForChat(message.chatId);
-    if (!task || !this.store.receive(task.id, message, 'user', undefined, !task.threadId && task.workspaceSelection.kind === 'waiting' ? 'workspace-selection' : 'task')) return;
+    if (!task || !this.receiveOwner(task, message, !task.threadId && task.workspaceSelection.kind === 'waiting' ? 'workspace-selection' : 'task')) return;
     if (this.running || !this.started) await this.serial(task.id, () => this.advance(task.id));
+  }
+  private receiveOwner(task: Task, message: IncomingMessage, route: Inbox['route']): boolean {
+    return this.store.transaction(() => {
+      const received = this.store.receive(task.id, message, 'user', undefined, route);
+      this.projects.observe(task, `user:${message.id}`, `Owner input ${message.id}:\n${message.text}\nAttachments: ${JSON.stringify(message.attachments)}`, 'owner_input');
+      return received;
+    });
   }
   async approve(action: ApprovalAction): Promise<void> {
     if (this.stopping) throw new Error('Agent Loop is closing');
@@ -625,7 +712,8 @@ export class AgentLoop {
       let prepared: AgentInput[];
       try { prepared = await this.prepare(task, input); }
       catch (error) { this.store.markInput(input.id, 'failed', errorMessage(error)); this.notify(task, `附件准备失败，文字与原文件仍保留，消息尚未投递。\n${errorMessage(error)}`, `attachment:${input.id}`); break; }
-      const questions = input.provenance.kind === 'user' ? snapshot.requests.filter(request => request.kind === 'question') : [];
+      const agentQuestion = input.provenance.kind === 'agent' && input.provenance.category === 'instruction' && this.projects.ledger.membership(input.provenance.taskId)?.role === 'coordinator';
+      const questions = input.provenance.kind === 'user' || agentQuestion ? snapshot.requests.filter(request => request.kind === 'question') : [];
       if (questions.length > 1) { this.store.markInput(input.id, 'failed', '存在多个原生问题，无法唯一关联'); this.notify(task, '存在多个原生问题，回复已保存，需要明确关联后再投递。', `question-ambiguous:${input.id}`); break; }
       if (this.stopping) break;
       this.store.markInput(input.id, 'delivering');
@@ -731,7 +819,7 @@ export class AgentLoop {
   async recover(): Promise<void> {
     await Promise.all(this.store.tasks().map(task => this.serial(task.id, async () => {
       try {
-        if (task.source.kind === 'github') {
+        if (task.source.kind === 'github' && !this.projects.ledger.membership(task.id)) {
           try {
             const source = await this.ports.github.get(task.source.issue.repository, task.source.issue.number);
             await this.updateSource(task.id, source); task = this.store.task(task.id);
@@ -759,8 +847,10 @@ export class AgentLoop {
       const cursor = Date.now();
       const since = Math.max(task.createdAt, previous - this.config.pollIntervalMs * 2);
       for (const message of await this.ports.feishu.history({ chatId: task.chatId, since })) {
-        if (message.senderId === this.config.feishu.userOpenId) this.store.receive(task.id, message, 'user', undefined,
-          !task.threadId && task.workspaceSelection.kind === 'waiting' && message.createdAt >= task.workspaceSelection.askedAt ? 'workspace-selection' : 'task');
+        if (message.senderId === this.config.feishu.userOpenId) {
+          this.receiveOwner(task, message,
+            !task.threadId && task.workspaceSelection.kind === 'waiting' && message.createdAt >= task.workspaceSelection.askedAt ? 'workspace-selection' : 'task');
+        }
       }
       this.store.setMeta(`history:${task.id}`, String(cursor));
     } catch (error) {
@@ -810,6 +900,7 @@ export class AgentLoop {
     await this.collecting;
     await Promise.allSettled([...this.lanes.values(), ...this.resourceLanes.values()]);
     await this.workspaceBridge.close();
+    await this.projects.close();
     await this.ports.codex.close();
     if (this.started) this.heartbeat('stopped');
     this.store.close();

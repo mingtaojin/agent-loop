@@ -1,5 +1,7 @@
 # 在本机运行 Agent Loop
 
+项目协调者可统一接手多个仓库中带指定标签或指派给指定账号的 Issue，委派使用 poteto-mode 的 Worker，并接收问题和成果。配置、项目工具和会话恢复见[项目协调者](docs/project-coordinator.md)。
+
 Agent Loop 保存一件事情的持续上下文。所有者在飞书中直接私聊机器人发送文字、图文、截图或日志文件，即可创建独立任务群，后续在该群继续。GitHub 可按配置收集 Issue，Agent 也可通过 CLI 提交自行整理的任务说明。新任务先由独立的临时 Codex Thread 只读选择工程入口，再建立正式 Thread。每项任务保留独立任务群和正式 Thread。Agent 决定调查、技能调用、实现和交付。Runtime 负责目录校验、输入、原生请求、输出与恢复。
 
 ## 准备配置

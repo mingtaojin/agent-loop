@@ -198,6 +198,7 @@ export interface ExecutionSnapshot {
   error: string | null;
 }
 export const inputProvenanceSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('agent'), projectId: z.string(), taskId: z.string(), eventId: z.string(), category: z.string() }),
   z.object({ kind: z.literal('user'), message: incomingSchema }),
   z.object({ kind: z.literal('github_issue'), sourceId: z.string(), revision: z.string(), url: z.string() }),
   z.object({ kind: z.literal('github_comment'), sourceId: z.string(), commentId: z.string(), revision: z.string(), url: z.string(), author: z.string() }),
