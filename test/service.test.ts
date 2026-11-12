@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { setTimeout } from 'node:timers/promises';
 import { test, type TestContext } from 'node:test';
+import { z } from 'zod';
 import { configSchema, type Config } from '../src/config.js';
 import { type IncomingMessage, type Task } from '../src/domain.js';
 import { AgentLoop } from '../src/loop.js';
@@ -411,10 +412,13 @@ test('screenshots and same-name logs reach Codex as unchanged, readable task-loc
   const input = f.codex.steers.at(-1)?.input;
   assert.ok(input);
   assert.deepEqual(input[0], { kind: 'text', text: message.text });
-  const imageInput = input.find(item => item.kind === 'image');
-  assert.ok(imageInput && imageInput.kind === 'image');
-  assert.deepEqual(await readFile(imageInput.path), image);
+  assert.ok(input.every(item => item.kind === 'text'));
+  const imageInput = input.find(item => item.kind === 'text' && item.text.startsWith('Image attachment as data: '));
+  assert.ok(imageInput && imageInput.kind === 'text');
+  const imageReference = z.object({ path: z.string() }).parse(JSON.parse(imageInput.text.slice('Image attachment as data: '.length).split('\n')[0] ?? ''));
+  assert.deepEqual(await readFile(imageReference.path), image);
   const logPaths = input.filter(item => item.kind === 'text').flatMap(item => {
+    if (item.text.startsWith('Image attachment as data: ')) return [];
     const match = /完整原文件位于 ("(?:[^"\\]|\\.)*")/.exec(item.text);
     if (!match?.[1]) return [];
     const path: unknown = JSON.parse(match[1]);
@@ -431,7 +435,7 @@ test('screenshots and same-name logs reach Codex as unchanged, readable task-loc
   await f.loop.receive(message);
   assert.equal(f.feishu.downloads.length, 3);
   assert.equal(f.codex.steers.filter(input => input.deliveryId === message.id).length, 1);
-  assert.deepEqual(await readFile(imageInput.path), image);
+  assert.deepEqual(await readFile(imageReference.path), image);
 });
 
 test('failed attachment retains text while later ordinary messages proceed and retry remains explicit', async t => {
