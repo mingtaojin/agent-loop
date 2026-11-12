@@ -26,11 +26,22 @@ Evidence directory on the authorized Mac is `/Users/developer/IdeaProjects/agent
 | Before on actual configured model path | Codex 0.167.0 reports `openai` and `gpt-6.1-sol`. The original schema receives the exact HTTP 400 `choice.oneOf` rejection, with `willRetry=false`. `before-result.json`, `before-protocol.jsonl`, `before-identity.json`. |
 | Failing regression | Three tests fail before the fix for schema rejection and repeated recovery. `regression-before.log`. |
 | Core regression after fix | Six tests pass. Both failed-turn and RPC errors submit once, remain stopped across recovery, and allow explicit continuation with original messages and attachment bytes. HTTP 429, a prose mention of the code, and a different service code retain finite recovery. `regression-after.log`. |
-| Full local tests | 484 of 485 pass. The CLI shutdown submission case returns `unknown_outcome` during its 15-second wait. It passes alone on rerun in 5.2 seconds. `full-tests.log`, `submission-retest.log`. |
+| Full local tests | 485 of 485 pass with test concurrency 2. The earlier unrestricted run passes 484 of 485; its CLI shutdown timeout also passes alone. `full-tests-concurrency2.log`, `full-tests.log`, `submission-retest.log`. |
 | Type check and build | Both pass. `check.log`, `build.log`. |
-| Actual service after fix | Pending coordinator notice after separate authentication maintenance. |
+| Current authentication, actual service | New `anyOf` returns and validates all four choices. Every temporary fixture retains its original file and bytes. `after-auth-summary.json` and `after-auth-fixed-*-protocol.jsonl`. |
+| Same authentication, original schema control | Old `oneOf` also succeeds after the authentication change. This prevents attributing the earlier failure and later success to the code change. `after-auth-original-protocol.jsonl`. |
+| Original rejecting backend, new schema | Unverified. An isolated environment using the previous authentication requires coordinator approval and operations handling. Global authentication is not rolled back. |
+| Read-only source preflight | The configured DeepSeek model is rejected by the current ChatGPT account with `modelNotFound`. This is not a quota error or a review pass. `source-preflight.jsonl`. |
 | Independent verification | Pending coordinator assignment. |
 
 The historical failed task belongs to the separate `/Users/developer/ydkideaproject/agent-loop` instance. It already has a selected directory and formal Thread and is idle when observed. This work does not replay or alter it. The current coordinator runs a compiled CLI worktree entry; its source HEAD does not establish the bytes used in the historical failed request.
 
-The before probe predates separately authorized authentication maintenance. After resumption, the original and fixed schemas must be compared under the same resulting authentication environment. No credential content is evidence. No production Feishu connection, task replay, service restart, or deployment is performed by this Worker.
+The before probe predates separately authorized authentication maintenance. After resumption, both schemas are tested under the same resulting environment. Codex 0.167.0 reports `openai` and `gpt-6.1-sol` in both phases, but the old schema's acceptance changes across the authentication boundary. The new schema's acceptance by the original rejecting backend remains a separate gate. No credential content is evidence. No production Feishu connection, task replay, service restart, or deployment is performed by this Worker.
+
+## Reproduce local verification
+
+Run `node --import tsx --test --test-concurrency=2 test/*.test.ts`, `npm run check`, and `npm run build` from this worktree. The focused regression command is `node --import tsx --test --test-name-pattern='strict-schema|deterministic invalid-schema|selector (rate-limit|schema-word)' test/codex-selection.test.ts test/workspace-selection.test.ts`.
+
+The real selector instrument is preserved locally at `.scratch/issue-16/probe.ts` with `proxy.mjs`; it loads the original instance's configuration and creates a separate temporary directory and read-only selector. Its arguments select a result label, expected choice, and an optional `original` schema mode. The original mode is compared offline to the captured failing request and has identical schema content. Real runs use the existing environment file without printing it. No persistent production platform adapter is started.
+
+PR #14's readable failure notice currently checks `WorkspaceSelectionError`, while this candidate preserves `InvalidOutputSchemaError` separately. Eventual integration must verify both the readable user notice and immediate retry stop. This independent candidate does not rewrite the other Owner's notice.
