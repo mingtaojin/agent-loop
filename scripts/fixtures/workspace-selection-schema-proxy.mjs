@@ -13,7 +13,7 @@ createInterface({ input: process.stdin }).on('line', line => {
     delete choice.anyOf;
   }
   if (message.method === 'turn/start') save({ method: message.method, outputSchema: message.params.outputSchema, sandboxPolicy: message.params.sandboxPolicy });
-  child.stdin.write(line + '\n');
+  child.stdin.write(JSON.stringify(message) + '\n');
 });
 createInterface({ input: child.stdout }).on('line', line => {
   const message = JSON.parse(line);
