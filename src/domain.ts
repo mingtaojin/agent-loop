@@ -219,6 +219,7 @@ export const approvalActionSchema = z.object({
 });
 export type ApprovalAction = z.infer<typeof approvalActionSchema>;
 export class UncertainOperationError extends Error {}
+export class InvalidOutputSchemaError extends Error {}
 export class TurnChangedError extends Error {}
 export class RejectedInputError extends Error {}
 export function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }

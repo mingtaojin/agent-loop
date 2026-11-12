@@ -37,18 +37,23 @@ createInterface({ input: process.stdin }).on('line', line => {
       if (selection && mode === 'crash') process.exit(27);
       if (selection && mode === 'approval') { send({ id: 'forbidden-approval', method: 'item/commandExecution/requestApproval', params: { ...scope, itemId: 'command', startedAtMs: Date.now(), command: 'touch forbidden', cwd } }); return; }
       if (selection && mode === 'slow') return;
-      const choice = ['project', 'unknown-project', 'project-path'].includes(mode)
+      const choice = ['project', 'unknown-project', 'project-path', 'missing-project-id', 'missing-project-reason'].includes(mode)
         ? { kind: 'project', projectId: mode === 'unknown-project' ? 'invented-project' : 'project-fixture', reason: 'Matches task evidence', ...(mode === 'project-path' ? { path: '/invented/path' } : {}) }
-        : mode === 'none' ? { kind: 'none', reason: 'Discussion only' } : mode === 'question' ? { kind: 'question', question: 'Which configured project should be used?' } : { kind: 'repository', repositoryName: mode === 'unknown-repository' ? 'outside/project' : 'example/project', reason: 'Matches task evidence' };
+        : ['none', 'missing-none-reason'].includes(mode) ? { kind: 'none', reason: 'Discussion only' } : ['question', 'missing-question'].includes(mode) ? { kind: 'question', question: 'Which configured project should be used?' } : { kind: 'repository', repositoryName: mode === 'unknown-repository' ? 'outside/project' : 'example/project', reason: 'Matches task evidence' };
       if (mode === 'missing-repository') delete choice.repositoryName;
-      if (mode === 'missing-reason') delete choice.reason;
+      if (['missing-reason', 'missing-project-reason', 'missing-none-reason'].includes(mode)) delete choice.reason;
+      if (mode === 'missing-project-id') delete choice.projectId;
+      if (mode === 'missing-question') delete choice.question;
       const text = selection ? mode === 'malformed' ? 'not JSON' : JSON.stringify({ choice }) : 'Formal task result';
       const commentary = { id: 'progress', type: 'agentMessage', phase: 'commentary', text: 'Temporary directory selection commentary' };
       const answer = { id: 'answer', type: 'agentMessage', phase: 'final_answer', text };
       if (selection) send({ method: 'item/completed', params: { ...scope, item: commentary } });
-      if ((!invalidSchema && mode !== 'failed') || !selection) send({ method: 'item/completed', params: { ...scope, item: answer } });
-      turn.status = selection && (mode === 'failed' || invalidSchema) ? 'failed' : 'completed';
-      turn.error = turn.status === 'failed' ? { message: invalidSchema ? schemaError : 'Selection failed in fixture' } : null;
+      const transient = ['rate-limit', 'schema-word-in-prose', 'schema-word-with-different-code'].includes(mode);
+      if ((!invalidSchema && !transient && mode !== 'failed') || !selection) send({ method: 'item/completed', params: { ...scope, item: answer } });
+      turn.status = selection && (mode === 'failed' || invalidSchema || transient) ? 'failed' : 'completed';
+      const transientError = mode === 'schema-word-in-prose' ? 'Temporary unavailable: invalid_json_schema is an example code, not this failure'
+        : JSON.stringify({ error: { message: mode === 'rate-limit' ? 'Rate limit reached' : 'Temporary unavailable: invalid_json_schema is an example code', code: 'rate_limit_exceeded' }, status: 429 });
+      turn.error = turn.status === 'failed' ? { message: invalidSchema ? schemaError : transient ? transientError : 'Selection failed in fixture' } : null;
       if (!selection) turn.items.push(answer);
       current.status = { type: 'idle' };
       send({ method: 'turn/completed', params: { threadId: current.id, turn } });

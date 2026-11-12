@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
-import { RejectedInputError, TurnChangedError, UncertainOperationError, workspaceTargetSchema, type AgentInput, type AgentOutput, type ExecutionSnapshot, type PendingRequest, type WorkspaceRequest, type WorkspaceSelectionRequest, type WorkspaceSelectionResponse } from '../domain.js';
+import { InvalidOutputSchemaError, RejectedInputError, TurnChangedError, UncertainOperationError, workspaceTargetSchema, type AgentInput, type AgentOutput, type ExecutionSnapshot, type PendingRequest, type WorkspaceRequest, type WorkspaceSelectionRequest, type WorkspaceSelectionResponse } from '../domain.js';
 import type { CodexPort } from '../ports.js';
 import { executionEvent, type ExecutionEvent } from '../execution-events.js';
 import { workspaceSelectionInput, workspaceSelectionInstructions, workspaceSelectionOutputSchema } from '../workspace-selection.js';
@@ -104,7 +104,13 @@ type CompletedHistory = { turnId: string; status: 'completed'; error: string | n
 type HistoryObservation = { completed?: CompletedHistory };
 class TurnHistoryPendingError extends UncertainOperationError {}
 class RpcError extends Error {
-  constructor(readonly code: number, message: string) { super(message); }
+  constructor(readonly code: number, message: string, readonly detail: string) { super(message); }
+}
+const invalidOutputSchemaErrorSchema = z.object({ error: z.object({ code: z.literal('invalid_json_schema') }) });
+function isInvalidOutputSchemaError(error: unknown): error is Error {
+  if (!(error instanceof Error)) return false;
+  try { return invalidOutputSchemaErrorSchema.safeParse(JSON.parse(error instanceof RpcError ? error.detail : error.message)).success; }
+  catch { return false; }
 }
 
 function historyDigest(value: object): string {
@@ -266,7 +272,7 @@ export class CodexAppServer implements CodexPort {
     if (!call) return;
     clearTimeout(call.timer);
     this.calls.delete(message.id);
-    if (message.error) call.reject(new RpcError(message.error.code, `${call.method}: ${message.error.message}`));
+    if (message.error) call.reject(new RpcError(message.error.code, `${call.method}: ${message.error.message}`, message.error.message));
     else call.resolve(message.result);
   }
 
@@ -324,6 +330,10 @@ export class CodexAppServer implements CodexPort {
     const abort = () => selector.fail(new Error('Temporary directory selection aborted'));
     input.signal?.addEventListener('abort', abort, { once: true });
     try { return await selector.runWorkspaceSelection(input); }
+    catch (error) {
+      if (isInvalidOutputSchemaError(error)) throw new InvalidOutputSchemaError(error.message, { cause: error });
+      throw error;
+    }
     finally {
       input.signal?.removeEventListener('abort', abort);
       await selector.dispose(new Error('Temporary directory selection closed'));

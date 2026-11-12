@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { criteriaSchema, discoveredProjectSchema, requestSchema, workspaceTargetSchema } from './domain.js';
 import { discoverProjects } from './project-discovery.js';
 import type { Config } from './config.js';
-import { errorMessage, presentTaskSource, matchSource, normalizeManualTaskText, RejectedInputError, submissionReceipt, submissionSourceId, TurnChangedError, workspaceSelectionResponseSchema, type Submission, type SubmissionReceipt, type AgentInput, type ApprovalAction, type DiscoveredProject, type ExecutionSnapshot, type IncomingMessage, type Repository, type Source, type SourceComment, type Task, type TaskResource, type TaskSource, type WorkspaceCandidate, type WorkspaceTarget, type WorkspaceSelectionResponse } from './domain.js';
+import { errorMessage, InvalidOutputSchemaError, presentTaskSource, matchSource, normalizeManualTaskText, RejectedInputError, submissionReceipt, submissionSourceId, TurnChangedError, workspaceSelectionResponseSchema, type Submission, type SubmissionReceipt, type AgentInput, type ApprovalAction, type DiscoveredProject, type ExecutionSnapshot, type IncomingMessage, type Repository, type Source, type SourceComment, type Task, type TaskResource, type TaskSource, type WorkspaceCandidate, type WorkspaceTarget, type WorkspaceSelectionResponse } from './domain.js';
 import { SubmissionError, SubmissionService } from './submission.js';
 import type { CodexPort, FeishuPort, GitHubPort, WorkspacePort } from './ports.js';
 import { Store, type Inbox } from './store.js';
@@ -345,7 +345,10 @@ export class AgentLoop {
         candidates,
         input: prepared, answers: validAnswers.map(input => ({ inputId: input.id, text: input.message.text })), signal: this.selectionAbort.signal,
       }));
-    } catch (error) { throw new WorkspaceSelectionError(errorMessage(error)); }
+    } catch (error) {
+      if (error instanceof InvalidOutputSchemaError) throw error;
+      throw new WorkspaceSelectionError(errorMessage(error));
+    }
     this.selectionAbort.signal.throwIfAborted();
     task = this.store.task(task.id);
     if (JSON.stringify(this.store.inputs(task.id).map(input => input.id)) !== JSON.stringify(inputIds)) {
@@ -504,7 +507,7 @@ export class AgentLoop {
     const message = errorMessage(error);
     task.executionStatus = 'unknown'; task.reason = message;
     task.recovery.lastError = message; task.recovery.interruptedTurnId = turnId;
-    if (task.recovery.attempts >= this.config.recovery.maxAttempts || (!task.threadId && !(error instanceof WorkspaceSelectionError))) {
+    if (error instanceof InvalidOutputSchemaError || task.recovery.attempts >= this.config.recovery.maxAttempts || (!task.threadId && !(error instanceof WorkspaceSelectionError))) {
       task.status = 'failed'; task.recovery.nextAttemptAt = null;
       task.recovery.lastUserInputSeq = this.store.inputs(task.id).filter(input => input.origin === 'user').at(-1)?.seq ?? 0;
       this.notify(task, `任务恢复已停止，保留现场。\n${message}`, `recovery-exhausted:${digest(message)}`);

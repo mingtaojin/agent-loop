@@ -420,12 +420,28 @@ for (const mode of ['invalid-schema', 'invalid-schema-rpc']) test(`deterministic
   assert.equal(f.codex.starts.length, 1);
   const start = f.codex.starts[0]; assert.ok(start);
   assert.equal(start.deliveryId, 'initial');
-  assert.deepEqual(start.additionalDeliveryIds, ['continue']);
-  assert.match(JSON.stringify(start.input), /Investigate the original task without deploying/);
-  assert.match(JSON.stringify(start.input), /preserve the original scope/);
+  const deliveries = [...f.codex.starts, ...f.codex.steers];
+  assert.deepEqual(deliveries.map(input => input.deliveryId), ['initial', 'continue']);
+  assert.match(JSON.stringify(deliveries), /Investigate the original task without deploying/);
+  assert.match(JSON.stringify(deliveries), /preserve the original scope/);
   const download = f.feishu.downloads[0]; assert.ok(download);
   assert.equal(download.messageId, 'initial');
   assert.deepEqual(await readFile(download.destination.replace(/\.partial$/, '')), bytes);
+});
+
+for (const mode of ['rate-limit', 'schema-word-in-prose', 'schema-word-with-different-code']) test(`selector ${mode} retains bounded automatic recovery`, async t => {
+  const f = await fixture(t);
+  const server = new CodexAppServer({ command: [process.execPath, resolve('test/fixtures/workspace-selection-codex.mjs'), mode, join(f.root, 'transient-requests.jsonl')],
+    approvalPolicy: 'never', sandbox: 'read-only', requestTimeoutMs: 1000 });
+  t.after(() => server.close());
+  let calls = 0;
+  f.codex.selectWorkspace = async input => { calls++; return server.selectWorkspace(input); };
+  await f.manual();
+  assert.equal(f.task().status, 'pending');
+  assert.notEqual(f.task().recovery.nextAttemptAt, null);
+  for (let attempt = 0; attempt < 3; attempt++) { await delay(5); await f.loop.tick(); }
+  assert.equal(calls, 3);
+  assert.equal(f.task().status, 'failed');
 });
 
 test('original attachments keep their identity and bytes through workspace clarification', async t => {

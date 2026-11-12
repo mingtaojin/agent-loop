@@ -37,7 +37,7 @@ for (const mode of ['repository', 'none', 'question', 'early-completion', 'stric
   assert.match(JSON.stringify(started.params), /Previously confirmed directory answer/);
 });
 
-for (const mode of ['wrong-cwd', 'wrong-policy', 'wrong-sandbox', 'malformed', 'unknown-repository', 'missing-repository', 'missing-reason', 'failed', 'crash', 'approval']) test(`selector rejects ${mode} and releases its process`, async t => {
+for (const mode of ['wrong-cwd', 'wrong-policy', 'wrong-sandbox', 'malformed', 'unknown-repository', 'missing-repository', 'missing-reason', 'missing-none-reason', 'missing-question', 'failed', 'crash', 'approval']) test(`selector rejects ${mode} and releases its process`, async t => {
   const f = await fixture(t, mode);
   await assert.rejects(f.server.selectWorkspace(f.input));
   const rows = await f.records(); assert.ok(rows[0]);
@@ -111,7 +111,7 @@ test('temporary selection uses the configured selection model while the formal t
   assert.deepEqual(models, [{ ephemeral: false, model: 'main-model' }, { ephemeral: true, model: 'selection-model' }]);
 });
 
-for (const mode of ['project', 'unknown-project', 'project-path']) test(`isolated selector validates ${mode} against exact project candidates and releases its process`, async t => {
+for (const mode of ['project', 'unknown-project', 'project-path', 'missing-project-id', 'missing-project-reason']) test(`isolated selector validates ${mode} against exact project candidates and releases its process`, async t => {
   const f = await fixture(t, mode);
   f.input.candidates = [{ kind: 'project', id: 'project-fixture', name: 'example/project', entryPath: f.root, canonicalPath: f.root }];
   if (mode === 'project') {
