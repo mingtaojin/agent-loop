@@ -60,3 +60,13 @@ npx --no-install tsx scripts/verify-project-coordinator.ts
 会话轮换、原生问题转接及角色模型恢复有 Runtime 和协议测试，未分别进行真实平台端到端验收。必要实机验证受阻时仍不得算作通过。
 
 Runtime 工作树释放采用保守的提交保全检查。配置基线未更新，或 squash 合并不能通过祖先核对时，保留资源并报告原因。Worker 自建工作树按 pstack 的清理规则处理。
+
+## 角色模型与推理强度更新
+
+用户指定协调者使用 `gpt-6-astra`、`high`，Worker 使用 `gpt-6.1-sol`、`xhigh`。新项目采用这些默认值，也可通过项目配置覆盖。模型与强度随任务保存，Thread 创建、恢复、轮换和新 Turn 均使用保存的设置。
+
+更新后的静态检查与构建通过，相关测试 80 项通过，完整套件复跑 473 项通过。首次完整测试有一个原有 CLI 启停测试遇到 Node 网络层 `setTypeOfService EINVAL`，同一源码的完整复跑没有再出现。
+
+真实 Codex 探针 `live-1794472876875-144c14d3` 使用上述角色组合，通过派单、结果唤醒、CAS 记录和重启恢复。启动与结束源码哈希一致，角色模型和强度已写入该次 `summary.json`。原始证据保存在隔离工作树的 `.scratch/project-coordinator/execution/`。
+
+本次更新没有配置正式项目或重启正式服务。

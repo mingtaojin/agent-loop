@@ -55,6 +55,8 @@ test('project config applies defaults and rejects empty selectors, duplicate rep
   const project = config();
   assert.equal(project.instructions, '');
   assert.equal(project.supervisionIntervalMs, 300_000);
+  assert.deepEqual(project.models, { coordinator: 'gpt-6-astra', worker: 'gpt-6.1-sol' });
+  assert.deepEqual(project.reasoningEfforts, { coordinator: 'high', worker: 'xhigh' });
   assert.deepEqual(project.repositories[1]?.labelsAny, []);
   const invalid: unknown[] = [
     { ...project, id: '' }, { ...project, id: ' ' }, { ...project, id: 'a\0b' },
@@ -68,6 +70,7 @@ test('project config applies defaults and rejects empty selectors, duplicate rep
     { ...project, instructions: 'a'.repeat(131_073) }, { ...project, supervisionIntervalMs: 0 },
     { ...project, supervisionIntervalMs: 1.5 }, { ...project, supervisionIntervalMs: 2_147_483_648 },
     { ...project, workflow: 'bug-fix' },
+    { ...project, reasoningEfforts: { worker: 'unsupported' } },
   ];
   for (const input of invalid) assert.equal(projectConfigSchema.safeParse(input).success, false);
 });

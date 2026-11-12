@@ -1,6 +1,6 @@
 import type { AgentInput, ApprovalAction, Attachment, CollectionRepository, ExecutionSnapshot, IncomingMessage, PendingRequest, Repository, Source, SourceComment, TaskResource, WorkspaceRequest, WorkspaceSelectionRequest, WorkspaceSelectionResponse } from './domain.js';
 import type { ExecutionEvent } from './execution-events.js';
-import type { ProjectAction } from './project.js';
+import type { ProjectAction, ReasoningEffort } from './project.js';
 
 export interface ProjectRequest {
   threadId: string;
@@ -51,8 +51,8 @@ export interface FeishuProgressPort {
 export interface CodexPort {
   selectWorkspace(input: WorkspaceSelectionRequest): Promise<WorkspaceSelectionResponse>;
   setEventHandler?(handler: (event: ExecutionEvent) => void): void;
-  createThread(input: { cwd: string; instructions: string; model?: string }): Promise<string>;
-  inspect(threadId: string, instructions?: string, model?: string): Promise<ExecutionSnapshot>;
+  createThread(input: { cwd: string; instructions: string; model?: string; reasoningEffort?: ReasoningEffort }): Promise<string>;
+  inspect(threadId: string, instructions?: string, model?: string, reasoningEffort?: ReasoningEffort): Promise<ExecutionSnapshot>;
   startTurn(input: { threadId: string; input: AgentInput[]; deliveryId: string; additionalDeliveryIds?: string[] }): Promise<string>;
   steer(input: { threadId: string; turnId: string; input: AgentInput[]; deliveryId: string }): Promise<void>;
   reply(input: { request: PendingRequest; text: string }): Promise<void>;

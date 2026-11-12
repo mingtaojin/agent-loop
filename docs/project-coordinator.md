@@ -18,6 +18,8 @@
         {"name": "example/backend", "labelsAny": ["agent"], "assigneesAny": []}
       ],
       "instructions": "优先处理 priority:urgent。用户保留亲自审核的 PR 等待确认。",
+      "models": {"coordinator": "gpt-6-astra", "worker": "gpt-6.1-sol"},
+      "reasoningEfforts": {"coordinator": "high", "worker": "xhigh"},
       "supervisionIntervalMs": 300000
     }
   ]
@@ -30,7 +32,9 @@
 
 配置在启动时加载。启用实际配置前，按[本机服务操作](agents/operations.md)执行切换并核对。源码测试不代表正式实例已经启用。
 
-项目可用 `models` 分别设置 `coordinator`、`worker` 和 `verifier` 的模型名，名称必须能由本机 Codex 解析。未设置时沿用 Codex 默认配置。按 pstack 为独立验证选择不同模型家族；Runtime 不按名称猜测模型家族，也不默默更换不可用模型。任务创建时保存所选模型，恢复与协调会话切换继续使用保存值。
+协调者默认使用 `gpt-6-astra` 和 `high`，Worker 默认使用 `gpt-6.1-sol` 和 `xhigh`。项目可通过 `models` 和 `reasoningEfforts` 分别覆盖角色模型和推理强度。verifier 未指定时沿用 Codex 默认配置，按 pstack 为独立验证选择不同模型家族。
+
+模型名必须能由本机 Codex 解析。Runtime 不按名称猜测模型家族，也不默默更换不可用模型。任务创建时保存所选模型与推理强度，恢复与协调会话切换继续使用保存值。普通非项目任务保持原 Codex 配置。
 
 ## 对话与角色指导
 

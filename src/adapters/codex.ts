@@ -7,7 +7,7 @@ import { RejectedInputError, TurnChangedError, UncertainOperationError, workspac
 import type { CodexPort } from '../ports.js';
 import { executionEvent, type ExecutionEvent } from '../execution-events.js';
 import { workspaceSelectionInput, workspaceSelectionInstructions, workspaceSelectionOutputSchema } from '../workspace-selection.js';
-import { projectActionSchema } from '../project.js';
+import { projectActionSchema, type ReasoningEffort } from '../project.js';
 
 export interface CodexOptions {
   command: string[];
@@ -133,7 +133,7 @@ export class CodexAppServer implements CodexPort {
   private readonly calls = new Map<RpcId, PendingCall>();
   private readonly requests = new Map<string, LiveRequest>();
   private readonly seenRequestIds = new Set<string>();
-  private readonly threads = new Map<string, { loaded: Promise<void>; untouched: boolean; instructions: string | undefined; model?: string }>();
+  private readonly threads = new Map<string, { loaded: Promise<void>; untouched: boolean; instructions: string | undefined; model?: string; reasoningEffort?: ReasoningEffort }>();
   private readonly activeTurns = new Map<string, string>();
   private readonly awaitingHistory = new Map<string, string>();
   private readonly historyObservations = new Map<string, HistoryObservation>();
@@ -374,34 +374,39 @@ export class CodexAppServer implements CodexPort {
     return instructions === undefined ? undefined : { 'agent-loop-runtime': { kind: 'application', value: `Current Runtime instructions. These replace earlier Runtime instructions for this conversation.\n${instructions}` } };
   }
 
-  async createThread(input: { cwd: string; instructions: string; model?: string }): Promise<string> {
+  async createThread(input: { cwd: string; instructions: string; model?: string; reasoningEffort?: ReasoningEffort }): Promise<string> {
     await this.ready();
-    const { thread } = threadResponseSchema.parse(await this.rpc('thread/start', { ...this.config(), ...(input.model ? { model: input.model } : {}), cwd: input.cwd, developerInstructions: input.instructions, dynamicTools: this.projectHandler ? [workspaceTool, projectTool] : [workspaceTool], ephemeral: false }));
+    const { thread } = threadResponseSchema.parse(await this.rpc('thread/start', { ...this.config(), ...(input.model ? { model: input.model } : {}),
+      ...(input.reasoningEffort ? { config: { model_reasoning_effort: input.reasoningEffort } } : {}),
+      cwd: input.cwd, developerInstructions: input.instructions, dynamicTools: this.projectHandler ? [workspaceTool, projectTool] : [workspaceTool], ephemeral: false }));
     if (thread.status.type !== 'idle' || thread.turns.length) throw new UncertainOperationError('New Codex thread was not empty and idle');
-    this.threads.set(thread.id, { loaded: Promise.resolve(), untouched: true, instructions: input.instructions, model: input.model });
+    this.threads.set(thread.id, { loaded: Promise.resolve(), untouched: true, instructions: input.instructions, model: input.model, reasoningEffort: input.reasoningEffort });
     return thread.id;
   }
 
-  private async resume(threadId: string, instructions?: string, model?: string): Promise<void> {
+  private async resume(threadId: string, instructions?: string, model?: string, reasoningEffort?: ReasoningEffort): Promise<void> {
     if (instructions !== undefined && this.threads.get(threadId)?.instructions !== instructions) this.historyObservations.delete(threadId);
     await this.ready();
     let entry = this.threads.get(threadId);
-    if (!entry || (instructions !== undefined && entry.instructions !== instructions) || (model !== undefined && model !== entry.model)) {
+    if (!entry || (instructions !== undefined && entry.instructions !== instructions) || (model !== undefined && model !== entry.model)
+      || (reasoningEffort !== undefined && reasoningEffort !== entry.reasoningEffort)) {
       this.historyObservations.delete(threadId);
       const currentInstructions = instructions ?? entry?.instructions;
       const currentModel = model ?? entry?.model;
-      const loaded = this.rpc('thread/resume', { ...this.config(), ...(currentModel ? { model: currentModel } : {}), threadId, developerInstructions: currentInstructions }).then(value => {
+      const currentEffort = reasoningEffort ?? entry?.reasoningEffort;
+      const loaded = this.rpc('thread/resume', { ...this.config(), ...(currentModel ? { model: currentModel } : {}),
+        ...(currentEffort ? { config: { model_reasoning_effort: currentEffort } } : {}), threadId, developerInstructions: currentInstructions }).then(value => {
         const { thread } = threadResponseSchema.parse(value);
         if (thread.id !== threadId) throw new Error('Codex resumed a different thread');
       }).catch(error => { this.threads.delete(threadId); throw error; }).finally(() => { this.historyObservations.delete(threadId); });
-      entry = { loaded, untouched: false, instructions: currentInstructions, model: currentModel };
+      entry = { loaded, untouched: false, instructions: currentInstructions, model: currentModel, reasoningEffort: currentEffort };
       this.threads.set(threadId, entry);
     }
     await entry.loaded;
   }
 
-  async inspect(threadId: string, instructions?: string, model?: string): Promise<ExecutionSnapshot> {
-    await this.resume(threadId, instructions, model);
+  async inspect(threadId: string, instructions?: string, model?: string, reasoningEffort?: ReasoningEffort): Promise<ExecutionSnapshot> {
+    await this.resume(threadId, instructions, model, reasoningEffort);
     const deadline = Date.now() + this.options.requestTimeoutMs;
     do {
       try { return await this.inspectSnapshot(threadId, true); }
@@ -506,6 +511,7 @@ export class CodexAppServer implements CodexPort {
     if (entry) entry.untouched = false;
     this.historyObservations.delete(input.threadId);
     const { turn } = z.object({ turn: turnSchema }).parse(await this.rpc('turn/start', {
+      ...(entry?.reasoningEffort ? { effort: entry.reasoningEffort } : {}),
       threadId: input.threadId, input: wireInput(input.input, input.deliveryId, input.additionalDeliveryIds), clientUserMessageId: input.deliveryId, additionalContext: this.runtimeContext(input.threadId),
     }).finally(() => { this.historyObservations.delete(input.threadId); }));
     this.awaitingHistory.set(input.threadId, turn.id);
@@ -645,7 +651,7 @@ export class CodexAppServer implements CodexPort {
     if (this.closed) return Promise.reject(new UncertainOperationError('Codex connection closed'));
     if (this.recovery) return this.recovery;
     if (!this.failure) return this.ready();
-    const known = [...this.threads].map(([threadId, entry]) => ({ threadId, instructions: entry.instructions, model: entry.model }));
+    const known = [...this.threads].map(([threadId, entry]) => ({ threadId, instructions: entry.instructions, model: entry.model, reasoningEffort: entry.reasoningEffort }));
     this.process = undefined;
     this.initialized = undefined;
     this.failure = undefined;
@@ -656,7 +662,7 @@ export class CodexAppServer implements CodexPort {
     this.summaryUnsupported = false;
     const operation = (async () => {
       await this.ready();
-      await Promise.all(known.map(thread => this.resume(thread.threadId, thread.instructions, thread.model)));
+      await Promise.all(known.map(thread => this.resume(thread.threadId, thread.instructions, thread.model, thread.reasoningEffort)));
     })();
     this.recovery = operation.finally(() => { this.historyObservations.clear(); this.recovery = undefined; });
     return this.recovery;

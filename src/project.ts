@@ -8,6 +8,8 @@ const idSchema = z.string().min(1).max(512)
   .refine(value => value.trim().length > 0 && !/[\u0000-\u001f\u007f]/u.test(value), 'Invalid identifier');
 const textSchema = z.string().max(131_072).refine(value => value.trim().length > 0, 'Text must not be blank');
 const versionSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+export const reasoningEffortSchema = z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
+export type ReasoningEffort = z.infer<typeof reasoningEffortSchema>;
 const repositoryNameSchema = z.string().max(512).regex(/^[\w.-]+\/[\w.-]+$/);
 const projectRepositorySchema = z.strictObject({
   name: repositoryNameSchema,
@@ -19,7 +21,10 @@ export const projectConfigSchema = z.strictObject({
     .refine(value => value.trim().length > 0 && !value.includes('\0'), 'Invalid project directory'),
   repositories: z.array(projectRepositorySchema).min(1).max(1_000),
   instructions: z.string().max(131_072).default(''),
-  models: z.strictObject({ coordinator: idSchema.optional(), worker: idSchema.optional(), verifier: idSchema.optional() }).default({}),
+  models: z.strictObject({ coordinator: idSchema.default('gpt-6-astra'), worker: idSchema.default('gpt-6.1-sol'), verifier: idSchema.optional() })
+    .default({ coordinator: 'gpt-6-astra', worker: 'gpt-6.1-sol' }),
+  reasoningEfforts: z.strictObject({ coordinator: reasoningEffortSchema.default('high'), worker: reasoningEffortSchema.default('xhigh'), verifier: reasoningEffortSchema.optional() })
+    .default({ coordinator: 'high', worker: 'xhigh' }),
   supervisionIntervalMs: z.number().int().positive().max(2_147_483_647).default(300_000),
 }).refine(value => new Set(value.repositories.map(repository => repository.name.toLowerCase())).size === value.repositories.length,
   'Duplicate project repository');

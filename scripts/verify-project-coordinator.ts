@@ -199,7 +199,8 @@ async function verify(): Promise<void> {
     proof: createHash('sha256').update(await readFile(proofFile)).digest('hex'),
     instructions: createHash('sha256').update(await readFile(join(directory, 'AGENTS.md'))).digest('hex') };
   const version = await execute('codex', ['--version'], { timeout: 10_000 });
-  note('native_codex', { version: version.stdout.trim(), model: options.model ?? 'native default; no model override' });
+  note('native_codex', { version: version.stdout.trim(), fallbackModel: options.model ?? 'native default',
+    roleModels: config.projects[0]?.models, roleReasoningEfforts: config.projects[0]?.reasoningEfforts });
   loop = newLoop();
   await bounded('Issue collection', loop.collect());
   const intake = loop.projects.ledger.project(projectId);
@@ -376,7 +377,8 @@ try {
   await writeFile(join(evidenceDirectory, 'summary.json'), sanitize({ ...outcome,
     scope: 'Actual AgentLoop, real SQLite, WorkspaceProvider and native CodexAppServer. Feishu/GitHub are local fakes. One read-only worker, result wakeup, coordinator CAS receipt, optional same-thread restart.',
     excluded: ['Real Feishu/GitHub writes', 'PR delivery/merge', 'Production service operations', 'Remote hosts', 'Images', 'Session rotation', 'Independent model review'],
-    model: options.model ?? 'Native Codex default; no model override', command: 'npx --no-install tsx scripts/verify-project-coordinator.ts',
+    fallbackModel: options.model ?? 'Native Codex default', roleModels: config.projects[0]?.models,
+    roleReasoningEfforts: config.projects[0]?.reasoningEfforts, command: 'npx --no-install tsx scripts/verify-project-coordinator.ts',
     source: { script: resolve('scripts/verify-project-coordinator.ts'),
       sha256: createHash('sha256').update(await readFile(new URL(import.meta.url))).digest('hex'),
       atStart: sourceAtStart, atFinish: await fingerprintSources() },

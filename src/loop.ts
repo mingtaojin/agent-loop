@@ -188,7 +188,7 @@ export class AgentLoop {
   private async inspect(threadId: string): Promise<ExecutionSnapshot> {
     const task = this.store.taskForThread(threadId);
     if (!task) throw new Error('Unbound Thread');
-    const snapshot = await this.ports.codex.inspect(threadId, await this.instructions(task), this.store.meta(`project-task-model:${task.id}`) ?? undefined);
+    const snapshot = await this.ports.codex.inspect(threadId, await this.instructions(task), this.store.meta(`project-task-model:${task.id}`) ?? undefined, this.projects.reasoningEffort(task.id));
     this.recordProgressStatus({ ...task, turnId: snapshot.turnId, executionStatus: snapshot.status, requests: snapshot.requests });
     return snapshot;
   }
@@ -404,6 +404,7 @@ export class AgentLoop {
       if (!this.selectionInputsCurrent(task)) return false;
       const generation = this.store.meta(`project-generation:${task.id}`);
       task.threadId = await this.effect(task, generation ? `thread:${generation}` : 'thread', false, () => this.ports.codex.createThread({ cwd: this.executionDirectory(task), instructions,
+        ...(this.projects.reasoningEffort(task.id) ? { reasoningEffort: this.projects.reasoningEffort(task.id) } : {}),
         ...(this.store.meta(`project-task-model:${task.id}`) ? { model: this.store.meta(`project-task-model:${task.id}`) ?? undefined } : {}) })); this.persist(task);
       this.selectionAbort.signal.throwIfAborted();
     }

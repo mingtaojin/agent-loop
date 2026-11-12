@@ -11,17 +11,18 @@ import { sourceCommentSchema, taskSchema, type IncomingMessage, type PendingRequ
 import { AgentLoop } from '../src/loop.js';
 import type { CodexPort, WorkspacePort } from '../src/ports.js';
 import { ProjectLedger, projectStateSchema, type ProjectAction } from '../src/project.js';
+import type { ReasoningEffort } from '../src/project.js';
 import { Store } from '../src/store.js';
 import { CodexFake, FeishuFake, GitHubFake, issue } from './fakes.js';
 
 class ProjectCodexFake extends CodexFake {
   projectHandler: Parameters<NonNullable<CodexPort['setProjectHandler']>>[0] | null = null;
-  readonly instructionUpdates: { threadId: string; instructions: string; model?: string }[] = [];
+  readonly instructionUpdates: { threadId: string; instructions: string; model?: string; reasoningEffort?: ReasoningEffort }[] = [];
   setProjectHandler(handler: Parameters<NonNullable<CodexPort['setProjectHandler']>>[0]): void {
     this.projectHandler = handler;
   }
-  override async inspect(threadId: string, instructions?: string, model?: string) {
-    if (instructions) this.instructionUpdates.push({ threadId, instructions, model });
+  override async inspect(threadId: string, instructions?: string, model?: string, reasoningEffort?: ReasoningEffort) {
+    if (instructions) this.instructionUpdates.push({ threadId, instructions, model, reasoningEffort });
     return super.inspect(threadId);
   }
 }
@@ -390,6 +391,7 @@ test('configured role models reach thread creation and saved task models survive
   const worker = await f.dispatch('model-worker', 'Investigate the export contract.');
   const verifier = await f.dispatch('model-verifier', 'Independently verify the findings.', { role: 'verifier' });
   assert.deepEqual(f.codex.created.map(input => input.model), [models.coordinator, models.worker, models.verifier]);
+  assert.deepEqual(f.codex.created.map(input => input.reasoningEffort), ['high', 'xhigh', undefined]);
   const assignments = [
     { task: coordinator, model: models.coordinator },
     { task: worker, model: models.worker },
@@ -397,6 +399,7 @@ test('configured role models reach thread creation and saved task models survive
   ];
   const inspected = f.codex.instructionUpdates.length;
   project.models = { coordinator: 'new-coordinator-default', worker: 'new-worker-default', verifier: 'new-verifier-default' };
+  project.reasoningEfforts = { coordinator: 'low', worker: 'low' };
   await f.restart();
   assert.equal(f.codex.created.length, 3);
   for (const assignment of assignments) {
@@ -412,11 +415,22 @@ test('configured role models reach thread creation and saved task models survive
   const rotated = f.coordinator(); assert.ok(rotated.threadId);
   assert.notEqual(rotated.threadId, coordinator.threadId); assert.equal(rotated.chatId, coordinator.chatId);
   assert.equal(f.codex.created.length, 4); assert.equal(f.codex.created.at(-1)?.model, models.coordinator);
+  assert.equal(f.codex.created.at(-1)?.reasoningEffort, 'high');
   assert.equal(f.loop.store.task(worker.id).threadId, worker.threadId);
   assert.equal(f.loop.store.task(verifier.id).threadId, verifier.threadId);
   await f.restart();
   assert.equal(f.coordinator().threadId, rotated.threadId); assert.equal(f.codex.created.length, 4);
   assert.ok(f.codex.instructionUpdates.some(input => input.threadId === rotated.threadId && input.model === models.coordinator));
+  assert.ok(f.codex.instructionUpdates.some(input => input.threadId === rotated.threadId && input.reasoningEffort === 'high'));
+  assert.ok(f.codex.instructionUpdates.some(input => input.threadId === worker.threadId && input.reasoningEffort === 'xhigh'));
+});
+
+test('default coordinator and Worker use the requested model and reasoning combinations', async t => {
+  const f = await fixture(t); await f.initialize();
+  await f.dispatch('default-role-models', 'Investigate within the project scope.');
+  assert.deepEqual(f.codex.created.map(input => ({ model: input.model, effort: input.reasoningEffort })), [
+    { model: 'gpt-6-astra', effort: 'high' }, { model: 'gpt-6.1-sol', effort: 'xhigh' },
+  ]);
 });
 
 test('dispatch persisted before launch is recovered once and an uncertain accepted input is never resent', async t => {

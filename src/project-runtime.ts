@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { realpath } from 'node:fs/promises';
-import { ProjectLedger, matchesProjectIssue, projectActionSchema, type ProjectAction, type ProjectConfig } from './project.js';
+import { ProjectLedger, matchesProjectIssue, projectActionSchema, reasoningEffortSchema, type ReasoningEffort, type ProjectAction, type ProjectConfig } from './project.js';
 import { submissionSchema, type DiscoveredProject, type InputProvenance, type Source, type Task } from './domain.js';
 import type { GitHubPort } from './ports.js';
 import { Store } from './store.js';
@@ -33,6 +33,10 @@ export class ProjectRuntime {
     const membership = this.ledger.membership(taskId);
     return membership ? this.configs.find(item => item.id === membership.projectId) ?? null : null;
   }
+  reasoningEffort(taskId: string): ReasoningEffort | undefined {
+    const saved = this.store.meta(`project-task-effort:${taskId}`);
+    return saved === null ? undefined : reasoningEffortSchema.parse(saved);
+  }
   private enqueue(taskId: string, key: string, text: string, provenance: InputProvenance): void {
     const task = this.store.task(taskId);
     this.store.receive(taskId, { id: `project:${taskId}:${key}`, chatId: task.chatId ?? '', senderId: 'runtime:project',
@@ -58,6 +62,7 @@ export class ProjectRuntime {
         this.store.saveTask(task);
         this.ledger.create(canonical, task.id);
         if (config.models.coordinator) this.store.setMeta(`project-task-model:${task.id}`, config.models.coordinator);
+        this.store.setMeta(`project-task-effort:${task.id}`, config.reasoningEfforts.coordinator);
         this.enqueue(task.id, 'initial', prompt, { kind: 'agent', projectId: config.id, taskId: task.id, eventId: 'initial', category: 'project_start' });
       });
     });
@@ -142,7 +147,7 @@ export class ProjectRuntime {
     const tasks = state.members.map(member => {
       const task = this.store.task(member.taskId);
       return { ...member, status: task.status, executionStatus: task.executionStatus, reason: task.reason,
-        chatId: task.chatId, threadId: task.threadId, model: this.store.meta(`project-task-model:${task.id}`), resources: task.resources, requests: task.requests.map(request => ({ id: request.id, kind: request.kind, prompt: request.prompt })),
+        chatId: task.chatId, threadId: task.threadId, model: this.store.meta(`project-task-model:${task.id}`), reasoningEffort: this.reasoningEffort(task.id), resources: task.resources, requests: task.requests.map(request => ({ id: request.id, kind: request.kind, prompt: request.prompt })),
         outputs: this.store.outputs(task.id).slice(-3).map(output => ({ id: output.id, text: output.text.slice(0, 4000), truncated: output.text.length > 4000, status: output.status })) };
     });
     const counts = { tasks: tasks.length, issues: state.issues.length, comments: state.comments.length, records: state.records.length };
@@ -181,6 +186,8 @@ export class ProjectRuntime {
           this.ledger.addMember(state.id, task.id, action.role, action.issueId);
           const model = this.config(callerId)?.models[action.role];
           if (model) this.store.setMeta(`project-task-model:${task.id}`, model);
+          const effort = this.config(callerId)?.reasoningEfforts[action.role];
+          if (effort) this.store.setMeta(`project-task-effort:${task.id}`, effort);
           this.enqueue(task.id, 'initial', action.prompt, { kind: 'agent', projectId: state.id, taskId: callerId, eventId: action.requestId, category: 'delegation' });
         });
         return { taskId: task.id };

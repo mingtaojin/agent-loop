@@ -165,6 +165,20 @@ test('project role model remains attached when guidance updates resume its Threa
   for (const row of configured) assert.equal(z.object({ model: z.string() }).parse(row.params).model, 'configured-verifier');
 });
 
+test('role reasoning is sent on Thread creation, resume and every new Turn', async t => {
+  const f = await adapter(t, { completed: true });
+  const threadId = await f.server.createThread({ cwd: f.root, instructions: 'Coordinator scope', model: 'gpt-6-astra', reasoningEffort: 'high' });
+  await f.server.inspect(threadId, 'Updated coordinator scope');
+  await f.server.startTurn({ threadId, input: [{ kind: 'text', text: 'First turn' }], deliveryId: 'first' });
+  await f.server.startTurn({ threadId, input: [{ kind: 'text', text: 'Second turn' }], deliveryId: 'second' });
+  const rows = await f.records();
+  for (const row of rows.filter(row => row.method === 'thread/start' || row.method === 'thread/resume')) {
+    assert.equal(z.object({ config: z.object({ model_reasoning_effort: z.string() }) }).parse(row.params).config.model_reasoning_effort, 'high');
+  }
+  const turns = rows.filter(row => row.method === 'turn/start'); assert.equal(turns.length, 2);
+  for (const row of turns) assert.equal(z.object({ effort: z.string() }).parse(row.params).effort, 'high');
+});
+
 const validActions = [
   { action: 'control', requestId: 'pause-worker', taskId: 'task-1', operation: 'pause' },
   { action: 'control', requestId: 'resume-worker', taskId: 'task-1', operation: 'resume' },
