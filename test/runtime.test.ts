@@ -14,7 +14,6 @@ import { AgentLoop } from '../src/loop.js';
 import { Store } from '../src/store.js';
 import { FeishuAdapter, parseFeishuEvent, type FeishuDependencies } from '../src/adapters/feishu.js';
 import type { EventDispatcher } from '@larksuiteoapi/node-sdk';
-import { z } from 'zod';
 import type { ApprovalAction, IncomingMessage, PendingRequest } from '../src/domain.js';
 import type { WorkspacePort } from '../src/ports.js';
 import { CodexFake, FeishuFake, GitHubFake, issue } from './fakes.js';

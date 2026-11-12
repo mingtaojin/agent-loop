@@ -30,7 +30,7 @@ cp config/example.json config.json
 
 `repositories` 继续定义 GitHub 采集来源。使用工程发现根目录时，条目只需仓库名与 `criteria`，无需填写本地 `path`、`baseBranch` 或 `workspace`。本地工程发现不依赖 Git remote，也不会自动采集这些工程的 GitHub Issue。飞书任务可使用 `repositories: []`，仍能发现本地工程。
 
-`criteria.taskTypes` 默认仍为 `["bug"]`，仅显式配置 `["bug", "feature"]` 或 `["feature"]` 才纳入 Feature。也可配置非空分类名称，如 `refactor`，并在 `nativeTypes` 或 `typeLabels` 中映射。仓库、分配人、标签和类型映射共同决定新来源的收集范围，不需要额外启动标签。
+`criteria.taskTypes` 默认仍为 `["bug"]`，可显式配置 `["bug", "feature"]` 或 `["feature"]` 来纳入 Feature。设置为 `null` 时不限制任务类型，仍应用状态、分配人和标签筛选。也可配置非空分类名称，如 `refactor`，并在 `nativeTypes` 或 `typeLabels` 中映射。仓库、分配人、标签和类型映射共同决定新来源的收集范围，不需要额外启动标签。
 
 未配置工程发现根目录时，原有显式工程配置仍可使用。仓库的 `path` 必须为 Git 根目录，`baseBranch` 必须是本地已有引用，默认准备任务独立的 Git worktree。要将原有条目关联到完整项目目录，在仓库条目中增加：
 
