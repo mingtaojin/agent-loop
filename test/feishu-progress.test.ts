@@ -1,5 +1,6 @@
+import { SurfaceCodex, testProject, receiveSurface, tickSurface } from './coordinated-surfaces.js';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { realpath, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test, type TestContext } from 'node:test';
@@ -85,7 +86,7 @@ function task(id = 'task', turnId = 'turn'): Task {
     chatId: `chat-${id}`, threadId: `thread-${id}`, turnId, executionStatus: 'running', lastHandledTurnId: null, requests: [], createdAt: 1, updatedAt: 1 });
 }
 async function fixture(t: TestContext, initialize = true) {
-  const directory = await mkdtemp(join(tmpdir(), 'feishu-progress-'));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'feishu-progress-')));
   let store = new Store(directory);
   const transport = new Transport();
   let now = Date.UTC(2026, 10, 7);
@@ -326,43 +327,44 @@ test('late final text updates the same closed card and never republishes its mes
 });
 
 test('whole runtime delivers final answer unchanged while progress API fails', async t => {
-  const directory = await mkdtemp(join(tmpdir(), 'feishu-runtime-'));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'feishu-runtime-')));
   const progress = new Transport(); progress.rejectCreate = true;
-  const feishu = Object.assign(new FeishuFake(), { progress }); const codex = new CodexFake();
-  const loop = new AgentLoop(configSchema.parse({ dataDir: directory, feishu: { userOpenId: 'owner', progress: { enabled: true } } }), {
+  const feishu = Object.assign(new FeishuFake(), { progress }); const codex = new SurfaceCodex();
+  const loop = new AgentLoop(configSchema.parse({ dataDir: directory, projects: [testProject(directory)], feishu: { userOpenId: 'owner', progress: { enabled: true } } }), {
     feishu, codex, github: new GitHubFake(), workspace: { ensure: async () => directory, head: async () => 'head' },
   });
   t.after(async () => { await loop.close(); await rm(directory, { recursive: true, force: true }); });
   await loop.start();
-  await loop.receive({ id: 'new', chatId: 'private', senderId: 'owner', chatType: 'p2p', text: 'test', attachments: [], createdAt: Date.now() });
-  const current = loop.tasks()[0]; assert.ok(current?.threadId);
+  await receiveSurface(loop, { id: 'new', chatId: 'private', senderId: 'owner', chatType: 'p2p', text: 'test', attachments: [], createdAt: Date.now() });
+  const current = loop.tasks().find(task => !task.sourceId.startsWith('project:')); assert.ok(current?.threadId);
   await setTimeout(1100);
   assert.ok(progress.calls.length > 0);
-  codex.complete(current.threadId, 'The original final answer.'); await loop.tick();
+  codex.complete(current.threadId, 'The original final answer.'); await tickSurface(loop);
   assert.equal(feishu.sent.filter(message => message.text === 'The original final answer.').length, 1);
-  assert.equal(loop.tasks()[0]?.status, 'idle');
+  assert.equal(loop.tasks().find(task => !task.sourceId.startsWith('project:'))?.status, 'idle');
   assert.ok(loop.store.diagnostics().some(row => row.scope === 'feishu-progress'));
 });
 
 test('enabling progress after completed runtime history ignores recovery observations and publishes only new turns', async t => {
-  const directory = await mkdtemp(join(tmpdir(), 'feishu-enable-'));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'feishu-enable-')));
   const progress = new Transport();
-  const feishu = Object.assign(new FeishuFake(), { progress }); const codex = new CodexFake();
-  const config = configSchema.parse({ dataDir: directory, feishu: { userOpenId: 'owner' } });
+  const feishu = Object.assign(new FeishuFake(), { progress }); const codex = new SurfaceCodex();
+  const config = configSchema.parse({ dataDir: directory, projects: [testProject(directory)], feishu: { userOpenId: 'owner' } });
   const ports = { feishu, codex, github: new GitHubFake(), workspace: { ensure: async () => directory, head: async () => 'head' } };
   let loop = new AgentLoop(config, ports);
   t.after(async () => { await loop.close(); await rm(directory, { recursive: true, force: true }); });
-  await loop.receive({ id: 'old', chatId: 'private', senderId: 'owner', chatType: 'p2p', text: 'old discussion', attachments: [], createdAt: Date.now() });
-  const current = loop.tasks()[0]; assert.ok(current?.threadId); assert.ok(current.chatId);
-  codex.complete(current.threadId, 'Historical final answer'); await loop.tick(); await loop.close();
+  await receiveSurface(loop, { id: 'old', chatId: 'private', senderId: 'owner', chatType: 'p2p', text: 'old discussion', attachments: [], createdAt: Date.now() });
+  const current = loop.tasks().find(task => !task.sourceId.startsWith('project:')); assert.ok(current?.threadId); assert.ok(current.chatId);
+  codex.complete(current.threadId, 'Historical final answer'); await tickSurface(loop); await loop.close();
   config.feishu.progress.enabled = true;
   loop = new AgentLoop(config, ports); await loop.start(); await setTimeout(1100);
   assert.equal(progress.calls.length, 0, 'recovery status observations cannot create a historical card');
   await loop.close(); loop = new AgentLoop(config, ports); await loop.start(); await setTimeout(1100);
   assert.equal(progress.calls.length, 0, 'history exclusion survives another restart');
-  await loop.receive({ id: 'new-turn', chatId: current.chatId, senderId: 'owner', chatType: 'group', text: 'Continue now', attachments: [], createdAt: Date.now() });
+  await receiveSurface(loop, { id: 'new-turn', chatId: current.chatId, senderId: 'owner', chatType: 'group', text: 'Continue now', attachments: [], createdAt: Date.now() });
   await setTimeout(2200);
-  assert.equal(progress.messages.size, 1);
-  assert.equal(progress.cards.size, 1);
+  const workerMessages = [...progress.messages.values()].filter(message => message.chatId === current.chatId);
+  assert.equal(workerMessages.length, 1);
+  assert.ok(workerMessages.every(message => progress.cards.has(message.cardId)));
   assert.equal(feishu.sent.filter(message => message.text === 'Historical final answer').length, 1);
 });

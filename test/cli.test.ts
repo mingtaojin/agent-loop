@@ -87,14 +87,16 @@ for (const scenario of [
   const repeated = await execute(process.execPath, [cli, entry, 'collect', '--config', 'config.json'], options);
   assert.deepEqual(JSON.parse(repeated.stdout), { collectedTasks: scenario.expectedNumbers.length, diagnostics: [] });
   const store = new Store(join(root, 'data'), { readOnly: true });
-  const tasks = store.tasks();
+  const tasks = store.tasks().filter(task => task.purpose === 'intake');
   const reasons = store.sources().map(record => record.reason);
   store.close();
   assert.deepEqual(tasks.map(task => [(task.source.kind === 'github' ? task.source.issue.number : null), task.status, task.resources, task.chatId, task.threadId]),
     scenario.expectedNumbers.map(number => [number, 'pending', [], null, null]));
-  assert.deepEqual(reasons, scenario.expectedNumbers.length ? [scenario.classification, scenario.classification] : ['type_not_enabled', 'type_not_enabled']);
+  if (scenario.expectedNumbers.length) assert.ok(reasons.every(reason => reason.startsWith('project:')));
+  else assert.deepEqual(reasons, ['type_not_enabled', 'type_not_enabled']);
   const status = await execute(process.execPath, [cli, entry, 'status', '--config', 'config.json'], { ...options, env: { ...process.env } });
-  assert.deepEqual(JSON.parse(status.stdout), { tasks: tasks.map(task => ({
+  const saved = JSON.parse(status.stdout);
+  assert.deepEqual({ tasks: saved.tasks.filter((task: { id: string }) => tasks.some(request => request.id === task.id)), diagnostics: saved.diagnostics }, { tasks: tasks.map(task => ({
     id: task.id, source: task.source.kind === 'github' ? task.source.issue.url : task.sourceId, status: 'pending', reason: null, chatId: null,
     threadId: null, resources: [], messages: [], outgoing: [],
   })), diagnostics: [] });

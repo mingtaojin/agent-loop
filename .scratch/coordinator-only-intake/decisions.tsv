@@ -1,0 +1,11 @@
+ts	phase	decision	why	evidence	result
+2026-11-12T09:33:18Z	frame	make coordination mandatory across all new request sources	user rejected the ordinary Runtime execution route	spec.md	open
+2026-11-12T09:33:18Z	baseline	use an isolated worktree and retain the current issue filter changes	canonical checkout contains unrelated user changes	/tmp/agent-loop-coordinator-intake-baseline.patch	baseline captured
+2026-11-12T11:56:04Z	design	reuse Task as threadless intake and require project membership for execution	retains source IDs, attachment ownership and native request associations without a second scheduler	.scratch/coordinator-only-intake/design.md	implemented
+2026-11-12T11:56:04Z	review	fix stale Task writes and persist explicit repository ownership	independent read-only reproduction showed promotion rollback and duplicate-owner risks	test/project-catalog.test.ts	regressions pass; independent fixes verified
+2026-11-12T11:56:04Z	migration	verify adoption against a copy of the live database	preserve existing groups, Threads, resources, requests and paused or failed state	.scratch/coordinator-only-intake/execution/migration-dry-run.json	dry-run preserved execution identities
+2026-11-12T11:56:04Z	acceptance	run actual CLI intake, delegation, retry and restart probe	test the public request path with controlled platforms	scripts/verify-task-submission.ts	PASS
+2026-11-12T12:05:24Z	deployment	run reviewed compilation from isolated worktree	preserve canonical dirty source and the existing data directory	docs/agents/operations.md	launchd listener and advancing heartbeat agree
+2026-11-12T12:05:24Z	migration	adopt 13 formal tasks and route 4 unstarted requests	all 23 previous task identities and states must survive	docs/verification/coordinator-only-intake.md	preserved; no unowned formal Threads
+2026-11-12T12:05:24Z	live-acceptance	read coordinator groups and actual intake dispatch	verify the live platform and execution boundary	docs/verification/coordinator-only-intake.md	Agent Loop coordinator visible; source intake and explicit Worker dispatch observed
+2026-11-12T12:05:24Z	delivery	open one ready PR for the coupled runtime and fixture migration	the schema and callers must land together	docs/adr/0011-all-requests-enter-project-coordination.md	compiled runtime deployed; main checkout remains unchanged

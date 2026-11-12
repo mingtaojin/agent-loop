@@ -114,6 +114,8 @@ export const submissionSchema = z.strictObject({
     .refine(text => !/[\uD800-\uDFFF]/u.test(text), 'Prompt contains an unpaired surrogate').brand<'SubmissionPrompt'>(),
 });
 export type Submission = z.infer<typeof submissionSchema>;
+export const submissionAnswerSchema = submissionSchema.extend({ answerId: submissionRequestIdSchema });
+export type SubmissionAnswer = z.infer<typeof submissionAnswerSchema>;
 export interface WorkspaceSelectionRequest {
   taskId: string;
   cwd: string;
@@ -161,6 +163,7 @@ export const recoverySchema = z.object({
 });
 export const taskSchema = z.object({
   id: z.string(), sourceId: z.string(), source: taskSourceSchema,
+  purpose: z.enum(['intake', 'execution', 'legacy']).default('legacy'),
   contextDirectory: z.string(), resources: z.array(taskResourceSchema),
   workspaceSelection: workspaceSelectionSchema.default({ kind: 'pending' }),
   status: z.enum(['pending', 'running', 'idle', 'paused', 'failed']),
@@ -173,13 +176,17 @@ export const taskSchema = z.object({
   createdAt: z.number(), updatedAt: z.number(),
 });
 export type Task = z.infer<typeof taskSchema>;
+export const intakeRouteSchema = z.strictObject({ projectId: z.string(), coordinatorTaskId: z.string() });
 export const submissionReceiptSchema = taskSchema.pick({ status: true, reason: true, chatId: true, threadId: true })
-  .extend({ requestId: submissionRequestIdSchema, taskId: z.string() }).strict();
+  .extend({ requestId: submissionRequestIdSchema, taskId: z.string(), purpose: taskSchema.shape.purpose,
+    projectId: z.string().nullable().default(null), coordinatorTaskId: z.string().nullable().default(null) }).strict();
 export type SubmissionReceipt = z.infer<typeof submissionReceiptSchema>;
 export function submissionSourceId(requestId: Submission['requestId']): string { return `cli:${requestId}`; }
-export function submissionReceipt(task: Task): SubmissionReceipt {
+export function submissionReceipt(task: Task, route: z.infer<typeof intakeRouteSchema> | null = null): SubmissionReceipt {
   if (task.source.kind !== 'cli') throw new Error('Task is not a CLI submission');
-  return { requestId: task.source.requestId, taskId: task.id, status: task.status, reason: task.reason, chatId: task.chatId, threadId: task.threadId };
+  return { requestId: task.source.requestId, taskId: task.id, status: task.status, purpose: task.purpose,
+    reason: task.reason, chatId: task.chatId, threadId: task.threadId,
+    projectId: route?.projectId ?? null, coordinatorTaskId: route?.coordinatorTaskId ?? null };
 }
 export interface AgentOutput {
   id: string;

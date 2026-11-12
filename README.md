@@ -1,8 +1,8 @@
 # 在本机运行 Agent Loop
 
-项目协调者可统一接手多个仓库中带指定标签或指派给指定账号的 Issue，委派使用 poteto-mode 的 Worker，并接收问题和成果。配置、项目工具和会话恢复见[项目协调者](docs/project-coordinator.md)。
+每个项目都通过自己的协调者接单，委派使用 poteto-mode 的 Worker，并接收问题和成果。配置、项目工具和会话恢复见[项目协调者](docs/project-coordinator.md)。
 
-Agent Loop 保存一件事情的持续上下文。所有者在飞书中直接私聊机器人发送文字、图文、截图或日志文件，即可创建独立任务群，后续在该群继续。GitHub 可按配置收集 Issue，Agent 也可通过 CLI 提交自行整理的任务说明。新任务先由独立的临时 Codex Thread 只读选择工程入口，再建立正式 Thread。每项任务保留独立任务群和正式 Thread。Agent 决定调查、技能调用、实现和交付。Runtime 负责目录校验、输入、原生请求、输出与恢复。
+Agent Loop 保存项目和任务的持续上下文。GitHub Issue、飞书私聊和 CLI 提交都先交给项目协调者。项目群也支持直接交办没有 Issue 的 Bug 和新需求。项目不明确时，独立的只读临时会话负责定位和澄清，不执行工程任务。协调者决定是否派发 Worker，派发后才建立执行 Thread 和任务群。Agent 选择技能、实现和交付流程，Runtime 保存关系、材料、原生请求与恢复记录。
 
 ## 准备配置
 
@@ -17,7 +17,7 @@ cp config/example.json config.json
 
 如需让目录选择与正式任务使用不同模型，在 `codex` 中增加 `selectionModel`；它只覆盖临时选择 Thread，正式 Thread 继续使用 `model` 或 `command` 中的模型。省略时两者相同。模型名必须是 Codex 当前配置能解析的名称。目录选择与正式任务仍各自启动独立 App Server，`selectionModel` 只改变选择侧的模型，不放宽只读与无审批限制。
 
-讨论任务可使用 `repositories: []`，不需要 GitHub token 或工程技能。所有正式任务默认读取 [prompts/task.md](prompts/task.md)，可通过 `engineering.promptPath` 指定替代文件。当前模板和环境信息通过 `developerInstructions` 与 `additionalContext` 传入正式 Thread，两处共用内容；用户消息和 Issue 内容作为任务输入。`engineering.skillPath` 指向已安装的 poteto-mode，其他技能通过现有机制发现。旧 `bug` 配置已移除，升级配置时将提示词和技能路径迁到 `engineering`。加载与更新方式见[正式任务提示词](docs/prompts/task.md)。
+本地项目可使用 `repositories: []`，不需要 GitHub token。正式会话按角色读取 `prompts/coordinator.md` 或 `prompts/worker.md`，`engineering.promptPath` 不覆盖角色规则。角色指导、委派范围和环境信息通过 `developerInstructions` 与 `additionalContext` 传入正式 Thread；用户消息和 Issue 内容作为请求材料。`engineering.skillPath` 指向已安装的 poteto-mode，其他技能通过现有机制发现。加载与更新方式见[正式会话提示词](docs/prompts/task.md)。
 
 在 `engineering.projectRoot` 中配置工程所在的父目录：
 
@@ -86,7 +86,7 @@ npm start -- run --config config.json
 
 ## CLI 提交新任务
 
-原 Agent 可以根据用户要求，把新任务说明写入 UTF-8 文件，再调用 CLI 创建独立任务。Runtime 接收提供的 prompt，沿现有流程建立任务群、选择工程并创建正式 Thread。spec、工单和原讨论中哪些信息写入 prompt，由原 Agent 决定。
+原 Agent 可以根据用户要求，把工作说明写入 UTF-8 文件，再通过 CLI 提交给项目协调者。Runtime 保存原文并确定项目，协调者决定如何派发 Worker。spec、工单和原讨论中哪些信息写入 prompt，由原 Agent 决定。
 
 先保存一个请求 ID，再提交文件：
 
@@ -102,7 +102,16 @@ npm start -- status --config config.json --request-id "$task_request_id"
 npm start -- submit --config config.json --request-id "$task_request_id" --prompt-file - < ./handoff.md
 ```
 
-提交成功返回 JSON，包含请求 ID、新 Task ID 和当前状态。成功表示任务已受理并持久化，工程目录、任务群和正式 Thread 可能仍在准备。通过同一请求 ID 查询后续状态。正式 Agent 的环境指导提供适用于其工作目录的完整命令。
+提交成功返回 JSON，包含请求 ID、接单记录 Task ID、当前状态，以及确定项目后的 `projectId` 和 `coordinatorTaskId`。成功只表示请求已保存，不代表已经派发或开始执行。通过同一请求 ID 查询项目澄清与后续状态。
+
+收到项目问题时，保存本次回答 ID，再补充原请求：
+
+```sh
+answer_id="$(node -p 'crypto.randomUUID()')"
+npm start -- answer --config config.json --request-id "$task_request_id" --answer-id "$answer_id" --prompt-file ./answer.md
+```
+
+同一回答 ID 与相同文字可安全重试，不同文字会被拒绝。已经派发的请求收到补充后，先交给协调者判断，再转给原 Worker。
 
 相同请求 ID 与相同 prompt 返回原任务，不重新执行；相同 ID 携带不同文字时报冲突。用户明确要再建一个任务时使用新 ID，即使 prompt 内容相同。提交回执未知时先查询原 ID，再使用同一 ID 和原文件重试。
 
@@ -182,11 +191,11 @@ npm start -- run --config config.json
 
 卡片身份和更新顺序持久化，服务恢复后继续更新原卡片。首次启用不补发已结束的历史轮次。进度投递失败记录到诊断，不触发任务重跑，也不阻断最终答复。飞书消息发送结果不明确时，先核对原群消息与已保存的卡片实体；找到原消息便继续更新，确认没有发送且仍在平台去重保证范围内才重试。无法完成核对时不会盲目补建卡片。
 
-在机器人私聊中直接发送任务文字、富文本、图片或文件。每条不同的非空私聊消息各自创建一个 Task 和独立任务群，不需要命令前缀。相同消息 ID 的重复投递不会重复创建任务群或正式 Thread；内容相同但消息 ID 不同的消息仍各自创建任务。空白文字且无附件的消息不创建任务。Runtime 不通过语义意图分类器判断消息是否像任务。
+在机器人私聊中直接发送文字、富文本、图片或文件，即可提交接单请求，无需命令前缀。相同消息 ID 的重复投递不会重复接单。接单记录先保存材料并定位项目，再交给该项目的协调者；此时不会直接创建 Worker、执行 Thread 或任务群。空白文字且无附件的消息不接单。
 
-后续补充、答复和材料发到对应任务群；再次私聊会创建另一项任务。正式 Thread 建立后，群内所有普通文字都进入原会话，包括 `/pause`、`/resume`、`/answer`、`/approve` 等旧命令文字。停止工作的意图由 Agent 理解。等待目录答复时，所有者回复先交给目录选择流程。
+项目明确后，在项目协调者群交办新工作或补充材料，也可以继续已有 Worker 的任务群。等待项目澄清时，只有一项待答请求可直接私聊回答；多项请求用 `/reply <请求编号> 回答` 指定。正式群内的普通文字继续原会话，包括旧命令文字，停止工作的意图由 Agent 理解。
 
-正式执行中，输入追加到当前轮次。没有活跃轮次时，新输入在原 Thread 启动一轮。普通答复后等待，不要求 JSON 报告或 PR。Issue 更新和评论使用相同规则，关闭、分配与标签变化不直接暂停任务。来源事件不会被当作原生问题的人工答案或权限批准。
+正式执行中，输入追加到当前轮次。没有活跃轮次时，新输入在原 Thread 启动一轮。Issue 更新和评论先交给协调者判断，再按需转给 Worker。关闭、分配与标签变化不直接暂停既有任务。来源事件不会被当作原生问题的人工答案或权限批准。
 
 原生问题可直接用文字回答。多个问题需要按提示中的问题 ID 提供完整 `answers` 对象。工具审批使用对应卡片的批准或拒绝按钮。按钮回调只表示操作已持久化接收；执行器确认、拒绝、过期或不确定结果另行记录。普通聊天不会批准工具。
 
@@ -194,7 +203,7 @@ npm start -- run --config config.json
 
 截图与 UTF-8 日志保存在 `<dataDir>/attachments/<taskId>`，独立于工程 worktree。相同文件名不会覆盖。下载、大小、编码或格式失败会保留消息并报告，失败消息的文字不伪装成完整送达。后续普通消息可继续投递。确认未送达的附件可通过服务 API `retryAttachment(taskId, inputId)` 重试；结果未知的输入不能直接重发。首版没有群聊附件重试命令。
 
-任务资料保存在 `<dataDir>/tasks/<taskId>`。新任务完成目录选择后，Runtime 为选中的项目准备工程资源，再创建正式 Thread。发现的项目直接使用已有项目目录，不新建分支或复制工程。旧独立 worktree 位于 `<dataDir>/workspaces/<taskId>--<resourceId>`，旧 `project-directory` 策略继续使用保存的完整项目目录。
+任务资料保存在 `<dataDir>/tasks/<taskId>`。接单记录中的原文、补充回答和附件保留到协调者派单后，再准备执行环境并创建正式 Thread。发现的项目直接使用已有项目目录，由 Worker 按项目约定创建独立工作树。旧独立 worktree 位于 `<dataDir>/workspaces/<taskId>--<resourceId>`，旧 `project-directory` 策略继续使用保存的完整项目目录。
 
 正式任务可通过 `ensure_workspace` 的 `projectId` 参数申请额外发现的项目，原有 `repository` 参数继续支持显式仓库与保存的旧资源。同一 Task 可关联多个工程资源。已有资源优先按保存的身份与路径恢复，配置更新不迁移旧工作区。目录或分支不符时停止并保留现场。
 

@@ -15,6 +15,7 @@ import { submissionReceiptSchema, type Submission, type SubmissionReceipt } from
 import { startDashboard } from '../src/dashboard.js';
 import { documentConversationText, projectDocumentConversation } from '../src/feishu-document-conversation.js';
 import { CodexFake, FeishuFake, GitHubFake } from './fakes.js';
+import { delegateIntake } from './coordinated-fixture.js';
 
 const loader = resolve('node_modules/tsx/dist/loader.mjs');
 const built = import.meta.url.endsWith('.js');
@@ -46,13 +47,15 @@ async function fixture(t: TestContext, settings: { maxPromptBytes?: number; requ
   const promptPath = join(root, 'guidance.md');
   await writeFile(promptPath, 'Generic engineering guidance, independent of the submitted task.');
   const config = configSchema.parse({ dataDir, engineering: { promptPath }, submission: settings,
+    repositories: [{ name: 'example/submission', path: root, baseBranch: 'main', workspace: { kind: 'project-directory', path: root } }],
     feishu: { userOpenId: 'owner', appIdEnv: 'ABSENT_SUBMIT_APP', appSecretEnv: 'ABSENT_SUBMIT_SECRET' },
     github: { tokenEnv: 'ABSENT_SUBMIT_GITHUB' }, pollIntervalMs: 60_000, executionPollMs: 60_000 });
   await writeFile(configPath, JSON.stringify(config));
   await mkdir(join(root, 'other-project'));
   const codex = new CodexFake(), feishu = new FeishuFake(), github = new GitHubFake();
+  codex.selectionResults = Array.from({ length: 20 }, () => ({ kind: 'repository', repositoryName: 'example/submission', reason: 'Select the submission project' }));
   const ports = { codex, feishu, github, workspace: {
-    async ensure() { throw new Error('Unexpected workspace acquisition'); }, async head() { return 'unused'; },
+    async ensure() { return root; }, async head() { return 'unused'; },
   } };
   let loop = new ControlledLoop(config, ports, storeFactory?.(dataDir), { configPath });
   t.after(async () => { await loop.close(); await rm(root, { recursive: true, force: true }); });
@@ -79,6 +82,8 @@ async function fixture(t: TestContext, settings: { maxPromptBytes?: number; requ
   const status = (requestId: string) => cli('status', ['--request-id', requestId]);
   const endpoint = async () => endpointSchema.parse(JSON.parse(await readFile(join(dataDir, 'submission-endpoint.json'), 'utf8')));
   return { root, dataDir, configPath, config, ports, codex, feishu, github, cli, submit, status, endpoint,
+    requests() { return loop.tasks().filter(task => !task.sourceId.startsWith('project:')); },
+    async delegate(taskId: string) { return delegateIntake(loop, taskId); },
     get loop() { return loop; },
     async restart() { await loop.close(); loop = new ControlledLoop(config, ports, undefined, { configPath }); await loop.start(); },
   };
@@ -106,49 +111,41 @@ async function rpc(endpoint: z.infer<typeof endpointSchema>, bytes: Uint8Array, 
   });
 }
 
-test('actual CLI file and stdin create independent tasks and preserve exact submitted text through selection and first turn', async t => {
-  const f = await fixture(t);
-  await f.loop.receive({ id: 'origin', chatId: 'private', senderId: 'owner', chatType: 'p2p', text: 'Original discussion', attachments: [], createdAt: Date.now() });
-  const original = f.loop.tasks()[0]; assert.ok(original);
-  await f.loop.start();
-  const saved = structuredClone(f.loop.store.task(original.id));
+test('actual CLI file and stdin preserve exact intake text and require coordinator dispatch before Worker execution', async t => {
+  const f = await fixture(t); await f.loop.start();
   const prompt = '\uFEFF  /new do not strip this\r\n规格与限制 🎯 e\u0301\r\n  final spaces  \r\n';
-  const groups: Parameters<FeishuFake['ensureGroup']>[0][] = [];
-  const ensureGroup = f.feishu.ensureGroup.bind(f.feishu);
-  f.feishu.ensureGroup = async input => { groups.push(input); return ensureGroup(input); };
-  const firstId = randomUUID(), secondId = randomUUID();
-  const first = accepted(await f.submit(firstId, prompt, join(f.root, "prompt ' $.txt")));
-  const second = accepted(await f.submit(secondId, prompt));
-  assert.equal(first.status, 'pending'); assert.equal(first.chatId, null); assert.equal(first.threadId, null);
-  assert.notEqual(first.taskId, second.taskId);
-  assert.equal(f.loop.tasks().length, 3);
+  const first = accepted(await f.submit(randomUUID(), prompt, join(f.root, "prompt ' $.txt")));
+  const second = accepted(await f.submit(randomUUID(), prompt));
+  assert.equal(first.status, 'pending'); assert.equal(first.purpose, 'intake');
+  assert.equal(first.chatId, null); assert.equal(first.threadId, null);
+  assert.equal(first.projectId, null); assert.equal(first.coordinatorTaskId, null);
+  assert.notEqual(first.taskId, second.taskId); assert.equal(f.requests().length, 2);
   assert.throws(() => new Store(f.dataDir), /已有 Agent Loop/);
   for (const receipt of [first, second]) {
     const task = f.loop.store.task(receipt.taskId);
     assert.equal(task.prompt, 'Generic engineering guidance, independent of the submitted task.');
-    assert.notEqual(task.prompt, prompt); assert.equal(task.source.kind, 'cli');
     assert.ok(task.source.kind === 'cli'); assert.equal(task.source.prompt, prompt);
     const inputs = f.loop.store.inputs(task.id); assert.equal(inputs.length, 1);
     assert.equal(inputs[0]?.message.text, prompt); assert.equal(inputs[0]?.message.senderId, 'external:cli');
     assert.deepEqual(inputs[0]?.provenance, { kind: 'cli', requestId: receipt.requestId });
   }
   await f.loop.tick();
-  const tasks = f.loop.tasks();
-  assert.equal(new Set(tasks.map(task => task.chatId)).size, 3);
-  assert.equal(new Set(tasks.map(task => task.threadId)).size, 3);
-  assert.equal(f.codex.created.length, 3);
+  assert.equal(f.codex.created.length, 1); assert.equal(f.feishu.groups.size, 1);
+  const routes = [first, second].map(receipt => f.loop.projects.intakeRoute(receipt.taskId));
+  assert.ok(routes[0]); assert.deepEqual(routes[0], routes[1]);
   for (const receipt of [first, second]) {
-    const task = f.loop.store.task(receipt.taskId); assert.ok(task.threadId && task.chatId);
-    assert.deepEqual(f.codex.starts.find(start => start.threadId === task.threadId)?.input[0], { kind: 'text', text: prompt });
-    assert.ok(f.codex.selections.some(selection => selection.taskId === task.id && selection.input.some(input => input.kind === 'text' && input.text === prompt)));
-    assert.equal(accepted(await f.status(receipt.requestId)).threadId, task.threadId);
+    const status = accepted(await f.status(receipt.requestId));
+    assert.equal(status.taskId, receipt.taskId); assert.equal(status.purpose, 'intake');
+    assert.equal(status.threadId, null); assert.equal(status.chatId, null);
+    assert.deepEqual({ projectId: status.projectId, coordinatorTaskId: status.coordinatorTaskId }, routes[0]);
   }
-  assert.equal(groups[0]?.title, '/new do not strip this\r\n规格与限制 🎯 e\u0301\r\n  final spaces');
-  assert.deepEqual({ ...f.loop.store.task(original.id), updatedAt: saved.updatedAt }, saved);
-  f.codex.complete(f.loop.store.task(first.taskId).threadId!, 'Reply in the new group');
-  await f.loop.tick();
-  assert.ok(f.feishu.sent.some(message => message.chatId === f.loop.store.task(first.taskId).chatId && message.text === 'Reply in the new group'));
-  assert.ok(!f.feishu.sent.some(message => message.chatId === original.chatId && message.text === 'Reply in the new group'));
+  const worker = await f.delegate(first.taskId); assert.ok(worker.threadId && worker.chatId);
+  assert.deepEqual(f.codex.starts.find(start => start.threadId === worker.threadId)?.input[0], { kind: 'text', text: prompt });
+  const promoted = accepted(await f.status(first.requestId));
+  assert.equal(promoted.taskId, first.taskId); assert.equal(promoted.purpose, 'execution');
+  assert.equal(promoted.threadId, worker.threadId); assert.equal(f.loop.store.task(second.taskId).threadId, null);
+  f.codex.complete(worker.threadId, 'Reply in the delegated group'); await f.loop.tick();
+  assert.ok(f.feishu.sent.some(message => message.chatId === worker.chatId && message.text === 'Reply in the delegated group'));
 });
 
 test('concurrent CLI retries, exact-content conflicts, persisted status and restart keep one task and input per request', async t => {
@@ -157,7 +154,7 @@ test('concurrent CLI retries, exact-content conflicts, persisted status and rest
   const receipts = await Promise.all(Array.from({ length: 5 }, () => f.submit(requestId, 'Same text\r\n').then(accepted)));
   assert.equal(new Set(receipts.map(receipt => receipt.taskId)).size, 1);
   const first = receipts[0]; assert.ok(first);
-  assert.equal(f.loop.tasks().length, 1); assert.equal(f.loop.store.inputs(first.taskId).length, 1);
+  assert.equal(f.requests().length, 1); assert.equal(f.loop.store.inputs(first.taskId).length, 1);
   for (const changed of ['Same text\n', '\uFEFFSame text\r\n', 'Same text\r\n ']) rejected(await f.submit(requestId, changed), 'conflict', requestId);
   await f.loop.tick();
   const snapshot = f.loop.store.task(first.taskId);
@@ -178,13 +175,13 @@ test('concurrent CLI retries, exact-content conflicts, persisted status and rest
 test('a repeated submit preserves a failed task and never resets recovery or starts another execution', async t => {
   const f = await fixture(t); await f.loop.start();
   const requestId = randomUUID(), first = accepted(await f.submit(requestId, 'A task'));
-  f.codex.loseCreateAck = true; await f.loop.tick();
+  await f.loop.tick(); f.codex.loseCreateAck = true; await f.delegate(first.taskId);
   const failed = f.loop.store.task(first.taskId); assert.equal(failed.status, 'failed');
   const retry = accepted(await f.submit(requestId, 'A task'));
   assert.equal(retry.status, 'failed'); assert.deepEqual(f.loop.store.task(first.taskId), failed);
   await f.restart();
   accepted(await f.submit(requestId, 'A task')); await f.loop.tick();
-  assert.equal(f.codex.created.length, 1); assert.equal(f.codex.starts.length, 0); assert.equal(f.feishu.groups.size, 1);
+  assert.equal(f.codex.created.length, 2); assert.equal(f.codex.starts.length, 1); assert.equal(f.feishu.groups.size, 2);
 });
 
 test('concurrent different prompts with one identity accept one immutable request and reject the other', async t => {
@@ -193,8 +190,8 @@ test('concurrent different prompts with one identity accept one immutable reques
   const results = await Promise.all(['First prompt', 'Different prompt'].map(prompt => f.submit(requestId, prompt)));
   assert.deepEqual(results.map(result => result.code).sort(), [0, 1]);
   const failure = results.find(result => result.code === 1); assert.ok(failure); rejected(failure, 'conflict', requestId);
-  const task = f.loop.tasks()[0]; assert.ok(task && task.source.kind === 'cli');
-  assert.equal(f.loop.tasks().length, 1); assert.equal(f.loop.store.inputs(task.id).length, 1);
+  const task = f.requests()[0]; assert.ok(task && task.source.kind === 'cli');
+  assert.equal(f.requests().length, 1); assert.equal(f.loop.store.inputs(task.id).length, 1);
   assert.equal(task.source.prompt, results[0]?.code === 0 ? 'First prompt' : 'Different prompt');
 });
 
@@ -210,11 +207,11 @@ test('a SQLite acceptance failure rolls back Task and inbox together and the sam
   const f = await fixture(t, {}, dataDir => new FaultStore(dataDir)); await f.loop.start();
   const requestId = randomUUID();
   rejected(await f.submit(requestId, 'Atomic acceptance'), 'unknown_outcome', requestId);
-  assert.equal(f.loop.tasks().length, 0);
+  assert.equal(f.requests().length, 0);
   const missing = await f.status(requestId); assert.equal(missing.code, 0); assert.equal(JSON.parse(missing.stdout).status, 'not_found');
   fail = false;
   const receipt = accepted(await f.submit(requestId, 'Atomic acceptance'));
-  assert.equal(f.loop.tasks().length, 1); assert.equal(f.loop.store.inputs(receipt.taskId).length, 1);
+  assert.equal(f.requests().length, 1); assert.equal(f.loop.store.inputs(receipt.taskId).length, 1);
   await f.loop.tick(); assert.equal(f.codex.starts.length, 1);
 });
 
@@ -227,13 +224,13 @@ test('bounded concurrent admission returns busy without persisting another reque
   try {
     await submitted.promise;
     rejected(await f.submit(secondId, 'Excess request'), 'busy', secondId);
-    assert.equal(f.loop.tasks().length, 1);
+    assert.equal(f.requests().length, 1);
     const missing = await f.status(secondId); assert.equal(missing.code, 0); assert.equal(JSON.parse(missing.stdout).status, 'not_found');
   } finally { held.release(); await pending; }
   accepted(await pending);
   f.loop.afterSubmit = null;
   accepted(await f.submit(secondId, 'Excess request'));
-  assert.equal(f.loop.tasks().length, 2);
+  assert.equal(f.requests().length, 2);
 });
 
 test('accepted pending submissions resume through normal lifecycle after restart', async t => {
@@ -242,14 +239,56 @@ test('accepted pending submissions resume through normal lifecycle after restart
   assert.equal(f.codex.created.length, 0);
   await f.restart();
   const recovered = accepted(await f.status(first.requestId));
-  assert.ok(recovered.threadId && recovered.chatId); assert.equal(recovered.taskId, first.taskId);
+  assert.equal(recovered.threadId, null); assert.equal(recovered.chatId, null); assert.equal(recovered.purpose, 'intake');
+  assert.ok(recovered.projectId && recovered.coordinatorTaskId); assert.equal(recovered.taskId, first.taskId);
   assert.equal(f.codex.starts.length, 1); assert.equal(f.loop.store.inputs(first.taskId).length, 1);
+});
+
+test('actual CLI answers clarify the same intake across restart and promoted follow-ups reach only its coordinator', async t => {
+  const f = await fixture(t);
+  f.codex.selectionResults.unshift({ kind: 'question', question: 'Which project owns this request?' });
+  await f.loop.start();
+  const requestId = randomUUID(), answerId = randomUUID();
+  const receipt = accepted(await f.submit(requestId, 'Investigate an unspecified project'));
+  await f.loop.tick();
+  assert.equal(f.codex.created.length, 0); assert.equal(f.feishu.groups.size, 0);
+  const answer = (id: string, text: string) => f.cli('answer', [
+    '--request-id', requestId, '--answer-id', id, '--prompt-file', '-',
+  ], Buffer.from(text));
+  const scope = 'Use example/submission. Investigate only; preserve local changes.\r\n';
+  assert.equal(accepted(await answer(answerId, scope)).taskId, receipt.taskId);
+  accepted(await answer(answerId, scope));
+  rejected(await answer(answerId, `${scope}Changed scope`), 'conflict', requestId);
+  assert.equal(f.loop.store.inputs(receipt.taskId).length, 2);
+  await f.restart();
+  const status = accepted(await f.status(requestId));
+  assert.equal(status.taskId, receipt.taskId); assert.equal(status.purpose, 'intake');
+  assert.equal(status.threadId, null); assert.ok(status.projectId && status.coordinatorTaskId);
+  assert.equal(f.requests().length, 1);
+  accepted(await answer(answerId, scope));
+  assert.equal(f.loop.store.inputs(receipt.taskId).length, 2);
+  const coordinatorMaterial = f.loop.store.inputs(status.coordinatorTaskId).map(input => input.message.text).join('\n');
+  assert.ok(coordinatorMaterial.includes('Investigate an unspecified project'));
+  assert.ok(coordinatorMaterial.includes(scope));
+  const worker = await f.delegate(receipt.taskId); assert.ok(worker.threadId);
+  const inbox = f.loop.store.inputs(worker.id), starts = f.codex.starts.filter(input => input.threadId === worker.threadId);
+  const steers = f.codex.steers.filter(input => input.threadId === worker.threadId);
+  const followUpId = randomUUID(), followUp = 'New evidence needs coordinator assessment before further work.';
+  accepted(await answer(followUpId, followUp)); await f.loop.tick();
+  assert.deepEqual(f.loop.store.inputs(worker.id), inbox);
+  assert.deepEqual(f.codex.starts.filter(input => input.threadId === worker.threadId), starts);
+  assert.deepEqual(f.codex.steers.filter(input => input.threadId === worker.threadId), steers);
+  const events = () => f.loop.store.inputs(status.coordinatorTaskId!).filter(input => input.provenance.kind === 'agent'
+    && input.provenance.category === 'request_followup' && input.message.text.includes(followUp));
+  assert.equal(events().length, 1);
+  await f.restart(); accepted(await answer(followUpId, followUp)); await f.loop.tick();
+  assert.equal(events().length, 1); assert.equal(f.requests().length, 1);
 });
 
 test('submit and status need no platform env file, Runtime or writable Store; missing Runtime creates no database', async t => {
   const f = await fixture(t); const id = randomUUID();
   rejected(await f.submit(id, 'Offline submission'), 'unavailable', id);
-  assert.equal(f.loop.tasks().length, 0);
+  assert.equal(f.requests().length, 0);
   await f.loop.close(); await rm(f.dataDir, { recursive: true, force: true });
   const result = await f.status(id); assert.equal(result.code, 0, result.stderr);
   assert.deepEqual(JSON.parse(result.stdout), { requestId: id, taskId: null, status: 'not_found', reason: null, chatId: null, threadId: null });
@@ -271,7 +310,7 @@ test('invalid CLI bytes, blank text, oversized files and IDs produce structured 
   rejected(await f.cli('submit', ['--prompt-file', '-'], Buffer.from('text')), 'invalid_input', null);
   rejected(await f.cli('submit', ['--request-id', id]), 'invalid_input', id);
   rejected(await f.cli('submit', ['--request-id', id, '--prompt-file', '/file/does-not-exist']), 'invalid_input', id);
-  assert.equal(f.loop.tasks().length, 0); assert.equal(f.codex.created.length, 0);
+  assert.equal(f.requests().length, 0); assert.equal(f.codex.created.length, 0);
   accepted(await f.submit(randomUUID(), 'a'.repeat(64)));
 });
 
@@ -288,7 +327,7 @@ test('local RPC authenticates, rejects malformed envelopes, surrogate text and b
     const result = await rpc(endpoint, bytes);
     assert.equal(result.status, 400); assert.equal(failureSchema.parse(result.body).error.code, 'invalid_input');
   }
-  assert.equal(f.loop.tasks().length, 0);
+  assert.equal(f.requests().length, 0);
   await f.loop.close();
   await assert.rejects(access(join(f.dataDir, 'submission-endpoint.json')));
   await assert.rejects(access(endpoint.socketPath));
@@ -312,7 +351,7 @@ test('CLI reports unknown outcome on lost response and reconciles by status and 
   const requestId = randomUUID();
   rejected(await f.submit(requestId, 'Response loss'), 'unknown_outcome', requestId);
   const receipt = accepted(await f.status(requestId)); assert.equal(receipt.status, 'pending');
-  assert.equal(f.loop.tasks().length, 1);
+  assert.equal(f.requests().length, 1);
   await writeFile(path, JSON.stringify(endpoint), { mode: 0o600 });
   assert.equal(accepted(await f.submit(requestId, 'Response loss')).taskId, receipt.taskId);
   await f.loop.tick(); assert.equal(f.codex.starts.length, 1); assert.equal(f.feishu.groups.size, 1);
@@ -342,8 +381,8 @@ test('new and retained formal Threads receive current absolute CLI commands and 
   const f = await fixture(t); await f.loop.start();
   const requestId = randomUUID(), receipt = accepted(await f.submit(requestId, 'A CLI task\r\nDetails'));
   await f.loop.tick();
-  const task = f.loop.store.task(receipt.taskId); assert.ok(task.threadId);
-  const instructions = f.codex.created[0]?.instructions; assert.ok(instructions);
+  const task = await f.delegate(receipt.taskId); assert.ok(task.threadId);
+  const instructions = f.codex.created.find(input => input.cwd === task.resources[0]?.workspace)?.instructions; assert.ok(instructions);
   assert.match(instructions, /submit --config/); assert.match(instructions, /status --config/);
   assert.ok(instructions.includes(entry)); assert.ok(instructions.includes(process.execPath));
   assert.ok(instructions.includes("'\"'\"'")); assert.doesNotMatch(instructions, /Bearer|submission-endpoint/);
@@ -371,6 +410,6 @@ test('new and retained formal Threads receive current absolute CLI commands and 
   const dashboard = await startDashboard({ dataDir: f.dataDir, port: 0 });
   t.after(() => dashboard.close());
   const snapshot = z.object({ tasks: z.array(z.object({ id: z.string(), sourceKind: z.string(), sourceLabel: z.string(), title: z.string() })) }).parse(await (await fetch(dashboard.url + '/api/snapshot')).json());
-  assert.deepEqual(snapshot.tasks[0], { id: task.id, sourceKind: 'cli', sourceLabel: 'CLI', title: 'A CLI task\r\nDetails' });
+  assert.deepEqual(snapshot.tasks.find(item => item.id === task.id), { id: task.id, sourceKind: 'cli', sourceLabel: 'CLI', title: 'A CLI task\r\nDetails' });
   const page = await (await fetch(dashboard.url + '/app.js')).text(); assert.match(page, /CLI SUBMISSION/);
 });

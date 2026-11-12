@@ -1,5 +1,5 @@
 # Dependencies and generated output
-node_modules/
+node_modules
 dist/
 
 # Local configuration and credentials

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
-import { sourceSchema, sourceCommentSchema, type Source, type SourceComment } from './domain.js';
+import { criteriaSchema, matchSource, sourceSchema, sourceCommentSchema, type Source, type SourceComment } from './domain.js';
 import type { Store } from './store.js';
 
 const idSchema = z.string().min(1).max(512)
@@ -15,11 +15,12 @@ const projectRepositorySchema = z.strictObject({
   name: repositoryNameSchema,
   labelsAny: z.array(idSchema).max(1_000).default([]),
   assigneesAny: z.array(idSchema).max(1_000).default([]),
-}).refine(value => value.labelsAny.length + value.assigneesAny.length > 0, 'An intake selector is required');
+  criteria: criteriaSchema.optional(),
+}).refine(value => value.labelsAny.length + value.assigneesAny.length > 0 || value.criteria !== undefined, 'An intake selector is required');
 export const projectConfigSchema = z.strictObject({
   id: idSchema, name: z.string().trim().min(1).max(512), directory: z.string().min(1).max(4_096)
     .refine(value => value.trim().length > 0 && !value.includes('\0'), 'Invalid project directory'),
-  repositories: z.array(projectRepositorySchema).min(1).max(1_000),
+  repositories: z.array(projectRepositorySchema).max(1_000),
   instructions: z.string().max(131_072).default(''),
   models: z.strictObject({ coordinator: idSchema.default('gpt-6-astra'), worker: idSchema.default('gpt-6.1-sol'), verifier: idSchema.optional() })
     .default({ coordinator: 'gpt-6-astra', worker: 'gpt-6.1-sol' }),
@@ -32,10 +33,10 @@ export type ProjectConfig = z.infer<typeof projectConfigSchema>;
 
 const recordRequestSchema = z.strictObject({ requestId: idSchema, key: idSchema, text: textSchema, expectedVersion: versionSchema });
 export const projectActionSchema = z.discriminatedUnion('action', [
-  z.strictObject({ action: z.literal('status'), section: z.enum(['overview', 'issues', 'comments', 'records', 'tasks']).optional(),
+  z.strictObject({ action: z.literal('status'), section: z.enum(['overview', 'issues', 'comments', 'records', 'tasks', 'intakes']).optional(),
     offset: versionSchema.optional(), limit: z.number().int().min(1).max(100).optional() }),
   z.strictObject({ action: z.literal('dispatch'), requestId: idSchema, prompt: textSchema,
-    issueId: idSchema.optional(), role: z.enum(['worker', 'verifier']).default('worker') }),
+    issueId: idSchema.optional(), intakeTaskId: idSchema.optional(), role: z.enum(['worker', 'verifier']).default('worker') }),
   z.strictObject({ action: z.literal('send'), requestId: idSchema, taskId: idSchema, text: textSchema }),
   z.strictObject({ action: z.literal('report'), requestId: idSchema, kind: z.enum(['result', 'question', 'update']), text: textSchema }),
   recordRequestSchema.extend({ action: z.literal('record') }),
@@ -135,7 +136,9 @@ const older = (incoming: string, current: string) => Date.parse(incoming) < Date
 export function matchesProjectIssue(source: Source, project: ProjectConfig): boolean {
   if (source.state !== 'open' || source.isPullRequest) return false;
   const repository = project.repositories.find(candidate => candidate.name.toLowerCase() === source.repository.toLowerCase());
-  return repository !== undefined && (repository.labelsAny.some(label => source.labels.includes(label))
+  if (repository?.criteria && !matchSource(source, repository.criteria).matches) return false;
+  return repository !== undefined && ((repository.labelsAny.length + repository.assigneesAny.length === 0 && repository.criteria !== undefined)
+    || repository.labelsAny.some(label => source.labels.includes(label))
     || repository.assigneesAny.some(assignee => source.assignees.some(name => name.toLowerCase() === assignee.toLowerCase())));
 }
 
@@ -241,7 +244,8 @@ export class ProjectLedger {
     if (current && older(incoming.updatedAt, current.updatedAt))
       return { changed: false, eventId: observed?.eventId ?? this.lastIssueEvent(document, incoming.id) };
     const changed = !current || issueFingerprint(current) !== issueFingerprint(incoming);
-    document.state.issues = [...document.state.issues.filter(candidate => candidate.id !== incoming.id), incoming];
+    document.state.issues = current ? document.state.issues.map(candidate => candidate.id === incoming.id ? incoming : candidate)
+      : [...document.state.issues, incoming];
     this.save(document.state);
     return { changed, eventId: this.lastIssueEvent(this.requiredDocument(projectId), incoming.id) };
   }

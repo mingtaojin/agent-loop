@@ -30,7 +30,7 @@ class ProjectCodexFake extends CodexFake {
 const dispatchReceipt = z.object({ taskId: z.string().min(1) });
 const overviewSchema = z.object({
   id: z.string(), coordinatorTaskId: z.string(), version: z.number(),
-  counts: z.object({ issues: z.number(), comments: z.number(), tasks: z.number(), records: z.number() }),
+  counts: z.object({ issues: z.number(), comments: z.number(), tasks: z.number(), records: z.number(), intakes: z.number() }),
   members: projectStateSchema.shape.members,
   records: z.array(projectStateSchema.shape.records.element.extend({ truncated: z.boolean().optional() })),
   tasks: z.array(taskSchema.pick({ status: true, executionStatus: true, reason: true, chatId: true, threadId: true, resources: true })
@@ -45,7 +45,7 @@ function projectIssue(number: number, repository = 'example/frontend', changes: 
   });
 }
 
-async function fixture(t: TestContext, options: { coordinated?: boolean; secondProject?: boolean } = {}) {
+async function fixture(t: TestContext, options: { secondProject?: boolean } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'agent-project-runtime-'));
   const directory = await realpath(root);
   const projectConfigs = configSchema.parse({ feishu: { userOpenId: 'owner' }, projects: [
@@ -59,7 +59,7 @@ async function fixture(t: TestContext, options: { coordinated?: boolean; secondP
   const config = configSchema.parse({ dataDir: root, feishu: { userOpenId: 'owner' },
     recovery: { maxAttempts: 2, retryDelayMs: 1 },
     repositories: ['example/frontend', 'example/backend'].map(name => ({ name, path: directory, baseBranch: 'main', criteria: { taskTypes: ['bug', 'feature'] } })),
-    projects: options.coordinated === false ? [] : projectConfigs,
+    projects: projectConfigs,
   });
   const github = new GitHubFake(), feishu = new FeishuFake(), codex = new ProjectCodexFake();
   const workspaces: Parameters<WorkspacePort['ensure']>[0][] = [];
@@ -89,6 +89,24 @@ async function fixture(t: TestContext, options: { coordinated?: boolean; secondP
   });
   return { root, directory, config, projectConfigs, github, feishu, codex, workspaces, state, coordinator, events, message,
     get loop() { return loop; },
+    async seedLegacy(source: Source) {
+      const repository = configSchema.parse({ feishu: { userOpenId: 'owner' }, repositories: [{ name: source.repository, path: directory, baseBranch: 'main', workspace: { kind: 'project-directory', path: directory } }] }).repositories[0];
+      assert.ok(repository && 'path' in repository && repository.workspace?.kind === 'project-directory');
+      const id = `legacy-${source.number}`, chatId = await feishu.ensureGroup({ taskId: id, title: source.title, sourceUrl: source.url });
+      const threadId = await codex.createThread({ cwd: directory, instructions: 'Saved legacy instructions' });
+      const turnId = await codex.startTurn({ threadId, deliveryId: `${id}:initial`, input: [{ kind: 'text', text: source.body }] });
+      const task = taskSchema.parse({ id, sourceId: source.id, source: { kind: 'github', issue: source, repository, collectionReason: 'legacy' },
+        contextDirectory: join(root, 'tasks', id), resources: [{ id: 'legacy-workspace', kind: 'project-directory', repository, workspace: directory }],
+        workspaceSelection: { kind: 'selected', temporaryThreadId: 'saved-legacy-selection', inputIds: [], choice: { kind: 'repository', repositoryName: repository.name, repository, reason: 'Saved selection' } },
+        status: 'running', reason: null, prompt: 'Saved prompt', promptHash: 'saved-hash', skillPath: null,
+        chatId, threadId, turnId, executionStatus: 'running', lastHandledTurnId: null, requests: [], createdAt: Date.now(), updatedAt: Date.now(),
+      });
+      assert.equal(task.purpose, 'legacy');
+      loop.store.saveTask(task);
+      loop.store.receive(id, { id: `${id}:initial`, chatId, senderId: 'runtime:initial', chatType: 'group', text: source.body, attachments: [], createdAt: task.createdAt }, 'initial');
+      loop.store.markInput(`${id}:initial`, 'delivered');
+      return task;
+    },
     async initialize() { await loop.collect(); await loop.tick(); return coordinator(); },
     async status(callerId = coordinator().id) { return overviewSchema.parse(await loop.projectAction(callerId, { action: 'status' })); },
     async dispatch(requestId: string, prompt: string, extra: { issueId?: string; role?: 'worker' | 'verifier'; callerId?: string } = {}) {
@@ -130,31 +148,47 @@ test('project collection uses label OR assignee across repositories without crea
   const coordinator = await f.initialize();
   await Promise.all([f.loop.collect(), f.loop.collect()]); await f.loop.tick();
   assert.deepEqual(f.state().issues.map(source => source.id).sort(), matched.map(source => source.id).sort());
-  assert.deepEqual(f.loop.tasks().map(task => task.id), [coordinator.id]);
+  assert.deepEqual(f.loop.tasks().filter(task => task.purpose === 'execution').map(task => task.id), [coordinator.id]);
+  assert.equal(f.loop.tasks().filter(task => task.purpose === 'intake').length, matched.length);
   assert.equal(f.events(coordinator.id, 'github_issue').length, matched.length);
   assert.equal(f.feishu.groups.size, 1);
   assert.equal(f.workspaces.length, 0);
   assert.equal(f.codex.selections.length, 0);
   assert.equal(f.codex.created[0]?.cwd, coordinator.contextDirectory);
   assert.match(f.codex.created[0]?.instructions ?? '', /Orchestrate/);
-  for (const source of matched) assert.equal(f.loop.store.taskForSource(source.id), null);
+  for (const source of matched) {
+    const intake = f.loop.store.taskForSource(source.id); assert.ok(intake);
+    assert.equal(intake.purpose, 'intake'); assert.equal(intake.threadId, null);
+    assert.equal(f.loop.projects.ledger.membership(intake.id), null);
+  }
   assert.equal((await f.status()).counts.issues, matched.length);
 });
 
-test('enabling a project adopts an existing Issue task and preserves its group, thread and work', async t => {
-  const f = await fixture(t, { coordinated: false });
+test('enabling a project adopts a paused legacy Issue and preserves its group, Thread, work and native approval', async t => {
+  const f = await fixture(t);
   const source = projectIssue(11);
-  f.github.sources = [source]; await f.loop.collect(); await f.loop.tick();
-  const original = f.loop.store.taskForSource(source.id); assert.ok(original?.threadId && original.chatId);
+  f.github.sources = [source]; const original = await f.seedLegacy(source); assert.ok(original.threadId && original.chatId);
+  const native: PendingRequest = { id: 'saved-approval', threadId: original.threadId, turnId: original.turnId!,
+    kind: 'approval', prompt: 'Saved native permission', method: 'item/commandExecution/requestApproval', payload: {}, isBlocking: true, connectionEpoch: 'saved-epoch' };
+  original.status = 'paused'; original.reason = 'Operator paused'; original.requests = [native];
+  f.loop.store.saveTask(original); f.codex.snapshot(original.threadId).requests = [native];
+  const decision = { id: 'saved-click', taskId: original.id, threadId: native.threadId, turnId: native.turnId,
+    requestId: native.id, decision: 'approve' as const, chatId: original.chatId, senderId: 'owner', epoch: native.connectionEpoch };
+  f.loop.store.queueApproval(decision); f.loop.store.markApproval(f.loop.store.approvalKey(decision), 'uncertain');
   const starts = f.codex.starts.filter(turn => turn.threadId === original.threadId).length;
-  f.config.projects = f.projectConfigs;
   await f.restart(); await f.loop.collect(); await f.loop.tick();
   assert.equal(f.loop.tasks().length, 2);
   assert.deepEqual(f.state().members.find(member => member.taskId === original.id), { taskId: original.id, role: 'worker', issueId: source.id });
   assert.equal(f.loop.store.task(original.id).threadId, original.threadId);
   assert.equal(f.loop.store.task(original.id).chatId, original.chatId);
+  assert.equal(f.loop.store.task(original.id).purpose, 'execution');
+  assert.equal(f.loop.store.task(original.id).status, 'paused');
+  assert.deepEqual(f.loop.store.task(original.id).resources, original.resources);
+  assert.deepEqual(f.loop.store.task(original.id).requests, [native]);
+  assert.deepEqual(f.loop.store.approvals(original.id)[0]?.action, decision);
+  assert.equal(f.loop.store.approvals(original.id)[0]?.status, 'uncertain'); assert.equal(f.codex.approvals.length, 0);
   assert.equal(f.codex.starts.filter(turn => turn.threadId === original.threadId).length, starts);
-  assert.equal(f.events(f.coordinator().id, 'github_issue').filter(input => input.message.text.includes(original.id)).length, 1);
+  assert.equal(f.events(f.coordinator().id, 'existing_work').filter(input => input.message.text.includes(original.id)).length, 1);
 });
 
 test('dispatch is idempotent under concurrent requests and restart, rejects conflicts and carries generic worker guidance', async t => {
@@ -168,11 +202,10 @@ test('dispatch is idempotent under concurrent requests and restart, rejects conf
   await f.loop.tick();
   const worker = f.loop.store.task(taskId); assert.ok(worker.threadId);
   assert.deepEqual(f.state().members.find(member => member.taskId === taskId), { taskId, role: 'worker', issueId: f.github.sources[0]!.id });
-  assert.equal(f.events(taskId, 'delegation').length, 1);
-  assert.equal(f.events(taskId, 'delegation')[0]?.message.text, action.prompt);
+  assert.equal(f.loop.store.meta(`project-delegation:${taskId}`), action.prompt);
   const creation = f.codex.created.find(input => input.cwd === f.directory); assert.ok(creation);
   assert.match(creation.instructions, /poteto-mode/);
-  assert.ok(f.codex.starts.some(turn => turn.threadId === worker.threadId && JSON.stringify(turn.input).includes(action.prompt)));
+  assert.ok(creation.instructions.includes(action.prompt));
   assert.equal(worker.resources[0]?.workspace, f.directory);
   assert.equal(f.codex.selections.length, 0);
   await assert.rejects(f.loop.projectAction(coordinator.id, { ...action, prompt: 'Different scope under the same request' }), /different|conflict|already/i);
@@ -472,6 +505,7 @@ test('project and role permissions reject cross-project messages, foreign Issues
   const manual: IncomingMessage = { ...f.message('ordinary-task', 'Discuss an unrelated idea.', 'private'), chatType: 'p2p' };
   await f.loop.receive(manual);
   const ordinary = f.loop.store.taskForSource('feishu:new:ordinary-task'); assert.ok(ordinary);
+  assert.equal(ordinary.purpose, 'intake'); assert.equal(ordinary.threadId, null);
   await assert.rejects(f.loop.projectAction(ordinary.id, { action: 'status' }), /project|bound/i);
 });
 
@@ -580,19 +614,20 @@ test('project intake clears legacy server filters so label-only and assignee-onl
   assert.equal(f.state().issues.length, 2);
 });
 
-test('a legacy Issue outside project selectors remains an ordinary task with its original update routing', async t => {
-  const f = await fixture(t, { coordinated: false });
+test('a legacy Issue outside intake selectors is adopted in place before further execution', async t => {
+  const f = await fixture(t);
   const source = projectIssue(63, 'example/frontend', { labels: ['ordinary'], assignees: ['ordinary-owner'] });
-  f.github.sources = [source]; await f.loop.collect(); await f.loop.tick();
-  const original = f.loop.store.taskForSource(source.id); assert.ok(original?.threadId);
-  f.config.projects = f.projectConfigs;
+  f.github.sources = [source]; const original = await f.seedLegacy(source);
   await f.restart(); await f.loop.collect(); await f.loop.tick();
-  assert.equal(f.state().issues.length, 0); assert.equal(f.loop.projects.ledger.membership(original.id), null);
-  f.github.sources = [{ ...source, body: 'Ordinary task new evidence' }];
-  await f.loop.collect(); await f.loop.tick();
   const retained = f.loop.store.task(original.id);
-  assert.equal(retained.threadId, original.threadId);
-  assert.ok(f.loop.store.inputs(original.id).some(input => input.message.text.includes('Ordinary task new evidence')));
+  assert.equal(retained.purpose, 'execution'); assert.equal(retained.threadId, original.threadId);
+  assert.equal(retained.chatId, original.chatId); assert.deepEqual(retained.resources, original.resources);
+  assert.equal(f.state().issues.length, 0);
+  assert.deepEqual(f.loop.projects.ledger.membership(original.id), { projectId: 'app', role: 'worker' });
+  assert.equal(f.events(f.coordinator().id, 'existing_work').length, 1);
+  await f.loop.receive(f.message('legacy-followup', 'Continue within the original scope', original.chatId!));
+  assert.equal(f.loop.store.task(original.id).threadId, original.threadId);
+  assert.equal(f.codex.steers.filter(input => input.threadId === original.threadId).length, 1);
   assert.equal(f.events(f.coordinator().id, 'github_issue').length, 0);
 });
 
