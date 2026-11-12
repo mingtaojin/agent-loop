@@ -1,12 +1,12 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { documentBaseUrlSchema, documentMaxLinesSchema } from './config.js';
-import { errorMessage } from './domain.js';
+import { errorMessage, type Task } from './domain.js';
 import { finished, progressViewSchema, taskProgressStatus } from './feishu-progress-view.js';
 import { documentConversationText, projectDocumentConversation } from './feishu-document-conversation.js';
 import { documentChunks } from './feishu-document-text.js';
 import { DocumentRequestRejected, type FeishuDocumentProgressPort } from './ports.js';
-import type { Store } from './store.js';
+import { documentSourcePositionSchema, type DocumentSourcePosition, type Store } from './store.js';
 
 const id = z.string().min(1);
 const writeSchema = z.strictObject({ clientToken: id, text: z.string(), sent: z.boolean(), chunks: z.array(z.string()).min(1).optional() });
@@ -26,10 +26,15 @@ const deliverySchema = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('ready'), ...blockFields, tabId: id, content: z.string(), write: writeSchema.nullable(),
     parts: z.array(partSchema).default([]), operation: operationSchema.nullable().default(null) }),
 ]);
+const projectionRevisionSchema = documentSourcePositionSchema.extend({
+  taskKey: z.string(), rendererVersion: z.number().int().nonnegative(), maxLines: documentMaxLinesSchema,
+});
+type DocumentProjectionRevision = z.infer<typeof projectionRevisionSchema>;
 export const documentPublicationSchema = z.strictObject({
   version: z.literal(1), taskId: id, chatId: id, turnId: id,
   view: progressViewSchema, text: z.string().default(''), delivery: deliverySchema,
   lastAttemptAt: z.number(), nextAttemptAt: z.number(), failures: z.number().int().nonnegative(),
+  projectionRevision: projectionRevisionSchema.nullable().default(null),
 });
 export type DocumentPublication = z.infer<typeof documentPublicationSchema>;
 const discoverySchema = z.strictObject({ cursor: z.number().int().nonnegative(), excludedTurns: z.array(z.string()) });
@@ -37,6 +42,16 @@ const discoveryKey = 'feishu-document-progress:discovery:v1';
 const turnKey = (taskId: string, turnId: string) => JSON.stringify([taskId, turnId]);
 const emptyView = () => progressViewSchema.parse({ status: 'running', cursor: 0, lastExecutionEventAt: null, assistant: [], tool: null });
 const content = (record: DocumentPublication) => record.text;
+function projectionRevision(task: Task, position: DocumentSourcePosition, maxLines: number): DocumentProjectionRevision {
+  const taskKey = createHash('sha256').update(JSON.stringify([
+    task.threadId, task.turnId, taskProgressStatus(task), task.source.kind === 'manual' ? task.source.message : null,
+  ])).digest('hex');
+  return { ...position, taskKey, rendererVersion: 1, maxLines };
+}
+function sameRevision(previous: DocumentProjectionRevision | null, current: DocumentProjectionRevision): boolean {
+  return previous !== null && previous.eventSeq === current.eventSeq && previous.inputSeq === current.inputSeq
+    && previous.taskKey === current.taskKey && previous.rendererVersion === current.rendererVersion && previous.maxLines === current.maxLines;
+}
 
 export class FeishuDocumentProgressPublisher {
   private readonly inFlight = new Map<string, Promise<void>>();
@@ -110,14 +125,17 @@ export class FeishuDocumentProgressPublisher {
         if (record && record.chatId !== task.chatId) throw new Error(`Document chat binding changed for ${task.id}`);
         if (!record) {
           record = { version: 1, taskId: task.id, chatId: task.chatId, turnId: task.turnId,
-            view: emptyView(), text: '', delivery: { kind: 'document', title: '执行进度', pending: false },
+            view: emptyView(), text: '', projectionRevision: null, delivery: { kind: 'document', title: '执行进度', pending: false },
             lastAttemptAt: 0, nextAttemptAt: 0, failures: 0 };
         }
+        const revision = projectionRevision(task, store.documentConversationPosition(task.id), this.maxLines);
+        if (sameRevision(record.projectionRevision, revision)) continue;
         record.turnId = task.turnId;
         const conversation = projectDocumentConversation(task, store.inputs(task.id), store.documentConversationEvents(task.id));
         record.view = { status: conversation.status, cursor: conversation.cursor,
           lastExecutionEventAt: conversation.lastExecutionEventAt, assistant: [], tool: null, notice: null };
         record.text = documentConversationText(conversation, this.maxLines);
+        record.projectionRevision = revision;
         this.save(record);
       }
       discovery.cursor = store.latestExecutionSequence();

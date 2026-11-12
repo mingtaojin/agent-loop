@@ -2,9 +2,10 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { test, type TestContext } from 'node:test';
 import { configSchema } from '../src/config.js';
-import { taskSchema, type Task } from '../src/domain.js';
+import { incomingSchema, submissionRequestIdSchema, taskSchema, type Task } from '../src/domain.js';
 import type { ExecutionEvent } from '../src/execution-events.js';
 import { FeishuDocumentProgressPublisher, documentPublicationSchema } from '../src/feishu-document-progress.js';
 import { documentChunks } from '../src/feishu-document-text.js';
@@ -80,14 +81,14 @@ async function fixture(t: TestContext, initialize = true) {
   let publisher = new FeishuDocumentProgressPublisher({ store, transport, documentBaseUrl: baseUrl, intervalMs: 1000, now: () => now });
   t.after(async () => { await publisher.close(); store.close(); await rm(directory, { recursive: true, force: true }); });
   if (initialize) await publisher.poll();
-  return { transport, get store() { return store; }, get publisher() { return publisher; },
+  return { directory, transport, get store() { return store; }, get publisher() { return publisher; },
     event(kind: ExecutionEvent['kind'], text: string, changes: Partial<ExecutionEvent> = {}) {
       store.recordExecutionEvent('task', { threadId: 'thread-task', turnId: 'turn', itemId: 'item', kind, text, label: kind, createdAt: now, ...changes });
     },
     advance(ms = 3000) { now += ms; },
     async pump(count = 1) { for (let i = 0; i < count; i++) { await publisher.poll(); now += 3000; } },
     record(id = 'task') { return documentPublicationSchema.parse(store.documentProgressRecord(id)); },
-    async restart() { await publisher.close(); store.close(); store = new Store(directory); publisher = new FeishuDocumentProgressPublisher({ store, transport, documentBaseUrl: baseUrl, now: () => now }); },
+    async restart(options: { maxLines?: number } = {}) { await publisher.close(); store.close(); store = new Store(directory); publisher = new FeishuDocumentProgressPublisher({ store, transport, documentBaseUrl: baseUrl, now: () => now, ...options }); },
   };
 }
 
@@ -187,7 +188,10 @@ test('new events and turn resets during writes survive stale acknowledgement; up
   await Promise.resolve();
   f.store.saveTask(task('task', 'second')); f.event('agent_message', 'Newest view', { turnId: 'second' });
   await f.publisher.poll();
+  const revision = f.record().projectionRevision;
+  assert.notEqual(revision, null);
   hold.resolve(); await sending; f.transport.hold = null;
+  assert.deepEqual(f.record().projectionRevision, revision);
   assert.match(f.record().text, /Newest view[\s\S]*Sending old view/);
   const count = f.transport.count('write'); await f.publisher.poll(); f.advance(2999); await f.publisher.poll();
   assert.equal(f.transport.count('write'), count);
@@ -275,6 +279,132 @@ test('legacy pending content is reconciled before conversation history replaces 
   assert.match(f.transport.text(), /Restored conversation/);
   assert.equal(f.transport.count('document'), 1);
   assert.ok(f.transport.calls.some(call => call.kind === 'write' && JSON.stringify(call.input).includes('legacy-token')));
+});
+
+test('legacy publications rebuild once and unchanged publications skip history across restart', async t => {
+  const f = await fixture(t); f.store.saveTask(task()); f.event('agent_message', 'Retained answer');
+  await f.pump(5);
+  const before = f.record();
+  const { projectionRevision, ...legacy } = before;
+  assert.notEqual(projectionRevision, null);
+  assert.equal(documentPublicationSchema.parse(legacy).projectionRevision, null);
+  f.store.saveDocumentProgressRecord('task', legacy);
+  await f.restart();
+  const events = t.mock.method(f.store, 'documentConversationEvents');
+  const inputs = t.mock.method(f.store, 'inputs');
+  await f.pump(3);
+  assert.equal(events.mock.callCount(), 1); assert.equal(inputs.mock.callCount(), 1);
+  assert.deepEqual(f.record(), before);
+  f.store.saveTask({ ...task(), updatedAt: 12345, prompt: 'Changed engineering guidance', promptHash: 'changed' });
+  await f.pump();
+  assert.equal(events.mock.callCount(), 1); assert.equal(inputs.mock.callCount(), 1);
+  await f.restart();
+  const restartedEvents = t.mock.method(f.store, 'documentConversationEvents');
+  const restartedInputs = t.mock.method(f.store, 'inputs');
+  await f.pump(2);
+  assert.equal(restartedEvents.mock.callCount(), 0); assert.equal(restartedInputs.mock.callCount(), 0);
+  assert.deepEqual(f.record(), before);
+});
+
+test('input-only changes retain original provenance, attachments and CLI submissions without execution events', async t => {
+  const f = await fixture(t); f.store.saveTask(task()); await f.pump(5);
+  assert.deepEqual(f.store.documentConversationPosition('task'), { eventSeq: 0, inputSeq: 0 });
+  const original = incomingSchema.parse({ id: 'reply', chatId: 'chat-task', senderId: 'owner', text: 'Original directory reply',
+    attachments: [{ key: 'file-key', kind: 'file', name: 'evidence.txt' }], createdAt: 2 });
+  f.store.receive('task', { ...original, text: 'PRIVATE_EXPANDED_PROMPT', attachments: [] }, 'user',
+    { kind: 'user', message: original }, 'workspace-selection');
+  await f.pump();
+  assert.match(f.transport.text(), /Original directory reply\n附件：evidence.txt/);
+  assert.doesNotMatch(f.transport.text(), /PRIVATE_EXPANDED_PROMPT|file-key/);
+  const userRevision = f.record().projectionRevision;
+  f.store.receive('task', { ...original, id: 'cli', text: 'CLI continuation', attachments: [], createdAt: 3 }, 'initial',
+    { kind: 'cli', requestId: submissionRequestIdSchema.parse('00000000-0000-4000-8000-000000000001') });
+  await f.pump();
+  assert.match(f.transport.text(), /CLI 提交[^\n]*\nCLI continuation/);
+  assert.notDeepEqual(f.record().projectionRevision, userRevision);
+  assert.equal(f.record().projectionRevision?.eventSeq, 0);
+  f.store.markInput('reply', 'delivered'); f.store.markSelectionHandled('reply', 'task');
+  const reads = t.mock.method(f.store, 'documentConversationEvents');
+  await f.pump(); assert.equal(reads.mock.callCount(), 0);
+});
+
+test('status, turn and thread identity changes invalidate projection without new events', async t => {
+  const f = await fixture(t); f.store.saveTask(task()); f.event('turn_end', 'completed'); await f.pump(5);
+  assert.equal(f.record().view.status, 'completed');
+  const reads = t.mock.method(f.store, 'documentConversationEvents');
+  await f.pump(); assert.equal(reads.mock.callCount(), 0, 'terminal event and running snapshot remain stable');
+  f.store.saveTask({ ...task(), status: 'paused' }); await f.pump(2);
+  assert.equal(f.record().view.status, 'paused'); assert.equal(reads.mock.callCount(), 1);
+  f.store.saveTask(task('task', 'second')); await f.pump(2);
+  assert.equal(f.record().turnId, 'second'); assert.equal(f.record().view.status, 'running');
+  assert.equal(reads.mock.callCount(), 2);
+  f.store.saveTask({ ...task(), threadId: 'new-thread' }); await f.pump(2);
+  assert.equal(f.record().view.status, 'running'); assert.equal(reads.mock.callCount(), 3);
+});
+
+test('manual source changes invalidate projection and chat binding is checked before an equal revision', async t => {
+  const f = await fixture(t); const current = task(); f.store.saveTask(current); await f.pump(5);
+  assert.equal(current.source.kind, 'manual'); if (current.source.kind !== 'manual') return;
+  f.store.saveTask({ ...current, source: { kind: 'manual', message: { ...current.source.message, text: 'Revised original question' } } });
+  await f.pump(); assert.match(f.transport.text(), /Revised original question/); assert.doesNotMatch(f.transport.text(), /Discuss/);
+  const before = f.record(), calls = f.transport.calls.length;
+  f.store.saveTask({ ...f.store.task('task'), chatId: 'other-chat' });
+  await f.pump();
+  assert.deepEqual(f.record(), before); assert.equal(f.transport.calls.length, calls);
+  assert.ok(f.store.diagnostics().some(row => row.message.includes('Document chat binding changed')));
+});
+
+test('maxLines and renderer revision changes re-render unchanged histories once', async t => {
+  const f = await fixture(t); f.store.saveTask(task());
+  f.event('agent_message', Array.from({ length: 20 }, (_, i) => `line-${i}`).join('\n')); await f.pump(5);
+  await f.restart({ maxLines: 8 });
+  const reads = t.mock.method(f.store, 'documentConversationEvents');
+  await f.pump(2);
+  assert.equal(f.record().text.split('\n').length, 8); assert.equal(f.record().projectionRevision?.maxLines, 8);
+  assert.equal(reads.mock.callCount(), 1); assert.equal(f.transport.text(), f.record().text);
+  const before = f.record(); assert.ok(before.projectionRevision);
+  f.store.saveDocumentProgressRecord('task', { ...before, projectionRevision: { ...before.projectionRevision, rendererVersion: 0 } });
+  await f.pump(2);
+  assert.equal(reads.mock.callCount(), 2); assert.deepEqual(f.record(), before);
+});
+
+test('source positions are per task and include tool events without moving the conversation cursor', async t => {
+  const f = await fixture(t); f.store.saveTask(task()); f.store.saveTask(task('other'));
+  f.event('agent_message', 'Answer'); await f.pump(5);
+  const before = f.record(); f.event('tool_output', 'PRIVATE_TOOL');
+  f.store.recordExecutionEvent('other', { kind: 'agent_message', threadId: 'thread-other', turnId: 'turn', itemId: 'other', text: 'Other', label: 'message', createdAt: 10 });
+  await f.pump();
+  assert.equal(f.record().projectionRevision?.eventSeq, 2);
+  assert.equal(f.store.documentConversationPosition('other').eventSeq, 3);
+  assert.equal(f.record().view.cursor, before.view.cursor); assert.equal(f.record().text, before.text);
+});
+
+test('invalid persisted events roll back all projections and discovery position until repaired', async t => {
+  const f = await fixture(t); f.store.saveTask(task()); f.store.saveTask(task('other')); await f.pump(10);
+  const before = f.store.documentProgressRecords(), discovery = f.store.meta('feishu-document-progress:discovery:v1');
+  f.event('agent_message', 'New task answer');
+  const valid = { kind: 'agent_message', threadId: 'thread-other', turnId: 'turn', itemId: 'other', text: 'New other answer', label: 'message', createdAt: 10 } satisfies ExecutionEvent;
+  f.store.recordExecutionEvent('other', valid);
+  const db = new DatabaseSync(join(f.directory, 'tasks.sqlite'));
+  let badSequence: number | bigint;
+  try {
+    badSequence = db.prepare('INSERT INTO execution_events(task_id,created_at,payload) VALUES(?,?,?)')
+      .run('other', 11, JSON.stringify({ ...valid, kind: 'agent_delta', text: 123 })).lastInsertRowid;
+  } finally { db.close(); }
+  const stream = f.store.documentConversationEvents('other');
+  assert.deepEqual(stream.next(), { done: false, value: { ...valid, seq: 2, taskId: 'other' } });
+  assert.throws(() => stream.next());
+  const calls = f.transport.calls.length;
+  await f.pump();
+  assert.deepEqual(f.store.documentProgressRecords(), before);
+  assert.equal(f.store.meta('feishu-document-progress:discovery:v1'), discovery);
+  assert.equal(f.transport.calls.length, calls);
+  assert.ok(f.store.diagnostics().some(row => row.scope === 'feishu-document-progress'));
+  const repair = new DatabaseSync(join(f.directory, 'tasks.sqlite'));
+  try { repair.prepare('DELETE FROM execution_events WHERE seq=?').run(badSequence); } finally { repair.close(); }
+  await f.pump(2);
+  assert.match(f.transport.text(), /New task answer/); assert.match(f.transport.text(), /New other answer/);
+  assert.equal(f.record('other').projectionRevision?.eventSeq, 2);
 });
 
 async function runtime(t: TestContext, enabled = true) {

@@ -7,6 +7,10 @@ import { executionEventSchema, storedExecutionEventSchema, type ExecutionEvent, 
 import { approvalActionSchema, inputProvenanceSchema, incomingSchema, repositorySchema, sourceSchema, taskSchema, type ApprovalAction, type IncomingMessage, type InputProvenance, type Source, type Task } from './domain.js';
 
 const payloadRow = z.object({ payload: z.string() });
+export const documentSourcePositionSchema = z.strictObject({
+  eventSeq: z.number().int().nonnegative(), inputSeq: z.number().int().nonnegative(),
+});
+export type DocumentSourcePosition = z.infer<typeof documentSourcePositionSchema>;
 const operationSchema = z.object({ id: z.string(), task_id: z.string(), kind: z.string(), status: z.enum(['attempting', 'confirmed', 'uncertain']), result: z.string().nullable(), error: z.string().nullable() });
 export type Operation = z.infer<typeof operationSchema>;
 const inboxRow = z.object({ seq: z.number(), id: z.string(), task_id: z.string(), payload: z.string(), status: z.enum(['pending', 'delivering', 'delivered', 'failed', 'uncertain', 'held']), origin: z.enum(['user', 'source', 'initial', 'resume']), error: z.string().nullable() });
@@ -171,11 +175,17 @@ export class Store {
       return storedExecutionEventSchema.parse({ ...executionEventSchema.parse(JSON.parse(row.payload)), seq: row.seq, taskId: row.task_id });
     });
   }
-  documentConversationEvents(taskId: string): StoredExecutionEvent[] {
-    return this.db.prepare("SELECT seq,payload FROM execution_events WHERE task_id=? AND json_extract(payload,'$.kind') IN ('agent_delta','agent_message','turn_start','turn_end','turn_status') ORDER BY seq").all(taskId).map(raw => {
-      const row = z.object({ seq: z.number(), payload: z.string() }).parse(raw);
-      return storedExecutionEventSchema.parse({ ...JSON.parse(row.payload), seq: row.seq, taskId });
-    });
+  documentConversationPosition(taskId: string): DocumentSourcePosition {
+    return documentSourcePositionSchema.parse(this.db.prepare(`SELECT
+      COALESCE((SELECT seq FROM execution_events WHERE task_id=? ORDER BY seq DESC LIMIT 1),0) AS eventSeq,
+      COALESCE((SELECT seq FROM inbox WHERE task_id=? ORDER BY seq DESC LIMIT 1),0) AS inputSeq`).get(taskId, taskId));
+  }
+  *documentConversationEvents(taskId: string): IterableIterator<StoredExecutionEvent> {
+    const rowSchema = z.object({ seq: z.number(), payload: z.string() });
+    for (const raw of this.db.prepare("SELECT seq,payload FROM execution_events WHERE task_id=? AND json_extract(payload,'$.kind') IN ('agent_delta','agent_message','turn_start','turn_end','turn_status') ORDER BY seq").iterate(taskId)) {
+      const row = rowSchema.parse(raw);
+      yield storedExecutionEventSchema.parse({ ...JSON.parse(row.payload), seq: row.seq, taskId });
+    }
   }
   setMeta(key: string, value: string): void { this.db.prepare('INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, value); }
   latestExecutionSequence(): number {

@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
+import { watch } from 'node:fs';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
+import { z } from 'zod';
 import { CodexAppServer } from '../src/adapters/codex.js';
 import { RejectedInputError, TurnChangedError, UncertainOperationError, type WorkspaceRequest } from '../src/domain.js';
 
@@ -79,6 +81,9 @@ createInterface({ input: process.stdin }).on('line', line => {
  case 'thread/turns/list':
   if (mode === 'paginated-materializing' && ++historyReads < 3) { send({ id: m.id, error: { code: -32603, message: 'list_turns is not supported yet' } }); return; }
   if (!turns.length) { send({ id: m.id, error: { code: -32000, message: 'thread is not materialized yet' } }); return; }
+  if (p.itemsView === 'summary' && p.sortDirection === 'desc' && p.limit === 1 && p.cursor === null) {
+   result = { data: turns.slice(-1).map(turn => ({ ...turn, itemsView: 'summary', items: turn.items.filter(item => ['userMessage', 'agentMessage'].includes(item.type)) })), nextCursor: null }; break;
+  }
   if (p.itemsView !== 'full' || p.sortDirection !== 'asc') throw new Error('partial history requested');
   result = { data: turns, nextCursor: null }; break;
  case 'turn/start':
@@ -138,6 +143,290 @@ async function start(server: CodexAppServer) {
   const turnId = await server.startTurn({ threadId, input: [{ kind: 'text', text: 'Investigate' }], deliveryId: 'delivery-1' });
   return { threadId, turnId };
 }
+
+const settledFixture = String.raw`
+const { createInterface } = require('node:readline');
+const fs = require('node:fs');
+const mode = process.argv[1];
+const logFile = process.argv[2];
+const generation = fs.existsSync(logFile) ? 2 : 1;
+const user = (id, delivery) => ({ id, type: 'userMessage', clientId: null, content: [{ type: 'text', text: '[agent-loop-delivery:' + delivery + ']\n[agent-loop-batch:' + encodeURIComponent(JSON.stringify(['batch-' + delivery])) + ']' }] });
+let turns = [
+ { id: 'old', status: 'completed', error: null, items: [user('user-old', 'old'), { id: 'tool', type: 'commandExecution', aggregatedOutput: 'x'.repeat(100000) }, { id: 'old-final', type: 'agentMessage', text: 'Previous answer', phase: 'final_answer' }] },
+ { id: 'latest', status: 'completed', error: null, items: [user('user-latest', 'latest'), { id: 'latest-final', type: 'agentMessage', text: 'Current answer', phase: 'final_answer' }] },
+];
+if (fs.existsSync(logFile + '.state')) turns = JSON.parse(fs.readFileSync(logFile + '.state', 'utf8'));
+if (mode.startsWith('state-')) turns.at(-1).status = mode.slice(6);
+let metadataReads = 0;
+let summaryReads = 0;
+let fullReads = 0;
+let heldHead;
+let heldMutation;
+const thread = () => ({ id: 'thread-1', updatedAt: 100, historyMode: mode === 'legacy' ? 'legacy' : 'paginated', status: { type: mode === 'system-error' ? 'systemError' : turns.at(-1).status === 'inProgress' ? 'active' : 'idle' }, turns: [] });
+const send = value => process.stdout.write(JSON.stringify(value) + '\n');
+const respond = (m, result) => {
+ fs.appendFileSync(logFile, JSON.stringify({ method: m.method, params: m.params, bytes: Buffer.byteLength(JSON.stringify(result)) }) + '\n');
+ send({ id: m.id, result });
+};
+const fail = (m, code, message) => { fs.appendFileSync(logFile, JSON.stringify({ method: m.method, params: m.params, bytes: 0 }) + '\n'); send({ id: m.id, error: { code, message } }); };
+const summary = () => {
+ const latest = turns.at(-1);
+ return { data: [{ ...latest, itemsView: 'summary', items: latest.items.filter(item => ['userMessage', 'agentMessage'].includes(item.type)) }], nextCursor: null };
+};
+const reorder = value => Array.isArray(value) ? value.map(reorder) : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).reverse().map(([key, entry]) => [key, reorder(entry)])) : value;
+const notify = () => send({ method: mode === 'event-unscoped' ? 'error' : 'thread/status/changed', params: mode === 'event-unscoped' ? { error: { message: 'thread changed' } } : { threadId: mode === 'event-other' ? 'another-thread' : 'thread-1', status: { type: 'idle' } } });
+createInterface({ input: process.stdin }).on('line', line => {
+ const m = JSON.parse(line);
+ if (m.method === 'initialized') return;
+ switch (m.method) {
+ case 'initialize': respond(m, {}); break;
+ case 'thread/resume': respond(m, { thread: thread() }); break;
+ case 'thread/read':
+  if (!m.params.includeTurns) metadataReads++;
+  if (mode === 'head-change' && metadataReads === 2) { turns.at(-1).items[0] = user('user-latest', 'changed'); turns.at(-1).items[1].text = 'Changed answer'; }
+  if (mode === 'event-metadata' && metadataReads === 2) notify();
+  if (mode.startsWith('recover') && generation === 1 && metadataReads === (mode === 'recover-unsupported' ? 3 : 2)) {
+   turns[0].items.push(user('recovered-user', 'recovered'));
+   fs.writeFileSync(logFile + '.state', JSON.stringify(turns)); process.exit(23);
+  }
+  if (mode === 'native-request' && metadataReads === 4) send({ method: 'serverRequest/resolved', params: { threadId: 'thread-1', requestId: 'pending' } });
+  respond(m, { thread: { ...thread(), turns: m.params.includeTurns ? turns : [] } }); break;
+ case 'thread/turns/list': {
+  const p = m.params;
+  if (p.itemsView === 'summary') {
+   if (p.sortDirection !== 'desc' || p.cursor !== null || p.limit !== 1) throw new Error('incorrect newest summary request');
+   summaryReads++;
+   if (mode === 'unsupported-method' || mode === 'recover-unsupported' && generation === 1) { fail(m, -32601, 'method not found'); break; }
+   if (mode === 'unsupported-params') { fail(m, -32602, 'unknown variant summary'); break; }
+   if (['transient', 'materializing'].includes(mode) && summaryReads === 2) { fail(m, mode === 'transient' ? -32000 : -32603, mode === 'transient' ? 'history unavailable' : 'list_turns is not supported yet'); break; }
+   if (mode.startsWith('mutation-') && summaryReads === 2) {
+    heldHead = { m, result: summary() };
+    fs.appendFileSync(logFile, JSON.stringify({ method: 'head-held', bytes: 0 }) + '\n'); break;
+   }
+   if (['event-head', 'event-unscoped', 'event-other'].includes(mode) && summaryReads === 2) notify();
+   if (mode === 'native-request' && summaryReads === 2) send({ id: 'pending', method: 'mcpServer/elicitation/request', params: { threadId: 'thread-1', serverName: 'fixture' } });
+   respond(m, mode === 'reordered' && summaryReads % 2 === 0 ? reorder(summary()) : summary());
+  } else {
+   if (p.itemsView !== 'full' || p.sortDirection !== 'asc') throw new Error('incorrect full history request');
+   const first = p.cursor === null;
+   if (!first && p.cursor !== 'next') throw new Error('incorrect history cursor');
+   fullReads++;
+   if (mode === 'event-full' && fullReads === 2) notify();
+   if (mode === 'head-disagrees' && fullReads === 1) turns.at(-1).items[1].text = 'Changed during full read';
+   if (mode === 'incomplete') { respond(m, { data: summary().data, nextCursor: null }); break; }
+   if (heldMutation) {
+    const { m: pending, turn, ambiguous } = heldMutation; heldMutation = undefined;
+    if (ambiguous) fail(pending, -32000, 'delivery acknowledgement uncertain');
+    else respond(pending, pending.method === 'turn/steer' ? { turnId: turn.id } : { turn });
+   }
+   respond(m, { data: first ? turns.slice(0, 1) : turns.slice(1), nextCursor: first ? 'next' : null });
+  }
+  break;
+ }
+ case 'turn/start':
+ case 'turn/steer': {
+  const p = m.params;
+  if (!heldHead) throw new Error('mutation must race an awaited summary');
+  const item = { id: 'new-user', type: 'userMessage', clientId: p.clientUserMessageId, content: p.input };
+  if (m.method === 'turn/start') turns.push({ id: 'next', status: 'completed', error: null, items: [item] });
+  else turns.at(-1).items.push(item);
+  heldMutation = { m, turn: turns.at(-1), ambiguous: mode.includes('ambiguous') };
+  respond(heldHead.m, heldHead.result); heldHead = undefined;
+  break;
+ }
+ case 'turn/interrupt': turns.at(-1).status = 'interrupted'; respond(m, {}); break;
+ default: throw new Error('unexpected method ' + m.method);
+ }
+});
+`;
+
+const wireCallSchema = z.object({ method: z.string(), params: z.object({ itemsView: z.string().optional(), includeTurns: z.boolean().optional() }).passthrough().optional(), bytes: z.number() });
+
+async function settledAdapter(t: TestContext, mode = 'settled') {
+  const directory = await mkdtemp('/tmp/agent-loop-settled-');
+  const logFile = `${directory}/wire.jsonl`;
+  const server = new CodexAppServer({ command: [process.execPath, '-e', settledFixture, mode, logFile], approvalPolicy: 'on-request', sandbox: 'read-only', requestTimeoutMs: 2000 });
+  t.after(async () => { await server.close(); await rm(directory, { recursive: true, force: true }); });
+  const wire = async () => (await readFile(logFile, 'utf8')).trim().split('\n').map(line => wireCallSchema.parse(JSON.parse(line)));
+  const headHeld = () => new Promise<void>((resolve, reject) => {
+    const check = () => { void wire().then(calls => { if (calls.some(call => call.method === 'head-held')) { watcher.close(); resolve(); } }, reject); };
+    const watcher = watch(directory, check);
+    t.after(() => watcher.close());
+    check();
+  });
+  const fullReads = async () => (await wire()).filter(call => call.params?.itemsView === 'full' || call.params?.includeTurns).length;
+  return { server, wire, headHeld, fullReads };
+}
+
+test('repeated settled inspections preserve complete snapshots without full history calls or bytes', async t => {
+  const { server, wire } = await settledAdapter(t);
+  const first = await server.inspect('thread-1');
+  assert.deepEqual(first, {
+    threadId: 'thread-1', turnId: 'latest', status: 'completed', error: null, requests: [],
+    seenInputIds: ['old', 'batch-old', 'latest', 'batch-latest'],
+    outputs: [
+      { id: 'thread-1:old:old-final', threadId: 'thread-1', turnId: 'old', phase: 'final', text: 'Previous answer' },
+      { id: 'thread-1:latest:latest-final', threadId: 'thread-1', turnId: 'latest', phase: 'final', text: 'Current answer' },
+    ],
+  });
+  const initial = await wire();
+  for (let i = 0; i < 3; i++) assert.deepEqual(await server.inspect('thread-1'), first);
+  const repeated = (await wire()).slice(initial.length);
+  const full = (calls: typeof initial) => calls.filter(call => call.params?.itemsView === 'full');
+  assert.equal(full(initial).length, 2);
+  assert.equal(full(repeated).length, 0, 'settled polling must not reread full tool history');
+  assert.equal(repeated.filter(call => call.method === 'thread/read').length, 3);
+  assert.equal(repeated.filter(call => call.params?.itemsView === 'summary').length, 3);
+  assert.ok(repeated.every(call => call.bytes < 2000), 'every repeated response must stay compact');
+  t.diagnostic(JSON.stringify({ initialFullBytes: full(initial).reduce((sum, call) => sum + call.bytes, 0), repeatedFullBytes: full(repeated).reduce((sum, call) => sum + call.bytes, 0), repeatedResponseBytes: repeated.reduce((sum, call) => sum + call.bytes, 0) }));
+});
+
+test('summary digests are stable across native JSON property order', async t => {
+  const { server, fullReads } = await settledAdapter(t, 'reordered');
+  const first = await server.inspect('thread-1');
+  for (let i = 0; i < 3; i++) assert.deepEqual(await server.inspect('thread-1'), first);
+  assert.equal(await fullReads(), 2);
+});
+
+test('changed summary content without notifications or timestamp changes restores full input and output evidence', async t => {
+  const { server, fullReads } = await settledAdapter(t, 'head-change');
+  await server.inspect('thread-1');
+  const changed = await server.inspect('thread-1');
+  assert.equal(changed.turnId, 'latest');
+  assert.deepEqual(changed.seenInputIds, ['old', 'batch-old', 'changed', 'batch-changed']);
+  assert.equal(changed.outputs.at(-1)?.text, 'Changed answer');
+  assert.equal(await fullReads(), 4);
+  assert.deepEqual(await server.inspect('thread-1'), changed);
+  assert.equal(await fullReads(), 4);
+});
+
+for (const mode of ['event-metadata', 'event-head', 'event-unscoped', 'event-full']) test(`${mode} invalidates the observation during awaited reads`, async t => {
+  const { server, fullReads } = await settledAdapter(t, mode);
+  const first = await server.inspect('thread-1');
+  assert.deepEqual(await server.inspect('thread-1'), first);
+  assert.equal(await fullReads(), 4);
+  assert.deepEqual(await server.inspect('thread-1'), first);
+  assert.equal(await fullReads(), mode === 'event-full' ? 4 : 6);
+  assert.deepEqual(await server.inspect('thread-1'), first);
+  assert.equal(await fullReads(), mode === 'event-full' ? 4 : 6);
+});
+
+test('a scoped native event does not invalidate a different settled thread', async t => {
+  const { server, fullReads } = await settledAdapter(t, 'event-other');
+  const first = await server.inspect('thread-1');
+  assert.deepEqual(await server.inspect('thread-1'), first);
+  assert.equal(await fullReads(), 2);
+});
+
+test('a full-history head that disagrees with the checked summary is not cached', async t => {
+  const { server, fullReads } = await settledAdapter(t, 'head-disagrees');
+  const first = await server.inspect('thread-1');
+  assert.equal(first.outputs.at(-1)?.text, 'Changed during full read');
+  assert.deepEqual(await server.inspect('thread-1'), first);
+  assert.equal(await fullReads(), 4);
+  assert.deepEqual(await server.inspect('thread-1'), first);
+  assert.equal(await fullReads(), 4);
+});
+
+for (const operation of ['start', 'steer']) for (const outcome of ['accepted', 'ambiguous']) test(`${operation} invalidates before its awaited ${outcome} mutation and reconciles delivery markers`, async t => {
+  const { server, headHeld, fullReads } = await settledAdapter(t, `mutation-${operation}-${outcome}`);
+  await server.inspect('thread-1');
+  const polling = server.inspect('thread-1');
+  await headHeld();
+  const input = { threadId: 'thread-1', deliveryId: 'new-input', input: [{ kind: 'text', text: 'Continue this task' }] satisfies Parameters<CodexAppServer['startTurn']>[0]['input'] };
+  const mutation = operation === 'start'
+    ? server.startTurn({ ...input, additionalDeliveryIds: ['directory-answer'] })
+    : server.steer({ ...input, turnId: 'latest' });
+  const [snapshot] = await Promise.all([polling, outcome === 'ambiguous' ? assert.rejects(mutation, /delivery acknowledgement uncertain/) : mutation]);
+  assert.equal(snapshot.status, 'completed');
+  assert.equal(snapshot.turnId, operation === 'start' ? 'next' : 'latest');
+  assert.deepEqual(snapshot.seenInputIds, ['old', 'batch-old', 'latest', 'batch-latest', 'new-input', ...(operation === 'start' ? ['directory-answer'] : [])]);
+  assert.equal(await fullReads(), 4);
+  const reconciled = await server.inspect('thread-1');
+  assert.deepEqual(reconciled, snapshot);
+  assert.equal(await fullReads(), 6);
+  assert.deepEqual(await server.inspect('thread-1'), reconciled);
+  assert.equal(await fullReads(), 6);
+});
+
+test('live unscoped-turn requests block compact history until native resolution', async t => {
+  const { server, fullReads } = await settledAdapter(t, 'native-request');
+  const first = await server.inspect('thread-1');
+  for (let i = 0; i < 3; i++) assert.deepEqual(await server.inspect('thread-1'), first);
+  assert.equal(await fullReads(), 8);
+  assert.deepEqual(await server.inspect('thread-1'), first);
+  assert.equal(await fullReads(), 10);
+  assert.deepEqual(await server.inspect('thread-1'), first);
+  assert.equal(await fullReads(), 10);
+});
+
+for (const mode of ['legacy', 'unsupported-method', 'unsupported-params']) test(`${mode} keeps complete history fallback and unsupported summary is sticky`, async t => {
+  const { server, wire, fullReads } = await settledAdapter(t, mode);
+  const first = await server.inspect('thread-1');
+  for (let i = 0; i < 3; i++) assert.deepEqual(await server.inspect('thread-1'), first);
+  assert.equal(await fullReads(), mode === 'legacy' ? 4 : 8);
+  assert.equal((await wire()).filter(call => call.params?.itemsView === 'summary').length, mode === 'legacy' ? 0 : 1);
+});
+
+for (const mode of ['transient', 'materializing']) test(`${mode} summary failure preserves uncertainty and does not disable summary for the connection`, async t => {
+  const { server, wire, fullReads } = await settledAdapter(t, mode);
+  const first = await server.inspect('thread-1');
+  await assert.rejects(server.inspect('thread-1'), mode === 'transient' ? /history unavailable/ : /list_turns is not supported yet/);
+  assert.deepEqual(await server.inspect('thread-1'), first);
+  assert.equal(await fullReads(), 4);
+  assert.deepEqual(await server.inspect('thread-1'), first);
+  assert.equal(await fullReads(), 4);
+  assert.equal((await wire()).filter(call => call.params?.itemsView === 'summary').length, 4);
+});
+
+for (const mode of ['recover', 'recover-unsupported']) test(`${mode} discards prior connection proof and retries summary on the new connection`, async t => {
+  const { server, wire, fullReads } = await settledAdapter(t, mode);
+  await server.inspect('thread-1');
+  if (mode === 'recover-unsupported') await server.inspect('thread-1');
+  const before = await fullReads();
+  await assert.rejects(server.inspect('thread-1'), UncertainOperationError);
+  await Promise.all([server.recover(), server.recover()]);
+  const recovered = await server.inspect('thread-1');
+  assert.deepEqual(recovered.seenInputIds, ['old', 'batch-old', 'recovered', 'batch-recovered', 'latest', 'batch-latest']);
+  assert.equal(recovered.outputs.length, 2);
+  assert.equal(await fullReads(), before + 2);
+  assert.deepEqual(await server.inspect('thread-1'), recovered);
+  assert.equal(await fullReads(), before + 2);
+  assert.equal((await wire()).filter(call => call.method === 'initialize').length, 2);
+  assert.equal((await wire()).filter(call => call.params?.itemsView === 'summary').length, 3);
+});
+
+for (const [mode, status] of [['state-inProgress', 'running'], ['state-failed', 'failed'], ['state-interrupted', 'interrupted'], ['system-error', 'failed']] as const) test(`${mode} never publishes a completed history cache`, async t => {
+  const { server, fullReads } = await settledAdapter(t, mode);
+  const first = await server.inspect('thread-1');
+  assert.equal(first.status, status);
+  assert.deepEqual(await server.inspect('thread-1'), first);
+  assert.equal(await fullReads(), 4);
+});
+
+test('incomplete full pages cannot become a compact completed snapshot', async t => {
+  const { server, fullReads } = await settledAdapter(t, 'incomplete');
+  await assert.rejects(server.inspect('thread-1'), /history is incomplete/);
+  await assert.rejects(server.inspect('thread-1'), /history is incomplete/);
+  assert.equal(await fullReads(), 2);
+});
+
+test('instruction replacement invalidates a settled observation even with an unchanged head', async t => {
+  const { server, fullReads } = await settledAdapter(t);
+  const first = await server.inspect('thread-1', 'Original instructions');
+  assert.deepEqual(await server.inspect('thread-1', 'New instructions'), first);
+  assert.equal(await fullReads(), 4);
+  assert.deepEqual(await server.inspect('thread-1', 'New instructions'), first);
+  assert.equal(await fullReads(), 4);
+});
+
+test('interrupt invalidates completed proof before the native mutation', async t => {
+  const { server, fullReads } = await settledAdapter(t);
+  await server.inspect('thread-1');
+  await server.interrupt({ threadId: 'thread-1', turnId: 'latest' });
+  assert.equal((await server.inspect('thread-1')).status, 'interrupted');
+  assert.equal(await fullReads(), 4);
+});
 
 test('start and steer preserve the original thread, delivery IDs, image and skill inputs', async t => {
   const server = adapter(); t.after(() => server.close());

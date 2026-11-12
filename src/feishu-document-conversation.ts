@@ -17,7 +17,7 @@ export const documentConversationSchema = z.strictObject({
 export type DocumentConversation = z.infer<typeof documentConversationSchema>;
 const normalize = (text: string) => text.replace(/\r\n?/g, '\n');
 
-export function projectDocumentConversation(task: Task, inputs: Inbox[], events: StoredExecutionEvent[]): DocumentConversation {
+export function projectDocumentConversation(task: Task, inputs: Inbox[], events: Iterable<StoredExecutionEvent>): DocumentConversation {
   const messages = new Map<string, ConversationMessage>();
   const addUser = (message: Inbox['message'], sequence: number) => {
     const key = JSON.stringify(['user', message.id]);

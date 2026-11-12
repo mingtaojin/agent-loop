@@ -60,7 +60,7 @@ test('rendered line limit includes labels and blank lines and keeps long Unicode
   const long = '文😀'.repeat(40_000);
   const longView = projectDocumentConversation(task, [], [event(1, 'agent_message', long)]);
   assert.ok(documentConversationText(longView, 3000).includes(long));
-  for (const maxLines of [1, 2, 3, 15]) assert.equal(documentConversationText(view, maxLines).split('\n').length, maxLines);
+  for (const maxLines of [1, 2, 3, 4, 15]) assert.equal(documentConversationText(view, maxLines).split('\n').length, maxLines);
 });
 
 test('newest messages appear first while lines within each message keep their reading order', () => {
@@ -82,4 +82,43 @@ test('line retention removes oldest messages rather than newest messages in a de
   assert.ok(text.split('\n').length <= 16);
   assert.match(text, /message-11-first\nmessage-11-second[\s\S]*message-10-first\nmessage-10-second/);
   assert.doesNotMatch(text, /message-0-|First question/);
+});
+
+test('one-shot event iterable preserves exact messages, ordering, completion and metadata', () => {
+  const events: StoredExecutionEvent[] = [
+    { ...event(1, 'agent_delta', 'Discarded'), createdAt: 10 },
+    { ...event(2, 'agent_delta', 'Other\r'), itemId: 'interleaved', createdAt: 10 },
+    { ...event(3, 'agent_delta', '\nline'), itemId: 'interleaved', createdAt: 8 },
+    { ...event(4, 'agent_message', ''), createdAt: 7 },
+    { ...event(5, 'agent_delta', 'Ignored after completion'), createdAt: 90 },
+    { ...event(6, 'agent_message', 'Second turn', 'second'), createdAt: 10 },
+    { ...event(7, 'agent_message', 'Other thread', 'second'), threadId: 'other-thread', createdAt: 9 },
+    { ...event(8, 'agent_delta', 'Null delta', 'second'), itemId: null, createdAt: 10 },
+    { ...event(9, 'agent_message', 'Null complete', 'second'), itemId: null, createdAt: 10 },
+    { ...event(10, 'turn_end', 'completed', 'second'), createdAt: 100 },
+    { ...event(11, 'turn_status', 'running', 'second'), createdAt: 110 },
+    { ...event(12, 'turn_end', 'failed'), createdAt: 120 },
+  ];
+  let iterations = 0;
+  const once: Iterable<StoredExecutionEvent> = {
+    [Symbol.iterator]() { assert.equal(++iterations, 1); return events.values(); },
+  };
+  const streamed = projectDocumentConversation(task, [], once);
+  assert.deepEqual(streamed, {
+    status: 'completed', cursor: 12, lastExecutionEventAt: 90,
+    messages: [
+      { key: '["user","initial"]', role: 'user', text: 'First question', createdAt: 1, sequence: 0, completed: true },
+      { key: '["assistant","other-thread","second","same-id"]', role: 'assistant', text: 'Other thread', createdAt: 9, sequence: 7, completed: true },
+      { key: '["assistant","thread","first","same-id"]', role: 'assistant', text: '', createdAt: 10, sequence: 1, completed: true },
+      { key: '["assistant","thread","first","interleaved"]', role: 'assistant', text: 'Other\nline', createdAt: 10, sequence: 2, completed: false },
+      { key: '["assistant","thread","second","same-id"]', role: 'assistant', text: 'Second turn', createdAt: 10, sequence: 6, completed: true },
+      { key: '["assistant","thread","second",8]', role: 'assistant', text: 'Null delta', createdAt: 10, sequence: 8, completed: false },
+      { key: '["assistant","thread","second",9]', role: 'assistant', text: 'Null complete', createdAt: 10, sequence: 9, completed: true },
+    ],
+  });
+  const fromArray = projectDocumentConversation(task, [], events);
+  assert.deepEqual(streamed, fromArray);
+  for (const maxLines of [1, 2, 3, 4, 8, 3000]) {
+    assert.equal(documentConversationText(streamed, maxLines), documentConversationText(fromArray, maxLines));
+  }
 });

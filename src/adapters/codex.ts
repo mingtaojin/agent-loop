@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
@@ -29,6 +29,11 @@ const turnSchema = z.object({
   error: z.object({ message: z.string() }).nullish(),
   items: z.array(itemSchema), itemsView: z.enum(['full', 'summary', 'notLoaded']).default('full'),
 });
+const turnPageSchema = z.object({ data: z.array(turnSchema), nextCursor: z.string().nullish() });
+const userMessageSchema = z.object({ clientId: z.string().nullish(), content: z.array(z.object({ type: z.string(), text: z.string().optional() })) });
+const agentMessageSchema = z.object({ id: z.string(), text: z.string(), phase: z.enum(['commentary', 'partial_answer', 'final_answer']).nullish() });
+const inputIdsSchema = z.array(z.string());
+const threadScopeSchema = z.object({ threadId: z.string() });
 const threadSchema = z.object({
   id: z.string(), status: z.object({ type: z.enum(['notLoaded', 'idle', 'active', 'systemError']) }),
   historyMode: z.enum(['legacy', 'paginated']).default('legacy'), turns: z.array(turnSchema),
@@ -88,9 +93,18 @@ type LiveRequest = {
     | { kind: 'unsupported' };
 };
 type PendingCall = { method: string; resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout };
+type CompletedHistory = { turnId: string; status: 'completed'; error: string | null; seenInputIds: string[]; digest: string };
+type HistoryObservation = { completed?: CompletedHistory };
 class TurnHistoryPendingError extends UncertainOperationError {}
 class RpcError extends Error {
   constructor(readonly code: number, message: string) { super(message); }
+}
+
+function historyDigest(value: object): string {
+  return createHash('sha256').update(JSON.stringify(value, (_key, entry: unknown) => {
+    if (entry && typeof entry === 'object' && !Array.isArray(entry)) return Object.fromEntries(Object.entries(entry).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
+    return entry;
+  })).digest('hex');
 }
 
 function wireInput(input: AgentInput[], deliveryId: string, additionalDeliveryIds: string[] = []) {
@@ -115,6 +129,8 @@ export class CodexAppServer implements CodexPort {
   private readonly threads = new Map<string, { loaded: Promise<void>; untouched: boolean; instructions: string | undefined }>();
   private readonly activeTurns = new Map<string, string>();
   private readonly awaitingHistory = new Map<string, string>();
+  private readonly historyObservations = new Map<string, HistoryObservation>();
+  private summaryUnsupported = false;
   private process: ChildProcessWithoutNullStreams | undefined;
   private initialized: Promise<void> | undefined;
   private failure: Error | undefined;
@@ -167,6 +183,7 @@ export class CodexAppServer implements CodexPort {
   }
 
   private fail(error: Error): void {
+    this.historyObservations.clear();
     this.failure ??= error;
     this.selectionRun?.reject(this.failure);
     for (const call of this.calls.values()) { clearTimeout(call.timer); call.reject(this.failure); }
@@ -202,6 +219,11 @@ export class CodexAppServer implements CodexPort {
   }
 
   private receive(message: z.infer<typeof messageSchema>): void {
+    if (message.method !== undefined) {
+      const scope = threadScopeSchema.safeParse(message.params);
+      if (scope.success) this.historyObservations.delete(scope.data.threadId);
+      else if (message.id !== undefined || /^(thread|turn|item|serverRequest|error)(\/|$)/.test(message.method)) this.historyObservations.clear();
+    }
     if (message.method !== undefined && message.id === undefined && this.eventHandler) {
       const event = executionEvent(message.method, message.params);
       if (event) this.eventHandler(event);
@@ -351,14 +373,16 @@ export class CodexAppServer implements CodexPort {
   }
 
   private async resume(threadId: string, instructions?: string): Promise<void> {
+    if (instructions !== undefined && this.threads.get(threadId)?.instructions !== instructions) this.historyObservations.delete(threadId);
     await this.ready();
     let entry = this.threads.get(threadId);
     if (!entry || (instructions !== undefined && entry.instructions !== instructions)) {
+      this.historyObservations.delete(threadId);
       const currentInstructions = instructions ?? entry?.instructions;
       const loaded = this.rpc('thread/resume', { ...this.config(), threadId, developerInstructions: currentInstructions }).then(value => {
         const { thread } = threadResponseSchema.parse(value);
         if (thread.id !== threadId) throw new Error('Codex resumed a different thread');
-      }).catch(error => { this.threads.delete(threadId); throw error; });
+      }).catch(error => { this.threads.delete(threadId); throw error; }).finally(() => { this.historyObservations.delete(threadId); });
       entry = { loaded, untouched: false, instructions: currentInstructions };
       this.threads.set(threadId, entry);
     }
@@ -371,6 +395,7 @@ export class CodexAppServer implements CodexPort {
     do {
       try { return await this.inspectSnapshot(threadId, true); }
       catch (error) {
+        this.historyObservations.delete(threadId);
         const materializing = error instanceof TurnHistoryPendingError || (error instanceof RpcError && /list_turns is not supported yet/.test(error.message) && this.activeTurns.has(threadId));
         if (!materializing || Date.now() >= deadline) throw error;
         await delay(50);
@@ -379,12 +404,38 @@ export class CodexAppServer implements CodexPort {
   }
 
   private async inspectSnapshot(threadId: string, reconcile: boolean): Promise<ExecutionSnapshot> {
+    const observation = this.historyObservations.get(threadId) ?? {};
+    this.historyObservations.set(threadId, observation);
+    const epoch = this.epoch;
+    const current = () => this.epoch === epoch && this.historyObservations.get(threadId) === observation;
+    const settled = () => current() && !this.activeTurns.has(threadId) && !this.awaitingHistory.has(threadId) && ![...this.requests.values()].some(live => live.request.threadId === threadId);
     await this.resume(threadId);
     let { thread } = threadResponseSchema.parse(await this.rpc('thread/read', { threadId, includeTurns: false }));
     if (thread.id !== threadId) throw new Error('Codex returned a different thread');
     if (this.threads.get(threadId)?.untouched && thread.status.type === 'idle') {
       return { threadId, turnId: null, status: 'idle', requests: [], outputs: [], seenInputIds: [], error: null };
     }
+    let head: z.infer<typeof turnSchema> | undefined;
+    let digest: string | undefined;
+    if (current() && thread.historyMode === 'paginated' && thread.status.type === 'idle' && !this.summaryUnsupported) {
+      try {
+        const page = turnPageSchema.parse(await this.rpc('thread/turns/list', { threadId, cursor: null, limit: 1, sortDirection: 'desc', itemsView: 'summary' }));
+        if (page.data.length === 1 && page.data[0]?.itemsView === 'summary' && page.data[0].status === 'completed') {
+          head = page.data[0];
+          digest = historyDigest(head);
+          const completed = observation.completed;
+          if (completed && completed.digest === digest && settled()) return {
+            threadId, turnId: completed.turnId, status: completed.status, error: completed.error, seenInputIds: [...completed.seenInputIds],
+            requests: [...this.requests.values()].map(live => live.request).filter(request => request.threadId === threadId),
+            outputs: [...this.outputs.values()].filter(output => output.threadId === threadId),
+          };
+        }
+      } catch (error) {
+        if (!(error instanceof RpcError) || ![-32601, -32602].includes(error.code)) throw error;
+        if (this.epoch === epoch) this.summaryUnsupported = true;
+      }
+    }
+    observation.completed = undefined;
     if (thread.historyMode === 'legacy') {
       ({ thread } = threadResponseSchema.parse(await this.rpc('thread/read', { threadId, includeTurns: true })));
     } else {
@@ -392,7 +443,7 @@ export class CodexAppServer implements CodexPort {
       const cursors = new Set<string>();
       let cursor: string | null = null;
       do {
-        const page = z.object({ data: z.array(turnSchema), nextCursor: z.string().nullish() }).parse(await this.rpc('thread/turns/list', { threadId, cursor, sortDirection: 'asc', itemsView: 'full' }));
+        const page = turnPageSchema.parse(await this.rpc('thread/turns/list', { threadId, cursor, sortDirection: 'asc', itemsView: 'full' }));
         turns.push(...page.data);
         cursor = page.nextCursor ?? null;
         if (cursor && cursors.has(cursor)) throw new Error('Codex history pagination repeated a cursor');
@@ -404,13 +455,13 @@ export class CodexAppServer implements CodexPort {
     const seenInputIds = new Set<string>();
     for (const turn of thread.turns) for (const item of turn.items) {
       if (item.type !== 'userMessage') continue;
-      const user = z.object({ clientId: z.string().nullish(), content: z.array(z.object({ type: z.string(), text: z.string().optional() })) }).parse(item);
+      const user = userMessageSchema.parse(item);
       if (user.clientId) seenInputIds.add(user.clientId);
       const content = user.content[0];
       if (content?.type === 'text' && content.text) {
         const marker = /^\[agent-loop-delivery:([^\]\r\n]+)\](?:\n\[agent-loop-batch:([^\]\r\n]+)\])?$/.exec(content.text);
         if (marker?.[1]) seenInputIds.add(decodeURIComponent(marker[1]));
-        if (marker?.[2]) for (const id of z.array(z.string()).parse(JSON.parse(decodeURIComponent(marker[2])))) seenInputIds.add(id);
+        if (marker?.[2]) for (const id of inputIdsSchema.parse(JSON.parse(decodeURIComponent(marker[2])))) seenInputIds.add(id);
       }
     }
     const latest = thread.turns.at(-1);
@@ -430,24 +481,32 @@ export class CodexAppServer implements CodexPort {
     if (status === 'running' && latest) this.activeTurns.set(threadId, latest.id);
     else this.activeTurns.delete(threadId);
     const requests = [...this.requests.values()].map(live => live.request).filter(request => request.threadId === threadId && (request.turnId === latest?.id || (request.kind === 'unsupported' && !request.turnId)) && status === 'running');
+    if (head && digest && latest?.status === 'completed' && thread.status.type === 'idle' && settled() &&
+      historyDigest({ ...latest, itemsView: 'summary', items: head.items.map(item => latest.items.find(full => full.id === item.id)) }) === digest) {
+      observation.completed = { turnId: latest.id, status: 'completed', error: latest.error?.message ?? null, seenInputIds: [...seenInputIds], digest };
+    }
     return { threadId, turnId: latest?.id ?? null, status, requests, outputs: [...this.outputs.values()].filter(output => output.threadId === threadId), seenInputIds: [...seenInputIds], error: latest?.error?.message ?? (status === 'failed' ? 'Codex thread system error' : null) };
   }
 
   async startTurn(input: Parameters<CodexPort['startTurn']>[0]): Promise<string> {
+    this.historyObservations.delete(input.threadId);
     await this.resume(input.threadId);
     const entry = this.threads.get(input.threadId);
     if (entry) entry.untouched = false;
+    this.historyObservations.delete(input.threadId);
     const { turn } = z.object({ turn: turnSchema }).parse(await this.rpc('turn/start', {
       threadId: input.threadId, input: wireInput(input.input, input.deliveryId, input.additionalDeliveryIds), clientUserMessageId: input.deliveryId, additionalContext: this.runtimeContext(input.threadId),
-    }));
+    }).finally(() => { this.historyObservations.delete(input.threadId); }));
     this.awaitingHistory.set(input.threadId, turn.id);
     if (turn.status === 'inProgress') this.activeTurns.set(input.threadId, turn.id);
     return turn.id;
   }
 
   async steer(input: { threadId: string; turnId: string; input: AgentInput[]; deliveryId: string }): Promise<void> {
+    this.historyObservations.delete(input.threadId);
     await this.resume(input.threadId);
     try {
+      this.historyObservations.delete(input.threadId);
       const response = z.object({ turnId: z.string() }).parse(await this.rpc('turn/steer', {
         threadId: input.threadId, expectedTurnId: input.turnId, input: wireInput(input.input, input.deliveryId), clientUserMessageId: input.deliveryId, additionalContext: this.runtimeContext(input.threadId),
       }));
@@ -455,10 +514,11 @@ export class CodexAppServer implements CodexPort {
     } catch (error) {
       if (error instanceof RpcError && /no active turn|expected turn (?:id )?.*(?:does not match|mismatch)|turn.*(?:is not active|is no longer active)|active turn.*(?:does not match|mismatch)/i.test(error.message)) throw new TurnChangedError(error.message);
       throw error;
-    }
+    } finally { this.historyObservations.delete(input.threadId); }
   }
 
   async reply(input: { request: PendingRequest; text: string }): Promise<void> {
+    this.historyObservations.delete(input.request.threadId);
     await this.ready();
     const live = this.liveRequest(input.request);
     if (live.response.kind !== 'question') throw new RejectedInputError('Only native questions can receive ordinary replies');
@@ -477,6 +537,7 @@ export class CodexAppServer implements CodexPort {
   }
 
   async respondApproval(input: Parameters<CodexPort['respondApproval']>[0]): Promise<'confirmed' | 'uncertain'> {
+    this.historyObservations.delete(input.request.threadId);
     await this.ready();
     const live = this.liveRequest(input.request);
     let result: unknown;
@@ -496,14 +557,17 @@ export class CodexAppServer implements CodexPort {
   }
 
   private async respond(live: LiveRequest, result: unknown): Promise<boolean> {
+    this.historyObservations.delete(live.request.threadId);
     live.responseSent = true;
     const resolved = new Promise<boolean>(resolve => {
       const settle = (confirmed: boolean) => { clearTimeout(timer); live.waiters.delete(settle); resolve(confirmed); };
       const timer = setTimeout(() => settle(false), this.options.requestTimeoutMs);
       live.waiters.add(settle);
     });
-    await this.write({ id: live.rpcId, result });
-    return resolved;
+    try {
+      await this.write({ id: live.rpcId, result });
+      return await resolved;
+    } finally { this.historyObservations.delete(live.request.threadId); }
   }
 
   private resolveRequest(key: string, confirmed: boolean): void {
@@ -515,7 +579,7 @@ export class CodexAppServer implements CodexPort {
 
   private captureOutput(threadId: string, turnId: string, item: z.infer<typeof itemSchema>, completed: boolean): void {
     if (item.type !== 'agentMessage') return;
-    const message = z.object({ id: z.string(), text: z.string(), phase: z.enum(['commentary', 'partial_answer', 'final_answer']).nullish() }).parse(item);
+    const message = agentMessageSchema.parse(item);
     if (!message.text || (!message.phase && !completed)) return;
     const phase = message.phase === 'final_answer' || !message.phase ? 'final' : 'progress';
     const id = `${threadId}:${turnId}:${message.id}`;
@@ -545,6 +609,7 @@ export class CodexAppServer implements CodexPort {
   }
 
   recover(): Promise<void> {
+    this.historyObservations.clear();
     if (this.closed) return Promise.reject(new UncertainOperationError('Codex connection closed'));
     if (this.recovery) return this.recovery;
     if (!this.failure) return this.ready();
@@ -556,17 +621,21 @@ export class CodexAppServer implements CodexPort {
     this.threads.clear();
     this.activeTurns.clear();
     this.awaitingHistory.clear();
+    this.summaryUnsupported = false;
     const operation = (async () => {
       await this.ready();
       await Promise.all(known.map(thread => this.resume(thread.threadId, thread.instructions)));
     })();
-    this.recovery = operation.finally(() => { this.recovery = undefined; });
+    this.recovery = operation.finally(() => { this.historyObservations.clear(); this.recovery = undefined; });
     return this.recovery;
   }
 
   async interrupt(input: { threadId: string; turnId: string }): Promise<void> {
+    this.historyObservations.delete(input.threadId);
     await this.resume(input.threadId);
-    await this.rpc('turn/interrupt', input);
+    this.historyObservations.delete(input.threadId);
+    try { await this.rpc('turn/interrupt', input); }
+    finally { this.historyObservations.delete(input.threadId); }
   }
 
   async close(): Promise<void> {
