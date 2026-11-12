@@ -20,9 +20,11 @@
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "1.76.0",
+    "mdast-util-from-markdown": "2.1.0",
     "zod": "^4.1.0"
   },
   "devDependencies": {
+    "@types/mdast": "4.0.4",
     "@types/node": "^24.0.0",
     "tsx": "^4.20.0",
     "typescript": "~5.9.3"

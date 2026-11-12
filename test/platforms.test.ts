@@ -437,6 +437,51 @@ test('Feishu group creation and sends use stable UUIDs and private owner members
   assert.match(groupUuids[0] ?? '', /^[0-9a-f-]{36}$/);
   assert.equal(messageUuids[0], messageUuids[1]);
 });
+test('Feishu replies render Markdown and source citations without changing delivery identity', async () => {
+  const api = fakeApi();
+  const sent: NonNullable<Parameters<typeof api.message.create>[0]>[] = [];
+  api.message.create = async payload => { assert.ok(payload); sent.push(payload); return { code: 0, data: { message_id: 'reply' } }; };
+  const adapter = new FeishuAdapter(options, { api });
+  const code = '```ts\nconst literal = "[source](/Users/demo/source.ts:9) <at user_id=all>";\n```';
+  const raw = '# Result\n\n| Feature | Status |\n| --- | --- |\n| Replay | Ready |\n\n'
+    + '[source.ts](/Users/demo/source.ts:42) and [details](https://example.com/report)\n\n' + code;
+  const input = { id: 'readable-reply', chatId: 'oc_1', text: raw };
+  await adapter.send(input); await adapter.send(input);
+  assert.equal(sent.length, 2);
+  const first = sent[0]; assert.ok(first);
+  assert.equal(first.data.msg_type, 'post');
+  const post = z.object({ zh_cn: z.object({ content: z.array(z.array(z.object({ tag: z.literal('md'), text: z.string() }))) }) })
+    .parse(JSON.parse(first.data.content));
+  const markdown = post.zh_cn.content[0]?.[0]?.text ?? '';
+  assert.ok(markdown.includes('| Feature | Status |'));
+  assert.ok(markdown.includes('source.ts:42'));
+  assert.ok(!markdown.includes('/Users/demo/source.ts:42'));
+  assert.ok(markdown.includes('[details](https://example.com/report)'));
+  assert.ok(markdown.includes(code));
+  assert.equal(sent[0]?.data.uuid, sent[1]?.data.uuid);
+  assert.equal(input.text, raw);
+});
+
+test('Feishu chooses one complete text fallback before sending an oversized rich reply', async () => {
+  const api = fakeApi();
+  const sent: NonNullable<Parameters<typeof api.message.create>[0]>[] = [];
+  api.message.create = async payload => { assert.ok(payload); sent.push(payload); return { code: 0, data: { message_id: 'long-reply' } }; };
+  const raw = '# Long result\n\n' + '"\\结果🙂\n'.repeat(4000);
+  await new FeishuAdapter(options, { api }).send({ id: 'long-reply', chatId: 'oc_1', text: raw });
+  assert.equal(sent.length, 1);
+  const first = sent[0]; assert.ok(first);
+  assert.equal(first.data.msg_type, 'text');
+  assert.deepEqual(JSON.parse(first.data.content), { text: raw });
+});
+
+test('a rejected rich reply never causes a second plain-text send', async () => {
+  const api = fakeApi();
+  const types: string[] = [];
+  api.message.create = async payload => { assert.ok(payload); types.push(payload.data.msg_type); return { code: 230001, msg: 'rejected' }; };
+  await assert.rejects(new FeishuAdapter(options, { api }).send({ id: 'rejected', chatId: 'oc_1', text: '**Result**' }), /230001/);
+  assert.deepEqual(types, ['post']);
+});
+
 test('Feishu write response loss is uncertain and never retried by the adapter', async () => {
   const api = fakeApi();
   let sends = 0;

@@ -9,6 +9,7 @@ import { z } from 'zod';
 import { UncertainOperationError, errorMessage, type ApprovalAction, type Attachment, type IncomingMessage, type PendingRequest } from '../domain.js';
 import type { FeishuPort, FeishuProgressPort } from '../ports.js';
 import { FeishuDocumentAdapter, type FeishuDocumentApi } from './feishu-document.js';
+import { renderFeishuMessage } from './feishu-message.js';
 
 export interface FeishuOptions {
   appId: string;
@@ -319,10 +320,11 @@ export class FeishuAdapter implements FeishuPort, FeishuProgressPort {
     }
   }
   async send(input: { chatId: string; text: string; id: string }): Promise<void> {
+    const message = renderFeishuMessage(input.text);
     let response: Awaited<ReturnType<FeishuApi['message']['create']>>;
     try {
       response = await this.api.message.create({ params: { receive_id_type: 'chat_id' },
-        data: { receive_id: input.chatId, msg_type: 'text', content: JSON.stringify({ text: input.text }), uuid: stableUuid(`message:${input.id}`) } });
+        data: { receive_id: input.chatId, ...message, uuid: stableUuid(`message:${input.id}`) } });
     } catch (error) {
       throw new UncertainOperationError(`Feishu message delivery outcome is unknown: ${errorMessage(error)}`);
     }
