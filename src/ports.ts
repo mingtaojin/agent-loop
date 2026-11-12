@@ -1,5 +1,13 @@
 import type { AgentInput, ApprovalAction, Attachment, CollectionRepository, ExecutionSnapshot, IncomingMessage, PendingRequest, Repository, Source, SourceComment, TaskResource, WorkspaceRequest, WorkspaceSelectionRequest, WorkspaceSelectionResponse } from './domain.js';
 import type { ExecutionEvent } from './execution-events.js';
+import type { ProjectAction } from './project.js';
+
+export interface ProjectRequest {
+  threadId: string;
+  turnId: string;
+  callId: string;
+  action: ProjectAction;
+}
 
 export interface GitHubPort {
   list(repository: CollectionRepository): AsyncIterable<Source>;
@@ -43,18 +51,20 @@ export interface FeishuProgressPort {
 export interface CodexPort {
   selectWorkspace(input: WorkspaceSelectionRequest): Promise<WorkspaceSelectionResponse>;
   setEventHandler?(handler: (event: ExecutionEvent) => void): void;
-  createThread(input: { cwd: string; instructions: string }): Promise<string>;
-  inspect(threadId: string, instructions?: string): Promise<ExecutionSnapshot>;
+  createThread(input: { cwd: string; instructions: string; model?: string }): Promise<string>;
+  inspect(threadId: string, instructions?: string, model?: string): Promise<ExecutionSnapshot>;
   startTurn(input: { threadId: string; input: AgentInput[]; deliveryId: string; additionalDeliveryIds?: string[] }): Promise<string>;
   steer(input: { threadId: string; turnId: string; input: AgentInput[]; deliveryId: string }): Promise<void>;
   reply(input: { request: PendingRequest; text: string }): Promise<void>;
   respondApproval(input: { request: PendingRequest; decision: 'approve' | 'reject' }): Promise<'confirmed' | 'uncertain'>;
   setWorkspaceHandler(handler: (request: WorkspaceRequest) => Promise<TaskResource>): void;
+  setProjectHandler?(handler: (request: ProjectRequest) => Promise<unknown>): void;
   recover(): Promise<void>;
   interrupt(input: { threadId: string; turnId: string }): Promise<void>;
   close(): Promise<void>;
 }
 export interface WorkspacePort {
+  release?(input: { taskId: string; resourceId: string; workspace: string; repository: Repository; branch: string }): Promise<void>;
   ensure(input: { taskId: string; resourceId: string; workspace?: string } & (
     { kind?: 'git-worktree'; repository: Repository; branch: string } |
     { kind: 'project-directory'; directory: string }

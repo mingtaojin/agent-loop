@@ -77,4 +77,20 @@ export class WorkspaceProvider implements WorkspacePort {
   }
 
   async head(workspace: string): Promise<string> { return git(workspace, 'rev-parse', '--verify', 'HEAD'); }
+
+  async release(input: { taskId: string; resourceId: string; workspace: string; repository: import('./domain.js').Repository; branch: string }): Promise<void> {
+    const root = await realpath(this.root);
+    const expected = resolve(root, `${input.taskId}--${input.resourceId}`);
+    const legacy = resolve(root, input.taskId);
+    if (resolve(input.workspace) !== expected && resolve(input.workspace) !== legacy) throw new Error('Release path does not belong to the task');
+    if (!await exists(input.workspace)) return;
+    await this.ensure({ ...input, kind: 'git-worktree' });
+    const dirty = await git(input.workspace, 'status', '--porcelain', '--untracked-files=all', '--ignored');
+    if (dirty) throw new Error('Workspace contains uncommitted, untracked or ignored files; preserve them before release');
+    const base = await git(input.repository.path, 'rev-parse', '--verify', '--end-of-options', `${input.repository.baseBranch}^{commit}`);
+    const head = await this.head(input.workspace);
+    try { await git(input.repository.path, 'merge-base', '--is-ancestor', head, base); }
+    catch { throw new Error('Workspace commits are not preserved on the configured base; release refused'); }
+    await git(input.repository.path, 'worktree', 'remove', '--', input.workspace);
+  }
 }

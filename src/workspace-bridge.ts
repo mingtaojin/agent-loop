@@ -4,13 +4,15 @@ import { mkdir, mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { workspaceTargetSchema, type TaskResource, type WorkspaceTarget } from './domain.js';
+import { projectActionSchema, type ProjectAction } from './project.js';
 
 export class WorkspaceBridge {
   private readonly capabilities = new Map<string, { token: string; file: string }>();
   private server: Server | null = null;
   private directory: string | null = null;
   private opening: Promise<string> | null = null;
-  constructor(private readonly dataDir: string, private readonly ensure: (taskId: string, target: WorkspaceTarget) => Promise<TaskResource>) {}
+  constructor(private readonly dataDir: string, private readonly ensure: (taskId: string, target: WorkspaceTarget) => Promise<TaskResource>,
+    private readonly project?: (taskId: string, action: ProjectAction) => Promise<unknown>) {}
 
   private open(): Promise<string> {
     this.opening ??= (async () => {
@@ -19,18 +21,21 @@ export class WorkspaceBridge {
       this.server = createServer(async (request, response) => {
         response.setHeader('content-type', 'application/json');
         try {
-          if (request.method !== 'POST' || request.url !== '/workspace') { response.writeHead(404).end('{}'); return; }
+          if (request.method !== 'POST' || !['/workspace', '/project'].includes(request.url ?? '')) { response.writeHead(404).end('{}'); return; }
           const capability = [...this.capabilities].find(([, value]) => request.headers.authorization === `Bearer ${value.token}`);
           if (!capability) { response.writeHead(403).end('{"error":"Invalid task capability"}'); return; }
           const chunks: Buffer[] = []; let size = 0;
           for await (const chunk of request) {
             const bytes: Buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
             size += bytes.length;
-            if (size > 16_384) { response.writeHead(413).end('{"error":"Request too large"}'); request.destroy(); return; }
+            if (size > (request.url === '/project' ? 1024 * 1024 : 16_384)) { response.writeHead(413).end('{"error":"Request too large"}'); request.destroy(); return; }
             chunks.push(bytes);
           }
-          const input = workspaceTargetSchema.parse(JSON.parse(Buffer.concat(chunks).toString('utf8')));
-          const resource = await this.ensure(capability[0], input);
+          const raw: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          if (request.url === '/project' && !this.project) throw new Error('Project actions unavailable');
+          const resource = request.url === '/project' && this.project
+            ? await this.project(capability[0], projectActionSchema.parse(raw))
+            : await this.ensure(capability[0], workspaceTargetSchema.parse(raw));
           response.end(JSON.stringify(resource));
         } catch (error) {
           response.writeHead(400).end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
