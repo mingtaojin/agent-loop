@@ -3,7 +3,7 @@ import { z } from 'zod';
 export const criteriaSchema = z.object({
   states: z.array(z.enum(['open', 'closed'])).default(['open']),
   assigneesAny: z.array(z.string()).default([]),
-  taskTypes: z.array(z.string().trim().min(1)).default(['bug']),
+  taskTypes: z.array(z.string().trim().min(1)).nullable().default(['bug']),
   labelsAll: z.array(z.string()).default([]),
   labelsAny: z.array(z.string()).default([]),
   labelsNone: z.array(z.string()).default([]),
@@ -50,19 +50,23 @@ export type SourceComment = z.infer<typeof sourceCommentSchema>;
 export function matchSource(source: Source, criteria: Criteria): { matches: boolean; reason: string } {
   if (source.isPullRequest) return { matches: false, reason: 'pull_request' };
   const labels = new Set(source.labels);
-  const labelTypes = new Set(source.labels.flatMap(label => criteria.typeLabels[label] ? [criteria.typeLabels[label]] : []));
-  const native = source.nativeType === null ? undefined : criteria.nativeTypes[source.nativeType];
-  if (source.nativeType !== null && !native) return { matches: false, reason: 'unmapped_native_type' };
-  if (labelTypes.size > 1 || (native && [...labelTypes].some(type => type !== native))) return { matches: false, reason: 'conflicting_type' };
-  const type = native ?? [...labelTypes][0];
-  if (!type) return { matches: false, reason: 'unclassified' };
-  if (!criteria.taskTypes.includes(type)) return { matches: false, reason: 'type_not_enabled' };
+  let reason = 'issue';
+  if (criteria.taskTypes !== null) {
+    const labelTypes = new Set(source.labels.flatMap(label => criteria.typeLabels[label] ? [criteria.typeLabels[label]] : []));
+    const native = source.nativeType === null ? undefined : criteria.nativeTypes[source.nativeType];
+    if (source.nativeType !== null && !native) return { matches: false, reason: 'unmapped_native_type' };
+    if (labelTypes.size > 1 || (native && [...labelTypes].some(type => type !== native))) return { matches: false, reason: 'conflicting_type' };
+    const type = native ?? [...labelTypes][0];
+    if (!type) return { matches: false, reason: 'unclassified' };
+    if (!criteria.taskTypes.includes(type)) return { matches: false, reason: 'type_not_enabled' };
+    reason = type;
+  }
   if (!criteria.states.includes(source.state)) return { matches: false, reason: 'state' };
   if (criteria.assigneesAny.length && !criteria.assigneesAny.some(name => source.assignees.includes(name))) return { matches: false, reason: 'assignee' };
   if (!criteria.labelsAll.every(label => labels.has(label))) return { matches: false, reason: 'labels_all' };
   if (criteria.labelsAny.length && !criteria.labelsAny.some(label => labels.has(label))) return { matches: false, reason: 'labels_any' };
   if (criteria.labelsNone.some(label => labels.has(label))) return { matches: false, reason: 'labels_none' };
-  return { matches: true, reason: type };
+  return { matches: true, reason };
 }
 
 export const requestSchema = z.object({

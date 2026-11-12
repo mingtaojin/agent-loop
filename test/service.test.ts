@@ -9,7 +9,7 @@ import { setTimeout } from 'node:timers/promises';
 import { test, type TestContext } from 'node:test';
 import { z } from 'zod';
 import { configSchema, type Config } from '../src/config.js';
-import { type IncomingMessage, type Task } from '../src/domain.js';
+import { criteriaSchema, matchSource, type IncomingMessage, type Task } from '../src/domain.js';
 import { AgentLoop } from '../src/loop.js';
 import { WorkspaceProvider } from '../src/workspace.js';
 import { type LegacyReport, CodexFake, FeishuFake, GitHubFake, issue } from './fakes.js';
@@ -104,6 +104,43 @@ test('collection classifies backlog, records skip reasons, deduplicates, and doe
   await f.loop.tick();
   assert.equal(f.feishu.groups.size, 2);
   assert.equal(f.codex.starts.length, 2);
+});
+
+test('open issue collection can omit type, assignee and label restrictions', async t => {
+  const f = await fixture(t);
+  const repository = f.config.repositories[0];
+  assert.ok(repository);
+  repository.criteria = criteriaSchema.parse({ states: ['open'], taskTypes: null });
+  f.github.sources = [
+    issue(1), issue(2, { nativeType: 'Feature', labels: ['enhancement'], assignees: ['other'] }),
+    issue(3, { nativeType: null, labels: [], assignees: [] }),
+    issue(4, { nativeType: 'Refactor', labels: [] }),
+    issue(5, { nativeType: 'Bug', labels: ['enhancement'] }),
+    issue(6, { nativeType: null, labels: ['bug', 'enhancement'] }),
+    issue(7, { state: 'closed' }), issue(8, { isPullRequest: true }),
+    issue(9, { repository: 'example/unconfigured' }),
+  ];
+  await f.loop.collect();
+  const originalIds = f.loop.tasks().map(task => task.id);
+  assert.deepEqual(f.loop.tasks().map(task => task.source.kind === 'github' ? task.source.issue.number : null), [1, 2, 3, 4, 5, 6]);
+  const reasons = new Map(f.loop.store.sources().map(record => [record.source.number, record.reason]));
+  assert.deepEqual([...reasons.values()], ['issue', 'issue', 'issue', 'issue', 'issue', 'issue', 'state', 'pull_request']);
+  assert.equal(reasons.has(9), false);
+  await f.loop.collect();
+  assert.deepEqual(f.loop.tasks().map(task => task.id), originalIds);
+  await f.loop.tick();
+  assert.equal(f.codex.starts.length, 6);
+});
+
+test('unrestricted issue types preserve configured assignee and label filters', () => {
+  const criteria = criteriaSchema.parse({ taskTypes: null, assigneesAny: ['developer'],
+    labelsAll: ['required'], labelsAny: ['triage'], labelsNone: ['blocked'] });
+  const source = issue(1, { nativeType: null, labels: ['required', 'triage'] });
+  assert.equal(matchSource(source, criteria).matches, true);
+  assert.equal(matchSource({ ...source, assignees: [] }, criteria).reason, 'assignee');
+  assert.equal(matchSource({ ...source, labels: ['triage'] }, criteria).reason, 'labels_all');
+  assert.equal(matchSource({ ...source, labels: ['required'] }, criteria).reason, 'labels_any');
+  assert.equal(matchSource({ ...source, labels: [...source.labels, 'blocked'] }, criteria).reason, 'labels_none');
 });
 
 test('partial collection survives retry without interpreting unread sources as closed', async t => {
