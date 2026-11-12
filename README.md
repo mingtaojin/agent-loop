@@ -55,7 +55,19 @@ Runtime 校验选择结果并保存绑定，再准备选定的项目目录。显
 
 凭证通过环境变量提供。默认名称为 `GITHUB_TOKEN`、`FEISHU_APP_ID`、`FEISHU_APP_SECRET`。配置仅保存变量名。程序加载当前目录的 `.env`，已有进程变量优先。可用 `--env-file` 指定其他文件。不要将真实凭证写入 JSON、prompt 或全局说明。
 
-在飞书应用中启用机器人、长连接、消息接收和交互卡片回调。授权群创建、群信息、消息收发、历史读取和资源下载。实际权限与回调可用性需要在租户验证。`npm run pair:feishu -- --config config.json` 可在独立进程通过私聊口令绑定所有者。
+## 飞书接入
+
+先在当前实例使用的飞书应用中启用机器人、长连接、消息接收和交互卡片回调，授权群创建、群信息、消息收发、历史读取和资源下载。`npm run pair:feishu -- --config config.json` 可在独立进程通过私聊口令绑定所有者。
+
+按需要启用的能力继续配置。基础消息收发成功，只代表基础聊天可用。
+
+| 需要的能力 | 配置与权限 | 接入说明 |
+| --- | --- | --- |
+| 基础聊天、任务群、最终答复及原生问题与审批 | 基础消息和群权限，进度默认关闭 | 本节及[检查与启动](#检查与启动) |
+| 聊天中的执行进度卡片 | `feishu.progress.enabled: true`、`surface: "card"`，额外需要 `cardkit:card:write` | [飞书执行进度卡片](#飞书执行进度卡片) |
+| 群顶部固定的“执行进度”Tab | `feishu.progress.enabled: true`、`surface: "document"`、当前企业的 HTTPS `documentBaseUrl`，额外需要文档、协作者和标签页权限 | [飞书固定进度页](#飞书固定进度页)及[完整接入与验收步骤](docs/feishu-setup.md) |
+
+进度卡片与固定 Tab 是两种展示方式，同一实例同时只使用一种。不同实例使用不同 App ID 时，需要分别配置权限。首次启用顶部 Tab 时，按[确认应用、开通权限、重载配置、逐项验收](docs/feishu-setup.md)的顺序操作。
 
 ## 检查与启动
 
@@ -68,7 +80,7 @@ npm start -- status --config config.json
 npm start -- run --config config.json
 ```
 
-`doctor` 检查本地配置和凭证是否存在，不验证远端权限。`collect` 只保存来源与事件，不创建群或启动 Codex。`status` 读取任务、输入、输出和诊断记录。`run` 启动常驻服务并处理已收集任务。
+`doctor` 检查本地配置和凭证是否存在，不验证远端权限。`collect` 只保存来源与事件，不创建群或启动 Codex。`status` 读取任务、输入、输出和诊断记录。`run` 启动常驻服务并处理已收集任务。`doctor` 通过不能代替[固定进度 Tab 的接入验收](docs/feishu-setup.md#验收新任务群)。
 
 ## CLI 提交新任务
 
@@ -118,6 +130,8 @@ npm start -- run --config config.json
 
 ### 飞书固定进度页
 
+首次接入请先完成[固定进度 Tab 配置与验收](docs/feishu-setup.md)，其中包含当前应用的确认方法、开放平台操作步骤、权限导入 JSON 和常见故障排查。
+
 在群里的“执行进度”标签页查看当前任务的对话记录，包括用户输入、AI 过程说明和最终答复。记录按时间倒序排列，最新消息在上方，每条消息内部保持正常阅读顺序。记录跨轮次保留，隐藏工具调用和工具输出。默认展示最近 3000 行，超过上限时移除最早的展示内容，原始任务记录仍保存在本地。
 
 每个任务复用同一篇飞书云文档。文档内容每隔几秒合并更新，最终答复、原生问题和审批仍在聊天中处理。
@@ -130,11 +144,11 @@ npm start -- run --config config.json
   "surface": "document",
   "intervalMs": 3000,
   "maxLines": 3000,
-  "documentBaseUrl": "https://<企业文档域名>.feishu.cn"
+  "documentBaseUrl": "https://example.feishu.cn"
 }
 ```
 
-`documentBaseUrl` 使用企业实际的飞书文档域名。文档由飞书托管，不依赖运行 Agent Loop 的电脑能否被手机访问。文档模式不会在失败时改发进度卡片。
+`documentBaseUrl` 中的 `https://example.feishu.cn` 是占位值，替换为企业实际的 HTTPS 飞书文档域名，不带文档路径、端口、查询参数或片段。文档由飞书托管，不依赖运行 Agent Loop 的电脑能否被手机访问。文档模式不会在失败时改发进度卡片。
 
 `maxLines` 是文档展示的逻辑行数上限，按文本中的换行计算，包含状态、角色标签和空行；屏幕自动折行不另计。已有文档在恢复后从本地保存的输入和 AI 执行事件重建历史。文档显示附件名称，附件原件保留在任务材料中。
 
@@ -143,9 +157,9 @@ npm start -- run --config config.json
 - `docx:document`，创建、读取和更新新版文档。
 - `docs:permission.member:create`，将任务群添加为可阅读的协作者。
 - `docs:permission.member:retrieve`，核对协作者，避免把创建标签页成功误认为群成员已经获得阅读权限。
-- `im:chat.tabs:read` 和 `im:chat.tabs:write_only`，查找并添加固定入口。已有 `im:chat` 权限时可覆盖这两项。
+- `im:chat.tabs:read` 和 `im:chat.tabs:write_only`，查找并添加固定入口。已有应用身份的 `im:chat` 权限时可覆盖这两项，`im:chat:read` 不能替代标签页读取权限。
 
-群设置还需允许机器人管理标签页。仅授予当前任务群阅读权限，不修改公开分享设置。权限不足、网络故障和文档创建结果不明确会记录到诊断，不阻断任务或最终答复；未知的创建结果不会自动重建文档。配置修改后按 [服务操作说明](docs/agents/operations.md) 重启执行服务。
+群设置还需允许机器人管理标签页。仅授予当前任务群阅读权限，不修改公开分享设置。权限不足、网络故障和文档创建结果不明确会记录到诊断，不阻断任务或最终答复；未知的创建结果不会自动重建文档。配置修改后按 [服务操作说明](docs/agents/operations.md) 重启执行服务。群消息正常但没有 Tab，或出现 `99991672`、`212002` 时，按[固定进度 Tab 排障顺序](docs/feishu-setup.md#按症状排查)检查。
 
 ### 飞书执行进度卡片
 
@@ -207,6 +221,6 @@ npm run build
 - `npm run verify:codex` 验证普通答复、会话续接、动态工具与进程恢复。
 - `npm run verify:inputs` 验证运行中追加、合成图片及临时 UTF-8 日志读取。
 - `npm run verify:runtime` 验证实际 Runtime 的新旧 Thread、真实工作区布局和双仓库隔离，仅批准脚本列出的临时命令。平台使用本地替身。
-- `npm run verify:feishu -- --listen` 会向真实验证群发送合成材料，需显式授权且与正式服务分开运行。
+- `npm run verify:feishu -- --listen` 会向真实验证群发送合成材料，需显式授权且与正式服务分开运行。它验证基础群消息和附件传输，不验证云文档、群阅读权限、固定 Tab 或文档内容更新；这些能力按[固定进度 Tab 验收步骤](docs/feishu-setup.md#验收新任务群)核对。
 
 当前证据和未完成验收见 [实现状态](docs/implementation-status.md)。已批准的持续上下文规格位于 [.scratch/agent-runtime-context/spec.md](.scratch/agent-runtime-context/spec.md)。历史 ADR 和旧规格保留为决策记录。
