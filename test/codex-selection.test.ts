@@ -23,7 +23,7 @@ async function fixture(t: TestContext, mode = 'repository') {
 }
 function alive(pid: number): boolean { try { process.kill(pid, 0); return true; } catch { return false; } }
 
-for (const mode of ['repository', 'none', 'question', 'early-completion']) test(`isolated selector returns ${mode} from completion events and releases its process`, async t => {
+for (const mode of ['repository', 'none', 'question', 'early-completion', 'strict-schema']) test(`isolated selector returns ${mode} from completion events and releases its process`, async t => {
   const f = await fixture(t, mode);
   const result = await f.server.selectWorkspace(f.input);
   assert.equal(result.choice.kind, mode === 'none' || mode === 'question' ? mode : 'repository');

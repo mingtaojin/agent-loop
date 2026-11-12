@@ -27,6 +27,10 @@ createInterface({ input: process.stdin }).on('line', line => {
   }
   if (message.method === 'turn/start') {
     if (selection && (!p.outputSchema?.properties?.choice || p.approvalPolicy !== 'never' || p.sandboxPolicy?.type !== 'readOnly' || p.sandboxPolicy.networkAccess !== false)) throw new Error('Selector turn lacks structured output or read-only policy');
+    if (selection && mode === 'strict-schema' && JSON.stringify(p.outputSchema).includes('"oneOf"')) {
+      send({ id: message.id, error: { code: -32600, message: "Invalid schema: oneOf is not permitted when strict is true" } });
+      return;
+    }
     const turn = { id: `turn-${process.pid}`, status: 'inProgress', items: [] };
     current.turns = [turn]; current.status = { type: 'active' };
     const scope = { threadId: current.id, turnId: turn.id };

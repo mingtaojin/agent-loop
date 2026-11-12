@@ -388,6 +388,20 @@ test('temporary selector failures exhaust the configured recovery limit before a
   await f.loop.tick(); assert.equal(f.codex.selections.length, 3);
 });
 
+test('selector failure keeps raw diagnostics but sends a readable recovery message to the group', async t => {
+  const f = await fixture(t);
+  const raw = JSON.stringify({ type: 'error', error: { message: 'oneOf is not permitted when strict is true', code: 'invalid_json_schema' }, status: 400 });
+  f.codex.selectionError = new Error(raw);
+  await f.manual();
+  for (let attempt = 0; attempt < 4; attempt++) { await delay(5); await f.loop.tick(); }
+  assert.equal(f.task().status, 'failed');
+  assert.equal(f.task().reason, raw);
+  const messages = f.feishu.sent.map(output => output.text).join('\n');
+  assert.match(messages, /工程目录选择失败/);
+  assert.match(messages, /继续/);
+  assert.doesNotMatch(messages, /oneOf|invalid_json_schema|"status":400/);
+});
+
 test('original attachments keep their identity and bytes through workspace clarification', async t => {
   const f = await fixture(t); const bytes = Buffer.from('original-log-evidence-23\n');
   f.feishu.resources.set('log-key', bytes);

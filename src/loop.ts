@@ -507,7 +507,10 @@ export class AgentLoop {
     if (task.recovery.attempts >= this.config.recovery.maxAttempts || (!task.threadId && !(error instanceof WorkspaceSelectionError))) {
       task.status = 'failed'; task.recovery.nextAttemptAt = null;
       task.recovery.lastUserInputSeq = this.store.inputs(task.id).filter(input => input.origin === 'user').at(-1)?.seq ?? 0;
-      this.notify(task, `任务恢复已停止，保留现场。\n${message}`, `recovery-exhausted:${digest(message)}`);
+      const notice = error instanceof WorkspaceSelectionError
+        ? '工程目录选择失败，任务还未开始执行。你的消息和附件已保留。\n请在本群发送“继续”重试；如再次失败，请联系管理员检查服务。'
+        : `任务恢复已停止，保留现场。\n${message}`;
+      this.notify(task, notice, `recovery-exhausted:${digest(message)}`);
     } else task.recovery.nextAttemptAt = Date.now() + this.config.recovery.retryDelayMs;
     this.persist(task); this.problem(task.id, error);
   }
