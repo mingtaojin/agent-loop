@@ -8,6 +8,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { test, type TestContext } from 'node:test';
 import { configSchema } from '../src/config.js';
 import { AgentLoop } from '../src/loop.js';
+import { CodexAppServer } from '../src/adapters/codex.js';
 import { criteriaSchema, type IncomingMessage, type WorkspaceChoice } from '../src/domain.js';
 import { WorkspaceProvider } from '../src/workspace.js';
 import { CodexFake, FeishuFake, GitHubFake, issue } from './fakes.js';
@@ -386,6 +387,45 @@ test('temporary selector failures exhaust the configured recovery limit before a
   assert.equal(f.task().status, 'failed');
   assert.equal(f.codex.created.length, 0);
   await f.loop.tick(); assert.equal(f.codex.selections.length, 3);
+});
+
+for (const mode of ['invalid-schema', 'invalid-schema-rpc']) test(`deterministic ${mode} stops after one submission and preserves inputs for explicit continuation`, async t => {
+  const f = await fixture(t);
+  const server = new CodexAppServer({ command: [process.execPath, resolve('test/fixtures/workspace-selection-codex.mjs'), mode, join(f.root, 'schema-requests.jsonl')],
+    approvalPolicy: 'never', sandbox: 'read-only', requestTimeoutMs: 1000 });
+  t.after(() => server.close());
+  const select = f.codex.selectWorkspace.bind(f.codex);
+  let calls = 0;
+  f.codex.selectWorkspace = async input => { calls++; return server.selectWorkspace(input); };
+  const bytes = Buffer.from('original-schema-error-evidence\n');
+  f.feishu.resources.set('original-evidence', bytes);
+  await f.loop.receive({ ...f.message('initial', 'Investigate the original task without deploying'),
+    attachments: [{ key: 'original-evidence', kind: 'file', name: 'evidence.log' }] });
+  const failed = f.task(); assert.ok(failed.chatId);
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.recovery.attempts, 0);
+  assert.equal(failed.recovery.nextAttemptAt, null);
+  assert.match(failed.recovery.lastError ?? '', /invalid_json_schema/);
+  assert.equal(failed.threadId, null);
+  assert.deepEqual(failed.resources, []);
+  for (let attempt = 0; attempt < 3; attempt++) { await delay(5); await f.loop.tick(); }
+  await f.restart(); await f.loop.tick();
+  assert.equal(calls, 1, 'Ticks and service recovery must not resubmit a deterministic schema rejection');
+  assert.equal(f.codex.created.length, 0);
+  assert.ok(f.loop.store.diagnostics().some(item => item.scope === failed.id && item.message.includes('invalid_json_schema')));
+  f.codex.selectWorkspace = select;
+  f.codex.selectionResults.push(selected());
+  await f.loop.receive(f.message('continue', 'Continue with the configured project; preserve the original scope.', failed.chatId, 'group'));
+  assert.equal(f.task().status, 'running');
+  assert.equal(f.codex.starts.length, 1);
+  const start = f.codex.starts[0]; assert.ok(start);
+  assert.equal(start.deliveryId, 'initial');
+  assert.deepEqual(start.additionalDeliveryIds, ['continue']);
+  assert.match(JSON.stringify(start.input), /Investigate the original task without deploying/);
+  assert.match(JSON.stringify(start.input), /preserve the original scope/);
+  const download = f.feishu.downloads[0]; assert.ok(download);
+  assert.equal(download.messageId, 'initial');
+  assert.deepEqual(await readFile(download.destination.replace(/\.partial$/, '')), bytes);
 });
 
 test('original attachments keep their identity and bytes through workspace clarification', async t => {

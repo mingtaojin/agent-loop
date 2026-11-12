@@ -23,7 +23,7 @@ async function fixture(t: TestContext, mode = 'repository') {
 }
 function alive(pid: number): boolean { try { process.kill(pid, 0); return true; } catch { return false; } }
 
-for (const mode of ['repository', 'none', 'question', 'early-completion']) test(`isolated selector returns ${mode} from completion events and releases its process`, async t => {
+for (const mode of ['repository', 'none', 'question', 'early-completion', 'strict-schema']) test(`isolated selector returns ${mode} from completion events and releases its process`, async t => {
   const f = await fixture(t, mode);
   const result = await f.server.selectWorkspace(f.input);
   assert.equal(result.choice.kind, mode === 'none' || mode === 'question' ? mode : 'repository');
@@ -37,7 +37,7 @@ for (const mode of ['repository', 'none', 'question', 'early-completion']) test(
   assert.match(JSON.stringify(started.params), /Previously confirmed directory answer/);
 });
 
-for (const mode of ['wrong-cwd', 'wrong-policy', 'wrong-sandbox', 'malformed', 'unknown-repository', 'failed', 'crash', 'approval']) test(`selector rejects ${mode} and releases its process`, async t => {
+for (const mode of ['wrong-cwd', 'wrong-policy', 'wrong-sandbox', 'malformed', 'unknown-repository', 'missing-repository', 'missing-reason', 'failed', 'crash', 'approval']) test(`selector rejects ${mode} and releases its process`, async t => {
   const f = await fixture(t, mode);
   await assert.rejects(f.server.selectWorkspace(f.input));
   const rows = await f.records(); assert.ok(rows[0]);

@@ -2,6 +2,7 @@ import { appendFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 
 const [mode, recordPath] = process.argv.slice(2);
+const schemaError = JSON.stringify({ type: 'error', error: { message: "Invalid schema for response_format 'codex_output_schema': 'schema.properties.choice.oneOf' is not permitted when strict is true.", type: 'invalid_request_error', param: 'text.format.schema', code: 'invalid_json_schema' }, status: 400 });
 const send = message => process.stdout.write(JSON.stringify(message) + '\n');
 let current;
 let selection = false;
@@ -27,6 +28,8 @@ createInterface({ input: process.stdin }).on('line', line => {
   }
   if (message.method === 'turn/start') {
     if (selection && (!p.outputSchema?.properties?.choice || p.approvalPolicy !== 'never' || p.sandboxPolicy?.type !== 'readOnly' || p.sandboxPolicy.networkAccess !== false)) throw new Error('Selector turn lacks structured output or read-only policy');
+    const invalidSchema = mode === 'invalid-schema' || mode === 'invalid-schema-rpc' || (mode === 'strict-schema' && JSON.stringify(p.outputSchema).includes('"oneOf"'));
+    if (selection && mode === 'invalid-schema-rpc') { send({ id: message.id, error: { code: -32600, message: schemaError } }); return; }
     const turn = { id: `turn-${process.pid}`, status: 'inProgress', items: [] };
     current.turns = [turn]; current.status = { type: 'active' };
     const scope = { threadId: current.id, turnId: turn.id };
@@ -37,13 +40,15 @@ createInterface({ input: process.stdin }).on('line', line => {
       const choice = ['project', 'unknown-project', 'project-path'].includes(mode)
         ? { kind: 'project', projectId: mode === 'unknown-project' ? 'invented-project' : 'project-fixture', reason: 'Matches task evidence', ...(mode === 'project-path' ? { path: '/invented/path' } : {}) }
         : mode === 'none' ? { kind: 'none', reason: 'Discussion only' } : mode === 'question' ? { kind: 'question', question: 'Which configured project should be used?' } : { kind: 'repository', repositoryName: mode === 'unknown-repository' ? 'outside/project' : 'example/project', reason: 'Matches task evidence' };
+      if (mode === 'missing-repository') delete choice.repositoryName;
+      if (mode === 'missing-reason') delete choice.reason;
       const text = selection ? mode === 'malformed' ? 'not JSON' : JSON.stringify({ choice }) : 'Formal task result';
       const commentary = { id: 'progress', type: 'agentMessage', phase: 'commentary', text: 'Temporary directory selection commentary' };
       const answer = { id: 'answer', type: 'agentMessage', phase: 'final_answer', text };
       if (selection) send({ method: 'item/completed', params: { ...scope, item: commentary } });
-      if (mode !== 'failed' || !selection) send({ method: 'item/completed', params: { ...scope, item: answer } });
-      turn.status = selection && mode === 'failed' ? 'failed' : 'completed';
-      turn.error = turn.status === 'failed' ? { message: 'Selection failed in fixture' } : null;
+      if ((!invalidSchema && mode !== 'failed') || !selection) send({ method: 'item/completed', params: { ...scope, item: answer } });
+      turn.status = selection && (mode === 'failed' || invalidSchema) ? 'failed' : 'completed';
+      turn.error = turn.status === 'failed' ? { message: invalidSchema ? schemaError : 'Selection failed in fixture' } : null;
       if (!selection) turn.items.push(answer);
       current.status = { type: 'idle' };
       send({ method: 'turn/completed', params: { threadId: current.id, turn } });
