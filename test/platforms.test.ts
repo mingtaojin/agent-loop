@@ -553,6 +553,14 @@ async function approvalCard(api: NonNullable<FeishuDependencies['api']>, request
 function click(value: unknown, actor = owner, chatId = 'oc_1') {
   return { operator: { open_id: actor }, context: { open_chat_id: chatId, open_message_id: 'om_card' }, action: { tag: 'button', value } };
 }
+const approvalFailureResponse = { toast: { type: 'error', content: '此次点击未被接收，请查看最新审批状态。' } };
+const approvalResponseSchema = z.object({
+  toast: z.object({ type: z.literal('info'), content: z.string() }),
+  card: z.object({ type: z.literal('raw'), data: cardSchema.extend({
+    config: z.object({ wide_screen_mode: z.literal(true) }),
+    header: z.object({ title: z.object({ tag: z.literal('plain_text'), content: z.string().min(1) }) }),
+  }) }),
+});
 
 test('Feishu approval cards authenticate request-bound decisions after adapter restart', async () => {
   const { values, uuids, adapter } = await approvalCard(fakeApi());
@@ -569,14 +577,24 @@ test('Feishu approval cards authenticate request-bound decisions after adapter r
     start: async ({ eventDispatcher }) => {
       const handle = (value: unknown) => eventDispatcher.invoke({ schema: '2.0',
         header: { event_type: 'card.action.trigger' }, event: value }, { needCheck: false });
+      for (const [value, decision] of [[first, '批准'], [second, '拒绝']] as const) {
+        const response = approvalResponseSchema.parse(await handle(click(value)));
+        assert.match(response.toast.content, /已接收.*等待执行器确认/);
+        assert.ok(response.toast.content.includes(decision));
+        assert.ok(response.card.data.elements.every(element => element.tag !== 'action'));
+        const text = response.card.data.elements.flatMap(element => element.tag === 'div' ? [element.text.content] : []).join('\n');
+        assert.ok(text.includes(decision));
+        assert.match(text, /已接收.*等待执行器确认/);
+        assert.match(text, /执行进度/);
+        assert.doesNotMatch(JSON.stringify(response), /agent_loop_approval|git status|test-secret|已完成|已确认/);
+      }
       await handle(click(first));
-      await handle(click(second));
-      await handle(click(first));
-      await handle(click(first, 'ou_wrong'));
-      await assert.rejects(handle({ ...click(first), open_chat_id: 'oc_wrong' }), /chat/);
-      await assert.rejects(handle(click(first, owner, 'oc_wrong')), /chat/);
-      await assert.rejects(handle(click({ agent_loop_approval: first.agent_loop_approval.slice(0, -8) + 'AAAAAAAA' })));
-      await assert.rejects(handle(click({ decision: 'approve', requestId: nativeApproval.id })));
+      assert.deepEqual(await handle(click(first, 'ou_wrong')), { toast: { type: 'warning', content: '此操作仅限任务所有者' } });
+      for (const attempt of [
+        { ...click(first), open_chat_id: 'oc_wrong' }, click(first, owner, 'oc_wrong'),
+        click({ agent_loop_approval: first.agent_loop_approval.slice(0, -8) + 'AAAAAAAA' }),
+        click({ decision: 'approve', requestId: nativeApproval.id }),
+      ]) assert.deepEqual(await handle(attempt), approvalFailureResponse);
     }, close: () => {},
   } });
   await restarted.start(async () => assert.fail('An action cannot become chat input'), error => errors.push(error), async action => { received.push(action); });
@@ -585,6 +603,69 @@ test('Feishu approval cards authenticate request-bound decisions after adapter r
   assert.deepEqual(received[0], { id: 'approval-card:approve', taskId: 'task-1', chatId: 'oc_1', senderId: owner,
     threadId: 'thread-1', turnId: 'turn-1', requestId: 'request-1', epoch: 'epoch-1', decision: 'approve' });
   assert.equal(received[2]?.id, received[0]?.id);
+  for (const error of errors) {
+    assert.ok(error instanceof Error);
+    assert.doesNotMatch(String(error), /agent_loop_approval|AAAAAAAA|test-secret|git status/);
+  }
+});
+
+test('Feishu approval failures return a stable toast and safe diagnostics even when reporting throws', async t => {
+  const { values } = await approvalCard(fakeApi());
+  const value = values[0];
+  assert.ok(value);
+  for (const failure of ['duplicate', 'stale', 'persistence', 'diagnostics']) await t.test(failure, async () => {
+    const errors: unknown[] = [];
+    let actions = 0;
+    const before = Date.now();
+    const adapter = new FeishuAdapter(options, { api: fakeApi(), socket: {
+      start: async ({ eventDispatcher }) => {
+        const response = await eventDispatcher.invoke({ schema: '2.0',
+          header: { event_type: 'card.action.trigger', event_id: `event-${failure}`, token: 'private-header-token' },
+          event: click(value) }, { needCheck: false });
+        assert.deepEqual(response, approvalFailureResponse);
+      }, close: () => {},
+    } });
+    await adapter.start(async () => assert.fail('An action cannot become chat input'), error => {
+      errors.push(error);
+      if (failure === 'diagnostics') throw new Error('private-diagnostic-error');
+    }, async () => { actions++; throw new Error(`${failure}: private-handler-error git status test-secret`); });
+    assert.equal(actions, 1);
+    assert.equal(errors.length, 1);
+    const error = errors[0];
+    assert.ok(error instanceof Error);
+    assert.doesNotMatch(String(error), /private-|git status|test-secret|agent_loop_approval/);
+    assert.ok(!String(error).includes(value.agent_loop_approval));
+    const context = z.object({
+      taskId: z.literal('task-1'), threadId: z.literal('thread-1'), turnId: z.literal('turn-1'),
+      requestId: z.literal('request-1'), decision: z.literal('approve'), eventId: z.literal(`event-${failure}`),
+      receivedAt: z.number(), durationMs: z.number().nonnegative(),
+    }).parse(JSON.parse(error.message.slice(error.message.indexOf('{'))));
+    assert.ok(context.receivedAt >= before && context.receivedAt <= Date.now());
+  });
+});
+
+test('Feishu approval callbacks wait for durable receipt before returning success', async () => {
+  const { values } = await approvalCard(fakeApi());
+  const value = values[0];
+  assert.ok(value);
+  let enter = () => {}; let release = () => {};
+  const entered = new Promise<void>(resolve => { enter = resolve; });
+  const receipt = new Promise<void>(resolve => { release = resolve; });
+  const adapter = new FeishuAdapter(options, { api: fakeApi(), socket: {
+    start: async ({ eventDispatcher }) => {
+      let settled = false;
+      const response = eventDispatcher.invoke({ schema: '2.0', header: { event_type: 'card.action.trigger' },
+        event: click(value) }, { needCheck: false }).finally(() => { settled = true; });
+      try {
+        await entered;
+        await new Promise<void>(resolve => setImmediate(resolve));
+        assert.equal(settled, false);
+      } finally { release(); }
+      approvalResponseSchema.parse(await response);
+    }, close: () => {},
+  } });
+  await adapter.start(async () => assert.fail('An action cannot become chat input'), error => { throw error; },
+    async () => { enter(); await receipt; });
 });
 
 test('Feishu approval cards require native approvals and preserve uncertain delivery', async () => {

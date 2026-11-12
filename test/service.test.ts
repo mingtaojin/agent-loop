@@ -348,7 +348,7 @@ test('project directory policy returns the whole engineering root and preserves 
   assert.equal('branch' in directory, false);
   assert.equal(await readFile(join(directory.workspace, 'repository', 'tracked.txt'), 'utf8'), 'original commit\n');
   assert.equal(await git(f.repository, 'branch', '--show-current'), 'main');
-  const client = fileURLToPath(new URL('../src/workspace-client.ts', import.meta.url));
+  const client = fileURLToPath(new URL(import.meta.url.endsWith('.ts') ? '../src/workspace-client.ts' : '../src/workspace-client.js', import.meta.url));
   secondTask.workspaceSelection = { kind: 'pending' }; f.loop.store.saveTask(secondTask); await f.loop.tick();
   const bridged = await execute(process.execPath, [client, join(f.config.dataDir, 'workspace-capabilities', `${secondTask.id}.json`), 'example/project']);
   assert.equal(JSON.parse(bridged.stdout).workspace, root);
