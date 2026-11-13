@@ -444,42 +444,109 @@ test('independent handoff race: a late owner restriction must reach the coordina
   assert.deepEqual(f.loop.store.inputs(task.id).find(input => input.id === message.id)?.message, message);
 });
 
-test('independent threadless legacy pause keeps the Operator reason when existing selected project permits coordinator handoff',async t=>{
-  const f=await fixture(t),saved=f.saved('threadless-legacy-pause');f.feishu.resources.set('old-file',Buffer.from('retained evidence'));
-  const app=f.loop.projects.projectConfig('app');assert.ok(app);
-  const project={kind:'project' as const,id:'coordinated:app',name:'App',entryPath:app.directory,canonicalPath:app.directory};
-  const original=taskSchema.parse({...saved,purpose:'legacy',status:'paused',reason:'Operator paused',legacy:{status:'paused',prUrl:null},workspaceSelection:{kind:'selected',temporaryThreadId:'saved-selection',inputIds:[],choice:{kind:'project',projectId:project.id,reason:'Original project',project}}});
+test('independent threadless legacy pause keeps the Operator reason when existing selected project permits coordinator handoff', async t => {
+  const f = await fixture(t), saved = f.saved('threadless-legacy-pause');
+  f.feishu.resources.set('old-file', Buffer.from('retained evidence'));
+  const app = f.loop.projects.projectConfig('app'); assert.ok(app);
+  const project = { kind: 'project' as const, id: 'coordinated:app', name: 'App', entryPath: app.directory, canonicalPath: app.directory };
+  const original = taskSchema.parse({ ...saved, purpose: 'legacy', status: 'paused', reason: 'Operator paused',
+    legacy: { status: 'paused', prUrl: null }, workspaceSelection: { kind: 'selected', temporaryThreadId: 'saved-selection',
+      inputIds: [], choice: { kind: 'project', projectId: project.id, reason: 'Original project', project } } });
   f.loop.store.saveTask(original);
-  const coordinators=new Set([f.coordinator().threadId,f.coordinator('other').threadId]);
-  const effects=()=>({created:f.codex.created.length,starts:f.codex.starts.filter(x=>!coordinators.has(x.threadId)).length,steers:f.codex.steers.filter(x=>!coordinators.has(x.threadId)).length,replies:f.codex.replies.filter(x=>!coordinators.has(x.request.threadId)).length,approvals:f.codex.approvals.filter(x=>!coordinators.has(x.request.threadId)).length});
-  const before=effects();
-  await f.loop.tick();const after=f.loop.store.task(saved.id);
-  console.log('THREADLESS_LEGACY_OPERATOR_PAUSE',JSON.stringify({status:after.status,reason:after.reason,purpose:after.purpose,route:f.loop.projects.intakeRoute(saved.id)}));
-  assert.equal(after.status,'paused');assert.equal(after.threadId,null);
-  assert.deepEqual(effects(),before,'the paused request creates or executes no Worker; normal coordinator delivery is allowed');
-  assert.deepEqual(after.source,original.source);assert.deepEqual(after.resources,original.resources);
-  assert.equal(after.reason,'Operator paused','coordinator handoff must not erase the Operator pause marker');
+  const coordinators = new Set([f.coordinator().threadId, f.coordinator('other').threadId]);
+  const effects = () => ({ created: f.codex.created.length,
+    starts: f.codex.starts.filter(call => !coordinators.has(call.threadId)).length,
+    steers: f.codex.steers.filter(call => !coordinators.has(call.threadId)).length,
+    replies: f.codex.replies.filter(call => !coordinators.has(call.request.threadId)).length,
+    approvals: f.codex.approvals.filter(call => !coordinators.has(call.request.threadId)).length });
+  const before = effects();
+  await f.loop.tick(); await f.loop.tick();
+  const after = f.loop.store.task(saved.id);
+  assert.equal(after.status, 'paused'); assert.equal(after.threadId, null);
+  assert.deepEqual(effects(), before, 'the paused request creates or executes no Worker; normal coordinator delivery is allowed');
+  assert.deepEqual(after.source, original.source); assert.deepEqual(after.resources, original.resources);
+  assert.equal(after.reason, 'Operator paused', 'coordinator handoff must not erase the Operator pause marker');
+  assert.equal(f.loop.projects.intakeRoute(saved.id)?.projectId, 'app');
+  const events = f.loop.store.inputs(f.coordinator().id).filter(input => input.provenance.kind === 'agent'
+    && input.provenance.taskId === saved.id && input.provenance.category === 'intake_request');
+  assert.equal(events.length, 1);
+  const [event] = events; assert.ok(event); assert.match(event.message.text, /PRIVATE ORIGINAL MATERIAL/);
+  await assert.rejects(f.loop.projectAction(f.coordinator().id, { action: 'dispatch', requestId: 'paused-handoff-dispatch',
+    intakeTaskId: saved.id, role: 'worker', prompt: 'Must not execute a paused request.' }), /paused/);
 });
 
-test('independent migration recovery validates preserved project resources before a newly adopted idle Thread can execute',async t=>{
-  const f=await fixture(t),saved=f.saved('unassigned-idle-invalid-resource');f.feishu.resources.set('old-file',Buffer.from('original pending material'));
-  const entry=join(f.root,'saved-workspace'),wrong=join(f.root,'different-workspace');await mkdir(entry);await mkdir(wrong);
-  const canonical=await realpath(entry);
-  const project={kind:'project' as const,id:'retained-project',name:'Retained project',entryPath:entry,canonicalPath:canonical};
-  const resource={kind:'project' as const,id:'retained-resource',project,workspace:canonical};
-  const threadId=await f.codex.createThread({cwd:canonical,instructions:'Saved original Thread.'});
-  const turnId=await f.codex.startTurn({threadId,deliveryId:'retained-initial',input:[{kind:'text',text:'Original turn.'}]});f.codex.complete(threadId,null);
-  const original=taskSchema.parse({...saved,purpose:'legacy',threadId,turnId,status:'idle',executionStatus:'completed',resources:[resource],workspaceSelection:{kind:'selected',temporaryThreadId:'retained-choice',inputIds:[],choice:{kind:'project',projectId:project.id,project,reason:'Saved original workspace'}}});
-  f.loop.store.saveTask(original);await rm(entry,{recursive:true});await symlink(wrong,entry);
-  const actual=await realpath(entry);assert.notEqual(actual,canonical);
-  const provider=new WorkspaceProvider(f.config.dataDir);let validations=0;
-  f.loop.ports.workspace={ensure:async input=>{if(input.resourceId===resource.id)validations++;return provider.ensure(input);},head:workspace=>provider.head(workspace)};
-  f.codex.selectionResults.push({kind:'project',projectId:'coordinated:app',reason:'Confirm App ownership of saved work'});
-  const before=f.codex.starts.filter(x=>x.threadId===threadId).length;
+async function retainedResource(t: TestContext, options: { changed: boolean; status: 'idle' | 'paused' }) {
+  const f = await fixture(t), saved = f.saved('unassigned-retained-resource');
+  f.feishu.resources.set('old-file', Buffer.from('original pending material'));
+  const entry = join(f.root, 'saved-workspace'), wrong = join(f.root, 'different-workspace');
+  await mkdir(entry); await mkdir(wrong);
+  const canonical = await realpath(entry);
+  const project = { kind: 'project' as const, id: 'retained-project', name: 'Retained project', entryPath: entry, canonicalPath: canonical };
+  const resource = { kind: 'project' as const, id: 'retained-resource', project, workspace: canonical };
+  const threadId = await f.codex.createThread({ cwd: canonical, instructions: 'Saved original Thread.' });
+  const turnId = await f.codex.startTurn({ threadId, deliveryId: 'retained-initial', input: [{ kind: 'text', text: 'Original turn.' }] });
+  f.codex.complete(threadId, null);
+  const original = taskSchema.parse({ ...saved, purpose: 'legacy', threadId, turnId, status: options.status,
+    reason: options.status === 'paused' ? 'Operator paused' : null, executionStatus: 'completed', resources: [resource],
+    workspaceSelection: { kind: 'selected', temporaryThreadId: 'retained-choice', inputIds: [],
+      choice: { kind: 'project', projectId: project.id, project, reason: 'Saved original workspace' } } });
+  f.loop.store.saveTask(original);
+  if (options.changed) { await rm(entry, { recursive: true }); await symlink(wrong, entry); }
+  const actual = await realpath(entry);
+  if (options.changed) assert.notEqual(actual, canonical);
+  else assert.equal(actual, canonical);
+  const provider = new WorkspaceProvider(f.config.dataDir);
+  let validations = 0;
+  f.loop.ports.workspace = { ensure: async input => {
+    if (input.resourceId === resource.id) validations++;
+    return provider.ensure(input);
+  }, head: workspace => provider.head(workspace) };
+  f.codex.selectionResults.push({ kind: 'project', projectId: 'coordinated:app', reason: 'Confirm App ownership of saved work' });
+  const starts = () => f.codex.starts.filter(call => call.threadId === threadId).length;
+  return { ...f, original, threadId, starts, get validations() { return validations; } };
+}
+
+test('independent migration recovery validates preserved project resources before a newly adopted idle Thread can execute', async t => {
+  const f = await retainedResource(t, { changed: true, status: 'idle' }), before = f.starts();
   await f.loop.recover();
-  const after=f.loop.store.task(saved.id),starts=f.codex.starts.filter(x=>x.threadId===threadId).length;
-  console.log('MIGRATION_RESOURCE_VALIDATION_BYPASS',JSON.stringify({before,after:starts,validations,status:after.status,member:f.loop.projects.ledger.membership(saved.id),savedCanonical:canonical,actualCanonical:actual,resourcesPreserved:JSON.stringify(after.resources)===JSON.stringify(original.resources)}));
-  assert.equal(after.threadId,threadId);assert.deepEqual(after.resources,original.resources);
-  assert.equal(starts,before,'unresolved legacy resources must be validated before selection-based adoption can execute pending input');
-  assert.ok(validations>0,'actual WorkspaceProvider must validate the retained resource');
+  const after = f.loop.store.task(f.original.id);
+  assert.equal(after.threadId, f.threadId); assert.deepEqual(after.resources, f.original.resources);
+  assert.equal(f.starts(), before, 'unresolved legacy resources must be validated before selection-based adoption can execute pending input');
+  assert.ok(f.validations > 0, 'actual WorkspaceProvider must validate the retained resource');
+});
+
+test('selection during a normal tick validates retained resources before adopting and executing an old Thread', async t => {
+  const f = await retainedResource(t, { changed: true, status: 'idle' }), before = f.starts();
+  await f.loop.tick(); await f.loop.tick();
+  assert.equal(f.starts(), before); assert.ok(f.validations > 0);
+  assert.equal(f.loop.projects.ledger.membership(f.original.id), null);
+  assert.deepEqual(f.loop.store.task(f.original.id).resources, f.original.resources);
+});
+
+test('valid retained resources still permit selection, same-Thread adoption and pending input execution', async t => {
+  const f = await retainedResource(t, { changed: false, status: 'idle' }), before = f.starts();
+  await f.loop.recover();
+  const after = f.loop.store.task(f.original.id);
+  assert.equal(after.threadId, f.threadId); assert.deepEqual(after.resources, f.original.resources);
+  assert.equal(f.starts(), before + 1); assert.ok(f.validations > 0);
+  assert.deepEqual(f.loop.projects.ledger.membership(after.id), { projectId: 'app', role: 'worker' });
+});
+
+test('failed retained resource validation preserves Operator pause and records the recovery error separately', async t => {
+  const f = await retainedResource(t, { changed: true, status: 'paused' }), before = f.starts();
+  await f.loop.recover();
+  const after = f.loop.store.task(f.original.id);
+  assert.equal(after.status, 'paused'); assert.equal(after.reason, 'Operator paused');
+  assert.match(after.recovery.lastError ?? '', /association changed/);
+  assert.equal(f.starts(), before); assert.ok(f.validations > 0);
+  assert.equal(after.threadId, f.threadId); assert.deepEqual(after.resources, f.original.resources);
+});
+
+test('explicit resume validates unassigned saved resources before clearing Operator pause', async t => {
+  const f = await retainedResource(t, { changed: true, status: 'paused' }), before = f.starts();
+  await assert.rejects(f.loop.control(f.original.id, 'resume'), /association changed/);
+  const after = f.loop.store.task(f.original.id);
+  assert.equal(after.status, 'paused'); assert.equal(after.reason, 'Operator paused');
+  assert.equal(f.starts(), before); assert.ok(f.validations > 0);
+  assert.equal(after.threadId, f.threadId); assert.deepEqual(after.resources, f.original.resources);
 });

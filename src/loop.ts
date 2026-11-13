@@ -436,6 +436,7 @@ export class AgentLoop {
       this.store.setMeta(`project-intake-choice:${task.id}`, JSON.stringify({ projectId: project.id, revision }));
     }
     if (task.threadId) {
+      for (const resource of task.resources) await this.restoreWorkspace(task.id, resource);
       await this.projects.adopt(task.id, project.id);
       return true;
     }
@@ -457,8 +458,10 @@ export class AgentLoop {
     this.store.setMeta(`project-intake-delivered:${task.id}`, revision);
     task = this.store.task(task.id);
     if (this.projects.ledger.membership(task.id)) return true;
-    if (!['paused', 'failed'].includes(task.status)) task.status = 'idle';
-    task.reason = '已交给项目协调者处理，等待协调者决定后续工作。'; this.persist(task);
+    if (!['paused', 'failed'].includes(task.status)) {
+      task.status = 'idle'; task.reason = '已交给项目协调者处理，等待协调者决定后续工作。';
+    }
+    this.persist(task);
     await this.flush(task);
     const accepted = this.projects.intakeRoute(task.id);
     if (accepted && (this.running || !this.started)) await this.serial(accepted.coordinatorTaskId, () => this.advance(accepted.coordinatorTaskId));
@@ -908,7 +911,7 @@ export class AgentLoop {
       if (action === 'pause') await this.pause(task, 'Operator paused');
       else if (action === 'status') this.notify(task, `Task ${task.id}\n${task.status}\n${task.reason ?? ''}`, `status:${randomUUID()}`);
       else if (['paused', 'failed'].includes(task.status)) {
-        for (const resource of this.projects.ledger.membership(task.id) ? task.resources : []) await this.restoreWorkspace(task.id, resource);
+        for (const resource of task.resources) await this.restoreWorkspace(task.id, resource);
         task.status = task.threadId ? 'idle' : 'pending'; task.reason = null; task.recovery = recoveryState(); this.persist(task);
         for (const input of this.store.inputs(task.id)) if (input.status === 'held') this.store.markInput(input.id, 'pending');
       }
@@ -965,6 +968,7 @@ export class AgentLoop {
     await this.projects.ensure();
     await Promise.all(this.store.tasks().map(task => this.serial(task.id, async () => {
       try {
+        for (const resource of task.resources) await this.restoreWorkspace(task.id, resource);
         if (!this.projects.ledger.membership(task.id)) {
           const project = await this.projects.resolveTask(task);
           if (project && task.threadId) {
@@ -979,9 +983,6 @@ export class AgentLoop {
           } catch (error) { this.problem(`source:${task.id}`, error); }
         }
         await mkdir(task.contextDirectory, { recursive: true, mode: 0o700 });
-        for (const resource of this.projects.ledger.membership(task.id) ? task.resources : []) {
-          await this.restoreWorkspace(task.id, resource);
-        }
         if (task.chatId) {
           try { await this.ports.feishu.verifyGroup(task.chatId); }
           catch (error) { if (error instanceof TaskGroupUnavailable) this.retireGroup(task); else throw error; }
@@ -989,7 +990,8 @@ export class AgentLoop {
         }
         await this.advance(task.id);
       } catch (error) {
-        const failed = this.store.task(task.id); failed.status = 'failed'; failed.reason = errorMessage(error);
+        const failed = this.store.task(task.id);
+        if (failed.status !== 'paused') { failed.status = 'failed'; failed.reason = errorMessage(error); }
         failed.recovery.nextAttemptAt = null; failed.recovery.lastError = errorMessage(error);
         failed.recovery.lastUserInputSeq = this.store.inputs(task.id).filter(input => input.origin === 'user').at(-1)?.seq ?? 0; this.persist(failed);
         this.problem(task.id, error); this.notify(failed, `任务关联核对失败，保留现场。\n${errorMessage(error)}`, `association:${digest(errorMessage(error))}`);
