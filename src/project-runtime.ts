@@ -6,7 +6,7 @@ import { ProjectCatalog } from './project-catalog.js';
 import { ProjectLedger, matchesProjectIssue, projectActionSchema, reasoningEffortSchema, type ReasoningEffort, type ProjectAction, type ProjectConfig } from './project.js';
 import { intakeRouteSchema, presentTaskSource, submissionSchema, type DiscoveredProject, type InputProvenance, type Source, type Task, type WorkspaceCandidate, type WorkspaceChoice } from './domain.js';
 import type { GitHubPort } from './ports.js';
-import { Store } from './store.js';
+import { Store, type Inbox } from './store.js';
 
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
 const stableId = (text: string) => {
@@ -22,6 +22,11 @@ interface ProjectHost {
 }
 
 export class IntakeOwnershipChanged extends Error {}
+export interface IntakeMaterial { text: string; version: string }
+export function intakeMaterialVersion(task: Task, inputs: readonly Inbox[]): string {
+  return hash(JSON.stringify({ source: task.source, resources: task.resources, threadId: task.threadId, status: task.status,
+    inputs: inputs.map(input => ({ id: input.id, provenance: input.provenance })) }));
+}
 
 export class ProjectRuntime {
   readonly ledger: ProjectLedger;
@@ -100,40 +105,48 @@ export class ProjectRuntime {
       });
     });
   }
-  async acceptIntake(taskId: string, projectId: string, material: string): Promise<void> {
+  async acceptIntake(taskId: string, projectId: string, material: IntakeMaterial): Promise<boolean> {
+    const currentMaterial = () => {
+      const task = this.store.task(taskId), inputs = this.store.inputs(taskId), route = this.intakeRoute(taskId);
+      if (route && route.projectId !== projectId) throw new IntakeOwnershipChanged('Intake project route is immutable');
+      if (task.purpose !== 'intake' || task.threadId || this.ledger.membership(taskId))
+        throw new IntakeOwnershipChanged('Intake ownership changed');
+      return { task, inputs };
+    };
+    currentMaterial();
     const intake = this.store.task(taskId);
     const route = this.intakeRoute(taskId);
-    if (route && route.projectId !== projectId) throw new Error('Intake project route is immutable');
     const config = intake.source.kind === 'github' && !route
       ? await this.catalog.bindRepository(intake.source.issue.repository, projectId, () => {
+        currentMaterial();
         const current = this.store.task(taskId);
         if (this.intakeRoute(taskId) || this.ledger.membership(taskId) || current.purpose !== 'intake'
           || current.threadId || current.status === 'paused') throw new IntakeOwnershipChanged('Intake ownership changed before repository binding');
       }) : await this.catalog.byId(projectId);
     if (!config) throw new Error('Project configuration unavailable');
     await this.initialize(config);
-    await this.serial(projectId, async () => this.store.transaction(() => {
-      const task = this.store.task(taskId);
-      if (task.purpose !== 'intake' || task.threadId || this.ledger.membership(taskId)) throw new Error('Task is not an unpromoted intake');
+    return this.serial(projectId, async () => this.store.transaction(() => {
+      const { task, inputs } = currentMaterial();
       const state = this.ledger.project(projectId);
       if (!state) throw new Error('Project unavailable');
       const route = { projectId, coordinatorTaskId: state.coordinatorTaskId };
       const previous = this.intakeRoute(taskId);
-      if (previous && (previous.projectId !== projectId || previous.coordinatorTaskId !== route.coordinatorTaskId)) throw new Error('Intake project route is immutable');
-      let revision: string | null = null;
+      if (previous && (previous.projectId !== projectId || previous.coordinatorTaskId !== route.coordinatorTaskId))
+        throw new IntakeOwnershipChanged('Intake project route is immutable');
+      this.store.setMeta(`project-intake-route:${taskId}`, JSON.stringify(route));
+      if (intakeMaterialVersion(task, inputs) !== material.version) return false;
       if (task.source.kind === 'github' && (state.issues.some(issue => issue.id === task.sourceId) || matchesProjectIssue(task.source.issue, config))) {
-        revision = this.ledger.issue(projectId, task.source.issue).eventId;
+        this.ledger.issue(projectId, task.source.issue);
         this.store.saveSource(task.source.issue, `project:${projectId}`);
       }
-      const inputs = this.store.inputs(taskId).map(input => ({ id: input.id, provenance: input.provenance }));
-      const key = `intake:${taskId}:${hash(JSON.stringify([inputs, revision]))}`;
-      this.store.setMeta(`project-intake-route:${taskId}`, JSON.stringify(route));
-      this.enqueue(state.coordinatorTaskId, key, `Intake request ${taskId}. Assess this request and existing work before dispatching.\n${material}`, {
+      const key = `intake:${taskId}:${material.version}`;
+      this.enqueue(state.coordinatorTaskId, key, `Intake request ${taskId}. Assess this request and existing work before dispatching.\n${material.text}`, {
         kind: 'agent', projectId, taskId, eventId: key, category: 'intake_request',
       });
-      for (const input of this.store.inputs(taskId)) {
+      for (const input of inputs) {
         if (input.route === 'workspace-selection' && input.status !== 'failed') this.store.markSelectionHandled(input.id, taskId);
       }
+      return true;
     }));
   }
   async adopt(taskId: string, projectId: string): Promise<void> {

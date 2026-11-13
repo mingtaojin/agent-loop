@@ -7,7 +7,7 @@ import { configSchema, type Config } from '../src/config.js';
 import { criteriaSchema, taskSchema, type Task } from '../src/domain.js';
 import { discoverProjects } from '../src/project-discovery.js';
 import { ProjectCatalog } from '../src/project-catalog.js';
-import { ProjectRuntime } from '../src/project-runtime.js';
+import { ProjectRuntime, intakeMaterialVersion } from '../src/project-runtime.js';
 import { Store } from '../src/store.js';
 import { issue } from './fakes.js';
 
@@ -44,6 +44,7 @@ async function fixture(t: TestContext) {
   let runtime = new ProjectRuntime(config, store, host);
   t.after(async () => { await runtime.close(); store.close(); await rm(root, { recursive: true, force: true }); });
   return { root, engineering, alpha, beta, config, task,
+    material(taskId: string, text: string) { return { text, version: intakeMaterialVersion(store.task(taskId), store.inputs(taskId)) }; },
     get store() { return store; }, get runtime() { return runtime; }, get created() { return created; },
     async restart() {
       await runtime.close(); store.close(); store = new Store(config.dataDir);
@@ -104,19 +105,19 @@ test('intake routes freeze atomically and repeated inbox revisions reach the coo
   const config = await f.runtime.resolveRepository('owner/beta'); assert.ok(config);
   const task = f.task('intake', { purpose: 'intake' }); f.store.saveTask(task); f.input(task.id, 'owner-input');
   const originalInputs = f.store.inputs(task.id);
-  await Promise.all([f.runtime.acceptIntake(task.id, config.id, 'owner-input; prepared path /cached/file'),
-    f.runtime.acceptIntake(task.id, config.id, 'owner-input; prepared path /cached/file')]);
+  await Promise.all([f.runtime.acceptIntake(task.id, config.id, f.material(task.id, 'owner-input; prepared path /cached/file')),
+    f.runtime.acceptIntake(task.id, config.id, f.material(task.id, 'owner-input; prepared path /cached/file'))]);
   const route = f.runtime.intakeRoute(task.id); assert.ok(route);
   assert.deepEqual(JSON.parse(f.store.meta(`project-intake-route:${task.id}`) ?? 'null'), route);
   assert.equal(f.events(route.coordinatorTaskId, 'intake_request').length, 1);
   assert.deepEqual(f.store.inputs(task.id), originalInputs);
   assert.equal(f.runtime.ledger.membership(task.id), null);
-  await f.restart(); await f.runtime.acceptIntake(task.id, config.id, 'same material');
+  await f.restart(); await f.runtime.acceptIntake(task.id, config.id, f.material(task.id, 'same material'));
   assert.equal(f.events(route.coordinatorTaskId, 'intake_request').length, 1);
   f.input(task.id, 'owner-followup', 'Additional scope.');
-  await f.runtime.acceptIntake(task.id, config.id, 'Complete original and additional scope.');
+  await f.runtime.acceptIntake(task.id, config.id, f.material(task.id, 'Complete original and additional scope.'));
   assert.equal(f.events(route.coordinatorTaskId, 'intake_request').length, 2);
-  await assert.rejects(f.runtime.acceptIntake(task.id, 'explicit-alpha', 'Wrong project'), /immutable/);
+  await assert.rejects(f.runtime.acceptIntake(task.id, 'explicit-alpha', f.material(task.id, 'Wrong project')), /immutable/);
   assert.deepEqual(f.runtime.intakeRoute(task.id), route);
 });
 
@@ -126,7 +127,7 @@ test('dispatch promotes the same intake with old group and resources and rejects
     project: { kind: 'project', id: 'saved', name: 'Alpha', entryPath: f.alpha, canonicalPath: f.alpha } } as const;
   const intake = f.task('old-group', { purpose: 'intake', chatId: 'original-group', resources: [resource], status: 'paused', reason: 'Owner paused' });
   f.store.saveTask(intake); f.input(intake.id, 'original-inbox');
-  await f.runtime.acceptIntake(intake.id, 'explicit-alpha', 'Full original input and prepared files.');
+  await f.runtime.acceptIntake(intake.id, 'explicit-alpha', f.material(intake.id, 'Full original input and prepared files.'));
   const route = f.runtime.intakeRoute(intake.id); assert.ok(route);
   const originalInputs = f.store.inputs(intake.id);
   const action = { action: 'dispatch', requestId: 'promote', intakeTaskId: intake.id, prompt: 'Delegated scope before initial input.' };
@@ -190,7 +191,7 @@ test('an accepted explicit repository cannot move to a different coordinator on 
   const request = f.task('explicit-binding', { purpose: 'intake', sourceId: source.id,
     source: { kind: 'github', issue: source, repository: { name: source.repository, criteria: criteriaSchema.parse({}) }, collectionReason: 'project:explicit-alpha' } });
   f.store.saveTask(request); f.input(request.id, 'binding-input');
-  await f.runtime.acceptIntake(request.id, 'explicit-alpha', 'Accepted source material.');
+  await f.runtime.acceptIntake(request.id, 'explicit-alpha', f.material(request.id, 'Accepted source material.'));
   const original = f.config.projects[0]; assert.ok(original);
   f.config.projects = [{ ...original, id: 'replacement' }];
   await assert.rejects(f.restart(), /ownership changed/);
@@ -204,7 +205,7 @@ test('concurrent source collection cannot overwrite a promoted intake with an ea
   const request = f.task('collection-race', { purpose: 'intake', sourceId: source.id,
     source: { kind: 'github', issue: source, repository: { name: source.repository, criteria: criteriaSchema.parse({}) }, collectionReason: 'project:explicit-alpha' } });
   f.store.saveTask(request); f.input(request.id, 'race-input');
-  await f.runtime.acceptIntake(request.id, 'explicit-alpha', 'Accepted source material.');
+  await f.runtime.acceptIntake(request.id, 'explicit-alpha', f.material(request.id, 'Accepted source material.'));
   const earlier = f.store.task(request.id);
   const collecting = f.runtime.collect({ ...source, body: 'Updated issue facts.' }, earlier);
   const route = f.runtime.intakeRoute(request.id); assert.ok(route);

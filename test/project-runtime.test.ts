@@ -1014,3 +1014,40 @@ test('recovery reconciles a removed workspace when its release acknowledgement w
   await assert.rejects(stat(resource.workspace), /ENOENT/);
   assert.deepEqual(await f.loop.projectAction(worker.id, action), { released: true, resourceId: resource.id });
 });
+
+
+test('independent startup race: recovery must validate saved resources before input can start the retained Thread', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('startup-order', 'Retain saved resources.'); await f.openGroup(worker.id);
+  await f.loop.ensureWorkspace(worker.id, 'example/frontend'); assert.ok(worker.threadId);
+  f.codex.complete(worker.threadId, null); await f.loop.tick();
+  const saved = f.loop.store.task(worker.id); assert.equal(saved.status, 'idle'); assert.ok(saved.chatId);
+  const ports = f.loop.ports; await f.loop.close();
+  const entered = { resolve: () => {} }, held = { resolve: () => {} };
+  const blocked = new Promise<void>(done => { entered.resolve = done; });
+  const hold = new Promise<void>(done => { held.resolve = done; });
+  let validations = 0;
+  ports.workspace.ensure = async input => {
+    if (input.kind === 'project-directory') return input.directory;
+    validations++; throw new Error('Saved worktree branch mismatch');
+  };
+  const config = { ...f.config, pollIntervalMs: 3600000, executionPollMs: 3600000 };
+  const restarted = new AgentLoop(config, ports, new Store(f.root));
+  const ensure = restarted.projects.ensure.bind(restarted.projects);
+  let calls = 0;
+  restarted.projects.ensure = async () => {
+    calls++; if (calls === 2) { entered.resolve(); await hold; }
+    return ensure();
+  };
+  const before = f.codex.starts.filter(call => call.threadId === worker.threadId).length;
+  const starting = restarted.start(); await blocked;
+  try {
+    await restarted.receive({ id: 'startup-owner', chatId: saved.chatId, chatType: 'group', senderId: 'owner',
+      text: 'Continue in the saved workspace.', attachments: [], createdAt: Date.now() });
+    assert.equal(f.codex.starts.filter(call => call.threadId === worker.threadId).length, before,
+      'input must not start execution while saved-workspace validation is still blocked');
+    assert.equal(validations, 0);
+  } finally { held.resolve(); await starting; await restarted.close(); }
+  assert.equal(validations, 1);
+  assert.equal(f.codex.starts.filter(call => call.threadId === worker.threadId).length, before);
+});

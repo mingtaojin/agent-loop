@@ -117,10 +117,11 @@ test('coordinator promotion during intake handoff keeps the Worker executable wi
   await loop.collect(); await loop.tick();
   const accept = loop.projects.acceptIntake.bind(loop.projects);
   loop.projects.acceptIntake = async (taskId, projectId, material) => {
-    await accept(taskId, projectId, material);
+    const accepted = await accept(taskId, projectId, material);
     const route = loop.projects.intakeRoute(taskId); assert.ok(route);
     await loop.projectAction(route.coordinatorTaskId, { action: 'dispatch', requestId: 'during-handoff', intakeTaskId: taskId,
       role: 'worker', prompt: 'Follow the original request and preserve its scope.' });
+    return accepted;
   };
   await recoverSavedIntake(loop, { id: 'handoff-owner-input', text: 'Investigate only; do not edit or deploy.', chatId: 'private', chatType: 'p2p',
     senderId: 'owner', attachments: [], createdAt: Date.now() });
@@ -154,7 +155,7 @@ for (const kind of ['open_group', 'control'] satisfies Array<'open_group' | 'con
   const accept = loop.projects.acceptIntake.bind(loop.projects);
   loop.projects.acceptIntake = async (...args) => {
     entered.release(); await release.promise;
-    await Promise.race([accept(...args), escape.promise]);
+    return Promise.race([accept(...args), escape.promise.then(() => false)]);
   };
   loop.store.receive(task.id, { id: 'saved-supplement', chatId: '', chatType: 'group', senderId: 'owner', text: 'Additional saved material.',
     attachments: [], createdAt: Date.now() }, 'user', undefined, 'workspace-selection');

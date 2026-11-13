@@ -368,3 +368,77 @@ for (const oldChoice of ['question', 'other-project']) test(`queued Operator pau
     assert.ok(!f.loop.store.meta(`project-intake-question:${task.id}`)?.includes('Obsolete project question'));
   } finally { release(); await Promise.allSettled([pending, pausing, incoming].filter(item => item !== undefined)); }
 });
+
+
+function latch() {
+  let release = () => {};
+  const promise = new Promise<void>(done => { release = done; });
+  return { promise, release };
+}
+
+test('independent handoff race: a valid claim during acceptIntake awaits must not fail the intake', async t => {
+  const f = await fixture(t), task = f.saved('claim-during-material');
+  f.feishu.resources.set('old-file', Buffer.from('original bytes'));
+  const decision = await f.decision('takeover-other', 'other');
+  f.codex.selectionResults.push({ kind: 'project', projectId: 'coordinated:app', reason: 'Old selection App' });
+  const entered = latch(), held = latch();
+  let accepting = false, once = true;
+  const accept = f.loop.projects.acceptIntake.bind(f.loop.projects);
+  f.loop.projects.acceptIntake = async (...args) => {
+    if (args[0] === task.id) accepting = true;
+    return accept(...args);
+  };
+  const byId = ProjectCatalog.prototype.byId;
+  t.mock.method(ProjectCatalog.prototype, 'byId', async function(this: ProjectCatalog, id: string) {
+    if (accepting && id === 'app' && once) { once = false; entered.release(); await held.promise; }
+    return byId.call(this, id);
+  });
+  const pending = f.loop.tick(); await entered.promise;
+  try {
+    await f.loop.projectAction(f.coordinator('other').id, {
+      action: 'claim_intake', requestId: 'other-claims-late', taskId: task.id, messageId: decision,
+    });
+  } finally { held.release(); }
+  await pending; await f.loop.tick();
+  const after = f.loop.store.task(task.id);
+  assert.notEqual(after.status, 'failed', 'successful owner-authorized claim must reconcile stale selected-project handoff');
+  assert.equal(f.loop.projects.intakeRoute(task.id)?.projectId, 'other');
+  const delivered = (projectId: string) => f.loop.store.inputs(f.coordinator(projectId).id)
+    .filter(input => input.provenance.kind === 'agent' && input.provenance.taskId === task.id && input.provenance.category === 'intake_request');
+  assert.equal(delivered('app').length, 0);
+  assert.equal(delivered('other').length, 1);
+  const [event] = delivered('other'); assert.ok(event);
+  assert.match(event.message.text, /PRIVATE ORIGINAL MATERIAL/);
+});
+
+test('independent handoff race: a late owner restriction must reach the coordinator under a distinct material identity', async t => {
+  const f = await fixture(t), task = f.saved('late-material-restriction');
+  f.feishu.resources.set('old-file', Buffer.from('old bytes'));
+  const chatId = await f.feishu.ensureGroup({ taskId: task.id, title: 'saved old group', sourceUrl: '' });
+  f.loop.store.saveTask({ ...task, chatId });
+  f.codex.selectionResults.push({ kind: 'project', projectId: 'coordinated:app', reason: 'App owns it' });
+  const entered = latch(), held = latch();
+  let accepting = false, once = true;
+  const accept = f.loop.projects.acceptIntake.bind(f.loop.projects);
+  f.loop.projects.acceptIntake = async (...args) => {
+    if (args[0] === task.id) accepting = true;
+    return accept(...args);
+  };
+  const byId = ProjectCatalog.prototype.byId;
+  t.mock.method(ProjectCatalog.prototype, 'byId', async function(this: ProjectCatalog, id: string) {
+    if (accepting && id === 'app' && once) { once = false; entered.release(); await held.promise; }
+    return byId.call(this, id);
+  });
+  const pending = f.loop.tick(); await entered.promise;
+  const message = { id: 'late-scope', chatId, chatType: 'group' as const, senderId: 'owner',
+    text: 'LATE_SCOPE_DO_NOT_DEPLOY', attachments: [], createdAt: Date.now() };
+  const incoming = f.loop.receive(message);
+  assert.ok(f.loop.store.inputs(task.id).some(input => input.id === message.id));
+  held.release(); await Promise.all([pending, incoming]); await f.loop.tick();
+  const events = f.loop.store.inputs(f.coordinator().id).filter(input => input.provenance.kind === 'agent'
+    && input.provenance.taskId === task.id && input.provenance.category === 'intake_request');
+  assert.ok(events.some(input => input.message.text.includes(message.text)),
+    'late owner scope must be delivered, not deduplicated under an older payload');
+  assert.equal(events.length, 1, 'stale material must not reserve the complete payload identity');
+  assert.deepEqual(f.loop.store.inputs(task.id).find(input => input.id === message.id)?.message, message);
+});

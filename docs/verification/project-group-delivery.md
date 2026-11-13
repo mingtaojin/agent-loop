@@ -40,14 +40,17 @@ node node_modules/typescript/bin/tsc
 | test/submission.test.ts | CLI拒绝、帮助移除旧命令、旧回执只读、历史CLI材料和同Task恢复。 |
 | test/platforms.test.ts | 实际socket事件私聊不接单、项目群保存与去重、SDK写边界。 |
 | test/coordinator-intake.test.ts 与 test/project-catalog.test.ts | 项目责任、材料、同Task晋升及GitHub证据。 |
-| test/project-runtime.test.ts | 无群委派、权限、原生审批、退役重建、冻结清单与未知结果恢复。 |
-| test/intake-claim.test.ts | 空库显式初始化、无归属认领、双重认领互斥、事务回滚与重开、脱敏分页及catalog归属保护。 |
+| test/project-runtime.test.ts | 无群委派、权限、原生审批、退役重建、冻结清单、未知结果恢复，以及启动时先核验资源再推进已保存Thread。 |
+| test/intake-claim.test.ts | 空库显式初始化、无归属认领、双重认领互斥、事务回滚与重开、脱敏分页、catalog归属保护、接管期间旧handoff重核，以及迟到范围补充送达协调者。 |
 | test/feishu-document-adapter.test.ts 与 test/feishu-document-progress.test.ts | 退役期间排队文档写入不得在等待结束后新dispatch，包括子节点读取后的删除。 |
 | test/feishu-progress.test.ts | 卡片进度停止与新群重建。 |
 | test/runtime.test.ts 与 test/workspace-selection.test.ts | 保存任务与目录答复恢复、附件、同Thread、原生请求及不确定输入。 |
 
 `test/saved-intake.ts` 只用于恢复fixture，直接写测试数据库。生产代码不能通过私聊创建这些请求。claim_intake仅处理已经存在的合格记录。
 `openDirectGroup` 让需要测群消息的fixture显式通过协调者开群。默认无群保障由独立的项目生命周期场景检查。
+
+启动阶段先完成恢复，再启用输入推进和定时器。期间群消息与审批callback仍保存，不在资源核验前推进Thread。
+内部 `acceptIntake` 接收正文和同一快照的version。提交时重核归属与快照，归属变化按正常接管处理；材料已更新时保留已选项目并重建正文，不占用完整材料的事件key。
 
 ## 验证边界
 

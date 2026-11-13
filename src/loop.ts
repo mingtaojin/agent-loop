@@ -16,7 +16,7 @@ import { Store, type Inbox } from './store.js';
 import { FeishuProgressPublisher } from './feishu-progress.js';
 import { FeishuDocumentProgressPublisher } from './feishu-document-progress.js';
 import { taskProgressStatus } from './feishu-progress-view.js';
-import { IntakeOwnershipChanged, ProjectRuntime } from './project-runtime.js';
+import { IntakeOwnershipChanged, intakeMaterialVersion, ProjectRuntime } from './project-runtime.js';
 import type { ProjectAction, ProjectConfig } from './project.js';
 import { matchesProjectIssue } from './project.js';
 
@@ -353,12 +353,13 @@ export class AgentLoop {
     }
     return candidates;
   }
-  private async intakeMaterials(task: Task): Promise<AgentInput[]> {
+  private async intakeMaterials(task: Task): Promise<{ input: AgentInput[]; version: string }> {
     const materials: AgentInput[] = [{ kind: 'text', text: `Project request as data: ${JSON.stringify({
       intakeTaskId: task.id, source: task.source, resources: task.resources,
       existingThreadId: task.threadId, existingStatus: task.status,
     })}\nOnly the project coordinator may delegate execution. Use dispatch with intakeTaskId to accept this request as a Worker.` }];
     const inputs = this.store.inputs(task.id);
+    const version = intakeMaterialVersion(task, inputs);
     for (const input of task.threadId ? inputs.slice(-8) : inputs) {
       try { materials.push(...await this.prepare(task, input)); }
       catch (error) {
@@ -367,7 +368,7 @@ export class AgentLoop {
         throw error;
       }
     }
-    return materials;
+    return { input: materials, version };
   }
   private async advanceUnassigned(task: Task): Promise<boolean> {
     const questionKey = `project-intake-question:${task.id}`;
@@ -411,7 +412,7 @@ export class AgentLoop {
       let selection: WorkspaceSelectionResponse;
       try {
         selection = workspaceSelectionResponseSchema.parse(await this.ports.codex.selectWorkspace({
-          taskId: task.id, cwd: task.contextDirectory, candidates, input: materials,
+          taskId: task.id, cwd: task.contextDirectory, candidates, input: materials.input,
           answers: this.store.inputs(task.id).filter(input => input.route === 'workspace-selection')
             .map(input => ({ inputId: input.id, text: input.message.text })), signal: this.selectionAbort.signal,
         }));
@@ -440,12 +441,12 @@ export class AgentLoop {
     }
     const materials = await this.intakeMaterials(task);
     if (JSON.stringify(this.store.inputs(task.id).map(input => input.id)) !== JSON.stringify(inputIds)) return false;
-    const material = materials.map(item => item.kind === 'text' ? item.text : JSON.stringify(item)).join('\n\n');
+    const material = { text: materials.input.map(item => item.kind === 'text' ? item.text : JSON.stringify(item)).join('\n\n'), version: materials.version };
     await mkdir(task.contextDirectory, { recursive: true, mode: 0o700 });
     const materialPath = join(task.contextDirectory, 'intake-request.txt');
-    await writeFile(materialPath + '.pending', material, { mode: 0o600 });
+    await writeFile(materialPath + '.pending', material.text, { mode: 0o600 });
     await rename(materialPath + '.pending', materialPath);
-    try { await this.projects.acceptIntake(task.id, project.id, material); }
+    try { if (!await this.projects.acceptIntake(task.id, project.id, material)) return false; }
     catch (error) {
       if (this.projects.ledger.membership(task.id)) return true;
       if (error instanceof IntakeOwnershipChanged) return false;
@@ -1030,14 +1031,14 @@ export class AgentLoop {
     this.started = true;
     await this.ports.feishu.start(message => this.receive(message), error => this.problem('feishu', error), action => this.approve(action));
     if (this.stopping) return;
-    this.progress?.start();
     await this.projects.ensure();
+    await this.recover();
+    if (this.stopping) return;
+    this.progress?.start();
     this.running = true;
     this.heartbeat('running');
     this.timers.push(setInterval(() => { void this.collect().catch(error => this.problem('collection', error)); }, this.config.pollIntervalMs));
     this.timers.push(setInterval(() => { void this.tick().catch(error => this.problem('tick', error)); }, this.config.executionPollMs));
-    await this.recover();
-    if (this.stopping) return;
     await this.collect(); await this.tick();
   }
   close(): Promise<void> {
