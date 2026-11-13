@@ -25,8 +25,7 @@ Worker 和 verifier 默认不建群；用户需要直接交流时，由协调者
       ],
       "instructions": "优先处理 priority:urgent。用户保留亲自审核的 PR 等待确认。",
       "models": {"coordinator": "gpt-6-astra", "worker": "gpt-6.1-sol"},
-      "reasoningEfforts": {"coordinator": "high", "worker": "xhigh"},
-      "supervisionIntervalMs": 300000
+      "reasoningEfforts": {"coordinator": "high", "worker": "xhigh"}
     }
   ]
 }
@@ -58,7 +57,11 @@ GitHub 和历史接单记录保留原文、来源和附件，不自动创建执�
 
 用户要求“只讨论、不实现”时，结论齐备也不自动进入开发，直到用户改变该限制。“少发消息、只在需要决策时发消息”减少日常进度噪声，必要问题与文档确认仍需完成。需求变化先记录与当前约定的差异，只澄清受影响的事项。普通业务回答不是原生工具批准。原生审批仍绑定具体请求与实际任务群，不能通过项目消息代为批准。
 
-Issue 评论先交协调者判断影响，再按需转给原 Worker。Worker 最终答复、原生问题、执行失败和任务群内用户补充会通知协调者。一轮结束只代表本轮结束。
+Issue 评论先交协调者判断影响，再按需转给原 Worker。Worker 和 verifier 的普通最终答复、任务群内用户消息留在原任务，保留完整来源、附件、原 Thread 和任务记录。有群时最终答复继续直接发送到该群，无群时保留本地记录。
+
+正式问题、阻塞、进展和成果通过显式 `report` 通知协调者，独立任务完成也须 `report result`。用户直接在任务群讨论或澄清时，普通问答在群内继续，不因需求尚未确定而自动汇报。原生问题、审批、权限请求、执行失败和非暂停中断保留原有通知与处理通道。一轮结束只代表本轮结束。
+
+用户说“同步给协调者”后，Worker 通过 `report update` 直接发送当前讨论摘要，无需预览确认。摘要包含已定结论、范围变化、待决问题和证据，引用实际用户消息、群、发送者及必要原文。用户指定话题时仅同步该话题。摘要仍是代理汇报，不能冒充用户决定或增加实施、合并、部署及原生审批授权。
 
 ## 项目工具
 
@@ -75,7 +78,6 @@ Issue 评论先交协调者判断影响，再按需转给原 Worker。Worker 最
 | `confirm_group_cleanup` | 核对实际用户对清单的确认消息 | 协调者 |
 | `apply_group_cleanup` | 执行或继续已确认清单，逐群记录结果 | 协调者 |
 | `control` | 暂停或恢复本项目的指定 Worker | 协调者 |
-| `supervision` | 持久暂停或恢复项目定时监督提醒 | 协调者 |
 | `report` | 上报结果、问题或更新 | Worker、verifier |
 | `record` | 按 scope 追加带项目版本的记录，返回有界确认 | 项目成员 |
 | `rotate` | 保存恢复说明并在安全结束后更换协调会话 | 协调者 |
@@ -140,21 +142,17 @@ record 的 scope 与作者分别保存。
 
 这些是加载与投递机制，不保证模型逐次遵守规则。源码、编译入口的隔离检查与场景核对见[共享需求工作流验证](verification/shared-requirement-workflow.md)。本改动不代表正式实例已发布或重启。
 
-## 监督和恢复
+## 事件触发和恢复
 
 项目关系、决定与请求回执通过现有 SQLite 写入者保存。协调者通过 `rotate` 提交恢复说明。当前轮次结束、没有未答原生问题和未确认输入后，Runtime 保留同一项目、Task、群和 Worker 关系，建立新正式 Thread。恢复输入要求读取项目记录并核实当前事实。原会话执行记录仍保留。
 
 升级时，已经存在的正式任务依据保存的工程资源原地纳入协调，保留群、Thread、待处理输入、审批、资源和暂停或失败状态。尚未执行的旧任务作为接单请求交给协调者决定。无法确定项目的历史任务保留现场并等待澄清，不继续无项目归属的执行。`status` 的 `intakes` 分页保存未派发请求入口，协调者更换上下文后仍能找回。
 
-存在可推进的 Worker 时，Runtime 按 `supervisionIntervalMs` 发送监督提醒。全部 Worker 暂停、失败、等待阻塞的原生请求，或本轮已结束且无待执行输入时，不生成周期提醒。协调者处于暂停、故障、运行中或已有待投递输入时，不叠加提醒。一轮结束不自动等同于任务完成，任务完成仍由协调者按验收证据判断。
+Runtime 不生成定时监督提醒。显式汇报、项目群用户输入、原生请求、执行异常、GitHub 更新及必要生命周期事件继续进入原协调者 Thread，运行中追加输入，空闲时启动下一轮。没有新事件时协调者持续等待，静默本身不证明任务失败。正常轮询仍负责观察执行状态、投递已有输入和有限恢复，不因时间流逝制造协调任务。具体核查、重规划与恢复方法由 Orchestrate 决定。
 
-协调者根据实际用户要求显式操作项目监督状态。Runtime 不从普通文本猜暂停。下面的操作在重启后仍然生效，恢复时使用新的 requestId 和 `"operation":"resume"`。
+当前项目配置不含监督间隔。显式配置和持久项目 catalog 的兼容入口只接受并移除历史合法 `supervisionIntervalMs`，不生成默认值；其他未知设置仍拒绝。正常保存 catalog 后旧字段消失，不改写用户配置文件。
 
-```json
-{"action":"supervision","requestId":"pause-project-reminders-1","operation":"pause"}
-```
-
-supervision 只控制定时提醒。Worker 继续执行，用户输入继续接收。暂停指定 Worker 仍使用 control。状态与操作回执原子保存，重试旧的 pause 不会覆盖后来已完成的 resume。尚未尝试投递的 pending 提醒可标记为 superseded，并记录原因。delivering 和 uncertain 提醒保留原始投递状态，不能被当作已送达。
+升级后，身份、来源和生成事件标识均匹配的旧自动用户消息副本、最终答复副本和监督提醒，在尚未尝试投递时标为终态 `dropped`。原始 payload、退役原因及已有错误保留，不再因重启、暂停恢复或附件重试投递。已送达历史不变；`delivering` 和 `uncertain` 继续按已见输入 ID 对账，不能宣称撤回，也不盲目重发。旧消息若已经进入模型历史，升级不能从历史中删除它。
 
 正常活动检查和动态工具校验使用当前连接的 Turn 身份与轻量状态，不读取完整历史。启动恢复、终态、结果未知的输入和审批仍需完整核对。轻量活动证据不包含历史输入 ID，不能据此宣称未知输入已投递。
 
@@ -172,7 +170,7 @@ supervision 只控制定时提醒。Worker 继续执行，用户输入继续接�
 
 需求及验收场景见[项目协调者规格](../.scratch/project-coordinator/spec.md)。隔离 Runtime 测试使用真实 SQLite 和受控平台接口，协议测试运行实际适配器及子进程。真实模型探针使用独立临时项目，不对业务仓库或任务群操作。结果分别记录在功能目录的 `execution` 中。
 
-任务记录、活动检查、监督暂停和超时隔离可在本地复查，无需真实模型或飞书实例。
+任务记录、活动检查、事件触发和超时隔离可在本地复查，无需真实模型或飞书实例。
 
 ```sh
 node --import tsx --test test/project.test.ts test/project-runtime.test.ts test/project-codex.test.ts test/codex.test.ts test/codex-isolation.test.ts test/runtime.test.ts

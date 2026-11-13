@@ -233,3 +233,27 @@ test('a source-only repository binding survives restart without expanding collec
   assert.equal(f.config.repositories.length, 1);
   assert.equal((await f.runtime.resolveRepository('owner/incoming'))?.repositories[0]?.criteria?.assigneesAny[0], 'alice');
 });
+
+test('persisted automatic project definitions strip the valid historical interval on restart', async t => {
+  const f = await fixture(t);
+  const automatic = await f.runtime.resolveRepository('owner/beta'); assert.ok(automatic);
+  f.store.setMeta('project-catalog:auto', JSON.stringify([{ ...automatic, supervisionIntervalMs: 300_000 }]));
+  await f.restart();
+  const restored = f.runtime.projectConfig(automatic.id); assert.ok(restored);
+  assert.equal(restored.id, automatic.id); assert.equal(restored.directory, automatic.directory);
+  assert.equal('supervisionIntervalMs' in restored, false);
+  const saved = JSON.parse(f.store.meta('project-catalog:auto') ?? 'null');
+  assert.ok(Array.isArray(saved));
+  assert.ok(saved.every(project => !('supervisionIntervalMs' in project)));
+  await f.restart();
+  assert.deepEqual(f.runtime.projectConfig(automatic.id), restored);
+});
+
+for (const extra of [{ supervisionIntervalMs: 0 }, { supervisionIntervalMs: 300_000, unexpected: true }]) {
+  test(`persisted catalog rejects invalid historical settings ${JSON.stringify(extra)}`, async t => {
+    const f = await fixture(t);
+    const automatic = await f.runtime.resolveRepository('owner/beta'); assert.ok(automatic);
+    f.store.setMeta('project-catalog:auto', JSON.stringify([{ ...automatic, ...extra }]));
+    await assert.rejects(f.runtime.ensure());
+  });
+}

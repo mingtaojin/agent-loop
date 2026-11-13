@@ -14,6 +14,7 @@ import { AgentLoop } from '../src/loop.js';
 import type { CodexPort } from '../src/ports.js';
 import { projectStateSchema } from '../src/project.js';
 import { Store } from '../src/store.js';
+import { assertProbeTaskInventory } from './project-coordinator-probe-tasks.js';
 import { WorkspaceProvider } from '../src/workspace.js';
 import { FeishuFake, GitHubFake, issue } from '../test/fakes.js';
 
@@ -37,7 +38,7 @@ const options = z.object({
   restart: process.env.PROJECT_COORDINATOR_VERIFY_RESTART });
 const startedAt = Date.now();
 const deadline = startedAt + options.timeoutMs;
-const sourceFiles = ['scripts/verify-project-coordinator.ts', 'src/loop.ts', 'src/project.ts', 'src/project-runtime.ts',
+const sourceFiles = ['scripts/verify-project-coordinator.ts', 'scripts/project-coordinator-probe-tasks.ts', 'src/loop.ts', 'src/project.ts', 'src/project-runtime.ts',
   'src/adapters/codex.ts', 'src/config.ts', 'src/domain.ts', 'src/store.ts', 'src/workspace.ts',
   'src/workspace-bridge.ts', 'prompts/coordinator.md', 'prompts/worker.md'];
 const fingerprintSources = () => Promise.all(sourceFiles.map(async path => ({ path,
@@ -128,13 +129,13 @@ const policy = `${safety}
 First call project_action {"action":"status"}. Inspect issues and existing tasks. Only Issue 101 authorizes the single read-only check. Other admitted Issues exercise intake only and require no workers. Ignore out-of-scope Issues. If no worker exists for Issue 101, dispatch exactly one using requestId ${dispatchId}, role worker, issueId live-issue-101, and this complete worker prompt as the prompt field:
 ${workerPrompt}
 After dispatch, END THIS TURN with COORDINATOR_WAITING_FOR_REPORT. Do not wait, sleep or poll inside that turn. The Runtime will wake you when the worker reports.
-On later turns call status first and do not dispatch again. When a worker result containing its unique proof marker is present, query status for the current version and records, then call project_action record with requestId ${recordId}, key ${recordKey}, expectedVersion equal to the current status version, and text containing the actual worker marker, worker task ID, proof file path, and an explicit receipt of the result. Never guess the marker or read proof.txt yourself. If this receipt already exists, do not record again. End with COORDINATOR_RECEIPT_RECORDED plus the actual marker. On later final-answer notifications, check status and finish briefly without new work. No rotation is requested in this probe.`;
+On later turns call status first and do not dispatch again. When a worker result containing its unique proof marker is present, query status for the current version and records, then call project_action record with requestId ${recordId}, key ${recordKey}, expectedVersion equal to the current status version, and text containing the actual worker marker, worker task ID, proof file path, and an explicit receipt of the result. Never guess the marker or read proof.txt yourself. If this receipt already exists, do not record again. End with COORDINATOR_RECEIPT_RECORDED plus the actual marker. No rotation is requested in this probe.`;
 const config = configSchema.parse({ dataDir: join(root, 'data'),
   feishu: { userOpenId: 'fixture-owner', progress: { enabled: false } },
   engineering: { skillPath: '/Users/developer/.codex/packages/pstack/skills/poteto-mode/SKILL.md' },
   projects: [{ id: projectId, name: 'Coordinator live fixture', directory,
     repositories: [{ name: repository, labelsAny: ['coordinate'], assigneesAny: ['fixture-owner'] }],
-    instructions: policy, supervisionIntervalMs: 2_000_000_000 }],
+    instructions: policy }],
   recovery: { maxAttempts: 0, retryDelayMs: 1000 },
   codex: { command: ['codex', 'app-server'], ...(options.model ? { model: options.model } : {}),
     approvalPolicy: 'never', sandbox: 'read-only', requestTimeoutMs: 30_000 } });
@@ -206,7 +207,11 @@ async function verify(): Promise<void> {
   const intake = loop.projects.ledger.project(projectId);
   assert.ok(intake);
   assert.deepEqual(intake.issues.map(source => source.id).sort(), ['live-issue-101', 'live-issue-102', 'live-issue-104']);
-  assert.equal(loop.tasks().length, 1, 'Issue collection must not create ordinary Issue workers');
+  const taskIdentities = loop.tasks().map(task => ({ id: task.id, sourceId: task.sourceId }));
+  const collected = assertProbeTaskInventory(loop.tasks(), intake, taskIdentities);
+  assert.equal(collected.executions.length, 1, 'Collection creates only the coordinator execution');
+  assert.equal(collected.intakes.length, 3, 'All three admitted Issues remain unbound intake tasks');
+  assert.ok(collected.intakes.every(task => task.status === 'pending'), 'Collected intakes must await routing');
   const coordinatorId = intake.coordinatorTaskId;
   note('intake_verified', { coordinatorId, admitted: intake.issues.map(source => source.id), excluded: 'live-issue-103' });
   let lastState = '';
@@ -219,7 +224,7 @@ async function verify(): Promise<void> {
     const summary = tasks.map(task => ({ id: task.id, status: task.status, executionStatus: task.executionStatus,
       turnId: task.turnId, reason: task.reason }));
     if (JSON.stringify(summary) !== lastState) { lastState = JSON.stringify(summary); note('tasks', summary); }
-    assert.ok(tasks.length <= 2, 'Exactly one coordinator and at most one worker may exist');
+    const { executions, intakes } = assertProbeTaskInventory(tasks, state, taskIdentities);
     for (const task of tasks) {
       if (task.requests.length) throw new ProbeBlocked(`Unexpected native request on ${task.id}; approvals are disabled`);
       if (task.executionStatus === 'failed' && task.reason && codexUnavailable(task.reason)) throw new ProbeBlocked(task.reason);
@@ -238,9 +243,7 @@ async function verify(): Promise<void> {
       note('dispatch_turn_ended', { initialTurn, initialThread });
     }
     if (initialTurn !== null && gateOpenedAt === null && current.status === 'idle') {
-      // Consume the first supervision reminder before releasing the report wakeup probe.
-      loop.projects.supervise();
-      if (!loop.store.inputs(coordinatorId).some(input => input.status !== 'delivered')) {
+      if (!loop.store.inputs(coordinatorId).some(input => input.status !== 'delivered' && input.status !== 'dropped')) {
         gateOpenedAt = Date.now();
         await writeFile(gateFile, 'Coordinator dispatch turn has ended. The read-only worker may proceed.\n');
         note('worker_gate_opened', { initialTurn, initialThread, at: gateOpenedAt });
@@ -248,8 +251,8 @@ async function verify(): Promise<void> {
     }
     const record = state.records.find(item => item.key === recordKey);
     const currentLoop = loop;
-    const allIdle = tasks.length === 2 && tasks.every(task => task.status === 'idle'
-      && currentLoop.store.inputs(task.id).every(input => input.status === 'delivered'));
+    const allIdle = executions.length === 2 && intakes.length === 2 && executions.every(task => task.status === 'idle'
+      && currentLoop.store.inputs(task.id).every(input => input.status === 'delivered' || input.status === 'dropped'));
     if (record && allIdle) {
       assert.ok(gateOpenedAt !== null);
       const worker = state.members.find(member => member.role === 'worker'); assert.ok(worker);
@@ -279,7 +282,7 @@ async function verify(): Promise<void> {
       assert.equal(recorded.request.threadId, current.threadId);
       assert.notEqual(recorded.request.turnId, initialTurn, 'Worker report must wake a later coordinator turn');
       assert.ok(reportArrival);
-      assert.equal(reportArrival.status, 'idle', 'Report must arrive at an idle coordinator, independently of supervision');
+      assert.equal(reportArrival.status, 'idle', 'Report must arrive at an idle coordinator');
       assert.notEqual(recorded.request.turnId, reportArrival.turnId);
       const reportInput = loop.store.inputs(coordinatorId).find(input => input.provenance.kind === 'agent'
         && input.provenance.taskId === worker.taskId && input.provenance.category === 'result' && input.message.text.includes(marker));
@@ -304,7 +307,8 @@ async function verify(): Promise<void> {
         instructions: createHash('sha256').update(await readFile(join(directory, 'AGENTS.md'))).digest('hex') }, fixtureBefore, 'Read-only fixture must remain unchanged');
       assert.equal(github.verifications.length, 0);
       assert.equal(feishu.approvals.length, 0);
-      coreProof = { coordinatorId, workerTaskId: worker.taskId, initialThread, initialTurn,
+      coreProof = { coordinatorId, workerTaskId: worker.taskId, taskIdentities,
+        retainedIntakeIds: intakes.map(task => task.id), initialThread, initialTurn,
         receiptTurn: recorded.request.turnId, receiptTurnStartedAt: receiptTurnStart.createdAt,
         gateOpenedAt, reportArrival, reportInputId: reportInput.id,
         reportProvenance: reportInput.provenance, marker, record, fixtureBefore, calls: successful.length };
@@ -325,7 +329,11 @@ async function verify(): Promise<void> {
     await bounded('post-recovery tick', loop.tick());
     assert.deepEqual(loop.tasks().map(task => ({ id: task.id, threadId: task.threadId, turnId: task.turnId })), before.tasks);
     assert.deepEqual(loop.projects.ledger.project(projectId), before.state);
-    assert.ok(loop.tasks().every(task => task.status === 'idle'));
+    const recoveredState = loop.projects.ledger.project(projectId); assert.ok(recoveredState);
+    const recovered = assertProbeTaskInventory(loop.tasks(), recoveredState, taskIdentities);
+    assert.equal(recovered.executions.length, 2);
+    assert.equal(recovered.intakes.length, 2);
+    assert.ok(recovered.executions.every(task => task.status === 'idle'));
     assert.equal(calls.length, before.calls, 'Restart must not trigger a new dispatch, report or record');
     const persisted = new Store(config.dataDir, { readOnly: true });
     try { assert.deepEqual(persisted.tasks().map(task => task.id), before.tasks.map(task => task.id)); }

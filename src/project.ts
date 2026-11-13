@@ -26,10 +26,12 @@ export const projectConfigSchema = z.strictObject({
     .default({ coordinator: 'gpt-6-astra', worker: 'gpt-6.1-sol' }),
   reasoningEfforts: z.strictObject({ coordinator: reasoningEffortSchema.default('high'), worker: reasoningEffortSchema.default('xhigh'), verifier: reasoningEffortSchema.optional() })
     .default({ coordinator: 'high', worker: 'xhigh' }),
-  supervisionIntervalMs: z.number().int().positive().max(2_147_483_647).default(300_000),
 }).refine(value => new Set(value.repositories.map(repository => repository.name.toLowerCase())).size === value.repositories.length,
   'Duplicate project repository');
 export type ProjectConfig = z.infer<typeof projectConfigSchema>;
+export const projectConfigInputSchema = projectConfigSchema.safeExtend({
+  supervisionIntervalMs: z.number().int().positive().max(2_147_483_647).optional(),
+}).transform(({ supervisionIntervalMs: _retired, ...config }) => config);
 
 export const recordScopeSchema = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('project') }),
@@ -54,7 +56,6 @@ export const projectActionSchema = z.discriminatedUnion('action', [
   recordRequestSchema.extend({ action: z.literal('record') }),
   z.strictObject({ action: z.literal('rotate'), requestId: idSchema, checkpoint: textSchema }),
   z.strictObject({ action: z.literal('release_workspace'), requestId: idSchema, resourceId: idSchema }),
-  z.strictObject({ action: z.literal('supervision'), requestId: idSchema, operation: z.enum(['pause', 'resume']) }),
   z.strictObject({ action: z.literal('control'), requestId: idSchema, taskId: idSchema, operation: z.enum(['pause', 'resume']) }),
 ]);
 export type ProjectAction = z.infer<typeof projectActionSchema>;
@@ -74,14 +75,10 @@ const ledgerCommentSchema = sourceCommentSchema.strict().extend({
   id: idSchema, sourceId: idSchema, url: z.string().max(8_192), author: idSchema,
   body: z.string().max(1_048_576), createdAt: z.string().min(1).max(128), updatedAt: z.string().min(1).max(128),
 });
-export const supervisionSchema = z.discriminatedUnion('kind', [
-  z.strictObject({ kind: z.literal('enabled') }), z.strictObject({ kind: z.literal('paused') }),
-]);
 export const projectStateSchema = z.strictObject({
   id: projectConfigSchema.shape.id, name: projectConfigSchema.shape.name, directory: projectConfigSchema.shape.directory,
   coordinatorTaskId: idSchema, members: z.array(memberSchema), issues: z.array(ledgerSourceSchema),
   comments: z.array(ledgerCommentSchema), records: z.array(recordSchema), version: versionSchema,
-  supervision: supervisionSchema.default({ kind: 'enabled' }),
 }).superRefine((state, context) => {
   const invalid = (message: string) => context.addIssue({ code: 'custom', message });
   const coordinators = state.members.filter(member => member.role === 'coordinator');
@@ -254,7 +251,7 @@ export class ProjectLedger {
       return existing;
     }
     const state: ProjectState = { id: config.id, name: config.name, directory: config.directory, coordinatorTaskId: coordinator,
-      members: [{ taskId: coordinator, role: 'coordinator' }], issues: [], comments: [], records: [], version: 0, supervision: { kind: 'enabled' } };
+      members: [{ taskId: coordinator, role: 'coordinator' }], issues: [], comments: [], records: [], version: 0 };
     this.save(state);
     return state;
   }

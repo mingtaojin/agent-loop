@@ -342,7 +342,6 @@ export class AgentLoop {
   }
   async tick(): Promise<void> {
     if (this.running) this.heartbeat('running');
-    this.projects.supervise();
     await Promise.all(this.store.tasks().filter(task => !this.lanes.has(task.id)).map(task => this.serial(task.id, () => this.advance(task.id))));
   }
   private executionDirectory(task: Task): string {
@@ -379,7 +378,7 @@ export class AgentLoop {
       intakeTaskId: task.id, source: task.source, resources: task.resources,
       existingThreadId: task.threadId, existingStatus: task.status,
     })}\nOnly the project coordinator may delegate execution. Use dispatch with intakeTaskId to accept this request as a Worker.` }];
-    const inputs = this.store.inputs(task.id);
+    const inputs = this.store.inputs(task.id).filter(input => input.status !== 'dropped');
     const version = intakeMaterialVersion(task, inputs);
     for (const input of task.threadId ? inputs.slice(-8) : inputs) {
       try { materials.push(...await this.prepare(task, input)); }
@@ -434,7 +433,7 @@ export class AgentLoop {
       try {
         selection = workspaceSelectionResponseSchema.parse(await this.ports.codex.selectWorkspace({
           taskId: task.id, cwd: task.contextDirectory, candidates, input: materials.input,
-          answers: this.store.inputs(task.id).filter(input => input.route === 'workspace-selection')
+          answers: this.store.inputs(task.id).filter(input => input.route === 'workspace-selection' && input.status !== 'dropped')
             .map(input => ({ inputId: input.id, text: input.message.text })), signal: this.selectionAbort.signal,
         }));
       } catch (error) { throw new WorkspaceSelectionError(errorMessage(error)); }
@@ -622,6 +621,7 @@ export class AgentLoop {
   private async advance(id: string, reconcile = false): Promise<void> {
     let task = this.store.task(id);
     try {
+      this.projects.retireObsoleteInputs(task);
       if (!this.projects.ledger.membership(task.id)) {
         const freshOwnerInput = this.store.inputs(task.id).some(input => input.origin === 'user' && input.status === 'pending'
           && (task.recovery.lastUserInputSeq === null ? input.message.createdAt > task.updatedAt : input.seq > task.recovery.lastUserInputSeq));
@@ -693,7 +693,6 @@ export class AgentLoop {
       if (task.legacy && this.store.hasOutput(task.id, `turn:${output.turnId}`)) continue;
       if (output.text.trim()) this.store.setMeta(`task-summary:${task.id}`, output.text);
       if (output.text.trim()) this.notify(task, output.text, `agent-output:${output.id}`);
-      if (output.text.trim()) this.projects.observe(task, `output:${output.id}`, output.text, 'final_answer');
     }
     for (const request of snapshot.requests) {
       const identity = `${request.connectionEpoch}:${request.id}`;
@@ -747,11 +746,7 @@ export class AgentLoop {
     if (this.running || !this.started) await this.serial(task.id, () => this.advance(task.id));
   }
   private receiveOwner(task: Task, message: IncomingMessage, route: Inbox['route']): boolean {
-    return this.store.transaction(() => {
-      const received = this.store.receive(task.id, message, 'user', undefined, route);
-      this.projects.observe(task, `user:${message.id}`, `Owner input ${message.id}:\n${message.text}\nAttachments: ${JSON.stringify(message.attachments)}`, 'owner_input');
-      return received;
-    });
+    return this.store.receive(task.id, message, 'user', undefined, route);
   }
   async approve(action: ApprovalAction): Promise<void> {
     if (this.stopping) throw new Error('Agent Loop is closing');
@@ -789,6 +784,7 @@ export class AgentLoop {
   }
   async retryAttachment(taskId: string, inputId: string): Promise<void> {
     await this.serial(taskId, async () => {
+      this.projects.retireObsoleteInputs(this.store.task(taskId));
       const input = this.store.inputs(taskId).find(item => item.id === inputId);
       if (!input || input.status !== 'failed') throw new Error('Only confirmed undelivered attachments can be retried');
       const task = this.store.task(taskId);
@@ -798,11 +794,10 @@ export class AgentLoop {
   }
   private async drain(task: Task): Promise<void> {
     this.requireMember(task);
-    this.projects.supersedeUnsentSupervision(task.id);
     const inputs = this.store.inputs(task.id).sort((a, b) => Number(b.origin === 'initial') - Number(a.origin === 'initial') || a.seq - b.seq);
     if (task.threadId && !this.stopping && task.status !== 'paused' && task.status !== 'failed'
       && (this.store.meta(`project-intake-promotion:${task.id}`) !== null
-        || inputs.some(input => input.route === 'workspace-selection' && input.selectionHandled && input.status !== 'delivered'))
+        || inputs.some(input => input.route === 'workspace-selection' && input.selectionHandled && input.status !== 'delivered' && input.status !== 'dropped'))
       && !inputs.some(input => input.status === 'delivering' || input.status === 'uncertain')) {
       const snapshot = await this.inspect(task.threadId);
       if (snapshot.turnId === null && !snapshot.seenInputIds.length) {
@@ -839,8 +834,8 @@ export class AgentLoop {
     }
     for (const input of inputs) {
       if (this.stopping) break;
-      if (input.status === 'delivered') continue;
-      if (input.status === 'failed' || input.status === 'superseded') continue;
+      if (input.status === 'delivered' || input.status === 'dropped') continue;
+      if (input.status === 'failed') continue;
       if (input.provenance.kind === 'github_issue' || input.provenance.kind === 'github_comment') {
         this.projects.observe(task, `forward:${input.id}`, input.message.text, input.provenance.kind);
         this.store.markInput(input.id, 'delivered');
@@ -861,8 +856,6 @@ export class AgentLoop {
       const questions = input.provenance.kind === 'user' || agentQuestion ? snapshot.requests.filter(request => request.kind === 'question') : [];
       if (questions.length > 1) { this.store.markInput(input.id, 'failed', '存在多个原生问题，无法唯一关联'); this.notify(task, '存在多个原生问题，回复已保存，需要明确关联后再投递。', `question-ambiguous:${input.id}`); break; }
       if (this.stopping) break;
-      this.projects.supersedeUnsentSupervision(task.id);
-      if (this.store.inputs(task.id).find(current => current.id === input.id)?.status === 'superseded') continue;
       this.store.markInput(input.id, 'delivering');
       try {
         const question = questions[0];
@@ -937,6 +930,7 @@ export class AgentLoop {
   async control(taskId: string, action: 'pause' | 'resume' | 'status'): Promise<void> {
     await this.serial(taskId, async () => {
       const task = this.store.task(taskId);
+      this.projects.retireObsoleteInputs(task);
       if (action === 'pause') await this.pause(task, 'Operator paused');
       else if (action === 'status') this.notify(task, `Task ${task.id}\n${task.status}\n${task.reason ?? ''}`, `status:${randomUUID()}`);
       else if (['paused', 'failed'].includes(task.status)) {

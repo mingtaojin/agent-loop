@@ -13,7 +13,7 @@ export const documentSourcePositionSchema = z.strictObject({
 export type DocumentSourcePosition = z.infer<typeof documentSourcePositionSchema>;
 const operationSchema = z.object({ id: z.string(), task_id: z.string(), kind: z.string(), status: z.enum(['attempting', 'confirmed', 'uncertain']), result: z.string().nullable(), error: z.string().nullable() });
 export type Operation = z.infer<typeof operationSchema>;
-const inboxRow = z.object({ seq: z.number(), id: z.string(), task_id: z.string(), payload: z.string(), status: z.enum(['pending', 'delivering', 'delivered', 'failed', 'uncertain', 'held', 'superseded']), origin: z.enum(['user', 'source', 'initial', 'resume']), error: z.string().nullable() });
+const inboxRow = z.object({ seq: z.number(), id: z.string(), task_id: z.string(), payload: z.string(), status: z.enum(['pending', 'delivering', 'delivered', 'failed', 'uncertain', 'held', 'dropped']), origin: z.enum(['user', 'source', 'initial', 'resume']), error: z.string().nullable() });
 export type Inbox = Omit<z.infer<typeof inboxRow>, 'payload'> & { message: IncomingMessage; provenance: InputProvenance; requestId: string | null; route: 'task' | 'workspace-selection'; selectionHandled: boolean };
 const outboxSchema = z.object({ id: z.string(), task_id: z.string(), text: z.string(), status: z.enum(['pending', 'sending', 'sent', 'uncertain', 'dropped']), error: z.string().nullable() });
 export type Outbox = z.infer<typeof outboxSchema>;
@@ -129,9 +129,6 @@ export class Store {
     this.db.prepare('UPDATE inbox SET payload=? WHERE id=?').run(JSON.stringify({ message: input.message, provenance: input.provenance, requestId: input.requestId, route: input.route, selectionHandled: true }), id);
   }
   markInput(id: string, status: Inbox['status'], error: string | null = null): void { this.db.prepare('UPDATE inbox SET status=?,error=? WHERE id=?').run(status, error, id); }
-  supersedePendingInput(id: string, reason: string): void {
-    this.db.prepare("UPDATE inbox SET status='superseded',error=? WHERE id=? AND status='pending'").run(reason, id);
-  }
   enqueue(taskId: string, text: string, key: string): string {
     const id = createHash('sha256').update(`${taskId}:${key}`).digest('hex').slice(0, 32);
     this.db.prepare("INSERT OR IGNORE INTO outbox VALUES(?,?,?,'pending',NULL)").run(id, taskId, text);
