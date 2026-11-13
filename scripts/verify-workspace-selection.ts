@@ -161,19 +161,28 @@ async function verifyExecution(expected: ExecutionExpectation): Promise<void> {
   if (task.source.kind === 'manual') assert.deepEqual(task.source.message, expected.source);
   const selectionState = task.workspaceSelection;
   assert.ok(selectionState.kind === 'selected' && selectionState.choice.kind === 'project');
-  const selection = selections.find(item => item.response.temporaryThreadId === selectionState.temporaryThreadId);
+  const taskSelections = selections.filter(item => item.request.taskId === task.id);
+  const selection = taskSelections.at(-1);
   assert.ok(selection && selection.response.choice.kind === 'project');
   const choice = selection.response.choice;
   const candidate = selection.request.candidates.find(item => 'kind' in item && item.kind === 'project' && item.id === choice.projectId);
-  assert.ok(candidate, 'Saved selection must refer to an exact captured candidate');
-  assert.equal(selectionState.choice.projectId, choice.projectId);
-  assert.deepEqual(selectionState.choice.project, candidate, 'Saved selection must retain the captured project snapshot');
+  assert.ok(candidate && 'kind' in candidate && candidate.kind === 'project', 'Selection must refer to an exact captured candidate');
+  assert.equal(candidate.canonicalPath, expected.directory);
+  const member = loop.projects.ledger.membership(task.id);
+  assert.ok(member?.role === 'worker');
+  const project = loop.projects.ledger.project(member.projectId);
+  assert.ok(project);
+  assert.equal(project.directory, candidate.canonicalPath, 'Coordinator delegation must retain the selected directory');
+  const delegatedProject = { kind: 'project', id: `coordinated:${project.id}`, name: project.name,
+    entryPath: project.directory, canonicalPath: project.directory };
+  assert.equal(selectionState.temporaryThreadId, 'runtime-delegation');
+  assert.equal(selectionState.choice.projectId, delegatedProject.id);
+  assert.deepEqual(selectionState.choice.project, delegatedProject, 'Saved execution directory must retain its project-scoped delegation');
   assert.equal(task.resources.length, 1);
   const resource = task.resources[0];
   assert.ok(resource && resource.kind === 'project');
   assert.equal(resource.workspace, expected.directory);
-  assert.deepEqual(resource.project, candidate, 'Resource must retain the selected project snapshot');
-  const taskSelections = selections.filter(item => item.request.taskId === task.id);
+  assert.deepEqual(resource.project, delegatedProject, 'Resource must retain the delegated project snapshot');
   assert.ok(taskSelections.every(item => item.response.temporaryThreadId !== task.threadId));
   assert.equal(new Set(taskSelections.map(item => item.response.temporaryThreadId)).size, taskSelections.length);
   const formal = formalRequests.find(item => item.threadId === task.threadId);
@@ -266,7 +275,11 @@ try {
   assert.equal(formalStarts.length, 1);
   assert.deepEqual(await projectFiles(), expectedFiles);
   const directoryQuestion = z.object({ question: z.string() }).parse(JSON.parse(loop.store.meta(`project-intake-question:${waiting.id}`)!)).question;
-  assert.ok(feishu.sent.some(output => output.chatId === answered.source.chatId && output.text.includes(directoryQuestion)));
+  assert.ok(directoryQuestion.trim());
+  assert.ok(!feishu.sent.some(output => output.chatId === answered.source.chatId), 'Saved groupless clarification must not reopen private delivery');
+  const questionOutput = loop.store.outputs(waiting.id).find(output => output.text.includes(directoryQuestion));
+  assert.ok(questionOutput);
+  assert.equal(questionOutput.status, 'dropped', 'Groupless clarification must not become a future delivery backlog');
 
   answered.answer = {
     ...message('fixture-directory-answer', 'Use the portal project. Supplement the original task before executing it. Replace the original marker with "ANSWER_DISCOVERY_761". Read both attached evidence files in the supplied order and put their trimmed contents into supplements. Restrictions still apply. Only portal/answer-result.json may be created; do not change existing files, write into audio, delegate, access network or real projects, commit, or deploy. Use the actual running Node process.cwd() and read the portal README.md evidence token.'),
