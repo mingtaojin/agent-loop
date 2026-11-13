@@ -563,3 +563,38 @@ test('resource recovery failure cannot turn into an automatically resumable lega
   assert.equal(after.status, 'failed'); assert.ok(f.validations > 0);
   assert.equal(after.threadId, f.threadId); assert.deepEqual(after.resources, f.original.resources);
 });
+
+test('independent attachment retry preserves Operator pause before coordinator dispatch', async t => {
+  const f = await fixture(t), saved = f.saved('independent-paused-attachment-retry');
+  const coordinator = f.coordinator();
+  const messageId = await f.decision('attachment-claim-owner');
+  await f.loop.projectAction(coordinator.id, { action: 'claim_intake', requestId: 'attachment-claim', taskId: saved.id, messageId });
+  await f.loop.tick();
+  const input = f.loop.store.inputs(saved.id).find(item => item.message.id === 'independent-paused-attachment-retry');
+  assert.ok(input);
+  assert.equal(input.status, 'failed', 'actual missing attachment download must fail before retry');
+  assert.ok(f.feishu.downloads.some(item => item.attachment.key === 'old-file'));
+  await f.loop.control(saved.id, 'pause');
+  const paused = f.loop.store.task(saved.id);
+  assert.equal(paused.status, 'paused');
+  assert.equal(paused.reason, 'Operator paused');
+  const before = { created: f.codex.created.length, starts: f.codex.starts.length };
+  f.feishu.resources.set('old-file', Buffer.from('PRIVATE ORIGINAL BYTES\n'));
+  await f.loop.retryAttachment(saved.id, input.id);
+  const afterRetry = f.loop.store.task(saved.id);
+  const beforeDispatch = { created: f.codex.created.length, starts: f.codex.starts.length };
+  let dispatchError: string | null = null;
+  try {
+    await f.loop.projectAction(coordinator.id, { action: 'dispatch', requestId: 'paused-attachment-dispatch', intakeTaskId: saved.id, prompt: 'Preserve original scope.', role: 'worker' });
+  } catch (error) { dispatchError = error instanceof Error ? error.message : String(error); }
+  await f.loop.tick();
+  const final = f.loop.store.task(saved.id);
+  const after = { created: f.codex.created.length, starts: f.codex.starts.length };
+  console.log('ATTACHMENT_RETRY_PAUSE', JSON.stringify({ paused: { status: paused.status, reason: paused.reason }, afterRetry: { status: afterRetry.status, reason: afterRetry.reason }, before, beforeDispatch, dispatchError, after, final: { status: final.status, reason: final.reason, purpose: final.purpose, threadId: final.threadId } }));
+  assert.deepEqual(afterRetry.source, paused.source);
+  assert.deepEqual(f.loop.store.inputs(saved.id).find(item => item.id === input.id)?.message, input.message);
+  assert.equal(afterRetry.status, 'paused', 'retrying a failed attachment must preserve Operator pause');
+  assert.equal(afterRetry.reason, 'Operator paused');
+  assert.match(dispatchError ?? '', /paused/i, 'coordinator dispatch must require explicit Operator resume');
+  assert.deepEqual(after, beforeDispatch, 'paused intake must not create a Worker Thread or start a turn');
+});
