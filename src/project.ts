@@ -26,10 +26,12 @@ export const projectConfigSchema = z.strictObject({
     .default({ coordinator: 'gpt-6-astra', worker: 'gpt-6.1-sol' }),
   reasoningEfforts: z.strictObject({ coordinator: reasoningEffortSchema.default('high'), worker: reasoningEffortSchema.default('xhigh'), verifier: reasoningEffortSchema.optional() })
     .default({ coordinator: 'high', worker: 'xhigh' }),
-  supervisionIntervalMs: z.number().int().positive().max(2_147_483_647).default(300_000),
 }).refine(value => new Set(value.repositories.map(repository => repository.name.toLowerCase())).size === value.repositories.length,
   'Duplicate project repository');
 export type ProjectConfig = z.infer<typeof projectConfigSchema>;
+export const projectConfigInputSchema = projectConfigSchema.safeExtend({
+  supervisionIntervalMs: z.number().int().positive().max(2_147_483_647).optional(),
+}).transform(({ supervisionIntervalMs: _retired, ...config }) => config);
 
 const recordRequestSchema = z.strictObject({ requestId: idSchema, key: idSchema, text: textSchema, expectedVersion: versionSchema });
 export const projectActionSchema = z.discriminatedUnion('action', [

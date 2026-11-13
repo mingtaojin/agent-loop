@@ -25,7 +25,7 @@ export class IntakeOwnershipChanged extends Error {}
 export interface IntakeMaterial { text: string; version: string }
 export function intakeMaterialVersion(task: Task, inputs: readonly Inbox[]): string {
   return hash(JSON.stringify({ source: task.source, resources: task.resources, threadId: task.threadId, status: task.status,
-    inputs: inputs.map(input => ({ id: input.id, provenance: input.provenance })) }));
+    inputs: inputs.filter(input => input.status !== 'dropped').map(input => ({ id: input.id, provenance: input.provenance })) }));
 }
 
 export class ProjectRuntime {
@@ -144,7 +144,7 @@ export class ProjectRuntime {
         kind: 'agent', projectId, taskId, eventId: key, category: 'intake_request',
       });
       for (const input of inputs) {
-        if (input.route === 'workspace-selection' && input.status !== 'failed') this.store.markSelectionHandled(input.id, taskId);
+        if (input.route === 'workspace-selection' && input.status !== 'failed' && input.status !== 'dropped') this.store.markSelectionHandled(input.id, taskId);
       }
       return true;
     }));
@@ -226,7 +226,7 @@ export class ProjectRuntime {
       }
     }
   }
-  observe(task: Task, key: string, text: string, category: string): void {
+  observe(task: Task, key: string, text: string, category: 'question' | 'native_request' | 'execution_status' | 'github_issue' | 'github_comment'): void {
     const member = this.ledger.membership(task.id);
     if (!member || member.role === 'coordinator') return;
     this.event(member.projectId, `${task.id}:${key}`, `Worker ${task.id} ${category}. A turn ending is not proof of completion.\n${text}`, task.id, category);
@@ -495,22 +495,31 @@ export class ProjectRuntime {
     });
     return true;
   }
-  supervise(): void {
-    for (const config of this.configs) {
-      const state = this.ledger.project(config.id);
-      if (!state || state.members.length < 2) continue;
-      const key = `project-supervision:${config.id}`;
-      const previous = Number(this.store.meta(key) ?? 0);
-      if (Date.now() - previous < config.supervisionIntervalMs) continue;
-      const coordinator = this.store.task(state.coordinatorTaskId);
-      if (['paused', 'failed', 'running'].includes(coordinator.status) || coordinator.requests.length) continue;
-      const pending = this.store.inputs(coordinator.id).some(input => input.status === 'pending');
-      if (pending) continue;
-      this.store.transaction(() => {
-        this.event(config.id, `supervision:${Date.now()}`, 'Review delegated work using project status and live artifacts. Reconcile stalls, blockers, owner changes and next actions according to Orchestrate. Do not infer failure from silence alone.', coordinator.id, 'supervision');
-        this.store.setMeta(key, String(Date.now()));
-      });
-    }
+  retireObsoleteInputs(task: Task): void {
+    const member = this.ledger.membership(task.id);
+    const state = member?.role === 'coordinator' ? this.ledger.project(member.projectId) : null;
+    if (!state || state.coordinatorTaskId !== task.id) return;
+    const obsolete = this.store.inputs(task.id).filter(input => {
+      const event = input.provenance;
+      if (!['pending', 'held', 'failed'].includes(input.status) || input.origin !== 'source' || input.route !== 'task'
+        || event.kind !== 'agent' || event.projectId !== state.id || input.task_id !== task.id
+        || input.id !== `project:${task.id}:${event.eventId}` || input.message.id !== input.id
+        || input.message.senderId !== 'runtime:project' || input.message.chatType !== 'group' || input.message.attachments.length) return false;
+      if (event.category === 'supervision') {
+        const timestamp = event.eventId.slice('supervision:'.length);
+        return event.taskId === task.id && event.eventId.startsWith('supervision:') && /^\d+$/u.test(timestamp)
+          && Number.isSafeInteger(Number(timestamp)) && String(Number(timestamp)) === timestamp;
+      }
+      const author = state.members.find(candidate => candidate.taskId === event.taskId);
+      if (!author || author.role === 'coordinator') return false;
+      const prefix = event.category === 'owner_input' ? `${event.taskId}:user:`
+        : event.category === 'final_answer' ? `${event.taskId}:output:` : null;
+      return prefix !== null && event.eventId.startsWith(prefix) && event.eventId.length > prefix.length;
+    });
+    if (obsolete.length) this.store.transaction(() => {
+      for (const input of obsolete) this.store.markInput(input.id, 'dropped',
+        `Retired automatic project event; use explicit work reports${input.error ? `\nPrevious delivery error: ${input.error}` : ''}`);
+    });
   }
   async close(): Promise<void> {
     this.closing = true;

@@ -4,8 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test, type TestContext } from 'node:test';
 import { z } from 'zod';
+import { configSchema } from '../src/config.js';
 import { taskSchema, type Source, type SourceComment } from '../src/domain.js';
-import { ProjectLedger, matchesProjectIssue, projectActionSchema, projectConfigSchema, projectStateSchema,
+import { ProjectLedger, matchesProjectIssue, projectActionSchema, projectConfigSchema, projectConfigInputSchema, projectStateSchema,
   type ProjectAction, type ProjectConfig, type ProjectState } from '../src/project.js';
 import { Store } from '../src/store.js';
 
@@ -54,7 +55,7 @@ function state(ledger: ProjectLedger, projectId = 'alpha'): ProjectState {
 test('project config applies defaults and rejects empty selectors, duplicate repositories and unexpected settings', () => {
   const project = config();
   assert.equal(project.instructions, '');
-  assert.equal(project.supervisionIntervalMs, 300_000);
+  assert.equal('supervisionIntervalMs' in project, false);
   assert.deepEqual(project.models, { coordinator: 'gpt-6-astra', worker: 'gpt-6.1-sol' });
   assert.deepEqual(project.reasoningEfforts, { coordinator: 'high', worker: 'xhigh' });
   assert.deepEqual(project.repositories[1]?.labelsAny, []);
@@ -459,4 +460,25 @@ test('persisted revision history must retain its source identity and agree with 
   }
   fx.store.setMeta(key, original);
   assert.deepEqual(state(fx.ledger), current);
+});
+
+test('project input compatibility validates and strips only the retired supervision interval', () => {
+  const current = config();
+  for (const interval of [undefined, 1, 300_000, 2_147_483_647]) {
+    const input = interval === undefined ? current : { ...current, supervisionIntervalMs: interval };
+    assert.deepEqual(projectConfigInputSchema.parse(input), current);
+    const parsed = configSchema.parse({ feishu: { userOpenId: 'owner' }, projects: [input] });
+    assert.deepEqual(parsed.projects, [current]);
+    assert.equal('supervisionIntervalMs' in parsed.projects[0]!, false);
+  }
+  assert.equal(projectConfigSchema.safeParse({ ...current, supervisionIntervalMs: 300_000 }).success, false);
+  for (const interval of [0, -1, 1.5, 2_147_483_648, '300000', null]) {
+    const input = { ...current, supervisionIntervalMs: interval };
+    assert.equal(projectConfigInputSchema.safeParse(input).success, false);
+    assert.equal(configSchema.safeParse({ feishu: { userOpenId: 'owner' }, projects: [input] }).success, false);
+  }
+  for (const input of [
+    { ...current, supervisionIntervalMs: 300_000, unexpected: true },
+    { ...current, repositories: [current.repositories[0], current.repositories[0]], supervisionIntervalMs: 300_000 },
+  ]) assert.equal(projectConfigInputSchema.safeParse(input).success, false);
 });

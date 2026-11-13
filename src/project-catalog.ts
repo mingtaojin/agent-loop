@@ -6,11 +6,11 @@ import type { Config } from './config.js';
 import type { Task, WorkspaceCandidate, WorkspaceChoice } from './domain.js';
 import { errorMessage } from './domain.js';
 import { discoverProjects } from './project-discovery.js';
-import { ProjectLedger, projectConfigSchema, type ProjectConfig } from './project.js';
+import { ProjectLedger, projectConfigSchema, projectConfigInputSchema, type ProjectConfig } from './project.js';
 import type { Store } from './store.js';
 
 const catalogKey = 'project-catalog:auto';
-const definitionsSchema = z.array(projectConfigSchema);
+const definitionsSchema = z.array(projectConfigInputSchema);
 const bindingsKey = 'project-catalog:repositories';
 const bindingsSchema = z.array(z.strictObject({ repository: z.string(), projectId: z.string() }));
 const contains = (directory: string, path: string) => {
