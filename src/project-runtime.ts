@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { realpath } from 'node:fs/promises';
+import { isAbsolute, relative } from 'node:path';
 import type { Config } from './config.js';
 import { ProjectCatalog } from './project-catalog.js';
 import { ProjectLedger, matchesProjectIssue, projectActionSchema, reasoningEffortSchema, type ReasoningEffort, type ProjectAction, type ProjectConfig } from './project.js';
@@ -23,11 +24,12 @@ interface ProjectHost {
 export class ProjectRuntime {
   readonly ledger: ProjectLedger;
   private readonly lanes = new Map<string, Promise<unknown>>();
+  private readonly taskActions = new Map<string, Promise<unknown>>();
   private readonly catalog: ProjectCatalog;
   private closing = false;
-  constructor(config: Config, private readonly store: Store, private readonly host: ProjectHost) {
+  constructor(private readonly settings: Config, private readonly store: Store, private readonly host: ProjectHost) {
     this.ledger = new ProjectLedger(store);
-    this.catalog = new ProjectCatalog(config, store);
+    this.catalog = new ProjectCatalog(settings, store);
   }
   private get configs(): ProjectConfig[] { return this.catalog.configs; }
   projectConfig(projectId: string): ProjectConfig | null { return this.configs.find(item => item.id === projectId) ?? null; }
@@ -44,11 +46,11 @@ export class ProjectRuntime {
     const raw = this.store.meta(`project-intake-route:${taskId}`);
     return raw === null ? null : intakeRouteSchema.parse(JSON.parse(raw));
   }
-  private async serial<T>(id: string, run: () => Promise<T>): Promise<T> {
-    const previous = this.lanes.get(id) ?? Promise.resolve();
+  private async serial<T>(id: string, run: () => Promise<T>, lanes = this.lanes): Promise<T> {
+    const previous = lanes.get(id) ?? Promise.resolve();
     const next = previous.catch(() => undefined).then(run);
-    this.lanes.set(id, next);
-    try { return await next; } finally { if (this.lanes.get(id) === next) this.lanes.delete(id); }
+    lanes.set(id, next);
+    try { return await next; } finally { if (lanes.get(id) === next) lanes.delete(id); }
   }
   config(taskId: string): ProjectConfig | null {
     const membership = this.ledger.membership(taskId);
@@ -98,7 +100,9 @@ export class ProjectRuntime {
   }
   async acceptIntake(taskId: string, projectId: string, material: string): Promise<void> {
     const intake = this.store.task(taskId);
-    const config = intake.source.kind === 'github'
+    const route = this.intakeRoute(taskId);
+    if (route && route.projectId !== projectId) throw new Error('Intake project route is immutable');
+    const config = intake.source.kind === 'github' && !route
       ? await this.catalog.bindRepository(intake.source.issue.repository, projectId) : await this.catalog.byId(projectId);
     if (!config) throw new Error('Project configuration unavailable');
     await this.initialize(config);
@@ -223,8 +227,11 @@ export class ProjectRuntime {
     if (!member || !this.config(callerId)) throw new Error('Task is not bound to an enabled project');
     const state = this.ledger.project(member.projectId);
     if (!state) throw new Error('Project unavailable');
-    if (action.action === 'status') return this.status(member.projectId, action);
-    return this.serial(member.projectId, async () => {
+    if (action.action === 'status') {
+      if (action.section === 'unassigned_intakes' && member.role !== 'coordinator') throw new Error('Only coordinators can discover unassigned intake identifiers');
+      return this.status(member.projectId, action);
+    }
+    const perform = async () => {
       const fingerprint = hash(JSON.stringify(action));
       const intentKey = `project-action-intent:${JSON.stringify([member.projectId, callerId, action.requestId])}`;
       const intent = this.store.meta(intentKey);
@@ -234,9 +241,66 @@ export class ProjectRuntime {
         if (old.fingerprint !== fingerprint) throw new Error('Project request ID already has different content');
         return old.value;
       }
+      if (action.action === 'claim_intake') return this.claimIntake(callerId, member, action, intentKey, fingerprint);
       this.store.setMeta(intentKey, fingerprint);
       const result = await this.perform(callerId, member, action);
       this.ledger.saveReceipt(member.projectId, callerId, action.requestId, fingerprint, result);
+      return result;
+    };
+    return action.action === 'open_group' || action.action === 'control'
+      ? this.serial(JSON.stringify([member.projectId, callerId, action.requestId]), perform, this.taskActions)
+      : this.serial(member.projectId, perform);
+  }
+
+  private visibleUnassigned(task: Task, projectId: string): boolean {
+    if (task.purpose !== 'intake' || task.threadId || this.ledger.membership(task.id) || this.intakeRoute(task.id)) return false;
+    if (task.source.kind !== 'github') return true;
+    const owner = this.catalog.repositoryOwner(task.source.issue.repository);
+    return owner === null || owner === projectId;
+  }
+
+  private async claimIntake(callerId: string, member: NonNullable<ReturnType<ProjectLedger['membership']>>,
+    action: Extract<ProjectAction, { action: 'claim_intake' }>, intentKey: string, fingerprint: string): Promise<unknown> {
+    if (member.role !== 'coordinator') throw new Error('Only the coordinator can claim an intake');
+    await this.catalog.refresh();
+    return this.store.transaction(() => {
+      const intent = this.store.meta(intentKey);
+      if (intent !== null && intent !== fingerprint) throw new Error('Project request ID already has different content');
+      const old = this.ledger.receipt(member.projectId, callerId, action.requestId);
+      if (old) {
+        if (old.fingerprint !== fingerprint) throw new Error('Project request ID already has different content');
+        return old.value;
+      }
+      const state = this.ledger.project(member.projectId);
+      if (!state || state.coordinatorTaskId !== callerId) throw new Error('Project coordinator identity changed');
+      const decision = this.store.inputs(callerId).find(input => input.id === action.messageId);
+      const caller = this.store.task(callerId);
+      if (!decision || decision.origin !== 'user' || decision.provenance.kind !== 'user'
+        || decision.message.senderId !== this.settings.feishu.userOpenId || decision.message.chatType !== 'group'
+        || !caller.chatId || decision.message.chatId !== caller.chatId) throw new Error('Claim requires an actual owner decision in this project group');
+      const task = this.store.task(action.taskId);
+      if (!this.visibleUnassigned(task, state.id) || task.status === 'paused') throw new Error('Intake is unavailable, already assigned or operator-paused');
+      const within = (path: string) => {
+        const suffix = relative(state.directory, path);
+        return suffix === '' || (!isAbsolute(suffix) && suffix !== '..' && !suffix.startsWith('../'));
+      };
+      if (task.resources.some(resource => !within(resource.workspace))) throw new Error('Saved resources require project ownership clarification');
+      if (task.workspaceSelection.kind === 'selected') {
+        const choice = task.workspaceSelection.choice;
+        if (choice.kind === 'project' && !within(choice.project.canonicalPath)) throw new Error('Saved selection belongs to another project');
+        if (choice.kind === 'repository') {
+          const owner = this.catalog.repositoryOwner(choice.repositoryName), repository = choice.repository;
+          if ((owner !== null && owner !== state.id) || (!owner && !repository)
+            || (repository && !within(repository.workspace?.kind === 'project-directory' ? repository.workspace.path : repository.path)))
+            throw new Error('Saved selection belongs to another project');
+        }
+      }
+      const route = { projectId: state.id, coordinatorTaskId: callerId };
+      const result = { taskId: task.id, ...route, claimed: true };
+      this.store.setMeta(intentKey, fingerprint);
+      this.store.setMeta(`project-intake-route:${task.id}`, JSON.stringify(route));
+      this.store.setMeta(`project-intake-claim:${task.id}`, JSON.stringify({ callerId, requestId: action.requestId, messageId: action.messageId }));
+      this.ledger.saveReceipt(state.id, callerId, action.requestId, fingerprint, result);
       return result;
     });
   }
@@ -257,6 +321,8 @@ export class ProjectRuntime {
     const identity = { id: state.id, name: state.name, directory: state.directory, coordinatorTaskId: state.coordinatorTaskId, version: state.version, counts };
     const page = <T>(items: T[]) => ({ ...identity, section, offset, items: items.slice(offset, offset + limit),
       nextOffset: offset + limit < items.length ? offset + limit : null });
+    if (section === 'unassigned_intakes') return page(this.store.tasks().filter(task => this.visibleUnassigned(task, projectId))
+      .map(task => ({ taskId: task.id, sourceKind: task.source.kind, status: task.status, createdAt: task.createdAt })));
     if (section === 'tasks') return page(tasks);
     if (section === 'intakes') return page(intakes);
     if (section === 'issues') return page(state.issues);
@@ -268,7 +334,7 @@ export class ProjectRuntime {
       nextOffset: offset + limit < Math.max(tasks.length, state.issues.length, intakes.length) ? offset + limit : null,
       history: 'Use section issues, comments, records, tasks or intakes with offset and limit. Intake materialPath preserves the complete request.' };
   }
-  private async perform(callerId: string, member: NonNullable<ReturnType<ProjectLedger['membership']>>, action: Exclude<ProjectAction, { action: 'status' }>): Promise<unknown> {
+  private async perform(callerId: string, member: NonNullable<ReturnType<ProjectLedger['membership']>>, action: Exclude<ProjectAction, { action: 'status' | 'claim_intake' }>): Promise<unknown> {
     const state = this.ledger.project(member.projectId);
     if (!state) throw new Error('Project unavailable');
     switch (action.action) {
@@ -414,7 +480,7 @@ export class ProjectRuntime {
   }
   async close(): Promise<void> {
     this.closing = true;
-    await Promise.allSettled([...this.lanes.values()]);
+    await Promise.allSettled([...this.lanes.values(), ...this.taskActions.values()]);
   }
   static submission(sourceId: string, prompt: string) {
     return submissionSchema.parse({ requestId: stableId(sourceId), prompt });

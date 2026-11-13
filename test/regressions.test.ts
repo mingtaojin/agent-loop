@@ -1,4 +1,4 @@
-import { tickWithCoordinator, workerCalls } from './coordinated-runtime.js';
+import { tickWithDirectGroups, workerCalls } from './coordinated-runtime.js';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
@@ -62,7 +62,7 @@ async function fixture(t: TestContext) {
   function thread() { const id = task().threadId; assert.ok(id); return id; }
   return {
     loop, config, github, feishu, codex, task, thread, close,
-    async launch() { github.sources = [issue(1)]; await loop.collect(); await tickWithCoordinator(loop); },
+    async launch() { github.sources = [issue(1)]; await loop.collect(); await tickWithDirectGroups(loop); },
     message(id: string, text: string): IncomingMessage {
       const chatId = task().chatId;
       assert.ok(chatId);
@@ -86,7 +86,7 @@ test('a rejected native answer leaves the question answerable and does not block
     if (input.text === 'incomplete') throw new RejectedInputError('Both answer fields are required');
     await reply(input);
   };
-  await tickWithCoordinator(f.loop);
+  await tickWithDirectGroups(f.loop);
   await f.loop.receive(f.message('bad-answer', 'incomplete'));
   assert.equal(workerCalls(f.loop, f.codex).replies.length, 0);
   assert.equal(f.task().status, 'running');
@@ -108,8 +108,8 @@ test('a source update queued before completion cannot answer the completed turn 
   f.github.sources = [issue(1, { body: 'Additional reproduction details' })];
   await f.loop.collect();
   f.codex.complete(f.thread(), waiting);
-  await tickWithCoordinator(f.loop);
-  await tickWithCoordinator(f.loop);
+  await tickWithDirectGroups(f.loop);
+  await tickWithDirectGroups(f.loop);
 
   assert.equal(f.task().status, 'idle');
   assert.equal(workerCalls(f.loop, f.codex).starts.length, 1);
@@ -128,7 +128,7 @@ test('a source update racing with turn completion starts once without manufactur
   assert.equal(workerCalls(f.loop, f.codex).steers.length, 0);
   f.codex.raceOnSteer = true;
   await f.loop.receive(f.message('owner-race', 'Use the additional evidence.'));
-  await tickWithCoordinator(f.loop);
+  await tickWithDirectGroups(f.loop);
 
   assert.equal(f.task().status, 'running');
   assert.equal(workerCalls(f.loop, f.codex).starts.length, 2);
@@ -148,7 +148,7 @@ test('periodic collection recovers history-only messages after a connection gap 
 
   f.feishu.historyError = null;
   await f.loop.collect();
-  await tickWithCoordinator(f.loop);
+  await tickWithDirectGroups(f.loop);
   await f.loop.collect();
   assert.ok(f.feishu.receiver);
   await f.feishu.receiver(message);
@@ -202,7 +202,7 @@ test('overlapping starts open only one message receiver and launch each task onc
   const second = f.loop.start();
   release.resolve();
   await Promise.all([first, second]);
-  await tickWithCoordinator(f.loop);
+  await tickWithDirectGroups(f.loop);
   assert.equal(starts, 1);
   assert.equal(workerCalls(f.loop, f.codex).created.length, 1);
   assert.equal(workerCalls(f.loop, f.codex).starts.length, 1, JSON.stringify(f.loop.tasks().map(task => ({ id: task.id, status: task.status,
@@ -249,7 +249,7 @@ for (const previous of ['running', 'waiting_user', 'paused'] as const) {
       const snapshot = f.codex.snapshot(threadId);
       assert.ok(snapshot.turnId);
       snapshot.requests = [{ id: 'old-request', threadId, turnId: snapshot.turnId, kind: 'question', isBlocking: true, connectionEpoch: 'epoch', prompt: 'Need input', method: 'item/tool/requestUserInput', payload: {} }];
-      await tickWithCoordinator(f.loop);
+      await tickWithDirectGroups(f.loop);
     }
     if (previous === 'paused') await f.loop.control(f.task().id, 'pause');
     const taskId = f.task().id;

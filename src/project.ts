@@ -33,11 +33,12 @@ export type ProjectConfig = z.infer<typeof projectConfigSchema>;
 
 const recordRequestSchema = z.strictObject({ requestId: idSchema, key: idSchema, text: textSchema, expectedVersion: versionSchema });
 export const projectActionSchema = z.discriminatedUnion('action', [
-  z.strictObject({ action: z.literal('status'), section: z.enum(['overview', 'issues', 'comments', 'records', 'tasks', 'intakes']).optional(),
+  z.strictObject({ action: z.literal('status'), section: z.enum(['overview', 'issues', 'comments', 'records', 'tasks', 'intakes', 'unassigned_intakes']).optional(),
     offset: versionSchema.optional(), limit: z.number().int().min(1).max(100).optional() }),
   z.strictObject({ action: z.literal('dispatch'), requestId: idSchema, prompt: textSchema,
     issueId: idSchema.optional(), intakeTaskId: idSchema.optional(), role: z.enum(['worker', 'verifier']).default('worker') }),
   z.strictObject({ action: z.literal('send'), requestId: idSchema, taskId: idSchema, text: textSchema }),
+  z.strictObject({ action: z.literal('claim_intake'), requestId: idSchema, taskId: idSchema, messageId: idSchema }),
   z.strictObject({ action: z.literal('open_group'), requestId: idSchema, taskId: idSchema }),
   z.strictObject({ action: z.literal('plan_group_cleanup'), requestId: idSchema }),
   z.strictObject({ action: z.literal('confirm_group_cleanup'), requestId: idSchema, planId: idSchema, messageId: idSchema }),

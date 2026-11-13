@@ -132,6 +132,13 @@ export class ProjectCatalog {
     return this.effective.find(project => project.repositories.some(repository => repository.name.toLowerCase() === repositoryName.toLowerCase())) ?? null;
   }
 
+  repositoryOwner(repositoryName: string): string | null {
+    const name = repositoryName.toLowerCase();
+    const saved = bindingsSchema.parse(JSON.parse(this.store.meta(bindingsKey) ?? '[]'));
+    return saved.find(binding => binding.repository.toLowerCase() === name)?.projectId
+      ?? this.effective.find(project => project.repositories.some(repository => repository.name.toLowerCase() === name))?.id ?? null;
+  }
+
   async bindRepository(repositoryName: string, projectId: string): Promise<ProjectConfig> {
     await this.refresh();
     const project = this.effective.find(item => item.id === projectId);

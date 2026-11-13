@@ -72,7 +72,7 @@ test('follow-up images and retries use text paths while later text never reattac
   assert.equal(workerCalls(f.loop, f.codex).steers.length, 0);
   assert.equal(f.loop.store.inputs(f.task().id).at(-1)?.status, 'failed');
   assert.deepEqual(f.loop.store.inputs(f.task().id).at(-1)?.message, failed);
-  assert.ok(f.feishu.sent.some(output => output.text.includes('附件准备失败')));
+  assert.ok(f.feishu.sent.some(output => output.chatId === chatId && output.text.includes('附件准备失败')));
   f.feishu.downloadFailures.delete('next');
   await f.loop.retryAttachment(f.task().id, failed.id);
   const input = workerCalls(f.loop, f.codex).steers.at(-1)?.input; assert.ok(input);
@@ -133,7 +133,8 @@ for (const failure of ['missing', 'directory', 'empty', 'unreadable'] as const) 
     assert.equal(workerCalls(f.loop, f.codex).starts.length, 0);
     const saved = f.loop.store.inputs(f.task().id)[0]; assert.ok(saved);
     assert.equal(saved.status, 'failed'); assert.deepEqual(saved.message, message);
-    assert.ok(f.feishu.sent.some(output => output.text.includes('附件准备失败')));
+    assert.ok(f.loop.store.outputs(f.task().id).some(output => output.text.includes('附件准备失败') && output.status === 'dropped'));
+    assert.ok(f.feishu.sent.every(output => output.chatId !== message.chatId));
     if (failure === 'unreadable') await chmod(imagePath, 0o600);
     else { await rm(imagePath, { recursive: true, force: true }); await writeFile(imagePath, bytes); }
     await f.loop.retryAttachment(f.task().id, message.id); await tickSurface(f.loop);

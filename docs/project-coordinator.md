@@ -6,7 +6,7 @@ Worker 和 verifier 默认不建群；用户需要直接交流时，由协调者
 
 ## 配置项目
 
-在 `engineering.projectRoot` 配置工程父目录后，Runtime 按直接子目录发现项目，首次接单时创建该项目的协调者。配置了本地路径的仓库也能确定项目。项目身份按实际目录持久保存，重复请求与重启复用原协调者。本地发现不扩大 GitHub 采集范围。
+首次建立本地项目协调群前，管理员必须在 `projects` 显式登记项目。空数据库仅配置 `engineering.projectRoot` 不会自动为每个目录建群。发现根目录只提供工程候选，GitHub 和历史请求确定项目归属时仍可复用相应协调者。项目身份按实际目录持久保存，重启复用原协调者。本地发现不扩大 GitHub 采集范围。
 
 需要明确仓库归属、接手条件或项目规则时，在 `projects` 配置项目。目录相对于配置文件解析，必须已经存在。纯本地项目可以设置 `repositories: []`。
 
@@ -61,6 +61,7 @@ Issue 评论先交协调者判断影响，再按需转给原 Worker。Worker 最
 | action | 作用 | 允许角色 |
 | --- | --- | --- |
 | `status` | 查询项目、任务和持久记录 | 项目成员 |
+| `claim_intake` | 引用本项目群实际用户消息，原地认领明确的未归属旧请求，不启动执行 | 协调者 |
 | `dispatch` | 接管指定 intakeTaskId，或按请求身份创建 Worker、独立 verifier | 协调者 |
 | `send` | 向本项目 Worker 追加指导或回答 | 协调者 |
 | `open_group` | 打开本项目指定 Worker 或 verifier 的任务群，已有有效群则复用 | 协调者 |
@@ -75,13 +76,15 @@ Issue 评论先交协调者判断影响，再按需转给原 Worker。Worker 最
 
 修改动作携带稳定的 `requestId`。同一调用方使用相同 ID 和内容重试，返回原结果；更换内容会报冲突。`record` 同时携带 `expectedVersion`，版本不符时先重新读取，再决定如何更新。
 
-默认 `status` 返回有界概览。完整历史按 `section` 分页，支持 `issues`、`comments`、`records` 和 `tasks`。`offset` 从零开始，`limit` 默认 20、最大 100。继续读取 `nextOffset`，不要把概览当作全部历史。
+默认 `status` 返回有界概览。完整历史按 `section` 分页，支持 `issues`、`comments`、`records`、`tasks` 和 `intakes`。协调者还可查询 `unassigned_intakes`，只发现脱敏标识，不提供其他项目的正文和附件路径。`offset` 从零开始，`limit` 默认 20、最大 100。继续读取 `nextOffset`，不要把概览当作全部历史。
 
 ```json
 {"action":"status","section":"records","offset":0,"limit":20}
 ```
 
 旧 Thread 无法补注册动态工具。Runtime 为项目成员提供任务限定的本机客户端命令，接收动作 JSON 文件，调用相同接口。命令只在该任务活跃执行时有效。能力文件不能读取、复制或在任务间共享。
+
+未归属的历史请求先在项目群确认实际归属，再调用 `claim_intake`。动作携带 `taskId`、`messageId` 和稳定 `requestId`，其中 `messageId` 必须指向本项目协调群保存的实际所有者消息。认领仅保存路由，不创建 Worker、启动 Thread 或回答原生请求。已有项目归属、正式 Thread、暂停以及其他项目的 GitHub catalog 绑定都会阻止认领。同一请求安全重试，随后仍需显式 `dispatch(intakeTaskId)`。不要自动认领积压请求。
 
 ## 监督和恢复
 

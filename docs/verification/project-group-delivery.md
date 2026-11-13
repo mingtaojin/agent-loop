@@ -13,6 +13,8 @@ PR25基于main `75e71405f7b12e121ba5b26642c8ac73d4bcc9e6`。
 | 项目归属、配置与发现目录身份 | 保留。新正式Thread必须属于协调者或已委派成员。 |
 | GitHub来源、评论、修订与catalog | 保留。只交协调者评估，不直接驱动Worker或回答原生请求。 |
 | 接单记录与同Task晋升 | 保留。GitHub与历史请求保留身份、材料及已有回答。 |
+| 未归属旧请求 | 协调者通过claim_intake引用本项目群实际用户决定，事务内原地认领，仍需显式dispatch。脱敏分页不暴露正文与材料路径。 |
+| 首个本地项目协调群 | 由管理员显式projects登记初始化，发现目录不会自动为全部子目录建群。 |
 | 历史Task、Thread、资源、暂停、失败与未知副作用 | 保留原地恢复。不会因移除入口删除或复制旧任务。 |
 | CLI submit、answer及本机接单服务 | 按用户明确决定删除，不提供继续接单的兼容层。 |
 | 私聊新请求、澄清回答及reply命令 | 按用户明确决定删除，receive直接忽略p2p。 |
@@ -39,11 +41,12 @@ node node_modules/typescript/bin/tsc
 | test/platforms.test.ts | 实际socket事件私聊不接单、项目群保存与去重、SDK写边界。 |
 | test/coordinator-intake.test.ts 与 test/project-catalog.test.ts | 项目责任、材料、同Task晋升及GitHub证据。 |
 | test/project-runtime.test.ts | 无群委派、权限、原生审批、退役重建、冻结清单与未知结果恢复。 |
+| test/intake-claim.test.ts | 空库显式初始化、无归属认领、双重认领互斥、事务回滚与重开、脱敏分页及catalog归属保护。 |
 | test/feishu-document-adapter.test.ts 与 test/feishu-document-progress.test.ts | 退役期间排队文档写入不得在等待结束后新dispatch，包括子节点读取后的删除。 |
 | test/feishu-progress.test.ts | 卡片进度停止与新群重建。 |
 | test/runtime.test.ts 与 test/workspace-selection.test.ts | 保存任务与目录答复恢复、附件、同Thread、原生请求及不确定输入。 |
 
-`test/saved-intake.ts` 只用于恢复fixture，直接写测试数据库。生产代码不存在等价接单入口。
+`test/saved-intake.ts` 只用于恢复fixture，直接写测试数据库。生产代码不能通过私聊创建这些请求。claim_intake仅处理已经存在的合格记录。
 `openDirectGroup` 让需要测群消息的fixture显式通过协调者开群。默认无群保障由独立的项目生命周期场景检查。
 
 ## 验证边界

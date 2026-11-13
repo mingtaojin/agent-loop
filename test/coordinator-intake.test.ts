@@ -1,4 +1,5 @@
-import { recoverSavedIntake } from './saved-intake.js';
+import { setTimeout as delay } from 'node:timers/promises';
+import { recoverSavedIntake, seedSavedIntake } from './saved-intake.js';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -130,4 +131,50 @@ test('coordinator promotion during intake handoff keeps the Worker executable wi
   assert.equal(loop.projects.ledger.membership(worker.id)?.role, 'worker');
   const start = codex.starts.find(call => call.threadId === worker.threadId); assert.ok(start);
   assert.ok(JSON.stringify(start.input).includes('Investigate only; do not edit or deploy.'));
+});
+
+
+for (const kind of ['open_group', 'control'] satisfies Array<'open_group' | 'control'>) test(`${kind} cannot deadlock a promoted intake material handoff`, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'coordinator-open-handoff-'));
+  const config = configSchema.parse({ dataDir: join(root, 'data'), feishu: { userOpenId: 'owner' },
+    projects: [{ id: 'app', name: 'Application', directory: root, repositories: [] }] });
+  const codex = new CodexFake(), feishu = new FeishuFake();
+  codex.selectionResults.push({ kind: 'project', projectId: 'coordinated:app', reason: 'Saved request' });
+  const loop = new AgentLoop(config, { codex, feishu, github: new GitHubFake(), workspace: {
+    async ensure() { return root; }, async head() { return 'fixture-head'; },
+  } });
+  t.after(async () => { await loop.close(); await rm(root, { recursive: true, force: true }); });
+  await loop.collect(); await loop.tick();
+  const task = seedSavedIntake(loop, { id: 'saved-handoff', chatId: 'historical-private', chatType: 'p2p', senderId: 'owner',
+    text: 'Preserve this request and its scope.', attachments: [], createdAt: Date.now() });
+  await loop.tick();
+  const route = loop.projects.intakeRoute(task.id); assert.ok(route);
+  const gate = () => { let release = () => {}; const promise = new Promise<void>(done => { release = done; }); return { promise, release }; };
+  const entered = gate(), release = gate(), escape = gate();
+  const accept = loop.projects.acceptIntake.bind(loop.projects);
+  loop.projects.acceptIntake = async (...args) => {
+    entered.release(); await release.promise;
+    await Promise.race([accept(...args), escape.promise]);
+  };
+  loop.store.receive(task.id, { id: 'saved-supplement', chatId: '', chatType: 'group', senderId: 'owner', text: 'Additional saved material.',
+    attachments: [], createdAt: Date.now() }, 'user', undefined, 'workspace-selection');
+  const handoff = loop.tick(); await entered.promise;
+  await loop.projectAction(route.coordinatorTaskId, { action: 'dispatch', requestId: 'promote-during-materials',
+    intakeTaskId: task.id, role: 'worker', prompt: 'Preserve original scope.' });
+  const opened = loop.projectAction(route.coordinatorTaskId, kind === 'open_group'
+    ? { action: kind, requestId: 'open-during-materials', taskId: task.id }
+    : { action: kind, requestId: 'open-during-materials', taskId: task.id, operation: 'pause' });
+  const intent = `project-action-intent:${JSON.stringify([route.projectId, route.coordinatorTaskId, 'open-during-materials'])}`;
+  for (let i = 0; i < 100 && !loop.store.meta(intent); i++) await delay(1);
+  assert.ok(loop.store.meta(intent)); release.release();
+  let completed = false;
+  try {
+    completed = await Promise.race([Promise.all([handoff, opened]).then(() => true), delay(500).then(() => false)]);
+  } finally { escape.release(); await Promise.allSettled([handoff, opened]); }
+  assert.equal(completed, true, 'The project action must not hold the project lane while waiting for the intake task lane');
+  const worker = loop.store.task(task.id); assert.equal(worker.purpose, 'execution');
+  if (kind === 'open_group') assert.ok(worker.chatId);
+  else { assert.equal(worker.status, 'paused'); assert.equal(worker.chatId, null); }
+  assert.equal(loop.store.inputs(task.id).filter(input => input.id === 'saved-supplement').length, 1);
+  assert.equal(feishu.groups.size, kind === 'open_group' ? 2 : 1);
 });
