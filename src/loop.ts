@@ -427,7 +427,8 @@ export class AgentLoop {
       if (!project) {
         const question = selection.choice.kind === 'question' ? selection.choice.question : '这项任务属于哪个项目？请提供项目名称。';
         this.store.setMeta(questionKey, JSON.stringify({ question, inputIds }));
-        task.reason = question; this.persist(task);
+        if (task.status !== 'paused') task.reason = question;
+        this.persist(task);
         this.notify(task, `需要确认项目：\n${question}\n请求编号：${task.id}。请在项目协调群补充项目归属。`, `project-question:${digest(JSON.stringify(inputIds))}`);
         await this.flush(task); return false;
       }
@@ -895,7 +896,8 @@ export class AgentLoop {
   private async pause(task: Task, reason: string): Promise<void> {
     task.status = 'paused'; task.reason = reason; task.recovery.nextAttemptAt = null; this.persist(task);
     if (task.threadId) {
-      const snapshot = await this.inspect(task.threadId);
+      const snapshot = this.projects.ledger.membership(task.id)
+        ? await this.inspect(task.threadId) : await this.ports.codex.inspect(task.threadId);
       if (snapshot.status === 'running' && snapshot.turnId) await this.ports.codex.interrupt({ threadId: task.threadId, turnId: snapshot.turnId });
     }
   }

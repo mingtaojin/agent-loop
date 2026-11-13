@@ -299,3 +299,72 @@ for (const initialStatus of ['running', 'paused'] satisfies Array<'running' | 'p
   assert.equal(f.codex.starts.length, starts); assert.ok(f.codex.interrupts.some(input => input.threadId === threadId));
   assert.deepEqual(adopted.resources, legacy.resources); assert.deepEqual(adopted.source, legacy.source);
 });
+
+test('an unresolved project question cannot erase Operator pause or resume a retained Thread on adoption', async t => {
+  const f = await fixture(t), task = f.saved('paused-question');
+  f.feishu.resources.set('old-file', Buffer.from('saved evidence\n'));
+  const app = f.loop.projects.projectConfig('app'); assert.ok(app);
+  const threadId = await f.codex.createThread({ cwd: app.directory, instructions: 'Saved paused legacy instructions.' });
+  const turnId = await f.codex.startTurn({ threadId, deliveryId: 'legacy-paused-start', input: [{ kind: 'text', text: 'Saved legacy turn.' }] });
+  f.loop.store.saveTask(taskSchema.parse({ ...task, purpose: 'legacy', threadId, turnId, status: 'paused', reason: 'Operator paused',
+    legacy: { status: 'paused', prUrl: null }, executionStatus: 'running' }));
+  f.codex.selectionResults.push({ kind: 'question', question: 'Which project owns this old task?' },
+    { kind: 'project', projectId: 'coordinated:app', reason: 'Confirmed existing project.' });
+  const starts = f.codex.starts.length;
+  await f.loop.tick();
+  const pauseReason = f.loop.store.task(task.id).reason;
+  f.loop.store.receive(task.id, { id: 'saved-project-answer', text: 'Use the original App project.', chatId: '', chatType: 'group',
+    senderId: 'owner', attachments: [], createdAt: Date.now() }, 'user', undefined, 'workspace-selection');
+  await f.loop.tick();
+  assert.equal(f.codex.starts.length, starts, 'Migration and project clarification must not resume an Operator-paused Thread');
+  assert.equal(pauseReason, 'Operator paused');
+  const adopted = f.loop.store.task(task.id);
+  assert.equal(adopted.status, 'paused'); assert.equal(adopted.reason, 'Operator paused'); assert.equal(adopted.threadId, threadId);
+  assert.deepEqual(f.loop.projects.ledger.membership(task.id), { projectId: 'app', role: 'worker' });
+  assert.ok(f.loop.store.meta(`project-intake-question:${task.id}`)?.includes('Which project owns this old task?'));
+});
+
+for (const oldChoice of ['question', 'other-project']) test(`queued Operator pause and group input survive a stale ${oldChoice} selection result`, async t => {
+  const f = await fixture(t), task = f.saved(`queued-${oldChoice}`);
+  f.feishu.resources.set('old-file', Buffer.from('saved evidence\n'));
+  const app = f.loop.projects.projectConfig('app'); assert.ok(app);
+  const chatId = await f.feishu.ensureGroup({ taskId: task.id, title: 'Saved legacy group' });
+  const threadId = await f.codex.createThread({ cwd: app.directory, instructions: 'Saved legacy instructions.' });
+  const turnId = await f.codex.startTurn({ threadId, deliveryId: 'queued-start', input: [{ kind: 'text', text: 'Saved old turn.' }] });
+  f.loop.store.saveTask(taskSchema.parse({ ...task, purpose: 'legacy', chatId, threadId, turnId, status: 'running',
+    reason: null, legacy: { status: 'paused', prUrl: null }, executionStatus: 'running' }));
+  f.codex.selectionResults.push(oldChoice === 'question' ? { kind: 'question', question: 'Obsolete project question' }
+    : { kind: 'project', projectId: 'coordinated:other', reason: 'Obsolete project choice' },
+    { kind: 'project', projectId: 'coordinated:app', reason: 'Current input belongs to App' });
+  let entered = () => {}, release = () => {};
+  const started = new Promise<void>(done => { entered = done; }), gate = new Promise<void>(done => { release = done; });
+  const resolve = f.loop.projects.resolveSelection.bind(f.loop.projects); let first = true;
+  f.loop.projects.resolveSelection = async (...args) => {
+    if (first) { first = false; entered(); await gate; }
+    return resolve(...args);
+  };
+  const starts = f.codex.starts.filter(call => call.threadId === threadId).length;
+  const steers = f.codex.steers.filter(call => call.threadId === threadId).length;
+  const replies = f.codex.replies.filter(call => call.request.threadId === threadId).length, threads = f.codex.created.length;
+  const pending = f.loop.tick();
+  let pausing: Promise<void> | undefined, incoming: Promise<void> | undefined;
+  try {
+    await started;
+    pausing = f.loop.control(task.id, 'pause');
+    incoming = f.loop.receive({ id: `queued-owner-${oldChoice}`, chatId, chatType: 'group', senderId: 'owner',
+      text: 'Keep the App scope and preserve local work.', attachments: [], createdAt: Date.now() });
+    release(); await Promise.all([pending, pausing, incoming]); await f.loop.tick();
+    const adopted = f.loop.store.task(task.id);
+    assert.deepEqual(f.loop.projects.ledger.membership(task.id), { projectId: 'app', role: 'worker' });
+    assert.equal(adopted.status, 'paused'); assert.equal(adopted.reason, 'Operator paused');
+    assert.equal(adopted.threadId, threadId); assert.equal(adopted.turnId, turnId); assert.equal(adopted.chatId, chatId);
+    assert.equal(f.codex.starts.filter(call => call.threadId === threadId).length, starts);
+    assert.equal(f.codex.steers.filter(call => call.threadId === threadId).length, steers);
+    assert.equal(f.codex.replies.filter(call => call.request.threadId === threadId).length, replies); assert.equal(f.codex.created.length, threads);
+    assert.deepEqual(adopted.source, task.source); assert.deepEqual(adopted.resources, task.resources);
+    const held = f.loop.store.inputs(task.id).find(input => input.id === `queued-owner-${oldChoice}`);
+    assert.ok(held); assert.equal(held.status, 'held');
+    assert.equal(held.message.text, 'Keep the App scope and preserve local work.');
+    assert.ok(!f.loop.store.meta(`project-intake-question:${task.id}`)?.includes('Obsolete project question'));
+  } finally { release(); await Promise.allSettled([pending, pausing, incoming].filter(item => item !== undefined)); }
+});
