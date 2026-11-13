@@ -33,7 +33,14 @@ export const projectConfigInputSchema = projectConfigSchema.safeExtend({
   supervisionIntervalMs: z.number().int().positive().max(2_147_483_647).optional(),
 }).transform(({ supervisionIntervalMs: _retired, ...config }) => config);
 
-const recordRequestSchema = z.strictObject({ requestId: idSchema, key: idSchema, text: textSchema, expectedVersion: versionSchema });
+export const recordScopeSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('project') }),
+  z.strictObject({ kind: z.literal('task'), taskId: idSchema }),
+  z.strictObject({ kind: z.literal('coordinator') }),
+]);
+export type RecordScope = z.infer<typeof recordScopeSchema>;
+const recordRequestSchema = z.strictObject({ requestId: idSchema, key: idSchema, text: textSchema, expectedVersion: versionSchema,
+  scope: recordScopeSchema.optional() });
 export const projectActionSchema = z.discriminatedUnion('action', [
   z.strictObject({ action: z.literal('status'), section: z.enum(['overview', 'issues', 'comments', 'records', 'tasks', 'intakes', 'unassigned_intakes']).optional(),
     offset: versionSchema.optional(), limit: z.number().int().min(1).max(100).optional() }),
@@ -56,7 +63,7 @@ const roleSchema = z.enum(['coordinator', 'worker', 'verifier']);
 const memberSchema = z.strictObject({ taskId: idSchema, role: roleSchema, issueId: idSchema.optional() });
 const recordSchema = z.strictObject({
   requestId: idSchema, key: idSchema, text: textSchema, version: versionSchema.refine(value => value > 0),
-  authorTaskId: idSchema, createdAt: versionSchema,
+  authorTaskId: idSchema, createdAt: versionSchema, scope: recordScopeSchema.optional(),
 });
 const ledgerSourceSchema = sourceSchema.strict().extend({
   id: idSchema, repository: repositoryNameSchema, url: z.string().max(8_192),
@@ -87,12 +94,34 @@ export const projectStateSchema = z.strictObject({
   if (state.members.some(member => member.issueId !== undefined && !issueIds.has(member.issueId))) invalid('Unknown member issue');
   if (state.comments.some(comment => !issueIds.has(comment.sourceId))) invalid('Unknown comment issue');
   if (state.records.some(record => !memberIds.has(record.authorTaskId))) invalid('Unknown record author');
+  if (state.records.some(record => record.scope?.kind === 'task' && !memberIds.has(record.scope.taskId))) invalid('Unknown record target');
   if (state.version !== state.records.length || state.records.some((record, index) => record.version !== index + 1))
     invalid('Record versions must form a continuous history');
   if (new Set(state.records.map(record => JSON.stringify([record.authorTaskId, record.requestId]))).size !== state.records.length)
     invalid('Duplicate record request');
 });
 export type ProjectState = z.infer<typeof projectStateSchema>;
+export function projectView(state: ProjectState, callerTaskId: string): ProjectState {
+  const caller = state.members.find(member => member.taskId === callerTaskId);
+  if (!caller) throw new Error('Task does not belong to this project');
+  if (caller.role === 'coordinator') return state;
+  const issues = state.issues.filter(issue => issue.id === caller.issueId);
+  return { ...state, members: [caller], issues,
+    comments: state.comments.filter(comment => comment.sourceId === caller.issueId),
+    records: state.records.filter(record => record.scope?.kind === 'project'
+      || (record.scope?.kind === 'task' && record.scope.taskId === callerTaskId)) };
+}
+
+export function currentRecords(records: ProjectState['records']): ProjectState['records'] {
+  const latest = new Map<string, ProjectState['records'][number]>();
+  for (const record of records) {
+    const identity = JSON.stringify([record.scope?.kind ?? 'legacy', record.scope?.kind === 'task' ? record.scope.taskId : null, record.key]);
+    latest.delete(identity);
+    latest.set(identity, record);
+  }
+  return [...latest.values()];
+}
+
 const membershipSchema = z.strictObject({ projectId: idSchema, role: roleSchema });
 const issueRevisionSchema = z.strictObject({ eventId: idSchema, source: ledgerSourceSchema });
 const commentRevisionSchema = z.strictObject({ eventId: idSchema, comment: ledgerCommentSchema });
@@ -293,16 +322,22 @@ export class ProjectLedger {
   record(projectId: string, input: z.infer<typeof recordInputSchema>): ProjectState {
     const request = recordInputSchema.parse(input);
     this.requireMember(projectId, request.authorTaskId);
+    const member = this.membership(request.authorTaskId);
+    const scope = request.scope ?? (member?.role === 'coordinator' ? { kind: 'coordinator' } : { kind: 'task', taskId: request.authorTaskId });
+    if (scope.kind === 'task') this.requireMember(projectId, scope.taskId);
+    if (member?.role !== 'coordinator' && (scope.kind !== 'task' || scope.taskId !== request.authorTaskId))
+      throw new Error('Only the coordinator can publish project records or route records to another task');
     const state = this.required(projectId);
     const existing = state.records.find(record => record.requestId === request.requestId && record.authorTaskId === request.authorTaskId);
     if (existing) {
-      if (existing.key !== request.key || existing.text !== request.text || existing.version !== request.expectedVersion + 1)
+      if (existing.key !== request.key || existing.text !== request.text || existing.version !== request.expectedVersion + 1
+        || (existing.scope !== undefined ? !isDeepStrictEqual(existing.scope, scope) : request.scope !== undefined))
         throw new Error('Project record request conflicts with existing history');
       return state;
     }
     if (request.expectedVersion !== state.version) throw new Error(`Project record version conflict: expected ${request.expectedVersion}, current ${state.version}`);
     const record = recordSchema.parse({ requestId: request.requestId, key: request.key, text: request.text,
-      version: state.version + 1, authorTaskId: request.authorTaskId, createdAt: Date.now() });
+      version: state.version + 1, authorTaskId: request.authorTaskId, createdAt: Date.now(), scope });
     state.records.push(record);
     state.version = record.version;
     this.save(state);

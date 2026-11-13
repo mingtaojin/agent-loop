@@ -319,7 +319,7 @@ test('project directory policy returns the whole engineering root and preserves 
     workspace: { kind: 'project-directory', path: f.root },
   }] }).repositories;
   const secondTask = f.task(2); assert.ok(secondTask.threadId); assert.ok(secondTask.turnId); assert.ok(f.codex.workspaceHandler);
-  const directory = await f.codex.workspaceHandler({ threadId: secondTask.threadId, turnId: secondTask.turnId,
+  const directory = await f.codex.workspaceHandler({ connectionEpoch: 'fake-epoch', threadId: secondTask.threadId, turnId: secondTask.turnId,
     callId: 'project-directory', repository: 'example/project' });
   assert.equal(directory.workspace, root);
   assert.equal(directory.kind, 'project-directory');

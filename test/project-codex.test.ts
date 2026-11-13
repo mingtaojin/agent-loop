@@ -68,7 +68,7 @@ createInterface({ input: process.stdin }).on('line', line => {
       current.turns.push(turn);
       current.status = { type: settings.completed ? 'idle' : 'active' };
       persist();
-      send({ id: message.id, result: { turn } });
+      if (!settings.callsBeforeResponse) send({ id: message.id, result: { turn } });
       for (const [index, call] of (settings.calls ?? []).entries()) {
         const request = { id: call.rpcId ?? 'wire-' + index, method: 'item/tool/call', params: {
           threadId: current.id, turnId: turn.id, callId: 'call-' + index,
@@ -77,6 +77,7 @@ createInterface({ input: process.stdin }).on('line', line => {
         send(request);
         if (settings.duplicate) send(request);
       }
+      if (settings.callsBeforeResponse) send({ id: message.id, result: { turn } });
       return;
     }
     case 'turn/steer':
@@ -206,7 +207,7 @@ test('every project action reaches only its handler with validated caller scope 
   });
   const active = await f.start();
   const replies = await f.results(validActions.length);
-  assert.deepEqual(requests, validActions.map((action, index) => ({ ...active, callId: 'call-' + index, action: projectActionSchema.parse(action) })));
+  assert.deepEqual(requests, validActions.map((action, index) => ({ ...active, connectionEpoch: requests[0]?.connectionEpoch, callId: 'call-' + index, action: projectActionSchema.parse(action) })));
   assert.ok(replies.every(reply => reply.success));
   assert.deepEqual(replies.map(reply => JSON.parse(reply.contentItems[0]?.text ?? 'null')), validActions.map((action, index) => ({ accepted: action.action, callId: 'call-' + index })));
 });
@@ -283,7 +284,7 @@ test('workspace calls keep their handler when project coordination is enabled', 
   assert.ok(reply);
   assert.equal(reply.success, true);
   assert.equal(JSON.parse(reply.contentItems[0]?.text ?? 'null').workspace, '/tmp/project');
-  assert.deepEqual(requests, [{ ...active, callId: 'call-0', projectId: 'workspace-project' }]);
+  assert.deepEqual(requests, [{ ...active, connectionEpoch: z.object({ connectionEpoch: z.string().min(1) }).parse(requests[0]).connectionEpoch, callId: 'call-0', projectId: 'workspace-project' }]);
 });
 
 test('a project handler rejection becomes a failed tool result without breaking the transport', async t => {
@@ -364,4 +365,65 @@ test('a project callback from a lost connection cannot answer its replacement tr
   const rows = await f.records();
   assert.equal(rows.filter(row => row.method === 'thread/start').length, 1);
   assert.equal(rows.filter(row => row.method === 'thread/resume').length, 1);
+});
+
+test('dynamic project callbacks validate the active turn without reading full history', async t => {
+  const f = await adapter(t, { calls: [{}] });
+  let calls = 0;
+  f.server.setProjectHandler(async () => { calls++; return { accepted: true }; });
+  await f.start();
+  assert.equal((await f.results())[0]?.success, true);
+  assert.equal(calls, 1);
+  const full = (await f.records()).filter(row => row.method === 'thread/read'
+    && z.object({ includeTurns: z.boolean() }).parse(row.params).includeTurns);
+  assert.equal(full.length, 0, 'active tool validation must not request complete history');
+});
+
+test('turn context is separate from stable instructions and delivery markers', async t => {
+  const f = await adapter(t);
+  const threadId = await f.create();
+  const turnId = await f.server.startTurn({ threadId, input: [{ kind: 'text', text: 'Original input' }], deliveryId: 'original-id', additionalDeliveryIds: ['second-id'], additionalContext: 'START_RECORD_CONTEXT' });
+  await f.server.steer({ threadId, turnId, input: [{ kind: 'text', text: 'Follow-up input' }], deliveryId: 'follow-up-id', additionalContext: 'STEER_RECORD_CONTEXT' });
+  const rows = await f.records();
+  assert.equal(rows.filter(row => row.method === 'thread/resume').length, 0);
+  assert.doesNotMatch(JSON.stringify(rows.find(row => row.method === 'thread/start')), /RECORD_CONTEXT/);
+  const turns = rows.filter(row => row.method === 'turn/start' || row.method === 'turn/steer').map(row =>
+    z.object({ clientUserMessageId: z.string(), input: z.array(z.object({ text: z.string() })), additionalContext: z.object({
+      'agent-loop-project-records': z.object({ kind: z.literal('application'), value: z.string() }),
+    }) }).parse(row.params));
+  assert.deepEqual(turns.map(turn => turn.additionalContext['agent-loop-project-records'].value), ['START_RECORD_CONTEXT', 'STEER_RECORD_CONTEXT']);
+  assert.deepEqual(turns.map(turn => turn.clientUserMessageId), ['original-id', 'follow-up-id']);
+  assert.equal(turns[0]?.input[1]?.text, 'Original input');
+  assert.match(turns[0]?.input[0]?.text ?? '', /agent-loop-delivery:original-id.*\n\[agent-loop-batch:/);
+  assert.doesNotMatch(JSON.stringify(turns.map(turn => turn.input)), /RECORD_CONTEXT/);
+});
+
+
+test('callbacks before the start response wait for exact turn evidence without loading history', async t => {
+  const f = await adapter(t, { callsBeforeResponse: true, calls: [{}, { turnId: 'wrong-turn' }], expectedReplies: 2 });
+  const requests: ProjectRequest[] = [];
+  f.server.setProjectHandler(async request => { requests.push(request); return { accepted: true }; });
+  const active = await f.start();
+  const replies = await f.results(2);
+  assert.equal(requests.length, 1); assert.equal(requests[0]?.turnId, active.turnId);
+  assert.equal(replies.filter(reply => reply.success).length, 1);
+  assert.equal(replies.filter(reply => !reply.success).length, 1);
+  assert.ok(!(await f.records()).some(row => row.method === 'thread/read' && z.object({ includeTurns: z.boolean() }).parse(row.params).includeTurns));
+});
+
+test('activity returns no delivery evidence and refuses terminal or unproven turns', async t => {
+  const f = await adapter(t);
+  const threadId = await f.create();
+  assert.deepEqual(await f.server.activity(threadId), { kind: 'reconcile' });
+  const { turnId } = await f.start(threadId);
+  const active = await f.server.activity(threadId);
+  assert.equal(active.kind, 'running'); assert.ok(!('seenInputIds' in active));
+  if (active.kind !== 'running') throw new Error('Expected active evidence');
+  assert.equal(active.turnId, turnId); assert.equal(f.server.isActiveTurn(active), true);
+  assert.equal(f.server.isActiveTurn({ ...active, connectionEpoch: 'old-epoch' }), false);
+  assert.equal(f.server.isActiveTurn({ ...active, turnId: 'old-turn' }), false);
+  await f.server.interrupt({ threadId, turnId });
+  assert.deepEqual(await f.server.activity(threadId), { kind: 'reconcile' });
+  assert.equal(f.server.isActiveTurn(active), false);
+  assert.equal((await f.server.inspect(threadId)).status, 'interrupted');
 });

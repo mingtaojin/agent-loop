@@ -1,12 +1,24 @@
-import type { AgentInput, ApprovalAction, Attachment, CollectionRepository, ExecutionSnapshot, IncomingMessage, PendingRequest, Repository, Source, SourceComment, TaskResource, WorkspaceRequest, WorkspaceSelectionRequest, WorkspaceSelectionResponse } from './domain.js';
+import type { AgentOutput, AgentInput, ApprovalAction, Attachment, CollectionRepository, ExecutionSnapshot, IncomingMessage, PendingRequest, Repository, Source, SourceComment, TaskResource, WorkspaceRequest, WorkspaceSelectionRequest, WorkspaceSelectionResponse } from './domain.js';
 import type { ExecutionEvent } from './execution-events.js';
 import type { ProjectAction, ReasoningEffort } from './project.js';
+
+export type Activity = { kind: 'reconcile' } | RunningActivity;
+export interface RunningActivity {
+  kind: 'running';
+  threadId: string;
+  turnId: string;
+  connectionEpoch: string;
+  requests: PendingRequest[];
+  outputs: AgentOutput[];
+}
+export type TurnIdentity = Pick<RunningActivity, 'threadId' | 'turnId' | 'connectionEpoch'>;
 
 export interface ProjectRequest {
   threadId: string;
   turnId: string;
   callId: string;
   action: ProjectAction;
+  connectionEpoch: string;
 }
 
 export interface GitHubPort {
@@ -61,8 +73,10 @@ export interface CodexPort {
   setEventHandler?(handler: (event: ExecutionEvent) => void): void;
   createThread(input: { cwd: string; instructions: string; model?: string; reasoningEffort?: ReasoningEffort }): Promise<string>;
   inspect(threadId: string, instructions?: string, model?: string, reasoningEffort?: ReasoningEffort): Promise<ExecutionSnapshot>;
-  startTurn(input: { threadId: string; input: AgentInput[]; deliveryId: string; additionalDeliveryIds?: string[] }): Promise<string>;
-  steer(input: { threadId: string; turnId: string; input: AgentInput[]; deliveryId: string }): Promise<void>;
+  activity(threadId: string, instructions?: string, model?: string, reasoningEffort?: ReasoningEffort): Promise<Activity>;
+  isActiveTurn(identity: TurnIdentity): boolean;
+  startTurn(input: { threadId: string; input: AgentInput[]; deliveryId: string; additionalDeliveryIds?: string[]; additionalContext?: string }): Promise<string>;
+  steer(input: { threadId: string; turnId: string; input: AgentInput[]; deliveryId: string; additionalContext?: string }): Promise<void>;
   reply(input: { request: PendingRequest; text: string }): Promise<void>;
   respondApproval(input: { request: PendingRequest; decision: 'approve' | 'reject' }): Promise<'confirmed' | 'uncertain'>;
   setWorkspaceHandler(handler: (request: WorkspaceRequest) => Promise<TaskResource>): void;

@@ -14,8 +14,10 @@ import { FeishuApiError, GroupCreationRejected, type CodexPort, type WorkspacePo
 import { GroupCleanup } from '../src/group-cleanup.js';
 import { groupGeneration, retireTaskGroup, TaskGroups } from '../src/task-groups.js';
 import { ProjectLedger, projectStateSchema, type ProjectAction } from '../src/project.js';
+import { ProjectRuntime } from '../src/project-runtime.js';
 import type { ReasoningEffort } from '../src/project.js';
 import { Store } from '../src/store.js';
+import { assertProbeTaskInventory } from '../scripts/project-coordinator-probe-tasks.js';
 import { CodexFake, FeishuFake, GitHubFake, issue } from './fakes.js';
 
 class ProjectCodexFake extends CodexFake {
@@ -507,6 +509,37 @@ test('project collection uses label OR assignee across repositories without crea
   assert.equal((await f.status()).counts.issues, matched.length);
 });
 
+test('native probe distinguishes retained Issue intakes from authorized executions across dispatch and restart', async t => {
+  const f = await fixture(t);
+  f.github.sources = [101, 102, 103, 104].map(number => projectIssue(number, 'example/frontend', {
+    id: `live-issue-${number}`, labels: number === 103 ? [] : ['coordinate'],
+  }));
+  await f.loop.collect();
+  const identities = f.loop.tasks().map(task => ({ id: task.id, sourceId: task.sourceId }));
+  const initial = assertProbeTaskInventory(f.loop.tasks(), f.state(), identities);
+  assert.equal(initial.executions.length, 1); assert.equal(initial.intakes.length, 3);
+  assert.ok(initial.intakes.every(task => task.status === 'pending'));
+  await f.loop.tick();
+  const worker = await f.dispatch('probe-worker', 'Read the fixture.', { issueId: 'live-issue-101' });
+  const check = () => {
+    const inventory = assertProbeTaskInventory(f.loop.tasks(), f.state(), identities);
+    assert.deepEqual(inventory.executions.map(task => task.id).sort(), [f.coordinator().id, worker.id].sort());
+    assert.deepEqual(inventory.intakes.map(task => task.sourceId).sort(), ['live-issue-102', 'live-issue-104']);
+  };
+  check(); await f.restart(); await f.loop.collect(); await f.loop.tick(); check();
+  const tasks = f.loop.tasks();
+  const hidden = tasks.find(task => task.sourceId === 'live-issue-102'); assert.ok(hidden);
+  assert.throws(() => assertProbeTaskInventory(tasks.map(task => task.id === hidden.id
+    ? { ...task, threadId: 'unauthorized-thread' } : task), f.state(), identities), /must not hide an executing thread/);
+  assert.throws(() => assertProbeTaskInventory([...tasks, { ...hidden, id: 'extra-task' }], f.state(), identities), /Exactly the coordinator/);
+  assert.throws(() => assertProbeTaskInventory(tasks.map(task => task.id === hidden.id
+    ? { ...task, sourceId: 'live-issue-103' } : task), f.state(), identities), /source identity must survive/);
+  const unauthorized = tasks.map(task => task.id === hidden.id ? { ...task, purpose: 'execution' as const } : task);
+  const extraMember = { ...f.state(), members: [...f.state().members,
+    { taskId: hidden.id, role: 'worker' as const, issueId: hidden.sourceId }] };
+  assert.throws(() => assertProbeTaskInventory(unauthorized, extraMember, identities), /Only Issue 101/);
+});
+
 test('enabling a project adopts a paused legacy Issue and preserves its group, Thread, work and native approval', async t => {
   const f = await fixture(t);
   const source = projectIssue(11);
@@ -710,13 +743,14 @@ test('CAS records reject stale writers and preserve immutable decisions, authors
   await assert.rejects(f.loop.projectAction(worker.id, { action: 'record', requestId: 'stale-write', key: 'export-scope', text: 'Unconfirmed assumption.', expectedVersion: 0 }), /version|conflict/i);
   await f.restart();
   assert.deepEqual(f.state().records, history);
-  assert.ok(f.codex.instructionUpdates.some(update => update.threadId === f.coordinator().threadId && update.instructions.includes(history[1]!.text)));
+  assert.ok(f.loop.projects.context(f.coordinator().id).includes(history[1]!.text));
+  assert.ok(f.codex.instructionUpdates.every(update => !update.instructions.includes(history[1]!.text)));
   assert.deepEqual(await f.loop.projectAction(f.coordinator().id, first), result);
   const firstPage = z.object({ items: projectStateSchema.shape.records, nextOffset: z.number().nullable() })
-    .parse(await f.loop.projectAction(worker.id, { action: 'status', section: 'records', offset: 0, limit: 1 }));
+    .parse(await f.loop.projectAction(f.coordinator().id, { action: 'status', section: 'records', offset: 0, limit: 1 }));
   assert.deepEqual(firstPage.items, [history[0]]); assert.equal(firstPage.nextOffset, 1);
   const secondPage = z.object({ items: projectStateSchema.shape.records, nextOffset: z.number().nullable() })
-    .parse(await f.loop.projectAction(worker.id, { action: 'status', section: 'records', offset: 1, limit: 1 }));
+    .parse(await f.loop.projectAction(f.coordinator().id, { action: 'status', section: 'records', offset: 1, limit: 1 }));
   assert.deepEqual(secondPage.items, [history[1]]); assert.equal(secondPage.nextOffset, null);
   assert.equal((await f.status()).version, 2);
 });
@@ -769,7 +803,8 @@ test('rotation waits for coordinator idleness and retains its group, members, pe
   assert.equal(f.loop.store.task(worker.id).requests[0]?.id, 'pending-scope');
   assert.equal(f.events(after.id, 'session_rotation').length, 1);
   assert.ok(f.codex.starts.some(input => input.threadId === after.threadId && JSON.stringify(input.input).includes(rotation.checkpoint)));
-  assert.ok(f.codex.created.at(-1)?.instructions.includes(state.records[0]!.text));
+  assert.ok(!f.codex.created.at(-1)?.instructions.includes(state.records[0]!.text));
+  assert.ok(f.loop.projects.context(after.id).includes(state.records[0]!.text));
   await f.restart(); await f.loop.projectAction(after.id, rotation); await f.loop.tick();
   assert.equal(f.coordinator().threadId, after.threadId);
   assert.equal(f.events(after.id, 'session_rotation').length, 1);
@@ -946,21 +981,59 @@ test('a final investigation reply stays local and an explicit report wakes the c
   assert.equal(f.loop.store.task(worker.id).status, 'idle');
 });
 
-test('the project shell fallback accepts the scoped task token only during an active turn', async t => {
+test('retained task shell fallback writes scoped records without native tools and requires the current active turn', async t => {
   const f = await fixture(t); const coordinator = await f.initialize(); assert.ok(coordinator.threadId);
+  const worker = await f.dispatch('fallback-worker', 'Receive selected evidence.'); assert.ok(worker.threadId);
+  await f.restart();
+  f.codex.projectHandler = null;
   const actionFile = join(f.root, 'project-action.json');
   await writeFile(actionFile, JSON.stringify({ action: 'status' }));
-  const instructions = f.codex.created[0]?.instructions ?? '';
+  const instructions = f.codex.instructionUpdates.findLast(update => update.threadId === coordinator.threadId)?.instructions ?? '';
+  assert.match(instructions, /project_action is absent or its retained schema lacks the required action or fields/);
   const command = /write the action JSON to a file and run (.+?) '<absolute-action-json-file>' using your shell tool/.exec(instructions)?.[1];
   assert.ok(command, 'The coordinator must receive an executable project fallback command');
-  const run = () => promisify(execFile)('/bin/sh', ['-c', `${command} "$1"`, 'project-fallback', actionFile], { timeout: 10_000 });
+  const run = (fallback = command) => promisify(execFile)('/bin/sh', ['-c', `${fallback} "$1"`, 'project-fallback', actionFile], { timeout: 10_000 });
   const active = await run();
   assert.equal(overviewSchema.parse(JSON.parse(active.stdout)).coordinatorTaskId, coordinator.id);
+  const action = { action: 'record', requestId: 'fallback-scoped-record', key: 'selected-evidence', text: 'SELECTED_FALLBACK_EVIDENCE',
+    expectedVersion: f.state().version, scope: { kind: 'task', taskId: worker.id } } satisfies ProjectAction;
+  await writeFile(actionFile, JSON.stringify(action));
+  const written = await run();
+  const acknowledgement = { accepted: true, requestId: action.requestId, key: action.key, version: action.expectedVersion + 1, scope: action.scope };
+  assert.deepEqual(JSON.parse(written.stdout), acknowledgement);
+  const saved = new Store(f.root, { readOnly: true });
+  try {
+    const records = new ProjectLedger(saved).project('app')?.records;
+    assert.equal(records?.length, 1);
+    assert.equal(records[0]?.text, action.text);
+    assert.equal(records[0]?.authorTaskId, coordinator.id);
+    assert.deepEqual(records[0]?.scope, action.scope);
+  } finally { saved.close(); }
+  const workerInstructions = f.codex.instructionUpdates.findLast(update => update.threadId === worker.threadId)?.instructions ?? '';
+  const workerCommand = /write the action JSON to a file and run (.+?) '<absolute-action-json-file>' using your shell tool/.exec(workerInstructions)?.[1];
+  assert.ok(workerCommand);
+  await writeFile(actionFile, JSON.stringify({ ...action, requestId: 'forbidden-fallback', expectedVersion: f.state().version,
+    scope: { kind: 'task', taskId: coordinator.id } }));
+  const beforeDenied = f.state();
+  await assert.rejects(run(workerCommand), /Only the coordinator/);
+  assert.deepEqual(f.state(), beforeDenied);
+  await writeFile(actionFile, JSON.stringify(action));
+  const oldActivity = await f.codex.activity(coordinator.threadId); assert.equal(oldActivity.kind, 'running');
   await f.idleCoordinator();
   await assert.rejects(run(), /active turn/i);
   await f.loop.receive(f.message('resume-project', 'Review current project work.', coordinator.chatId!));
-  const resumed = await run(); assert.equal(overviewSchema.parse(JSON.parse(resumed.stdout)).id, 'app');
+  const activity = f.codex.activity.bind(f.codex);
+  f.codex.activity = async () => oldActivity;
+  await assert.rejects(run(), /original active task turn/i);
+  const currentActivity = await activity(coordinator.threadId); assert.equal(currentActivity.kind, 'running');
+  f.codex.activity = async () => ({ ...currentActivity, connectionEpoch: 'stale-epoch' });
+  await assert.rejects(run(), /original active task turn/i);
+  f.codex.activity = activity;
+  const resumed = await run(); assert.deepEqual(JSON.parse(resumed.stdout), acknowledgement);
+  assert.deepEqual(f.state(), beforeDenied);
   assert.equal(f.coordinator().threadId, coordinator.threadId);
+  assert.equal(f.loop.store.task(worker.id).threadId, worker.threadId);
+  assert.equal(f.codex.created.length, 2);
 });
 
 test('project intake clears legacy server filters so label-only and assignee-only Issues remain visible', async t => {
@@ -1067,6 +1140,179 @@ test('independent startup race: recovery must validate saved resources before in
   } finally { held.resolve(); await starting; await restarted.close(); }
   assert.equal(validations, 1);
   assert.equal(f.codex.starts.filter(call => call.threadId === worker.threadId).length, before);
+});
+
+
+test('task record sentinels stay out of unrelated instructions and every status section', async t => {
+  const f = await fixture(t); await f.initialize();
+  const privateIssue = projectIssue(91, 'example/frontend', { title: 'A_PRIVATE_ISSUE_TITLE', body: 'A_PRIVATE_ISSUE_BODY' });
+  f.loop.projects.ledger.issue('app', privateIssue);
+  f.loop.projects.ledger.comment('app', sourceCommentSchema.parse({ id: 'private-comment', sourceId: privateIssue.id,
+    url: 'https://example.test/comment', author: 'owner', body: 'A_PRIVATE_COMMENT_BODY', createdAt: '2026-11-14T01:00:00Z', updatedAt: '2026-11-14T01:00:00Z' }));
+  const a = await f.dispatch('private-a', 'Task A.', { issueId: privateIssue.id });
+  const b = await f.dispatch('private-b', 'Task B.');
+  const verifier = await f.dispatch('private-verifier', 'Verify selected evidence.', { role: 'verifier' });
+  const before = f.loop.projects.instructions(b.id);
+  await f.loop.projectAction(a.id, { action: 'record', requestId: 'a-private', key: 'requirements', text: 'A_PRIVATE_RECORD_SENTINEL', expectedVersion: 0 });
+  assert.equal(f.loop.projects.instructions(b.id), before);
+  const saved = f.loop.store.task(a.id);
+  saved.reason = 'A_PRIVATE_REASON_SENTINEL';
+  saved.resources.push({ kind: 'project', id: 'private-resource', workspace: '/tmp/A_PRIVATE_RESOURCE_PATH', project: {
+    kind: 'project', id: 'private-project', name: 'private', entryPath: '/tmp/A_PRIVATE_RESOURCE_PATH', canonicalPath: '/tmp/A_PRIVATE_RESOURCE_PATH',
+  } });
+  const intake = taskSchema.parse({ ...a, id: 'private-intake', sourceId: 'private-intake', purpose: 'intake', status: 'pending',
+    source: { kind: 'cli', ...ProjectRuntime.submission('private-intake', 'A_PRIVATE_INTAKE_BODY'), submittedAt: 1 },
+    threadId: null, turnId: null, chatId: null, executionStatus: 'unbound', resources: [] });
+  f.loop.store.saveTask(intake);
+  f.loop.store.setMeta(`project-intake-route:${intake.id}`, JSON.stringify({ projectId: 'app', coordinatorTaskId: f.coordinator().id }));
+  f.loop.store.setMeta(`project-intake-material:${intake.id}`, '/tmp/A_PRIVATE_INTAKE_PATH');
+  saved.requests = [{ id: 'private-question', threadId: a.threadId!, turnId: a.turnId!, kind: 'question',
+    prompt: 'A_PRIVATE_PROMPT_SENTINEL', method: 'item/tool/requestUserInput', payload: {}, isBlocking: true, connectionEpoch: 'scope-test' }];
+  f.loop.store.saveTask(saved);
+  f.loop.store.enqueue(a.id, 'A_PRIVATE_OUTPUT_SENTINEL', 'private-output');
+  for (const caller of [b, verifier]) {
+    for (const section of ['overview', 'records', 'tasks', 'issues', 'comments', 'intakes'] as const) {
+      const response = await f.loop.projectAction(caller.id, { action: 'status', section, limit: 1 });
+      assert.doesNotMatch(JSON.stringify(response), /A_PRIVATE_/, `${caller.id} ${section}`);
+    }
+  }
+  assert.match(JSON.stringify(await f.loop.projectAction(a.id, { action: 'status', section: 'records' })), /A_PRIVATE_RECORD_SENTINEL/);
+  assert.match(JSON.stringify(await f.loop.projectAction(f.coordinator().id, { action: 'status', section: 'tasks' })), /A_PRIVATE_PROMPT_SENTINEL/);
+});
+
+test('record acknowledgements sanitize both new writes and legacy full-state receipt replays', async t => {
+  const f = await fixture(t); await f.initialize();
+  const a = await f.dispatch('receipt-a', 'Task A.');
+  const b = await f.dispatch('receipt-b', 'Task B.');
+  await f.loop.projectAction(a.id, { action: 'record', requestId: 'receipt-private', key: 'private', text: 'RECEIPT_PRIVATE_SENTINEL', expectedVersion: 0 });
+  const action: ProjectAction = { action: 'record', requestId: 'receipt-b-write', key: 'own', text: 'Own evidence.', expectedVersion: 1 };
+  const response = await f.loop.projectAction(b.id, action);
+  assert.doesNotMatch(JSON.stringify(response), /RECEIPT_PRIVATE_SENTINEL/);
+  assert.deepEqual(Object.keys(z.object({ accepted: z.literal(true), requestId: z.string(), key: z.string(), version: z.number() }).parse(response)).sort(), ['accepted', 'key', 'requestId', 'version']);
+  const key = `project:${JSON.stringify(['receipt', 'app', b.id, action.requestId])}`;
+  const { fingerprint } = z.object({ fingerprint: z.string() }).parse(JSON.parse(f.loop.store.meta(key)!));
+  f.loop.store.setMeta(key, JSON.stringify({ fingerprint, value: f.state() }));
+  const historical = f.loop.store.meta(key);
+  const replay = await f.loop.projectAction(b.id, action);
+  assert.deepEqual(replay, response);
+  assert.equal(f.loop.store.meta(key), historical);
+});
+
+
+test('scoped records retain same-key identities, caller defaults and explicit coordinator routing after restart', async t => {
+  const f = await fixture(t, { secondProject: true }); await f.initialize();
+  const a = await f.dispatch('scope-a', 'Task A.');
+  const b = await f.dispatch('scope-b', 'Task B.');
+  const verifier = await f.dispatch('scope-v', 'Verify selected evidence.', { role: 'verifier' });
+  const record = (callerId: string, requestId: string, text: string, scope?: Extract<ProjectAction, { action: 'record' }>['scope']) =>
+    f.loop.projectAction(callerId, { action: 'record', requestId, key: 'same-key', text, expectedVersion: f.state().version, ...(scope ? { scope } : {}) });
+  await record(a.id, 'a', 'A_ONLY');
+  await record(b.id, 'b', 'B_ONLY');
+  await record(verifier.id, 'v', 'VERIFIER_ONLY');
+  await record(f.coordinator().id, 'coord', 'COORDINATOR_ONLY');
+  await record(f.coordinator().id, 'shared', 'PROJECT_SHARED', { kind: 'project' });
+  await record(f.coordinator().id, 'routed', 'SELECTED_A_EVIDENCE', { kind: 'task', taskId: verifier.id });
+  for (const scope of [{ kind: 'project' }, { kind: 'coordinator' }, { kind: 'task', taskId: a.id }] as const)
+    await assert.rejects(record(b.id, `forbidden-${scope.kind}`, 'FORBIDDEN', scope), /Only the coordinator/);
+  await assert.rejects(record(f.coordinator().id, 'foreign', 'FORBIDDEN', { kind: 'task', taskId: f.coordinator('docs').id }), /does not belong/);
+  await assert.rejects(record(f.coordinator().id, 'missing', 'FORBIDDEN', { kind: 'task', taskId: 'missing' }), /does not belong/);
+  const all = await f.status();
+  assert.equal(all.records.length, 5);
+  await record(f.coordinator().id, 'coordinator-task', 'COORDINATOR_TASK_TARGET', { kind: 'task', taskId: f.coordinator().id });
+  assert.match(f.loop.projects.context(f.coordinator().id), /COORDINATOR_TASK_TARGET/);
+  assert.doesNotMatch(f.loop.projects.context(a.id), /COORDINATOR_TASK_TARGET/);
+  assert.ok(f.loop.projects.context(a.id).includes('A_ONLY'));
+  assert.doesNotMatch(f.loop.projects.context(a.id), /B_ONLY|COORDINATOR_ONLY|SELECTED_A_EVIDENCE|VERIFIER_ONLY/);
+  assert.match(f.loop.projects.context(verifier.id), /SELECTED_A_EVIDENCE/);
+  assert.doesNotMatch(f.loop.projects.context(f.coordinator().id), /A_ONLY|B_ONLY|SELECTED_A_EVIDENCE|VERIFIER_ONLY/);
+  assert.doesNotMatch(f.loop.projects.context(f.coordinator('docs').id), /PROJECT_SHARED/);
+  const page = z.object({ counts: z.object({ records: z.number() }), items: projectStateSchema.shape.records, nextOffset: z.number().nullable() });
+  const first = page.parse(await f.loop.projectAction(a.id, { action: 'status', section: 'records', limit: 1 }));
+  const second = page.parse(await f.loop.projectAction(a.id, { action: 'status', section: 'records', limit: 1, offset: 1 }));
+  assert.equal(first.counts.records, 2); assert.equal(first.items[0]?.text, 'A_ONLY'); assert.equal(first.nextOffset, 1);
+  assert.equal(second.items[0]?.text, 'PROJECT_SHARED'); assert.equal(second.nextOffset, null);
+  const before = f.state(); const context = f.loop.projects.context(a.id);
+  await f.restart();
+  assert.deepEqual(f.state(), before); assert.equal(f.loop.projects.context(a.id), context);
+  await assert.rejects(f.loop.projectAction(a.id, { action: 'record', requestId: 'a', key: 'same-key', text: 'A_ONLY', expectedVersion: 0, scope: { kind: 'project' } }), /different content/);
+});
+
+test('legacy unscoped records remain query-only for coordinators without rewriting stored originals', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('legacy-scope', 'Continue original task.');
+  const legacy = { requestId: 'legacy-original', key: 'legacy', text: 'LEGACY_UNSCOPED_SENTINEL', authorTaskId: worker.id, version: 1, createdAt: 1 };
+  const state = f.state();
+  f.loop.projects.ledger.save({ ...state, version: 1, records: [legacy] });
+  const key = `project:${JSON.stringify(['state', state.id])}`;
+  const raw = f.loop.store.meta(key);
+  assert.doesNotMatch(f.loop.projects.context(worker.id), /LEGACY_UNSCOPED/);
+  assert.doesNotMatch(f.loop.projects.context(f.coordinator().id), /LEGACY_UNSCOPED/);
+  assert.doesNotMatch(JSON.stringify(await f.loop.projectAction(worker.id, { action: 'status', section: 'records' })), /LEGACY_UNSCOPED/);
+  assert.match(JSON.stringify(await f.loop.projectAction(f.coordinator().id, { action: 'status', section: 'records' })), /LEGACY_UNSCOPED/);
+  const replay = await f.loop.projectAction(worker.id, { action: 'record', requestId: legacy.requestId, key: legacy.key, text: legacy.text, expectedVersion: 0 });
+  assert.deepEqual(replay, { accepted: true, requestId: legacy.requestId, key: legacy.key, version: 1 });
+  assert.equal(f.loop.store.meta(key), raw);
+  await f.restart();
+  assert.deepEqual(f.state().records, [legacy]);
+});
+
+
+test('record writes enqueue no turn and actual inputs receive only current task context', async t => {
+  const f = await fixture(t); await f.initialize();
+  const a = await f.dispatch('context-a', 'Task A.'); const b = await f.dispatch('context-b', 'Task B.');
+  const aOpened = await f.openGroup(a.id); const bOpened = await f.openGroup(b.id);
+  assert.ok(aOpened.chatId && bOpened.chatId);
+  const beforeB = f.loop.projects.context(b.id);
+  const starts = f.codex.starts.length, steers = f.codex.steers.length;
+  const instructions = f.loop.projects.instructions(b.id);
+  await f.loop.projectAction(a.id, { action: 'record', requestId: 'context-write', key: 'scope', text: 'A_DYNAMIC_RECORD', expectedVersion: 0 });
+  await f.loop.tick();
+  assert.equal(f.codex.starts.length, starts); assert.equal(f.codex.steers.length, steers);
+  assert.equal(f.loop.projects.context(b.id), beforeB);
+  assert.equal(f.loop.projects.instructions(b.id), instructions);
+  await f.loop.receive(f.message('context-input-a', 'Continue A.', aOpened.chatId));
+  await f.loop.receive(f.message('context-input-b', 'Continue B.', bOpened.chatId));
+  assert.match(f.codex.steers.find(input => input.deliveryId === 'context-input-a')?.additionalContext ?? '', /A_DYNAMIC_RECORD/);
+  assert.equal(f.codex.steers.find(input => input.deliveryId === 'context-input-b')?.additionalContext, beforeB);
+  assert.ok(f.codex.instructionUpdates.every(update => !update.instructions.includes('A_DYNAMIC_RECORD')));
+  await f.loop.projectAction(f.coordinator().id, { action: 'record', requestId: 'shared-context', key: 'rule', text: 'SHARED_DYNAMIC_RULE', expectedVersion: 1, scope: { kind: 'project' } });
+  f.codex.complete(a.threadId!, null); await f.loop.tick();
+  await f.loop.receive(f.message('context-new-turn', 'Next task input.', aOpened.chatId));
+  const started = f.codex.starts.find(input => input.deliveryId === 'context-new-turn');
+  assert.match(started?.additionalContext ?? '', /A_DYNAMIC_RECORD/);
+  assert.match(started?.additionalContext ?? '', /SHARED_DYNAMIC_RULE/);
+  assert.doesNotMatch(JSON.stringify(started?.input), /DYNAMIC_RECORD|DYNAMIC_RULE/);
+});
+
+test('running observation preserves approval identity and full inspection still reconciles unknown deliveries and startup', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('activity-worker', 'Work continuously.');
+  const opened = await f.openGroup(worker.id); assert.ok(opened.chatId && opened.threadId);
+  const inspect = f.codex.inspect.bind(f.codex); let fullReads = 0;
+  f.codex.inspect = async (...args) => { if (args[0] === worker.threadId) fullReads++; return inspect(...args); };
+  f.codex.activity = async threadId => {
+    const snapshot = f.codex.snapshot(threadId);
+    if (snapshot.status !== 'running' || !snapshot.turnId) return { kind: 'reconcile' };
+    return { kind: 'running', threadId, turnId: snapshot.turnId, connectionEpoch: 'fake-epoch', requests: snapshot.requests, outputs: [] };
+  };
+  const snapshot = f.codex.snapshot(opened.threadId); assert.ok(snapshot.turnId);
+  snapshot.requests = [{ id: 'activity-approval', threadId: opened.threadId, turnId: snapshot.turnId, kind: 'approval',
+    prompt: 'Approve this operation?', method: 'item/commandExecution/requestApproval', payload: {}, isBlocking: true, connectionEpoch: 'fake-epoch' }];
+  await f.loop.tick();
+  assert.equal(fullReads, 0); assert.equal(f.loop.store.task(worker.id).requests[0]?.id, 'activity-approval');
+  assert.equal(f.codex.approvals.length, 0);
+  snapshot.requests = [];
+  f.codex.loseInputAck = true;
+  await f.loop.receive(f.message('activity-lost-input', 'Continue once.', opened.chatId));
+  assert.equal(f.loop.store.inputs(worker.id).find(input => input.id === 'activity-lost-input')?.status, 'uncertain');
+  assert.equal(fullReads, 0);
+  await f.loop.tick();
+  assert.ok(fullReads > 0);
+  assert.equal(f.loop.store.inputs(worker.id).find(input => input.id === 'activity-lost-input')?.status, 'delivered');
+  assert.equal(f.codex.steers.filter(input => input.deliveryId === 'activity-lost-input').length, 1);
+  fullReads = 0; await f.restart();
+  assert.ok(fullReads > 0);
+  assert.equal(f.loop.store.task(worker.id).threadId, worker.threadId);
 });
 
 for (const role of ['worker', 'verifier'] as const) for (const grouped of [false, true]) for (const running of [false, true]) {

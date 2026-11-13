@@ -217,7 +217,7 @@ export const workspaceTargetSchema = z.union([
   z.strictObject({ projectId: z.string().min(1) }),
 ]);
 export type WorkspaceTarget = z.infer<typeof workspaceTargetSchema>;
-export type WorkspaceRequest = { threadId: string; turnId: string; callId: string } & WorkspaceTarget;
+export type WorkspaceRequest = { threadId: string; turnId: string; callId: string; connectionEpoch: string } & WorkspaceTarget;
 export const approvalActionSchema = z.object({
   id: z.string(), taskId: z.string(), threadId: z.string(), turnId: z.string(), requestId: z.string(),
   decision: z.enum(['approve', 'reject']), chatId: z.string(), senderId: z.string(), epoch: z.string(),

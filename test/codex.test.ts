@@ -16,7 +16,7 @@ const stateFile = process.argv[2];
 const fs = require('node:fs');
 let turns = mode.startsWith('recover') && fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile, 'utf8')) : [];
 const persist = () => { if (mode.startsWith('recover')) fs.writeFileSync(stateFile, JSON.stringify(turns)); };
-const record = method => { if (mode.startsWith('recover')) fs.appendFileSync(stateFile + '.calls', method + '\n'); };
+const record = method => { if (mode.startsWith('recover') || mode.startsWith('paginated-start-')) fs.appendFileSync(stateFile + '.calls', method + '\n'); };
 let receivedReply;
 let metadataReads = 0;
 let historyReads = 0;
@@ -69,6 +69,7 @@ createInterface({ input: process.stdin }).on('line', line => {
   if (mode === 'orphaned') turns = [{ id: 'turn-1', status: 'inProgress', items: [] }];
   result = { thread: thread() }; break;
  case 'thread/read':
+  if (mode.startsWith('paginated-start-') && historyReads < 3) { result = { thread: { ...thread(), status: { type: 'idle' }, turns: [] } }; break; }
   if (mode === 'external-active-history' && ++unpublishedReads < 5) { result = { thread: { ...thread(), status: { type: 'active' }, turns: [] } }; break; }
   if (mode === 'start-status-race' && ++unpublishedReads < 5) { result = { thread: { ...thread(), status: { type: 'idle' }, turns: p.includeTurns ? turns : [] } }; break; }
   if (mode === 'start-history-race' && ++unpublishedReads < 5) { result = { thread: { ...thread(), status: { type: 'idle' }, turns: [] } }; break; }
@@ -79,6 +80,11 @@ createInterface({ input: process.stdin }).on('line', line => {
   } else result = { thread: { ...thread(), turns: p.includeTurns ? turns : [] } };
   break;
  case 'thread/turns/list':
+  if (mode.startsWith('paginated-start-')) {
+   record(p.itemsView);
+   if (++historyReads < 3 || mode === 'paginated-start-timeout') { send({ id: m.id, error: { code: -32601, message: 'list_turns is not supported yet' } }); return; }
+   if (turns.at(-1).status === 'inProgress') { send({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: turns.at(-1).id } } }); complete(); }
+  }
   if (mode === 'paginated-materializing' && ++historyReads < 3) { send({ id: m.id, error: { code: -32603, message: 'list_turns is not supported yet' } }); return; }
   if (!turns.length) { send({ id: m.id, error: { code: -32000, message: 'thread is not materialized yet' } }); return; }
   if (p.itemsView === 'summary' && p.sortDirection === 'desc' && p.limit === 1 && p.cursor === null) {
@@ -92,6 +98,10 @@ createInterface({ input: process.stdin }).on('line', line => {
   turns.push({ id: 'turn-' + (turns.length + 1), status: 'inProgress', items: [inputItem(p)] });
   persist();
   result = { turn: turns.at(-1) };
+  if (mode.startsWith('paginated-start-')) {
+   result = { turn: { ...turns.at(-1), items: [], itemsView: 'notLoaded' } };
+   if (mode === 'paginated-start-completed') { send({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: turns.at(-1).id } } }); complete(); }
+  }
   if (mode === 'workspace-completed') turns.at(-1).status = 'completed';
   if (mode.startsWith('workspace')) send({ id: 'workspace-wire', method: 'item/tool/call', params: { threadId: mode === 'workspace-unknown' ? 'unknown-thread' : 'thread-1', turnId: mode === 'workspace-stale' ? 'old-turn' : turns.at(-1).id, callId: 'workspace-call', tool: 'ensure_workspace', arguments: mode === 'workspace-project' ? { projectId: 'project-fixture' } : mode === 'workspace-ambiguous' ? { projectId: 'project-fixture', repository: 'example/one' } : mode === 'workspace-project-path' ? { projectId: 'project-fixture', path: '/invented/path' } : { repository: 'example/one' } } });
   if (mode === 'outputs') {
@@ -198,7 +208,7 @@ createInterface({ input: process.stdin }).on('line', line => {
    summaryReads++;
    if (mode === 'unsupported-method' || mode === 'recover-unsupported' && generation === 1) { fail(m, -32601, 'method not found'); break; }
    if (mode === 'unsupported-params') { fail(m, -32602, 'unknown variant summary'); break; }
-   if (['transient', 'materializing'].includes(mode) && summaryReads === 2) { fail(m, mode === 'transient' ? -32000 : -32603, mode === 'transient' ? 'history unavailable' : 'list_turns is not supported yet'); break; }
+   if (['transient', 'materializing', 'materializing-method'].includes(mode) && summaryReads === 2) { fail(m, mode === 'transient' ? -32000 : mode === 'materializing-method' ? -32601 : -32603, mode === 'transient' ? 'history unavailable' : 'list_turns is not supported yet'); break; }
    if (mode.startsWith('mutation-') && summaryReads === 2) {
     heldHead = { m, result: summary() };
     fs.appendFileSync(logFile, JSON.stringify({ method: 'head-held', bytes: 0 }) + '\n'); break;
@@ -365,7 +375,7 @@ for (const mode of ['legacy', 'unsupported-method', 'unsupported-params']) test(
   assert.equal((await wire()).filter(call => call.params?.itemsView === 'summary').length, mode === 'legacy' ? 0 : 1);
 });
 
-for (const mode of ['transient', 'materializing']) test(`${mode} summary failure preserves uncertainty and does not disable summary for the connection`, async t => {
+for (const mode of ['transient', 'materializing', 'materializing-method']) test(`${mode} summary failure preserves uncertainty and does not disable summary for the connection`, async t => {
   const { server, wire, fullReads } = await settledAdapter(t, mode);
   const first = await server.inspect('thread-1');
   await assert.rejects(server.inspect('thread-1'), mode === 'transient' ? /history unavailable/ : /list_turns is not supported yet/);
@@ -455,6 +465,39 @@ test('a newly created thread can be inspected before its first user turn', async
   const server = adapter('paginated'); t.after(() => server.close());
   const threadId = await server.createThread({ cwd: '/tmp', instructions: '' });
   assert.equal((await server.inspect(threadId)).status, 'idle');
+});
+
+for (const mode of ['paginated-start-idle', 'paginated-start-completed', 'paginated-start-timeout']) test(`${mode} retains accepted-turn uncertainty until native history materializes`, async t => {
+  const directory = await mkdtemp('/tmp/agent-loop-materializing-');
+  const stateFile = `${directory}/state`;
+  const server = new CodexAppServer({ command: [process.execPath, '-e', fixture, mode, stateFile], approvalPolicy: 'never', sandbox: 'read-only', requestTimeoutMs: 2000 });
+  t.after(async () => { await server.close(); await rm(directory, { recursive: true, force: true }); });
+  const threadId = await server.createThread({ cwd: '/tmp', instructions: 'Wait for reproduction confirmation' });
+  assert.equal((await server.inspect(threadId)).status, 'idle');
+  const turnId = await server.startTurn({ threadId, input: [{ kind: 'text', text: 'Investigate' }], deliveryId: 'delivery-1' });
+  assert.deepEqual(await server.activity(threadId), { kind: 'reconcile' });
+  if (mode === 'paginated-start-timeout') {
+    await assert.rejects(server.inspect(threadId), UncertainOperationError);
+    await assert.rejects(server.inspect(threadId), UncertainOperationError);
+  } else {
+    const snapshot = await server.inspect(threadId);
+    assert.equal(snapshot.turnId, turnId);
+    assert.equal(snapshot.status, 'completed');
+    assert.deepEqual(snapshot.seenInputIds, ['delivery-1']);
+    assert.equal(snapshot.outputs.length, 1);
+    const calls = (await readFile(`${stateFile}.calls`, 'utf8')).trim().split('\n');
+    assert.equal(calls.filter(method => method === 'summary').length, 3);
+    assert.equal(calls.filter(method => method === 'full').length, 1);
+    assert.deepEqual(await server.inspect(threadId), snapshot);
+    assert.deepEqual(await server.inspect(threadId), snapshot);
+    const cachedCalls = (await readFile(`${stateFile}.calls`, 'utf8')).trim().split('\n');
+    assert.equal(cachedCalls.filter(method => method === 'summary').length, 5);
+    assert.equal(cachedCalls.filter(method => method === 'full').length, mode === 'paginated-start-idle' ? 2 : 1);
+  }
+  const calls = (await readFile(`${stateFile}.calls`, 'utf8')).trim().split('\n');
+  assert.equal(calls.filter(method => method === 'turn/start').length, 1);
+  assert.equal(calls.filter(method => method === 'turn/steer').length, 0);
+  assert.equal(calls.filter(method => method === 'thread/resume').length, 0);
 });
 
 test('resuming restores original output and delivery evidence from history', async t => {
@@ -614,7 +657,7 @@ test('completed progress survives repeated snapshots without leaking deltas, rea
 
 test('workspace provisioning remains asynchronous while an RPC and callback inspect are pending', async t => {
   const server = adapter('workspace'); t.after(() => server.close());
-  const requests: unknown[] = [];
+  const requests: WorkspaceRequest[] = [];
   server.setWorkspaceHandler(async request => {
     requests.push(request);
     assert.equal((await server.inspect(request.threadId)).threadId, 'thread-1');
@@ -624,7 +667,8 @@ test('workspace provisioning remains asynchronous while an RPC and callback insp
   let snapshot = await server.inspect('thread-1');
   for (let attempt = 0; snapshot.status === 'running' && attempt < 10; attempt++) snapshot = await server.inspect('thread-1');
   assert.equal(snapshot.status, 'completed');
-  assert.deepEqual(requests, [{ threadId: 'thread-1', turnId: 'turn-1', callId: 'workspace-call', repository: 'example/one' }]);
+  assert.ok(requests[0]?.connectionEpoch);
+  assert.deepEqual(requests, [{ threadId: 'thread-1', turnId: 'turn-1', connectionEpoch: requests[0]?.connectionEpoch, callId: 'workspace-call', repository: 'example/one' }]);
 });
 
 test('dynamic project targets cross the adapter boundary with their exact Runtime identity', async t => {
@@ -640,7 +684,8 @@ test('dynamic project targets cross the adapter boundary with their exact Runtim
   let snapshot = await server.inspect('thread-1');
   for (let attempt = 0; snapshot.status === 'running' && attempt < 10; attempt++) snapshot = await server.inspect('thread-1');
   assert.equal(snapshot.status, 'completed');
-  assert.deepEqual(requests, [{ threadId: 'thread-1', turnId: 'turn-1', callId: 'workspace-call', projectId: 'project-fixture' }]);
+  assert.ok(requests[0]?.connectionEpoch);
+  assert.deepEqual(requests, [{ threadId: 'thread-1', turnId: 'turn-1', connectionEpoch: requests[0]?.connectionEpoch, callId: 'workspace-call', projectId: 'project-fixture' }]);
 });
 
 test('inspection replaces historical developer instructions using the current runtime contract', async t => {

@@ -219,7 +219,7 @@ test('dynamic project acquisition and retained shell bridge preserve original re
     prompt: 'Preserved native question', method: 'item/tool/requestUserInput', payload: {}, isBlocking: true, connectionEpoch: 'epoch' };
   f.codex.snapshot(task.threadId).requests.push(nativeRequest);
   await f.loop.tick(); assert.ok(f.codex.workspaceHandler);
-  const extra = await f.codex.workspaceHandler({ threadId: task.threadId, turnId: task.turnId, callId: 'extra-project', projectId: extraId });
+  const extra = await f.codex.workspaceHandler({ connectionEpoch: 'fake-epoch', threadId: task.threadId, turnId: task.turnId, callId: 'extra-project', projectId: extraId });
   assert.equal(extra.workspace, await realpath(join(root, 'extra')));
   assert.deepEqual(f.task().resources.filter(resource => resource.id !== extra.id), original);
   assert.deepEqual(f.task().requests, [nativeRequest]);
