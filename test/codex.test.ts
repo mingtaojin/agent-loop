@@ -614,7 +614,7 @@ test('completed progress survives repeated snapshots without leaking deltas, rea
 
 test('workspace provisioning remains asynchronous while an RPC and callback inspect are pending', async t => {
   const server = adapter('workspace'); t.after(() => server.close());
-  const requests: unknown[] = [];
+  const requests: WorkspaceRequest[] = [];
   server.setWorkspaceHandler(async request => {
     requests.push(request);
     assert.equal((await server.inspect(request.threadId)).threadId, 'thread-1');
@@ -624,7 +624,8 @@ test('workspace provisioning remains asynchronous while an RPC and callback insp
   let snapshot = await server.inspect('thread-1');
   for (let attempt = 0; snapshot.status === 'running' && attempt < 10; attempt++) snapshot = await server.inspect('thread-1');
   assert.equal(snapshot.status, 'completed');
-  assert.deepEqual(requests, [{ threadId: 'thread-1', turnId: 'turn-1', callId: 'workspace-call', repository: 'example/one' }]);
+  assert.ok(requests[0]?.connectionEpoch);
+  assert.deepEqual(requests, [{ threadId: 'thread-1', turnId: 'turn-1', connectionEpoch: requests[0]?.connectionEpoch, callId: 'workspace-call', repository: 'example/one' }]);
 });
 
 test('dynamic project targets cross the adapter boundary with their exact Runtime identity', async t => {
@@ -640,7 +641,8 @@ test('dynamic project targets cross the adapter boundary with their exact Runtim
   let snapshot = await server.inspect('thread-1');
   for (let attempt = 0; snapshot.status === 'running' && attempt < 10; attempt++) snapshot = await server.inspect('thread-1');
   assert.equal(snapshot.status, 'completed');
-  assert.deepEqual(requests, [{ threadId: 'thread-1', turnId: 'turn-1', callId: 'workspace-call', projectId: 'project-fixture' }]);
+  assert.ok(requests[0]?.connectionEpoch);
+  assert.deepEqual(requests, [{ threadId: 'thread-1', turnId: 'turn-1', connectionEpoch: requests[0]?.connectionEpoch, callId: 'workspace-call', projectId: 'project-fixture' }]);
 });
 
 test('inspection replaces historical developer instructions using the current runtime contract', async t => {

@@ -1117,6 +1117,9 @@ test('scoped records retain same-key identities, caller defaults and explicit co
   await assert.rejects(record(f.coordinator().id, 'missing', 'FORBIDDEN', { kind: 'task', taskId: 'missing' }), /does not belong/);
   const all = await f.status();
   assert.equal(all.records.length, 5);
+  await record(f.coordinator().id, 'coordinator-task', 'COORDINATOR_TASK_TARGET', { kind: 'task', taskId: f.coordinator().id });
+  assert.match(f.loop.projects.context(f.coordinator().id), /COORDINATOR_TASK_TARGET/);
+  assert.doesNotMatch(f.loop.projects.context(a.id), /COORDINATOR_TASK_TARGET/);
   assert.ok(f.loop.projects.context(a.id).includes('A_ONLY'));
   assert.doesNotMatch(f.loop.projects.context(a.id), /B_ONLY|COORDINATOR_ONLY|SELECTED_A_EVIDENCE|VERIFIER_ONLY/);
   assert.match(f.loop.projects.context(verifier.id), /SELECTED_A_EVIDENCE/);
@@ -1148,4 +1151,63 @@ test('legacy unscoped records remain query-only for coordinators without rewriti
   assert.equal(f.loop.store.meta(key), raw);
   await f.restart();
   assert.deepEqual(f.state().records, [legacy]);
+});
+
+
+test('record writes enqueue no turn and actual inputs receive only current task context', async t => {
+  const f = await fixture(t); await f.initialize();
+  const a = await f.dispatch('context-a', 'Task A.'); const b = await f.dispatch('context-b', 'Task B.');
+  const aOpened = await f.openGroup(a.id); const bOpened = await f.openGroup(b.id);
+  assert.ok(aOpened.chatId && bOpened.chatId);
+  const beforeB = f.loop.projects.context(b.id);
+  const starts = f.codex.starts.length, steers = f.codex.steers.length;
+  const instructions = f.loop.projects.instructions(b.id);
+  await f.loop.projectAction(a.id, { action: 'record', requestId: 'context-write', key: 'scope', text: 'A_DYNAMIC_RECORD', expectedVersion: 0 });
+  await f.loop.tick();
+  assert.equal(f.codex.starts.length, starts); assert.equal(f.codex.steers.length, steers);
+  assert.equal(f.loop.projects.context(b.id), beforeB);
+  assert.equal(f.loop.projects.instructions(b.id), instructions);
+  await f.loop.receive(f.message('context-input-a', 'Continue A.', aOpened.chatId));
+  await f.loop.receive(f.message('context-input-b', 'Continue B.', bOpened.chatId));
+  assert.match(f.codex.steers.find(input => input.deliveryId === 'context-input-a')?.additionalContext ?? '', /A_DYNAMIC_RECORD/);
+  assert.equal(f.codex.steers.find(input => input.deliveryId === 'context-input-b')?.additionalContext, beforeB);
+  assert.ok(f.codex.instructionUpdates.every(update => !update.instructions.includes('A_DYNAMIC_RECORD')));
+  await f.loop.projectAction(f.coordinator().id, { action: 'record', requestId: 'shared-context', key: 'rule', text: 'SHARED_DYNAMIC_RULE', expectedVersion: 1, scope: { kind: 'project' } });
+  f.codex.complete(a.threadId!, null); await f.loop.tick();
+  await f.loop.receive(f.message('context-new-turn', 'Next task input.', aOpened.chatId));
+  const started = f.codex.starts.find(input => input.deliveryId === 'context-new-turn');
+  assert.match(started?.additionalContext ?? '', /A_DYNAMIC_RECORD/);
+  assert.match(started?.additionalContext ?? '', /SHARED_DYNAMIC_RULE/);
+  assert.doesNotMatch(JSON.stringify(started?.input), /DYNAMIC_RECORD|DYNAMIC_RULE/);
+});
+
+test('running observation preserves approval identity and full inspection still reconciles unknown deliveries and startup', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('activity-worker', 'Work continuously.');
+  const opened = await f.openGroup(worker.id); assert.ok(opened.chatId && opened.threadId);
+  const inspect = f.codex.inspect.bind(f.codex); let fullReads = 0;
+  f.codex.inspect = async (...args) => { if (args[0] === worker.threadId) fullReads++; return inspect(...args); };
+  f.codex.activity = async threadId => {
+    const snapshot = f.codex.snapshot(threadId);
+    if (snapshot.status !== 'running' || !snapshot.turnId) return { kind: 'reconcile' };
+    return { kind: 'running', threadId, turnId: snapshot.turnId, connectionEpoch: 'fake-epoch', requests: snapshot.requests, outputs: [] };
+  };
+  const snapshot = f.codex.snapshot(opened.threadId); assert.ok(snapshot.turnId);
+  snapshot.requests = [{ id: 'activity-approval', threadId: opened.threadId, turnId: snapshot.turnId, kind: 'approval',
+    prompt: 'Approve this operation?', method: 'item/commandExecution/requestApproval', payload: {}, isBlocking: true, connectionEpoch: 'fake-epoch' }];
+  await f.loop.tick();
+  assert.equal(fullReads, 0); assert.equal(f.loop.store.task(worker.id).requests[0]?.id, 'activity-approval');
+  assert.equal(f.codex.approvals.length, 0);
+  snapshot.requests = [];
+  f.codex.loseInputAck = true;
+  await f.loop.receive(f.message('activity-lost-input', 'Continue once.', opened.chatId));
+  assert.equal(f.loop.store.inputs(worker.id).find(input => input.id === 'activity-lost-input')?.status, 'uncertain');
+  assert.equal(fullReads, 0);
+  await f.loop.tick();
+  assert.ok(fullReads > 0);
+  assert.equal(f.loop.store.inputs(worker.id).find(input => input.id === 'activity-lost-input')?.status, 'delivered');
+  assert.equal(f.codex.steers.filter(input => input.deliveryId === 'activity-lost-input').length, 1);
+  fullReads = 0; await f.restart();
+  assert.ok(fullReads > 0);
+  assert.equal(f.loop.store.task(worker.id).threadId, worker.threadId);
 });

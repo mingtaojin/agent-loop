@@ -1,7 +1,7 @@
 import { writeFile } from 'node:fs/promises';
 import { TurnChangedError, UncertainOperationError, type ExecutionSnapshot, type IncomingMessage, type Source, type SourceComment, type TaskResource, type WorkspaceRequest, type WorkspaceChoice } from '../src/domain.js';
 export interface LegacyReport { status: 'waiting_user' | 'awaiting_review' | 'failed'; summary: string; question: string | null; prUrl: string | null; validation: string[]; limitations: string[] }
-import { TaskGroupUnavailable, type CodexPort, type FeishuPort, type GitHubPort } from '../src/ports.js';
+import { TaskGroupUnavailable, type Activity, type TurnIdentity, type CodexPort, type FeishuPort, type GitHubPort } from '../src/ports.js';
 
 export function issue(number: number, changes: Partial<Source> = {}): Source {
   return {
@@ -140,7 +140,18 @@ export class CodexFake implements CodexPort {
     if (this.loseCreateAck) { this.loseCreateAck = false; throw new UncertainOperationError('Thread created; acknowledgement lost'); }
     return id;
   }
-  async inspect(threadId: string): Promise<ExecutionSnapshot> { if (this.inspectError) throw this.inspectError; return structuredClone(this.snapshot(threadId)); }
+  async inspect(...[threadId]: Parameters<CodexPort['inspect']>): Promise<ExecutionSnapshot> { if (this.inspectError) throw this.inspectError; return structuredClone(this.snapshot(threadId)); }
+  async activity(...args: Parameters<CodexPort['activity']>): Promise<Activity> {
+    const [threadId] = args;
+    const snapshot = await this.inspect(...args);
+    if (snapshot.status !== 'running' || !snapshot.turnId) return { kind: 'reconcile' };
+    return { kind: 'running', threadId, turnId: snapshot.turnId, connectionEpoch: 'fake-epoch',
+      requests: structuredClone(snapshot.requests), outputs: structuredClone(snapshot.outputs.filter(output => output.phase === 'progress')) };
+  }
+  isActiveTurn(identity: TurnIdentity): boolean {
+    const snapshot = this.snapshot(identity.threadId);
+    return identity.connectionEpoch === 'fake-epoch' && snapshot.status === 'running' && snapshot.turnId === identity.turnId;
+  }
   async startTurn(input: Parameters<CodexPort['startTurn']>[0]): Promise<string> {
     this.starts.push(structuredClone(input));
     const snapshot = this.snapshot(input.threadId);

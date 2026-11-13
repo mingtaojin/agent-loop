@@ -428,7 +428,7 @@ test('dynamic workspace request completes while startTurn holds the task lane an
   const start = f.codex.startTurn.bind(f.codex);
   f.codex.startTurn = async input => {
     const turnId = await start(input); if (!f.workers().some(task => task.threadId === input.threadId)) return turnId; assert.ok(f.codex.workspaceHandler);
-    await Promise.all(['example/one', 'example/two', 'example/one'].map((name, index) => f.codex.workspaceHandler!({ threadId: input.threadId, turnId, callId: String(index), repository: name })));
+    await Promise.all(['example/one', 'example/two', 'example/one'].map((name, index) => f.codex.workspaceHandler!({ connectionEpoch: 'fake-epoch', threadId: input.threadId, turnId, callId: String(index), repository: name })));
     return turnId;
   };
   await f.manual();

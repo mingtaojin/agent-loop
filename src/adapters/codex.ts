@@ -4,7 +4,7 @@ import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
 import { RejectedInputError, TurnChangedError, UncertainOperationError, workspaceTargetSchema, type AgentInput, type AgentOutput, type ExecutionSnapshot, type PendingRequest, type WorkspaceRequest, type WorkspaceSelectionRequest, type WorkspaceSelectionResponse } from '../domain.js';
-import type { CodexPort } from '../ports.js';
+import type { Activity, CodexPort, TurnIdentity } from '../ports.js';
 import { executionEvent, type ExecutionEvent } from '../execution-events.js';
 import { workspaceSelectionInput, workspaceSelectionInstructions, workspaceSelectionOutputSchema } from '../workspace-selection.js';
 import { projectActionSchema, type ReasoningEffort } from '../project.js';
@@ -135,6 +135,8 @@ export class CodexAppServer implements CodexPort {
   private readonly seenRequestIds = new Set<string>();
   private readonly threads = new Map<string, { loaded: Promise<void>; untouched: boolean; instructions: string | undefined; model?: string; reasoningEffort?: ReasoningEffort }>();
   private readonly activeTurns = new Map<string, string>();
+  private readonly startingTurns = new Map<string, Promise<string>>();
+  private readonly endedTurns = new Map<string, string>();
   private readonly awaitingHistory = new Map<string, string>();
   private readonly historyObservations = new Map<string, HistoryObservation>();
   private summaryUnsupported = false;
@@ -192,6 +194,9 @@ export class CodexAppServer implements CodexPort {
 
   private fail(error: Error): void {
     this.historyObservations.clear();
+    this.activeTurns.clear();
+    this.startingTurns.clear();
+    this.endedTurns.clear();
     this.failure ??= error;
     this.selectionRun?.reject(this.failure);
     for (const call of this.calls.values()) { clearTimeout(call.timer); call.reject(this.failure); }
@@ -244,6 +249,9 @@ export class CodexAppServer implements CodexPort {
         const key = this.requestId(resolved.requestId);
         const live = this.requests.get(key);
         if (live?.request.threadId === resolved.threadId) this.resolveRequest(key, true);
+      } else if (message.method === 'turn/started') {
+        const started = z.object({ threadId: z.string(), turn: z.object({ id: z.string() }) }).parse(message.params);
+        if (this.threads.has(started.threadId)) this.activeTurns.set(started.threadId, started.turn.id);
       } else if (message.method === 'item/completed') {
         const completed = z.object({ threadId: z.string(), turnId: z.string(), item: itemSchema }).parse(message.params);
         this.captureOutput(completed.threadId, completed.turnId, completed.item, false);
@@ -254,6 +262,7 @@ export class CodexAppServer implements CodexPort {
           for (const item of turn.items) this.captureOutput(completed.threadId, turn.id, item, turn.status === 'completed');
           this.selectionRun.resolve(turn);
         }
+        this.endedTurns.set(completed.threadId, completed.turn.id);
         if (this.activeTurns.get(completed.threadId) === completed.turn.id) this.activeTurns.delete(completed.threadId);
         for (const [key, live] of this.requests) {
           if (live.request.threadId === completed.threadId && live.request.turnId === completed.turn.id) this.resolveRequest(key, false);
@@ -369,9 +378,12 @@ export class CodexAppServer implements CodexPort {
     if (child && child.exitCode === null && child.signalCode === null) await new Promise<void>(resolve => child.once('exit', () => resolve()));
   }
 
-  private runtimeContext(threadId: string) {
+  private runtimeContext(threadId: string, additionalContext?: string) {
     const instructions = this.threads.get(threadId)?.instructions;
-    return instructions === undefined ? undefined : { 'agent-loop-runtime': { kind: 'application', value: `Current Runtime instructions. These replace earlier Runtime instructions for this conversation.\n${instructions}` } };
+    return {
+      ...(instructions === undefined ? {} : { 'agent-loop-runtime': { kind: 'application', value: `Current Runtime instructions. These replace earlier Runtime instructions for this conversation.\n${instructions}` } }),
+      ...(additionalContext === undefined ? {} : { 'agent-loop-project-records': { kind: 'application', value: additionalContext } }),
+    };
   }
 
   async createThread(input: { cwd: string; instructions: string; model?: string; reasoningEffort?: ReasoningEffort }): Promise<string> {
@@ -403,6 +415,31 @@ export class CodexAppServer implements CodexPort {
       this.threads.set(threadId, entry);
     }
     await entry.loaded;
+  }
+
+  isActiveTurn(identity: TurnIdentity): boolean {
+    return !this.failure && !this.closed && identity.connectionEpoch === this.epoch
+      && this.activeTurns.get(identity.threadId) === identity.turnId;
+  }
+
+  async activity(threadId: string, instructions?: string, model?: string, reasoningEffort?: ReasoningEffort): Promise<Activity> {
+    await this.resume(threadId, instructions, model, reasoningEffort);
+    const epoch = this.epoch;
+    const starting = this.startingTurns.get(threadId);
+    if (starting && !this.activeTurns.has(threadId)) await starting;
+    const turnId = this.activeTurns.get(threadId);
+    if (!turnId || epoch !== this.epoch) return { kind: 'reconcile' };
+    const { thread } = threadResponseSchema.parse(await this.rpc('thread/read', { threadId, includeTurns: false }));
+    if (thread.id !== threadId) throw new Error('Codex returned a different thread');
+    if (epoch !== this.epoch || this.activeTurns.get(threadId) !== turnId) return { kind: 'reconcile' };
+    if (thread.status.type !== 'active') {
+      this.activeTurns.delete(threadId);
+      return { kind: 'reconcile' };
+    }
+    return { kind: 'running', threadId, turnId, connectionEpoch: epoch,
+      requests: [...this.requests.values()].map(live => live.request).filter(request => request.threadId === threadId
+        && (request.turnId === turnId || (request.kind === 'unsupported' && !request.turnId))),
+      outputs: [...this.outputs.values()].filter(output => output.threadId === threadId && output.turnId === turnId && output.phase === 'progress') };
   }
 
   async inspect(threadId: string, instructions?: string, model?: string, reasoningEffort?: ReasoningEffort): Promise<ExecutionSnapshot> {
@@ -510,22 +547,33 @@ export class CodexAppServer implements CodexPort {
     const entry = this.threads.get(input.threadId);
     if (entry) entry.untouched = false;
     this.historyObservations.delete(input.threadId);
-    const { turn } = z.object({ turn: turnSchema }).parse(await this.rpc('turn/start', {
+    const epoch = this.epoch;
+    const starting = this.rpc('turn/start', {
       ...(entry?.reasoningEffort ? { effort: entry.reasoningEffort } : {}),
-      threadId: input.threadId, input: wireInput(input.input, input.deliveryId, input.additionalDeliveryIds), clientUserMessageId: input.deliveryId, additionalContext: this.runtimeContext(input.threadId),
-    }).finally(() => { this.historyObservations.delete(input.threadId); }));
-    this.awaitingHistory.set(input.threadId, turn.id);
-    if (turn.status === 'inProgress') this.activeTurns.set(input.threadId, turn.id);
-    return turn.id;
+      threadId: input.threadId, input: wireInput(input.input, input.deliveryId, input.additionalDeliveryIds), clientUserMessageId: input.deliveryId,
+      additionalContext: this.runtimeContext(input.threadId, input.additionalContext),
+    }).then(value => {
+      const { turn } = z.object({ turn: turnSchema }).parse(value);
+      if (epoch !== this.epoch) throw new UncertainOperationError('Codex connection changed during turn start');
+      this.awaitingHistory.set(input.threadId, turn.id);
+      if (turn.status === 'inProgress' && this.endedTurns.get(input.threadId) !== turn.id) this.activeTurns.set(input.threadId, turn.id);
+      return turn.id;
+    });
+    this.startingTurns.set(input.threadId, starting);
+    try { return await starting; }
+    finally {
+      if (this.startingTurns.get(input.threadId) === starting) this.startingTurns.delete(input.threadId);
+      this.historyObservations.delete(input.threadId);
+    }
   }
 
-  async steer(input: { threadId: string; turnId: string; input: AgentInput[]; deliveryId: string }): Promise<void> {
+  async steer(input: Parameters<CodexPort['steer']>[0]): Promise<void> {
     this.historyObservations.delete(input.threadId);
     await this.resume(input.threadId);
     try {
       this.historyObservations.delete(input.threadId);
       const response = z.object({ turnId: z.string() }).parse(await this.rpc('turn/steer', {
-        threadId: input.threadId, expectedTurnId: input.turnId, input: wireInput(input.input, input.deliveryId), clientUserMessageId: input.deliveryId, additionalContext: this.runtimeContext(input.threadId),
+        threadId: input.threadId, expectedTurnId: input.turnId, input: wireInput(input.input, input.deliveryId), clientUserMessageId: input.deliveryId, additionalContext: this.runtimeContext(input.threadId, input.additionalContext),
       }));
       if (response.turnId !== input.turnId) throw new UncertainOperationError('Codex steered a different turn');
     } catch (error) {
@@ -615,9 +663,9 @@ export class CodexAppServer implements CodexPort {
       if (!this.threads.has(call.threadId)) throw new Error('Project request belongs to an unknown thread');
       if (!this.projectHandler) throw new Error('Project coordination is unavailable');
       const action = projectActionSchema.parse(call.arguments);
-      const snapshot = await this.inspect(call.threadId);
-      if (epoch !== this.epoch || snapshot.status !== 'running' || snapshot.turnId !== call.turnId) throw new Error('Project request belongs to an inactive turn');
-      const value = await this.projectHandler({ threadId: call.threadId, turnId: call.turnId, callId: call.callId, action });
+      const activity = await this.activity(call.threadId);
+      if (epoch !== this.epoch || activity.kind !== 'running' || activity.turnId !== call.turnId || !this.isActiveTurn(activity)) throw new Error('Project request belongs to an inactive turn');
+      const value = await this.projectHandler({ threadId: call.threadId, turnId: call.turnId, callId: call.callId, action, connectionEpoch: epoch });
       result = { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify(value) }] };
     } catch (error) {
       result = { success: false, contentItems: [{ type: 'inputText', text: error instanceof Error ? error.message : String(error) }] };
@@ -634,9 +682,9 @@ export class CodexAppServer implements CodexPort {
       if (!this.threads.has(call.threadId)) throw new Error('Workspace request belongs to an unknown thread');
       if (!this.workspaceHandler) throw new Error('Workspace provisioning is unavailable');
       const args = workspaceTargetSchema.parse(call.arguments);
-      const snapshot = await this.inspect(call.threadId);
-      if (epoch !== this.epoch || snapshot.status !== 'running' || snapshot.turnId !== call.turnId) throw new Error('Workspace request belongs to an inactive turn');
-      const request: WorkspaceRequest = { threadId: call.threadId, turnId: call.turnId, callId: call.callId, ...args };
+      const activity = await this.activity(call.threadId);
+      if (epoch !== this.epoch || activity.kind !== 'running' || activity.turnId !== call.turnId || !this.isActiveTurn(activity)) throw new Error('Workspace request belongs to an inactive turn');
+      const request: WorkspaceRequest = { threadId: call.threadId, turnId: call.turnId, callId: call.callId, connectionEpoch: epoch, ...args };
       const resource = await this.workspaceHandler(request);
       result = { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify(resource) }] };
     } catch (error) {

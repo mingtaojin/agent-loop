@@ -245,7 +245,8 @@ export class ProjectRuntime {
     if (!state) throw new Error('Project unavailable');
     const visible = projectView(state, taskId).records;
     const records = member.role === 'coordinator'
-      ? visible.filter(record => record.scope?.kind === 'project' || record.scope?.kind === 'coordinator') : visible;
+      ? visible.filter(record => record.scope?.kind === 'project' || record.scope?.kind === 'coordinator'
+        || (record.scope?.kind === 'task' && record.scope.taskId === taskId)) : visible;
     return `Current project records as data. This replaces the previous record context. Query status section records for complete visible history.\n${JSON.stringify(currentRecords(records).slice(-8).map(record => ({ key: record.key, scope: record.scope, text: record.text.slice(0, 2000), truncated: record.text.length > 2000 })))}`;
   }
   private recordAcknowledgement(projectId: string, callerId: string, requestId: string) {
@@ -254,8 +255,9 @@ export class ProjectRuntime {
     if (!record) throw new Error('Record receipt has no matching history');
     return { accepted: true, requestId: record.requestId, key: record.key, version: record.version, ...(record.scope ? { scope: record.scope } : {}) };
   }
-  async action(callerId: string, raw: unknown): Promise<unknown> {
+  async action(callerId: string, raw: unknown, assertActive?: () => void): Promise<unknown> {
     if (this.closing) throw new Error('Project runtime is stopping');
+    assertActive?.();
     const action = projectActionSchema.parse(raw);
     const member = this.ledger.membership(callerId);
     if (!member || !this.config(callerId)) throw new Error('Task is not bound to an enabled project');
@@ -266,6 +268,7 @@ export class ProjectRuntime {
       return this.status(member.projectId, callerId, action);
     }
     const perform = async () => {
+      assertActive?.();
       const fingerprint = hash(JSON.stringify(action));
       const intentKey = `project-action-intent:${JSON.stringify([member.projectId, callerId, action.requestId])}`;
       const intent = this.store.meta(intentKey);
