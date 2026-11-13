@@ -44,10 +44,7 @@
     "userOpenId": "REPLACE_WITH_YOUR_OPEN_ID"
   },
   "codex": {
-    "command": [
-      "codex",
-      "app-server"
-    ],
+    "executable": "codex",
     "selectionModel": "deepseek/deepseek-v4.1-flash-1017",
     "approvalPolicy": "on-request",
     "sandbox": "workspace-write",

@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { test, type TestContext } from 'node:test';
 import { z } from 'zod';
 import { configSchema } from '../src/config.js';
-import { CodexAppServer } from '../src/adapters/codex.js';
+import { CodexAppServer } from './helpers/codex.js';
 import type { AgentInput, IncomingMessage } from '../src/domain.js';
 import { AgentLoop } from '../src/loop.js';
 import { WorkspaceProvider } from '../src/workspace.js';
@@ -162,11 +162,9 @@ test('the actual App Server selector and formal requests contain text paths and 
   const protocol = join(root, 'protocol.jsonl');
   const config = configSchema.parse({ dataDir: join(root, 'data'), feishu: { userOpenId: 'owner' },
     repositories: [{ name: 'example/project', path: root, baseBranch: 'main', workspace: { kind: 'project-directory', path: root } }],
-    codex: { command: [process.execPath, resolve('scripts/fixtures/record-app-server.mjs'), protocol,
-      process.execPath, resolve('test/fixtures/workspace-selection-codex.mjs'), 'repository', join(root, 'fixture.jsonl')],
-    sandbox: 'read-only', approvalPolicy: 'never', requestTimeoutMs: 2000 },
+    codex: { sandbox: 'read-only', approvalPolicy: 'never', requestTimeoutMs: 2000 },
   });
-  const codex = new CodexAppServer(config.codex), feishu = new FeishuFake();
+  const codex = new CodexAppServer({ ...config.codex, command: [process.execPath, resolve('scripts/fixtures/record-app-server.mjs'), protocol, process.execPath, resolve('test/fixtures/workspace-selection-codex.mjs'), 'repository', join(root, 'fixture.jsonl')] }), feishu = new FeishuFake();
   const loop = new AgentLoop(config, { codex, feishu, github: new GitHubFake(), workspace: new WorkspaceProvider(config.dataDir) });
   t.after(async () => { await loop.close(); await rm(root, { recursive: true, force: true }); });
   const bytes = Buffer.alloc(1024 * 1024, 0x71); feishu.resources.set('original', bytes);

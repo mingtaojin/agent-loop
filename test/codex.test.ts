@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test, type TestContext } from 'node:test';
 import { z } from 'zod';
-import { CodexAppServer } from '../src/adapters/codex.js';
+import { CodexAppServer } from './helpers/codex.js';
 import { RejectedInputError, TurnChangedError, UncertainOperationError, type WorkspaceRequest } from '../src/domain.js';
 
 const fixture = String.raw`

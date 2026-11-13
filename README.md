@@ -6,7 +6,7 @@ Agent Loop 保存项目和任务的持续上下文。用户在项目协调群交
 
 ## 准备配置
 
-安装 Node.js 24 或更高版本、Git 和可运行 `codex app-server` 的 Codex CLI。完成 Codex 登录后运行以下命令。
+安装 Node.js 24 或更高版本、Git 和支持 `codex app-server daemon` 的 Codex CLI。完成 Codex 登录后运行以下命令。
 
 ```sh
 npm install
@@ -15,7 +15,11 @@ cp config/example.json config.json
 
 编辑 `config.json`，将 `feishu.userOpenId` 改为应用下的所有者 Open ID。相对路径均以配置文件所在目录为基准。
 
-如需让目录选择与正式任务使用不同模型，在 `codex` 中增加 `selectionModel`；它只覆盖临时选择 Thread，正式 Thread 继续使用 `model` 或 `command` 中的模型。省略时两者相同。模型名必须是 Codex 当前配置能解析的名称。目录选择与正式任务仍各自启动独立 App Server，`selectionModel` 只改变选择侧的模型，不放宽只读与无审批限制。
+正式任务与目录选择共用本机 Codex daemon。Agent Loop 通过官方 `daemon version` 发现服务，只在服务未运行时调用 `daemon start`。连接失败会报告错误，断线后重新连接并核对原 Thread。Agent Loop 不停止、重启或更新 daemon，也不回退私有 App Server。
+
+在 `codex.executable` 配置 CLI 入口，默认使用 PATH 中的 `codex`。可选的 `socketPath` 直接指定本机 daemon socket，此时不执行发现或自动启动。`model`、`modelProvider` 和 `reasoningEffort` 在 Thread 范围生效，不修改 Codex 全局配置。旧 `command` 中的 `-c model=...`、`-c model_provider=...` 和 `-c model_reasoning_effort=...` 自动迁移为 Thread 设置。其他参数会报告迁移错误。
+
+如需让目录选择与正式任务使用不同模型，在 `codex` 中增加 `selectionModel`。它只覆盖临时选择 Thread，正式 Thread 继续使用 `model` 或角色模型。省略时两者相同。模型名必须是 Codex 当前配置能解析的名称。临时选择使用独立连接和空白 Thread，保持只读、无审批和无动态工具。
 
 本地项目可使用 `repositories: []`，不需要 GitHub token。正式会话按角色读取 `prompts/coordinator.md` 或 `prompts/worker.md`，`engineering.promptPath` 不覆盖角色规则。角色指导、委派范围和环境信息通过 `developerInstructions` 与 `additionalContext` 传入正式 Thread；用户消息和 Issue 内容作为请求材料。`engineering.skillPath` 指向已安装的 poteto-mode，其他技能通过现有机制发现。加载与更新方式见[正式会话提示词](docs/prompts/task.md)。
 
@@ -51,7 +55,7 @@ cp config/example.json config.json
 
 选择需要补充信息时，所有者在任务群中的答复用于目录选择，也作为用户补充保留给正式任务。下一次选择使用新的临时 Thread，携带原始材料和已保存的目录答复。正式任务的首轮输入包含原始任务与这些答复的完整文字、来源和附件，避免遗漏“只排查、不改代码”等限制。临时模型的问题、推理和选择输出不进入正式任务；关联的 Issue 更新和评论不能冒充所有者答复。
 
-Runtime 校验选择结果并保存绑定，再准备选定的项目目录。显式配置的旧独立 worktree 策略继续适用。正式 Thread 使用准备好的工程目录作为实际工作目录；无需工程目录时使用任务资料目录。临时 App Server 在本次选择完成或失败后释放，正式 Thread 不继承它的对话历史。正式任务收到统一工作指导、简短环境说明和完整任务材料。
+Runtime 校验选择结果并保存绑定，再准备选定的项目目录。显式配置的旧独立 worktree 策略继续适用。正式 Thread 使用准备好的工程目录作为实际工作目录；无需工程目录时使用任务资料目录。临时选择完成、失败或取消后，适配器确认己方执行停止，再解除订阅并关闭连接。正式 Thread 不继承选择对话历史，共享 daemon 和其他客户端继续运行。若断线使活跃临时 Turn 的标识不可知，适配器报告结果未知，不猜测标识或重复执行。正式任务收到统一工作指导、简短环境说明和完整任务材料。
 
 后续讨论、澄清、工程工作和恢复沿用正式 Thread。已有正式 Thread 的任务保留原会话和资源，不重新选目录。历史上已收集但尚未建立正式 Thread 的任务在启动时进入目录选择。职责边界见 [ADR 0008](docs/adr/0008-temporary-workspace-selection.md)。
 
@@ -191,7 +195,7 @@ CLI `submit`、`answer` 及机器人私聊接单已经移除。运维 `doctor`�
 
 ## 重启和故障
 
-本机常驻服务按[本机服务操作](docs/agents/operations.md)中的 launchd 命令重启。前台调试进程按 Ctrl+C 退出。保留数据目录、任务分支和 worktree。服务核对群、目录选择结果、资源、正式 Thread 和未确认输入，不建立第二个同任务执行者。已保存的目录选择结果继续复用；等待目录答复和正式任务的正常等待均在重启后保留。服务关闭会中止临时目录选择并释放其独立 App Server。
+本机常驻服务按[本机服务操作](docs/agents/operations.md)中的 launchd 命令重启。前台调试进程按 Ctrl+C 退出。保留数据目录、任务分支和 worktree。服务核对群、目录选择结果、资源、正式 Thread 和未确认输入，不建立第二个同任务执行者。已保存的目录选择结果继续复用；等待目录答复和正式任务的正常等待均在重启后保留。服务关闭会中止己方活跃执行、解除己方 Thread 订阅并关闭连接，共享 Codex daemon 继续运行。
 
 目录选择失败和已确认的执行故障按 `recovery.maxAttempts` 和 `recovery.retryDelayMs` 有限恢复。临时选择中断后可依据已保存材料重新选择，正式任务的未知副作用仍须核对。没有正式执行总时长限制，静默本身不触发故障判定。达到恢复上限、目录不匹配或未知副作用会保留诊断。未知输入、审批和通知不盲目重放。
 
@@ -215,3 +219,9 @@ npm run build
 - `npm run verify:feishu -- --listen` 会向真实验证群发送合成材料，需显式授权且与正式服务分开运行。它验证基础群消息和附件传输，不验证云文档、群阅读权限、固定 Tab 或文档内容更新；这些能力按[固定进度 Tab 验收步骤](docs/feishu-setup.md#验收新任务群)核对。
 
 当前证据和未完成验收见 [实现状态](docs/implementation-status.md)。已批准的持续上下文规格位于 [.scratch/agent-runtime-context/spec.md](.scratch/agent-runtime-context/spec.md)。历史 ADR 和旧规格保留为决策记录。
+
+## 验证共享 Codex 服务
+
+运行 `npm run verify:shared-codex`，通过构建产物验证正式对话、动态工具、目录选择、选择取消和独立客户端继续执行。脚本仅使用临时目录和只读模型请求，记录 daemon socket 与进程身份，不停止、重启或更新真实 daemon。可用 `CODEX_VERIFY_EXECUTABLE`、`CODEX_VERIFY_MODEL`、`CODEX_VERIFY_PROVIDER` 和 `CODEX_VERIFY_OUTPUT` 指定入口、Thread 设置与证据路径。
+
+`npm test` 的本机多客户端协议 fixture 覆盖未运行时启动、启动失败、响应丢失和断线恢复。真实服务验证不通过停止正在使用的 daemon 注入故障。测试、真实服务验证、Git 合并和部署分别报告。

@@ -48,7 +48,7 @@ async function doctor(config: Config): Promise<void> {
   ) : null;
   const userConfigured = !config.feishu.userOpenId.startsWith('REPLACE_');
   const ready = credentials.every(item => item.present) && repositories.every(item => item.exists) && userConfigured && discovery?.readable !== false;
-  output({ ready, node: process.version, dataDir: config.dataDir, repositories, discovery, credentials, feishuUserConfigured: userConfigured, codexCommand: config.codex.command, note: '此检查未验证远端权限，也未创建群或启动 Codex 任务。' });
+  output({ ready, node: process.version, dataDir: config.dataDir, repositories, discovery, credentials, feishuUserConfigured: userConfigured, codex: { mode: 'shared-daemon', executable: config.codex.executable, socketPath: config.codex.socketPath, model: config.codex.model, modelProvider: config.codex.modelProvider, reasoningEffort: config.codex.reasoningEffort, selectionModel: config.codex.selectionModel }, note: '此检查未验证远端权限，也未创建群或启动 Codex 任务。' });
   if (!ready) process.exitCode = 1;
 }
 async function main(): Promise<void> {

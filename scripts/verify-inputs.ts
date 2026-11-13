@@ -6,12 +6,13 @@ import { resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { deflateSync } from 'node:zlib';
 import { z } from 'zod';
+import { observedCodexConnection } from './codex-connection.js';
 import { CodexAppServer } from '../src/adapters/codex.js';
 import { TurnChangedError } from '../src/domain.js';
 
 const workspace = await mkdtemp('/tmp/agent-loop-inputs-');
 const output = resolve('.scratch/verification', `inputs-${Date.now()}.json`);
-const pidFile = `${workspace}/server.pid`;
+const daemonBefore = execFileSync('codex', ['app-server', 'daemon', 'version'], { encoding: 'utf8' });
 const protocolFile = `${workspace}/protocol.jsonl`;
 const logPath = `${workspace}/fixture.log`;
 const imagePath = `${workspace}/fixture.png`;
@@ -47,9 +48,8 @@ for (let y = 0; y < 64; y++) for (let x = 0; x < 64; x++) pixels[y * 193 + 1 + x
 await writeFile(imagePath, Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), chunk('IHDR', header), chunk('IDAT', deflateSync(pixels)), chunk('IEND', Buffer.alloc(0))]));
 await writeFile(logPath, `测试日志，仅读取本文件。\nnonce=${nonce}\n`, { mode: 0o600 });
 const server = new CodexAppServer({
-  command: ['sh', '-c', 'printf "%s" "$$" > "$1"; codex app-server | tee "$2"', '--', pidFile, protocolFile],
   approvalPolicy: 'never', sandbox: 'read-only', requestTimeoutMs: 20_000,
-});
+}, observedCodexConnection({ recordPath: protocolFile }).connector);
 try {
   const threadId = await server.createThread({ cwd: workspace, instructions: `This is a harmless input protocol test. Never access repositories, network, remote hosts, credentials, or other files. You may use a shell read command ONLY to read ${logPath}. Inspect the attached image directly; do not use tools for the image. Do not use other tools or commands. Delivery markers are transport metadata. Follow the newest user instruction. Return a plain final answer.` });
   evidence.threadId = threadId;
@@ -99,19 +99,8 @@ try {
 } finally {
   try { await server.close(); evidence.cleanup = 'closed'; }
   catch (error) { evidence.cleanup = String(error); process.exitCode = 1; }
-  try {
-    const pid = Number(await readFile(pidFile, 'utf8'));
-    assert.ok(Number.isSafeInteger(pid) && pid > 1);
-    let members: string[] = [];
-    const cleanupDeadline = Date.now() + 5_000;
-    do {
-      members = execFileSync('ps', ['-axo', 'pid=,pgid=,stat=,command='], { encoding: 'utf8' }).split('\n').filter(line => Number(line.trim().split(/\s+/)[1]) === pid);
-      if (!members.length) break;
-      await delay(100);
-    } while (Date.now() < cleanupDeadline);
-    evidence.processGroup = { pid, stopped: members.length === 0, remaining: members };
-    if (members.length) { process.kill(-pid, 'SIGKILL'); throw new Error('Process group required forced cleanup'); }
-  } catch (error) { evidence.cleanupAuditError = String(error); process.exitCode = 1; }
+  evidence.daemonPreserved = execFileSync('codex', ['app-server', 'daemon', 'version'], { encoding: 'utf8' }) === daemonBefore;
+  assert.equal(evidence.daemonPreserved, true);
   try {
     const protocol = (await readFile(protocolFile, 'utf8')).trim().split('\n').map(line => protocolEventSchema.parse(JSON.parse(line)));
     evidence.completedItems = protocol.filter(event => event.method === 'item/completed').map(event => event.params);

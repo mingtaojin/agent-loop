@@ -7,6 +7,7 @@ import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { deflateSync } from 'node:zlib';
 import { z } from 'zod';
+import { observedCodexConnection } from './codex-connection.js';
 import { CodexAppServer } from '../src/adapters/codex.js';
 import { configSchema } from '../src/config.js';
 import type { IncomingMessage } from '../src/domain.js';
@@ -21,10 +22,10 @@ const project = join(root, 'selected-project');
 await mkdir(project);
 const config = configSchema.parse({ dataDir: join(root, 'data'), feishu: { userOpenId: 'fixture-owner' },
   repositories: [{ name: 'fixture/images', path: project, baseBranch: 'main', workspace: { kind: 'project-directory', path: project } }],
-  codex: { command: [process.execPath, resolve('scripts/fixtures/record-app-server.mjs'), protocolPath, 'codex', 'app-server'],
+  codex: { executable: 'codex',
     sandbox: 'read-only', approvalPolicy: 'never', requestTimeoutMs: 60_000 },
 });
-const server = new CodexAppServer(config.codex);
+const server = new CodexAppServer(config.codex, observedCodexConnection({ recordPath: protocolPath }).connector);
 const feishu = new FeishuFake();
 const loop = new AgentLoop(config, { codex: server, feishu, github: new GitHubFake(), workspace: new WorkspaceProvider(config.dataDir) });
 const evidence: Record<string, unknown> = {

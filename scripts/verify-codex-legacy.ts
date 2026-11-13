@@ -2,13 +2,14 @@ import assert from 'node:assert/strict';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { observedCodexConnection } from './codex-connection.js';
 import { CodexAppServer } from '../src/adapters/codex.js';
 const workspace = await mkdtemp('/tmp/agent-loop-codex-legacy-');
 const evidence: Record<string, unknown> = { workspace, startedAt: new Date().toISOString(), protocol: 'codex-cli 0.166.0', purpose: 'Create a real Thread without dynamic tools, then try adding the tool during same-Thread resume.' };
 const servers: CodexAppServer[] = [];
 const instructions = 'Harmless protocol verification in a temporary empty directory. No shell, external network, credentials, or real repositories. Only call ensure_workspace if that exact native tool is available. If unavailable, say NATIVE_WORKSPACE_TOOL_UNAVAILABLE. Remember user context.';
 function server(tryResumeTools = false) {
-  const instance = new CodexAppServer({ command: [process.execPath, resolve('scripts/fixtures/codex-legacy-proxy.mjs'), ...(tryResumeTools ? ['--try-resume-tools'] : [])], approvalPolicy: 'never', sandbox: 'read-only', requestTimeoutMs: 30000 });
+  const instance = new CodexAppServer({ approvalPolicy: 'never', sandbox: 'read-only', requestTimeoutMs: 30000 }, observedCodexConnection({ legacy: true, tryResumeTools }).connector);
   servers.push(instance);
   return instance;
 }

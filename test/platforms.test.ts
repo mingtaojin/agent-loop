@@ -12,7 +12,7 @@ import { repositorySchema, UncertainOperationError, type ApprovalAction, type Pe
 import { configSchema } from '../src/config.js';
 import { AgentLoop } from '../src/loop.js';
 import { Store } from '../src/store.js';
-import { CodexAppServer } from '../src/adapters/codex.js';
+import { CodexAppServer } from './helpers/codex.js';
 import { GitHubFake } from './fakes.js';
 import { FeishuApiError, GroupCreationRejected, TaskGroupBindingChanged, TaskGroupUnavailable, type FeishuProgressPort, type ProgressWriteGuard } from '../src/ports.js';
 

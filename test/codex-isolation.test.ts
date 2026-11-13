@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { test, type TestContext } from 'node:test';
 import { z } from 'zod';
-import { CodexAppServer } from '../src/adapters/codex.js';
+import { CodexAppServer } from './helpers/codex.js';
 import { UncertainOperationError } from '../src/domain.js';
 
 const fixture = String.raw`

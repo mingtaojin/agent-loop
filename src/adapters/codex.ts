@@ -1,6 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
 import { RejectedInputError, TurnChangedError, UncertainOperationError, workspaceTargetSchema, type AgentInput, type AgentOutput, type ExecutionSnapshot, type PendingRequest, type WorkspaceRequest, type WorkspaceSelectionRequest, type WorkspaceSelectionResponse } from '../domain.js';
@@ -8,9 +6,14 @@ import type { Activity, CodexPort, TurnIdentity } from '../ports.js';
 import { executionEvent, type ExecutionEvent } from '../execution-events.js';
 import { workspaceSelectionInput, workspaceSelectionInstructions, workspaceSelectionOutputSchema } from '../workspace-selection.js';
 import { projectActionSchema, type ReasoningEffort } from '../project.js';
+import { normalizeDaemonSettings, sharedDaemonConnector, type CodexConnection, type CodexConnector, type DaemonSettings } from './codex-daemon.js';
 
 export interface CodexOptions {
-  command: string[];
+  command?: string[];
+  executable?: string;
+  socketPath?: string;
+  modelProvider?: string;
+  reasoningEffort?: ReasoningEffort;
   model?: string;
   selectionModel?: string;
   approvalPolicy: 'untrusted' | 'on-request' | 'never';
@@ -148,10 +151,13 @@ export class CodexAppServer implements CodexPort {
   private readonly activeTurns = new Map<string, string>();
   private readonly startingTurns = new Map<string, Promise<string>>();
   private readonly endedTurns = new Map<string, string>();
+  private readonly needsCleanup = new Set<string>();
   private readonly awaitingHistory = new Map<string, string>();
   private readonly historyObservations = new Map<string, HistoryObservation>();
   private summaryUnsupported = false;
-  private process: ChildProcessWithoutNullStreams | undefined;
+  private connection: CodexConnection | undefined;
+  private readonly settings: DaemonSettings;
+  private readonly connector: CodexConnector;
   private initialized: Promise<void> | undefined;
   private failure: Error | undefined;
   private recovery: Promise<void> | undefined;
@@ -160,52 +166,46 @@ export class CodexAppServer implements CodexPort {
   private projectHandler: Parameters<NonNullable<CodexPort['setProjectHandler']>>[0] | undefined;
   private readonly outputs = new Map<string, AgentOutput>();
   private sequence = 0;
-  private stderr = '';
   private eventHandler: ((event: ExecutionEvent) => void) | undefined;
   private readonly selectors = new Set<CodexAppServer>();
   private selectorsClosing = false;
+  private selectionThreadId: string | undefined;
+  private selectionTurnId: string | undefined;
+  private disposal: Promise<void> | undefined;
   private selectionRun: { threadId: string; resolve: (turn: z.infer<typeof turnSchema>) => void; reject: (error: Error) => void } | undefined;
 
   setEventHandler(handler: (event: ExecutionEvent) => void): void { this.eventHandler = handler; }
 
-  constructor(private readonly options: CodexOptions) {
-    if (!options.command[0] || !Number.isFinite(options.requestTimeoutMs) || options.requestTimeoutMs <= 0) {
-      throw new Error('Codex command and positive requestTimeoutMs are required');
-    }
+  constructor(private readonly options: CodexOptions, connector?: CodexConnector) {
+    if (!Number.isFinite(options.requestTimeoutMs) || options.requestTimeoutMs <= 0) throw new Error('Positive Codex requestTimeoutMs is required');
+    this.settings = normalizeDaemonSettings(options);
+    this.connector = connector ?? sharedDaemonConnector(this.settings, options.requestTimeoutMs, options.env);
   }
 
   private ready(): Promise<void> {
     if (this.closed) return Promise.reject(new UncertainOperationError('Codex connection closed'));
     if (this.failure) return Promise.reject(this.failure);
-    this.initialized ??= this.connect();
+    this.initialized ??= this.connect().catch(error => {
+      this.fail(error instanceof Error ? error : new Error(String(error)));
+      throw this.failure;
+    });
     return this.initialized;
   }
 
   private async connect(): Promise<void> {
-    const [command, ...args] = this.options.command;
-    if (!command) throw new Error('Codex command is empty');
-    const child = spawn(command, args, { stdio: 'pipe', detached: process.platform !== 'win32', env: this.options.env ?? process.env });
-    this.process = child;
-    child.stderr.setEncoding('utf8');
-    child.stderr.on('data', (chunk: string) => { this.stderr = (this.stderr + chunk).slice(-4096); });
-    child.on('error', error => { if (this.process === child) this.fail(error); });
-    child.stdin.on('error', error => { if (this.process === child) this.fail(error); });
-    child.on('exit', (code, signal) => {
-      if (this.process === child) this.fail(new UncertainOperationError(`Codex exited (${signal ?? code}): ${this.stderr}`));
+    const epoch = this.epoch;
+    const connection = await this.connector({
+      message: data => {
+        if (this.epoch !== epoch || this.failure) return;
+        try { this.receive(messageSchema.parse(JSON.parse(data))); }
+        catch (error) { this.fail(new UncertainOperationError(`Invalid Codex protocol message: ${error instanceof Error ? error.message : String(error)}`)); }
+      },
+      error: error => { if (this.epoch === epoch) this.fail(new UncertainOperationError(error.message)); },
     });
-    const lines = createInterface({ input: child.stdout });
-    lines.on('line', line => {
-      if (this.process !== child || this.failure) return;
-      try { this.receive(messageSchema.parse(JSON.parse(line))); }
-      catch (error) { this.fail(new Error(`Invalid Codex protocol message: ${error instanceof Error ? error.message : String(error)}`)); }
-    });
-    try {
-      await this.rpc('initialize', { clientInfo: { name: 'agent_loop', version: '0.1.0' }, capabilities: { experimentalApi: true } });
-      await this.write({ method: 'initialized' });
-    } catch (error) {
-      this.fail(error instanceof Error ? error : new Error(String(error)));
-      throw error;
-    }
+    if (this.epoch !== epoch || this.failure || this.closed) { await connection.close(); throw this.failure ?? new UncertainOperationError('Codex connection closed while connecting'); }
+    this.connection = connection;
+    await this.rpc('initialize', { clientInfo: { name: 'agent_loop', version: '0.1.0' }, capabilities: { experimentalApi: true } });
+    await this.write({ method: 'initialized' });
   }
 
   private fail(error: Error): void {
@@ -223,24 +223,19 @@ export class CodexAppServer implements CodexPort {
     this.requests.clear();
     this.seenRequestIds.clear();
     this.epoch = randomUUID();
-    const child = this.process;
-    if (child?.pid && process.platform !== 'win32') {
-      try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }
-    } else child?.kill('SIGKILL');
+    const connection = this.connection;
+    this.connection = undefined;
+    void connection?.close().catch(() => undefined);
   }
 
   private async write(message: unknown): Promise<void> {
     if (this.failure) throw this.failure;
-    const child = this.process;
-    if (!child) throw new Error('Codex is not connected');
-    await new Promise<void>((resolve, reject) => child.stdin.write(`${JSON.stringify(message)}\n`, error => {
-      if (error) {
-        const failure = new UncertainOperationError(`Codex transport write failed: ${error.message}`);
-        this.fail(failure);
-        reject(failure);
-      }
-      else resolve();
-    }));
+    if (!this.connection) throw new Error('Codex is not connected');
+    try { await this.connection.send(JSON.stringify(message)); }
+    catch (error) {
+      const failure = new UncertainOperationError(`Codex transport write failed: ${error instanceof Error ? error.message : String(error)}`);
+      this.fail(failure); throw failure;
+    }
   }
 
   private rpc(method: string, params: unknown, settled?: (outcome: RpcOutcome) => void): Promise<unknown> {
@@ -263,6 +258,11 @@ export class CodexAppServer implements CodexPort {
   private receive(message: z.infer<typeof messageSchema>): void {
     if (message.method !== undefined) {
       const scope = threadScopeSchema.safeParse(message.params);
+      if (scope.success && !this.threads.has(scope.data.threadId) && this.selectionThreadId !== scope.data.threadId) return;
+      if (!scope.success && message.id !== undefined) throw new Error(`Unsupported unscoped server request ${message.method}`);
+    }
+    if (message.method !== undefined) {
+      const scope = threadScopeSchema.safeParse(message.params);
       if (scope.success) this.historyObservations.delete(scope.data.threadId);
       else if (message.id !== undefined || /^(thread|turn|item|serverRequest|error)(\/|$)/.test(message.method)) this.historyObservations.clear();
     }
@@ -280,7 +280,8 @@ export class CodexAppServer implements CodexPort {
         if (live?.request.threadId === resolved.threadId) this.resolveRequest(key, true);
       } else if (message.method === 'turn/started') {
         const started = z.object({ threadId: z.string(), turn: z.object({ id: z.string() }) }).parse(message.params);
-        if (this.threads.has(started.threadId)) this.activeTurns.set(started.threadId, started.turn.id);
+        this.activeTurns.set(started.threadId, started.turn.id);
+        if (this.selectionThreadId === started.threadId) this.selectionTurnId = started.turn.id;
       } else if (message.method === 'item/completed') {
         const completed = z.object({ threadId: z.string(), turnId: z.string(), item: itemSchema }).parse(message.params);
         this.captureOutput(completed.threadId, completed.turnId, completed.item, false);
@@ -292,6 +293,7 @@ export class CodexAppServer implements CodexPort {
           this.selectionRun.resolve(turn);
         }
         this.endedTurns.set(completed.threadId, completed.turn.id);
+        this.needsCleanup.delete(completed.threadId);
         if (this.activeTurns.get(completed.threadId) === completed.turn.id) this.activeTurns.delete(completed.threadId);
         for (const [key, live] of this.requests) {
           if (live.request.threadId === completed.threadId && live.request.turnId === completed.turn.id) this.resolveRequest(key, false);
@@ -357,34 +359,38 @@ export class CodexAppServer implements CodexPort {
   }
 
   private config() {
-    return { model: this.options.model, approvalPolicy: this.options.approvalPolicy, sandbox: this.options.sandbox, approvalsReviewer: 'user' };
+    return { model: this.settings.model, modelProvider: this.settings.modelProvider, ...(this.settings.reasoningEffort ? { config: { model_reasoning_effort: this.settings.reasoningEffort } } : {}), approvalPolicy: this.options.approvalPolicy, sandbox: this.options.sandbox, approvalsReviewer: 'user' };
   }
 
   async selectWorkspace(input: WorkspaceSelectionRequest): Promise<WorkspaceSelectionResponse> {
     if (this.closed || this.selectorsClosing) throw new Error('Codex owner is closed for directory selection');
     input.signal?.throwIfAborted();
-    const selector = new CodexAppServer({ ...this.options, approvalPolicy: 'never', sandbox: 'read-only' });
+    const selector = new CodexAppServer({ ...this.options, ...this.settings, command: undefined, approvalPolicy: 'never', sandbox: 'read-only' }, this.connector);
     this.selectors.add(selector);
     const abort = () => selector.fail(new Error('Temporary directory selection aborted'));
     input.signal?.addEventListener('abort', abort, { once: true });
+    const timer = setTimeout(() => selector.fail(new UncertainOperationError('Temporary directory selection timed out; cleanup must be confirmed')), this.options.requestTimeoutMs);
     try { return await selector.runWorkspaceSelection(input); }
     finally {
+      clearTimeout(timer);
       input.signal?.removeEventListener('abort', abort);
-      await selector.dispose(new Error('Temporary directory selection closed'));
+      await selector.dispose(new Error(input.signal?.aborted ? 'Temporary directory selection aborted' : 'Temporary directory selection closed'));
       this.selectors.delete(selector);
     }
   }
 
   private async runWorkspaceSelection(input: WorkspaceSelectionRequest): Promise<WorkspaceSelectionResponse> {
     await this.ready();
+    const startedThread = await this.rpc('thread/start', {
+      ...this.config(), model: this.options.selectionModel ?? this.settings.model,
+      cwd: input.cwd, developerInstructions: workspaceSelectionInstructions,
+      ephemeral: true, dynamicTools: [],
+    });
+    this.selectionThreadId = threadResponseSchema.parse(startedThread).thread.id;
     const response = z.object({
       thread: threadSchema, cwd: z.string(), approvalPolicy: z.literal('never'),
       sandbox: z.object({ type: z.literal('readOnly'), networkAccess: z.literal(false).optional() }),
-    }).parse(await this.rpc('thread/start', {
-      ...this.config(), model: this.options.selectionModel ?? this.options.model,
-      cwd: input.cwd, developerInstructions: workspaceSelectionInstructions,
-      ephemeral: true, dynamicTools: [],
-    }));
+    }).parse(startedThread);
     if (response.cwd !== input.cwd || response.thread.status.type !== 'idle' || response.thread.turns.length) throw new Error('Temporary directory selection did not start in the requested empty read-only context');
     const threadId = response.thread.id;
     const completion = new Promise<z.infer<typeof turnSchema>>((resolve, reject) => { this.selectionRun = { threadId, resolve, reject }; });
@@ -394,7 +400,10 @@ export class CodexAppServer implements CodexPort {
       input: wireInput(workspaceSelectionInput(input), `directory-selection:${input.taskId}`),
       outputSchema: z.toJSONSchema(workspaceSelectionOutputSchema),
     }));
+    this.selectionTurnId = started.id;
+    if (!this.activeTurns.has(threadId) && this.endedTurns.get(threadId) !== started.id) this.activeTurns.set(threadId, started.id);
     const completed = await completion;
+    this.activeTurns.delete(threadId);
     if (completed.id !== started.id) throw new Error('Temporary directory selection completed a different turn');
     if (completed.status !== 'completed') throw new Error(completed.error?.message ?? `Temporary directory selection ${completed.status}`);
     const answers = [...this.outputs.values()].filter(output => output.threadId === threadId && output.turnId === completed.id && output.phase === 'final');
@@ -406,11 +415,48 @@ export class CodexAppServer implements CodexPort {
     return { temporaryThreadId: threadId, choice };
   }
 
-  private async dispose(error: Error): Promise<void> {
-    this.closed = true;
-    this.fail(error);
-    const child = this.process;
-    if (child && child.exitCode === null && child.signalCode === null) await new Promise<void>(resolve => child.once('exit', () => resolve()));
+  private dispose(error: Error): Promise<void> {
+    this.selectionRun?.reject(error);
+    this.disposal ??= (async () => {
+      try {
+        if (this.selectionThreadId) {
+          if (this.failure) await this.reconnect();
+          await this.stopOwnedThread(this.selectionThreadId);
+          await this.rpc('thread/unsubscribe', { threadId: this.selectionThreadId });
+        }
+      } catch (cause) {
+        throw new UncertainOperationError(`${error.message}; temporary Thread ${this.selectionThreadId ?? 'unknown'} cleanup could not be confirmed: ${cause instanceof Error ? cause.message : String(cause)}`);
+      } finally {
+        this.closed = true;
+        const connection = this.connection;
+        this.fail(error);
+        await connection?.close();
+      }
+    })();
+    return this.disposal;
+  }
+
+  private async stopOwnedThread(threadId: string): Promise<void> {
+    if (threadId !== this.selectionThreadId) await this.resume(threadId);
+    const read = async () => {
+      const { thread } = threadResponseSchema.parse(await this.rpc('thread/read', { threadId, includeTurns: this.selectionThreadId !== threadId }));
+      if (thread.id !== threadId) throw new Error('Codex returned a different cleanup Thread');
+      return thread;
+    };
+    let thread = await read();
+    if (thread.status.type === 'active') {
+      const turnId = (threadId === this.selectionThreadId ? this.selectionTurnId : this.activeTurns.get(threadId)) ?? thread.turns.findLast(turn => turn.status === 'inProgress')?.id;
+      if (!turnId) throw new Error('Active Thread has no identifiable Turn to interrupt');
+      await this.rpc('turn/interrupt', { threadId, turnId });
+      const deadline = Date.now() + this.options.requestTimeoutMs;
+      do {
+        thread = await read();
+        if (thread.status.type !== 'active' && thread.turns.every(turn => turn.status !== 'inProgress')) return;
+        if (Date.now() >= deadline) throw new Error('Owned Turn interruption was not confirmed');
+        await delay(50);
+      } while (true);
+    }
+    if (thread.status.type !== 'idle' || thread.turns.some(turn => turn.status === 'inProgress')) throw new Error('Owned Thread terminal state could not be confirmed');
   }
 
   private runtimeContext(threadId: string, additionalContext?: string) {
@@ -589,8 +635,8 @@ export class CodexAppServer implements CodexPort {
     if (thread.status.type === 'active' && latest?.status !== 'inProgress') throw new TurnHistoryPendingError('Active Codex turn is missing from history; reconcile before continuing');
     if (latest?.status === 'inProgress' && thread.status.type !== 'active') return { threadId, turnId: latest.id, status: 'interrupted', requests: [], outputs: [...this.outputs.values()].filter(output => output.threadId === threadId), seenInputIds: [...seenInputIds], error: latest.error?.message ?? 'Persisted active turn has no live execution' };
     const status: ExecutionSnapshot['status'] = thread.status.type === 'systemError' ? 'failed' : latest?.status === 'inProgress' ? 'running' : latest?.status ?? 'idle';
-    if (status === 'running' && latest) this.activeTurns.set(threadId, latest.id);
-    else this.activeTurns.delete(threadId);
+    if (status === 'running' && latest) { this.activeTurns.set(threadId, latest.id); this.needsCleanup.add(threadId); }
+    else { this.activeTurns.delete(threadId); this.needsCleanup.delete(threadId); }
     const requests = [...this.requests.values()].map(live => live.request).filter(request => request.threadId === threadId && (request.turnId === latest?.id || (request.kind === 'unsupported' && !request.turnId)) && status === 'running');
     if (head && digest && latest?.status === 'completed' && thread.status.type === 'idle' && settled() &&
       historyDigest({ ...latest, itemsView: 'summary', items: head.items.map(item => latest.items.find(full => full.id === item.id)) }) === digest) {
@@ -605,6 +651,7 @@ export class CodexAppServer implements CodexPort {
     const entry = this.threads.get(input.threadId);
     if (entry) entry.untouched = false;
     this.historyObservations.delete(input.threadId);
+    this.needsCleanup.add(input.threadId);
     const epoch = this.epoch;
     const starting = this.rpc('turn/start', {
       ...(entry?.reasoningEffort ? { effort: entry.reasoningEffort } : {}),
@@ -752,19 +799,22 @@ export class CodexAppServer implements CodexPort {
     await this.write({ id: rpcId, result });
   }
 
+  private async reconnect(): Promise<void> {
+    this.connection = undefined;
+    this.initialized = undefined;
+    this.failure = undefined;
+    await this.ready();
+  }
+
   recover(): Promise<void> {
     this.historyObservations.clear();
     if (this.closed) return Promise.reject(new UncertainOperationError('Codex connection closed'));
     if (this.recovery) return this.recovery;
     if (!this.failure) return this.ready();
-    this.process = undefined;
-    this.initialized = undefined;
-    this.failure = undefined;
-    this.stderr = '';
     this.activeTurns.clear();
     this.awaitingHistory.clear();
     this.summaryUnsupported = false;
-    const operation = this.ready();
+    const operation = this.reconnect();
     this.recovery = operation.finally(() => { this.historyObservations.clear(); this.recovery = undefined; });
     return this.recovery;
   }
@@ -778,27 +828,27 @@ export class CodexAppServer implements CodexPort {
   }
 
   async close(): Promise<void> {
+    if (this.closed) return;
     this.selectorsClosing = true;
-    await Promise.all([...this.selectors].map(selector => selector.dispose(new Error('Codex owner is closing'))));
-    const child = this.process;
+    const failures: unknown[] = [];
+    const results = await Promise.allSettled([...this.selectors].map(selector => selector.dispose(new Error('Codex owner is closing'))));
+    for (const result of results) if (result.status === 'rejected') failures.push(result.reason);
     try {
-      if (!this.failure) for (const [threadId] of this.activeTurns) {
-        let snapshot = await this.inspect(threadId);
-        if (snapshot.status !== 'running' || !snapshot.turnId) continue;
-        const turnId = snapshot.turnId;
-        await this.interrupt({ threadId, turnId });
-        const deadline = Date.now() + this.options.requestTimeoutMs;
-        do {
-          snapshot = await this.inspect(threadId);
-          if (snapshot.status !== 'running') break;
-          if (Date.now() >= deadline) throw new UncertainOperationError('Codex interruption was not confirmed before shutdown; manual recovery required');
-          await delay(50);
-        } while (true);
+      if (this.failure && this.threads.size) await this.recover();
+      for (const threadId of [...this.threads.keys()]) {
+        try {
+          if (this.failure) await this.recover();
+          if (this.needsCleanup.has(threadId) || this.activeTurns.has(threadId)) await this.stopOwnedThread(threadId);
+          await this.rpc('thread/unsubscribe', { threadId });
+        } catch (error) { failures.push(error); }
       }
-    } finally {
+    } catch (error) { failures.push(error); }
+    finally {
       this.closed = true;
+      const connection = this.connection;
       this.fail(new UncertainOperationError('Codex connection closed'));
-      if (child && child.exitCode === null && child.signalCode === null) await new Promise<void>(resolve => child.once('exit', () => resolve()));
+      await connection?.close();
     }
+    if (failures.length) throw new UncertainOperationError(`Codex shutdown cleanup could not be confirmed: ${failures.map(error => error instanceof Error ? error.message : String(error)).join('; ')}`);
   }
 }

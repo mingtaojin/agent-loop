@@ -2,10 +2,11 @@ import assert from 'node:assert/strict';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { observedCodexConnection } from './codex-connection.js';
 import { CodexAppServer } from '../src/adapters/codex.js';
 const workspace = await mkdtemp('/tmp/agent-loop-codex-question-');
 const evidence: Record<string, unknown> = { workspace, startedAt: new Date().toISOString(), mode: 'native plan mode via verification-only proxy', scope: 'The production adapter does not select workflow mode.' };
-const server = new CodexAppServer({ command: [process.execPath, resolve('scripts/fixtures/codex-plan-proxy.mjs')], approvalPolicy: 'never', sandbox: 'read-only', requestTimeoutMs: 30000 });
+const server = new CodexAppServer({ approvalPolicy: 'never', sandbox: 'read-only', requestTimeoutMs: 30000 }, observedCodexConnection({ plan: true }).connector);
 try {
   const threadId = await server.createThread({ cwd: workspace, instructions: 'Harmless native question verification. Do not use shell, files, network or delegates. Ask only the requested question via the real native request_user_input tool.' });
   evidence.threadId = threadId;

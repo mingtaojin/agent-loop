@@ -5,6 +5,7 @@ import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { crc32, deflateSync } from 'node:zlib';
+import { observedCodexConnection } from './codex-connection.js';
 import { CodexAppServer } from '../src/adapters/codex.js';
 import { repositorySchema, type ExecutionSnapshot, type PendingRequest, type TaskResource, type WorkspaceRequest } from '../src/domain.js';
 
@@ -17,7 +18,7 @@ const evidence: Record<string, unknown> = {
   sourceHead: execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
   adapterSha256: createHash('sha256').update(await readFile(new URL('../src/adapters/codex.ts', import.meta.url))).digest('hex'),
   version: execFileSync('codex', ['--version'], { encoding: 'utf8' }).trim(),
-  nativeQuestionsFeatureOverride: process.env.CODEX_VERIFY_NATIVE_QUESTIONS === '1',
+  nativeQuestionsFeatureOverride: false,
   limits: ['Temporary fixture repositories only', 'No Feishu or production collector', 'Process recovery does not prove arbitrary external side-effect recovery'],
 };
 async function checkpoint(stage: string) {
@@ -26,17 +27,12 @@ async function checkpoint(stage: string) {
   process.stdout.write(`${JSON.stringify({ stage, output })}\n`);
 }
 const servers: CodexAppServer[] = [];
-const pidFiles: string[] = [];
-let sequence = 0;
+const daemonBefore = execFileSync('codex', ['app-server', 'daemon', 'version'], { encoding: 'utf8' });
 function server() {
-  const pidFile = join(workspace, `server-${++sequence}.pid`);
-  pidFiles.push(pidFile);
-  const instance = new CodexAppServer({
-    command: ['sh', '-c', 'printf "%s" "$$" > "$1"; shift; exec codex app-server "$@"', '--', pidFile, ...(process.env.CODEX_VERIFY_NATIVE_QUESTIONS === '1' ? ['--enable', 'default_mode_request_user_input'] : [])],
-    approvalPolicy: 'on-request', sandbox: 'workspace-write', requestTimeoutMs: 30_000,
-  });
+  const connection = observedCodexConnection();
+  const instance = new CodexAppServer({ approvalPolicy: 'on-request', sandbox: 'workspace-write', requestTimeoutMs: 30_000 }, connection.connector);
   servers.push(instance);
-  return { instance, pidFile };
+  return { instance, disconnect: connection.disconnect };
 }
 async function terminal(instance: CodexAppServer, threadId: string, onSnapshot?: (snapshot: ExecutionSnapshot) => Promise<void>) {
   const deadline = Date.now() + 240_000;
@@ -172,30 +168,31 @@ try {
     evidence[`nativeQuestionRequestedBlocking${blocking}`] = snapshot;
   }
   evidence.nativeQuestions = { requests: observedQuestions, blocking: observedQuestions.some(request => request.isBlocking), nonblocking: observedQuestions.some(request => !request.isBlocking), coverage: observedQuestions.length ? 'Observed native requests; inspect isBlocking values for actual coverage' : 'NOT VERIFIED: installed native tool did not emit a request' };
-  if (process.env.CODEX_VERIFY_NATIVE_QUESTIONS === '1') assert.ok(observedQuestions.length > 0, 'The explicitly enabled native question feature must produce an actual request');
 
   await checkpoint('native questions');
-  const crashTurn = await resumed.instance.startTurn({ threadId, deliveryId: 'verify-hard-kill', input: [{ kind: 'text', text: 'Emit a short progress sentence then run sleep 20 in this fixture directory. This harmless turn will be interrupted. Do not modify files.' }] });
-  let beforeHardKill = await resumed.instance.inspect(threadId);
+  const crashTurn = await resumed.instance.startTurn({ threadId, deliveryId: 'verify-disconnect', input: [{ kind: 'text', text: 'Emit a short progress sentence then run sleep 20 in this fixture directory. This harmless turn will be interrupted. Do not modify files.' }] });
+  let beforeDisconnect = await resumed.instance.inspect(threadId);
   const persistenceDeadline = Date.now() + 20_000;
-  while (beforeHardKill.status === 'running' && !beforeHardKill.seenInputIds.includes('verify-hard-kill') && Date.now() < persistenceDeadline) {
+  while (beforeDisconnect.status === 'running' && !beforeDisconnect.seenInputIds.includes('verify-disconnect') && Date.now() < persistenceDeadline) {
     await delay(50);
-    beforeHardKill = await resumed.instance.inspect(threadId);
+    beforeDisconnect = await resumed.instance.inspect(threadId);
   }
-  assert.equal(beforeHardKill.status, 'running');
-  assert.equal(beforeHardKill.turnId, crashTurn);
-  assert.ok(beforeHardKill.seenInputIds.includes('verify-hard-kill'));
-  evidence.beforeHardKill = beforeHardKill;
-  const pid = Number(await readFile(resumed.pidFile, 'utf8'));
-  assert.ok(Number.isSafeInteger(pid) && pid > 1);
-  process.kill(-pid, 'SIGKILL');
-  await delay(150);
+  assert.equal(beforeDisconnect.status, 'running');
+  assert.equal(beforeDisconnect.turnId, crashTurn);
+  assert.ok(beforeDisconnect.seenInputIds.includes('verify-disconnect'));
+  evidence.beforeDisconnect = beforeDisconnect;
+  await resumed.disconnect();
   await Promise.all([resumed.instance.recover(), resumed.instance.recover(), resumed.instance.recover()]);
   const recovered = await resumed.instance.inspect(threadId, instructions);
   assert.equal(recovered.threadId, threadId);
-  assert.equal(recovered.status, 'interrupted');
-  assert.ok(recovered.seenInputIds.includes('verify-hard-kill'));
-  evidence.afterHardKill = recovered;
+  if (recovered.status === 'running' && recovered.turnId) await resumed.instance.interrupt({ threadId, turnId: recovered.turnId });
+  const interruptionDeadline = Date.now() + 30_000;
+  while ((await resumed.instance.inspect(threadId)).status === 'running') {
+    if (Date.now() > interruptionDeadline) throw new Error('Disconnected Turn interruption was not confirmed');
+    await delay(100);
+  }
+  assert.ok(recovered.seenInputIds.includes('verify-disconnect'));
+  evidence.afterDisconnect = recovered;
   await resumed.instance.startTurn({ threadId, deliveryId: 'verify-after-recovery', input: [{ kind: 'text', text: 'Cancel the interrupted sleep work. Reply with RECOVERED and the original memory word. No tools.' }] });
   const afterRecovery = await terminal(resumed.instance, threadId);
   assert.match(final(afterRecovery), /RECOVERED/);
@@ -209,13 +206,8 @@ try {
 } finally {
   const cleanup = await Promise.allSettled(servers.map(instance => instance.close()));
   evidence.cleanup = cleanup.map(result => result.status === 'fulfilled' ? 'closed' : String(result.reason));
-  evidence.processGroups = await Promise.all(pidFiles.map(async path => {
-    try {
-      const pid = Number(await readFile(path, 'utf8'));
-      try { process.kill(-pid, 0); return { pid, stopped: false }; }
-      catch { return { pid, stopped: true }; }
-    } catch (error) { return { path, error: String(error) }; }
-  }));
+  evidence.daemonPreserved = execFileSync('codex', ['app-server', 'daemon', 'version'], { encoding: 'utf8' }) === daemonBefore;
+  assert.equal(evidence.daemonPreserved, true);
   evidence.finishedAt = new Date().toISOString();
   await mkdir(resolve(output, '..'), { recursive: true });
   await writeFile(output, `${JSON.stringify(evidence, null, 2)}\n`, { mode: 0o600 });

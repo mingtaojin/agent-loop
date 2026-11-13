@@ -1,4 +1,4 @@
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 
 const [mode, recordPath] = process.argv.slice(2);
@@ -6,7 +6,9 @@ const send = message => process.stdout.write(JSON.stringify(message) + '\n');
 let current;
 let selection = false;
 let cwd;
-const threads = new Map();
+const statePath = recordPath + '.state';
+const threads = new Map(existsSync(statePath) ? JSON.parse(readFileSync(statePath, 'utf8')) : []);
+const persist = () => writeFileSync(statePath, JSON.stringify([...threads]));
 const record = message => appendFileSync(recordPath, JSON.stringify({ pid: process.pid, ...message }) + '\n');
 createInterface({ input: process.stdin }).on('line', line => {
   const message = JSON.parse(line);
@@ -19,14 +21,20 @@ createInterface({ input: process.stdin }).on('line', line => {
     cwd = p.cwd;
     if (selection && (p.sandbox !== 'read-only' || p.approvalPolicy !== 'never' || p.dynamicTools?.length !== 0)) throw new Error('Selector permissions or tools were not isolated');
     current = { id: `${selection ? 'temporary' : 'formal'}-${process.pid}-${threads.size + 1}`, status: { type: 'idle' }, turns: [] };
-    threads.set(current.id, { thread: current, selection, cwd });
+    threads.set(current.id, { thread: current, selection, cwd }); persist();
     send({ id: message.id, result: { thread: current, cwd: selection && mode === 'wrong-cwd' ? '/unexpected' : cwd, approvalPolicy: selection && mode === 'wrong-policy' ? 'on-request' : p.approvalPolicy, approvalsReviewer: 'user', sandbox: { type: selection && mode !== 'wrong-sandbox' ? 'readOnly' : 'workspaceWrite', networkAccess: false }, model: 'fixture', modelProvider: 'fixture' } });
     return;
   }
   if (message.method === 'thread/read' || message.method === 'thread/resume') {
     const saved = threads.get(p.threadId);
-    if (!saved || saved.selection) throw new Error('Ephemeral or unknown history must not be read or resumed');
+    if (!saved || (saved.selection && message.method === 'thread/resume')) throw new Error('Unknown Thread or ephemeral resume');
     send({ id: message.id, result: { thread: saved.thread } }); return;
+  }
+  if (message.method === 'turn/interrupt') {
+    const saved = threads.get(p.threadId);
+    const turn = saved.thread.turns.find(turn => turn.id === p.turnId);
+    turn.status = 'interrupted'; saved.thread.status = { type: 'idle' }; persist();
+    send({ id: message.id, result: {} }); return;
   }
   if (message.method === 'turn/start') {
     const saved = threads.get(p.threadId);
@@ -34,7 +42,8 @@ createInterface({ input: process.stdin }).on('line', line => {
     ({ thread: current, selection, cwd } = saved);
     if (selection && (!p.outputSchema?.properties?.choice || p.approvalPolicy !== 'never' || p.sandboxPolicy?.type !== 'readOnly' || p.sandboxPolicy.networkAccess !== false)) throw new Error('Selector turn lacks structured output or read-only policy');
     const turn = { id: `turn-${process.pid}-${current.turns.length + 1}`, status: 'inProgress', items: [] };
-    current.turns.push(turn); current.status = { type: 'active' };
+    current.turns.push(turn); current.status = { type: 'active' }; persist();
+    send({ method: 'turn/started', params: { threadId: current.id, turn } });
     const scope = { threadId: current.id, turnId: turn.id };
     const complete = () => {
       if (selection && mode === 'crash') process.exit(27);
@@ -51,7 +60,7 @@ createInterface({ input: process.stdin }).on('line', line => {
       turn.status = selection && mode === 'failed' ? 'failed' : 'completed';
       turn.error = turn.status === 'failed' ? { message: 'Selection failed in fixture' } : null;
       if (!selection) turn.items.push(answer);
-      current.status = { type: 'idle' };
+      current.status = { type: 'idle' }; persist();
       send({ method: 'turn/completed', params: { threadId: current.id, turn } });
     };
     if (selection && mode === 'early-completion') complete();

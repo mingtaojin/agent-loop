@@ -14,7 +14,7 @@ import { startDashboard } from '../src/dashboard.js';
 import { dashboardScript } from '../src/dashboard-page.js';
 import { AgentLoop } from '../src/loop.js';
 import { configSchema } from '../src/config.js';
-import { CodexAppServer } from '../src/adapters/codex.js';
+import { CodexAppServer } from './helpers/codex.js';
 import { Store } from '../src/store.js';
 import { storedExecutionEventSchema, executionEvent } from '../src/execution-events.js';
 import { CodexFake, FeishuFake, GitHubFake } from './fakes.js';

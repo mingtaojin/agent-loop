@@ -4,7 +4,7 @@ import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test, type TestContext } from 'node:test';
 import { z } from 'zod';
-import { CodexAppServer } from '../src/adapters/codex.js';
+import { CodexAppServer } from './helpers/codex.js';
 import type { WorkspaceSelectionRequest } from '../src/domain.js';
 
 const recordSchema = z.object({ pid: z.number(), method: z.string().optional(), params: z.unknown().optional() });
@@ -30,7 +30,7 @@ for (const mode of ['repository', 'none', 'question', 'early-completion']) test(
   assert.match(result.temporaryThreadId, /^temporary-/);
   const rows = await f.records();
   assert.equal(new Set(rows.map(row => row.pid)).size, 1);
-  assert.ok(rows.every(row => !['thread/read', 'thread/resume', 'thread/turns/list'].includes(row.method ?? '')));
+  assert.ok(rows.every(row => !['thread/resume', 'thread/turns/list'].includes(row.method ?? '')));
   assert.equal(alive(rows[0]!.pid), false);
   const started = rows.find(row => row.method === 'turn/start'); assert.ok(started);
   assert.match(JSON.stringify(started.params), /Original task evidence/);
@@ -72,13 +72,13 @@ test('aborting an active selector rejects promptly and releases only its child p
   assert.match(formalId, /^formal-/);
 });
 
-test('closing the owner cancels active selectors without reading ephemeral history', async t => {
+test('closing the owner cancels active selectors by interrupting their owned ephemeral turn', async t => {
   const f = await fixture(t, 'slow');
   const pending = f.server.selectWorkspace(f.input);
   const rejected = assert.rejects(pending, /closed|closing/i);
   await f.waitForTurn(); await f.server.close(); await rejected;
   const rows = await f.records(); assert.equal(alive(rows[0]!.pid), false);
-  assert.ok(rows.every(row => row.method !== 'thread/read'));
+  assert.ok(rows.some(row => row.method === 'turn/interrupt'));
 });
 
 test('an already aborted selection does not start a protocol process', async t => {
@@ -120,7 +120,7 @@ for (const mode of ['project', 'unknown-project', 'project-path']) test(`isolate
   } else await assert.rejects(f.server.selectWorkspace(f.input));
   const rows = await f.records(); assert.ok(rows[0]);
   assert.equal(alive(rows[0].pid), false);
-  assert.ok(rows.every(row => !['thread/read', 'thread/resume', 'thread/turns/list'].includes(row.method ?? '')));
+  assert.ok(rows.every(row => !['thread/resume', 'thread/turns/list'].includes(row.method ?? '')));
 });
 
 test('a repository name cannot select a discovered project with the same display name', async t => {

@@ -4,6 +4,7 @@ import { dirname, resolve } from 'node:path';
 import { z } from 'zod';
 import { collectionRepositorySchema } from './domain.js';
 import { projectConfigInputSchema } from './project.js';
+import { daemonSettingsSchema, normalizeDaemonSettings } from './adapters/codex-daemon.js';
 
 const environmentName = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'Use an environment variable name, not a credential');
 const positiveMilliseconds = z.number().int().positive();
@@ -55,13 +56,15 @@ export const configSchema = z.strictObject({
       'documentBaseUrl is required for enabled document progress').default({ enabled: false, surface: 'card', intervalMs: 1000, maxLines: 3000 }),
   }),
   codex: z.strictObject({
-    command: z.array(z.string().min(1)).min(1).default(['codex', 'app-server']),
-    model: z.string().min(1).optional(),
+    ...daemonSettingsSchema.shape,
     selectionModel: z.string().min(1).optional(),
     approvalPolicy: z.enum(['untrusted', 'on-request', 'never']).default('on-request'),
     sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).default('workspace-write'),
     requestTimeoutMs: positiveMilliseconds.default(120_000),
-  }).default({ command: ['codex', 'app-server'], approvalPolicy: 'on-request', sandbox: 'workspace-write', requestTimeoutMs: 120_000 }),
+  }).transform((value, context) => {
+    try { return { ...value, ...normalizeDaemonSettings(value), command: undefined }; }
+    catch (error) { context.addIssue({ code: 'custom', message: error instanceof Error ? error.message : String(error) }); return z.NEVER; }
+  }).prefault({}),
   pollIntervalMs: positiveMilliseconds.default(30_000),
   executionPollMs: positiveMilliseconds.default(2_000),
   maxAttachmentBytes: z.number().int().positive().default(20 * 1024 * 1024),
