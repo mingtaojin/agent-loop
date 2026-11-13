@@ -1238,6 +1238,58 @@ test('supervision does not wake a coordinator when all workers have no actionabl
   assert.equal(f.events(f.coordinator().id, 'supervision').length, before);
 });
 
+for (const status of ['delivering', 'uncertain'] satisfies Parameters<Store['markInput']>[1][]) {
+  test(`supervision does not wake for ${status}-only idle work and preserves delivery evidence`, async t => {
+    const f = await fixture(t); await f.initialize();
+    const worker = await f.dispatch(`settled-${status}`, 'Complete this round.');
+    f.codex.complete(worker.threadId!, null); await f.loop.tick(); await f.idleCoordinator();
+    await f.loop.projectAction(f.coordinator().id, { action: 'send', requestId: `unsettled-${status}`,
+      text: 'Reconcile the original delivery outcome.', taskId: worker.id });
+    const input = f.events(worker.id, 'instruction')[0]; assert.ok(input);
+    f.loop.store.markInput(input.id, status, 'The original delivery still requires historical reconciliation');
+    const beforeTask = f.loop.store.task(worker.id), beforeInputs = f.loop.store.inputs(worker.id);
+    assert.equal(beforeTask.status, 'idle'); assert.equal(beforeTask.executionStatus, 'completed');
+    assert.equal(beforeTask.recovery.nextAttemptAt, null); assert.deepEqual(beforeTask.requests, []);
+    assert.equal(beforeInputs.filter(item => item.status === 'pending').length, 0);
+    assert.equal(beforeInputs.filter(item => item.status === status).length, 1);
+    assert.equal(f.coordinator().status, 'idle');
+    const before = f.events(f.coordinator().id, 'supervision').length;
+    f.loop.store.setMeta('project-supervision:app', '0');
+    f.loop.projects.supervise();
+    assert.equal(f.events(f.coordinator().id, 'supervision').length, before);
+    assert.deepEqual(f.loop.store.task(worker.id), beforeTask);
+    assert.deepEqual(f.loop.store.inputs(worker.id), beforeInputs);
+  });
+}
+
+for (const work of ['pending', 'running', 'retry']) {
+  test(`supervision wakes for a worker with ${work} work`, async t => {
+    const f = await fixture(t); await f.initialize();
+    const worker = await f.dispatch(`actionable-${work}`, 'Continue the delegated work.');
+    if (work !== 'running') { f.codex.complete(worker.threadId!, null); await f.loop.tick(); }
+    await f.idleCoordinator();
+    if (work === 'pending') {
+      await f.loop.projectAction(f.coordinator().id, { action: 'send', requestId: 'executable-input',
+        text: 'Continue this task.', taskId: worker.id });
+    } else if (work === 'retry') {
+      const task = f.loop.store.task(worker.id);
+      task.status = 'pending'; task.executionStatus = 'interrupted';
+      task.recovery = { attempts: 1, nextAttemptAt: Date.now() + 60_000, lastError: 'Transient execution failure',
+        interruptedTurnId: task.turnId, lastUserInputSeq: null };
+      f.loop.store.saveTask(task);
+    }
+    const beforeTask = f.loop.store.task(worker.id), beforeInputs = f.loop.store.inputs(worker.id);
+    assert.equal(beforeInputs.filter(input => input.status === 'pending').length, work === 'pending' ? 1 : 0);
+    const before = f.events(f.coordinator().id, 'supervision').length;
+    f.loop.store.setMeta('project-supervision:app', '0');
+    f.loop.projects.supervise();
+    assert.equal(f.events(f.coordinator().id, 'supervision').length, before + 1);
+    assert.equal(f.events(f.coordinator().id, 'supervision').at(-1)?.status, 'pending');
+    assert.deepEqual(f.loop.store.task(worker.id), beforeTask);
+    assert.deepEqual(f.loop.store.inputs(worker.id), beforeInputs);
+  });
+}
+
 test('explicit supervision pause survives restart while workers and owner input keep their identities', async t => {
   const f = await fixture(t); const coordinator = await f.initialize();
   const worker = await f.dispatch('supervision-live', 'Continue working.');
