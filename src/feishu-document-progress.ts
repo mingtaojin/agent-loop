@@ -42,6 +42,7 @@ const discoverySchema = z.strictObject({ cursor: z.number().int().nonnegative(),
 const discoveryKey = 'feishu-document-progress:discovery:v1';
 const turnKey = (taskId: string, turnId: string) => JSON.stringify([taskId, turnId]);
 const emptyView = () => progressViewSchema.parse({ status: 'running', cursor: 0, lastExecutionEventAt: null, assistant: [], tool: null });
+class DocumentBindingChanged extends Error {}
 const content = (record: DocumentPublication) => record.text;
 function projectionRevision(task: Task, position: DocumentSourcePosition, maxLines: number): DocumentProjectionRevision {
   const taskKey = createHash('sha256').update(JSON.stringify([
@@ -105,7 +106,7 @@ export class FeishuDocumentProgressPublisher {
   private saveDelivery(record: DocumentPublication): void {
     const latest = this.load(record.taskId);
     if (!latest) throw new Error('Document publication disappeared');
-    if (latest.chatId !== record.chatId || this.options.store.task(record.taskId).chatId !== record.chatId) return;
+    if (latest.chatId !== record.chatId || this.options.store.task(record.taskId).chatId !== record.chatId) throw new DocumentBindingChanged();
     this.save({ ...latest, delivery: record.delivery, lastAttemptAt: record.lastAttemptAt,
       nextAttemptAt: record.nextAttemptAt, failures: record.failures });
   }
@@ -282,6 +283,7 @@ export class FeishuDocumentProgressPublisher {
       record.nextAttemptAt = this.now() + this.intervalMs;
       this.saveDelivery(record);
     } catch (error) {
+      if (error instanceof DocumentBindingChanged) return;
       if (error instanceof TaskGroupUnavailable) {
         retireTaskGroup(this.options.store, record.taskId, record.chatId);
         this.report(`${record.taskId}: ${error.message}`); return;

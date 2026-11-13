@@ -370,6 +370,21 @@ test('dissolved and absent chats stop saved document publications without affect
   await f.pump(5); assert.equal(f.transport.calls.length, stopped);
 });
 
+test('retiring a task group during unknown-write readback prevents a later write to its document', async t => {
+  const f = await fixture(t); f.store.saveTask(task()); await f.pump(5);
+  f.event('agent_message', 'Changed document content');
+  f.transport.fail = { kind: 'write', when: 'before', error: new Error('write outcome unknown') };
+  await f.pump();
+  const writes = f.transport.count('write');
+  const hold = gate(); f.transport.hold = { kind: 'read', gate: hold };
+  const reading = f.publisher.poll();
+  await Promise.resolve();
+  assert.ok(f.transport.count('read') > 0);
+  f.store.saveTask({ ...f.store.task('task'), chatId: null });
+  hold.resolve(); await reading; f.transport.hold = null;
+  assert.equal(f.transport.count('write'), writes, 'detaching during readback must stop the old publication');
+});
+
 test('maxLines and renderer revision changes re-render unchanged histories once', async t => {
   const f = await fixture(t); f.store.saveTask(task());
   f.event('agent_message', Array.from({ length: 20 }, (_, i) => `line-${i}`).join('\n')); await f.pump(5);
