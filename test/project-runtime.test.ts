@@ -693,13 +693,14 @@ test('CAS records reject stale writers and preserve immutable decisions, authors
   await assert.rejects(f.loop.projectAction(worker.id, { action: 'record', requestId: 'stale-write', key: 'export-scope', text: 'Unconfirmed assumption.', expectedVersion: 0 }), /version|conflict/i);
   await f.restart();
   assert.deepEqual(f.state().records, history);
-  assert.ok(f.codex.instructionUpdates.some(update => update.threadId === f.coordinator().threadId && update.instructions.includes(history[1]!.text)));
+  assert.ok(f.loop.projects.context(f.coordinator().id).includes(history[1]!.text));
+  assert.ok(f.codex.instructionUpdates.every(update => !update.instructions.includes(history[1]!.text)));
   assert.deepEqual(await f.loop.projectAction(f.coordinator().id, first), result);
   const firstPage = z.object({ items: projectStateSchema.shape.records, nextOffset: z.number().nullable() })
-    .parse(await f.loop.projectAction(worker.id, { action: 'status', section: 'records', offset: 0, limit: 1 }));
+    .parse(await f.loop.projectAction(f.coordinator().id, { action: 'status', section: 'records', offset: 0, limit: 1 }));
   assert.deepEqual(firstPage.items, [history[0]]); assert.equal(firstPage.nextOffset, 1);
   const secondPage = z.object({ items: projectStateSchema.shape.records, nextOffset: z.number().nullable() })
-    .parse(await f.loop.projectAction(worker.id, { action: 'status', section: 'records', offset: 1, limit: 1 }));
+    .parse(await f.loop.projectAction(f.coordinator().id, { action: 'status', section: 'records', offset: 1, limit: 1 }));
   assert.deepEqual(secondPage.items, [history[1]]); assert.equal(secondPage.nextOffset, null);
   assert.equal((await f.status()).version, 2);
 });
@@ -752,7 +753,8 @@ test('rotation waits for coordinator idleness and retains its group, members, pe
   assert.equal(f.loop.store.task(worker.id).requests[0]?.id, 'pending-scope');
   assert.equal(f.events(after.id, 'session_rotation').length, 1);
   assert.ok(f.codex.starts.some(input => input.threadId === after.threadId && JSON.stringify(input.input).includes(rotation.checkpoint)));
-  assert.ok(f.codex.created.at(-1)?.instructions.includes(state.records[0]!.text));
+  assert.ok(!f.codex.created.at(-1)?.instructions.includes(state.records[0]!.text));
+  assert.ok(f.loop.projects.context(after.id).includes(state.records[0]!.text));
   await f.restart(); await f.loop.projectAction(after.id, rotation); await f.loop.tick();
   assert.equal(f.coordinator().threadId, after.threadId);
   assert.equal(f.events(after.id, 'session_rotation').length, 1);
@@ -1050,4 +1052,100 @@ test('independent startup race: recovery must validate saved resources before in
   } finally { held.resolve(); await starting; await restarted.close(); }
   assert.equal(validations, 1);
   assert.equal(f.codex.starts.filter(call => call.threadId === worker.threadId).length, before);
+});
+
+
+test('task record sentinels stay out of unrelated instructions and every status section', async t => {
+  const f = await fixture(t); await f.initialize();
+  const a = await f.dispatch('private-a', 'Task A.');
+  const b = await f.dispatch('private-b', 'Task B.');
+  const verifier = await f.dispatch('private-verifier', 'Verify selected evidence.', { role: 'verifier' });
+  const before = f.loop.projects.instructions(b.id);
+  await f.loop.projectAction(a.id, { action: 'record', requestId: 'a-private', key: 'requirements', text: 'A_PRIVATE_RECORD_SENTINEL', expectedVersion: 0 });
+  assert.equal(f.loop.projects.instructions(b.id), before);
+  const saved = f.loop.store.task(a.id);
+  saved.reason = 'A_PRIVATE_REASON_SENTINEL';
+  saved.requests = [{ id: 'private-question', threadId: a.threadId!, turnId: a.turnId!, kind: 'question',
+    prompt: 'A_PRIVATE_PROMPT_SENTINEL', method: 'item/tool/requestUserInput', payload: {}, isBlocking: true, connectionEpoch: 'scope-test' }];
+  f.loop.store.saveTask(saved);
+  f.loop.store.enqueue(a.id, 'A_PRIVATE_OUTPUT_SENTINEL', 'private-output');
+  for (const caller of [b, verifier]) {
+    for (const section of ['overview', 'records', 'tasks', 'issues', 'comments', 'intakes'] as const) {
+      const response = await f.loop.projectAction(caller.id, { action: 'status', section, limit: 1 });
+      assert.doesNotMatch(JSON.stringify(response), /A_PRIVATE_/, `${caller.id} ${section}`);
+    }
+  }
+  assert.match(JSON.stringify(await f.loop.projectAction(a.id, { action: 'status', section: 'records' })), /A_PRIVATE_RECORD_SENTINEL/);
+  assert.match(JSON.stringify(await f.loop.projectAction(f.coordinator().id, { action: 'status', section: 'tasks' })), /A_PRIVATE_PROMPT_SENTINEL/);
+});
+
+test('record acknowledgements sanitize both new writes and legacy full-state receipt replays', async t => {
+  const f = await fixture(t); await f.initialize();
+  const a = await f.dispatch('receipt-a', 'Task A.');
+  const b = await f.dispatch('receipt-b', 'Task B.');
+  await f.loop.projectAction(a.id, { action: 'record', requestId: 'receipt-private', key: 'private', text: 'RECEIPT_PRIVATE_SENTINEL', expectedVersion: 0 });
+  const action: ProjectAction = { action: 'record', requestId: 'receipt-b-write', key: 'own', text: 'Own evidence.', expectedVersion: 1 };
+  const response = await f.loop.projectAction(b.id, action);
+  assert.doesNotMatch(JSON.stringify(response), /RECEIPT_PRIVATE_SENTINEL/);
+  assert.deepEqual(Object.keys(z.object({ accepted: z.literal(true), requestId: z.string(), key: z.string(), version: z.number() }).parse(response)).sort(), ['accepted', 'key', 'requestId', 'version']);
+  const key = `project:${JSON.stringify(['receipt', 'app', b.id, action.requestId])}`;
+  const { fingerprint } = z.object({ fingerprint: z.string() }).parse(JSON.parse(f.loop.store.meta(key)!));
+  f.loop.store.setMeta(key, JSON.stringify({ fingerprint, value: f.state() }));
+  const historical = f.loop.store.meta(key);
+  const replay = await f.loop.projectAction(b.id, action);
+  assert.deepEqual(replay, response);
+  assert.equal(f.loop.store.meta(key), historical);
+});
+
+
+test('scoped records retain same-key identities, caller defaults and explicit coordinator routing after restart', async t => {
+  const f = await fixture(t, { secondProject: true }); await f.initialize();
+  const a = await f.dispatch('scope-a', 'Task A.');
+  const b = await f.dispatch('scope-b', 'Task B.');
+  const verifier = await f.dispatch('scope-v', 'Verify selected evidence.', { role: 'verifier' });
+  const record = (callerId: string, requestId: string, text: string, scope?: Extract<ProjectAction, { action: 'record' }>['scope']) =>
+    f.loop.projectAction(callerId, { action: 'record', requestId, key: 'same-key', text, expectedVersion: f.state().version, ...(scope ? { scope } : {}) });
+  await record(a.id, 'a', 'A_ONLY');
+  await record(b.id, 'b', 'B_ONLY');
+  await record(verifier.id, 'v', 'VERIFIER_ONLY');
+  await record(f.coordinator().id, 'coord', 'COORDINATOR_ONLY');
+  await record(f.coordinator().id, 'shared', 'PROJECT_SHARED', { kind: 'project' });
+  await record(f.coordinator().id, 'routed', 'SELECTED_A_EVIDENCE', { kind: 'task', taskId: verifier.id });
+  for (const scope of [{ kind: 'project' }, { kind: 'coordinator' }, { kind: 'task', taskId: a.id }] as const)
+    await assert.rejects(record(b.id, `forbidden-${scope.kind}`, 'FORBIDDEN', scope), /Only the coordinator/);
+  await assert.rejects(record(f.coordinator().id, 'foreign', 'FORBIDDEN', { kind: 'task', taskId: f.coordinator('docs').id }), /does not belong/);
+  await assert.rejects(record(f.coordinator().id, 'missing', 'FORBIDDEN', { kind: 'task', taskId: 'missing' }), /does not belong/);
+  const all = await f.status();
+  assert.equal(all.records.length, 5);
+  assert.ok(f.loop.projects.context(a.id).includes('A_ONLY'));
+  assert.doesNotMatch(f.loop.projects.context(a.id), /B_ONLY|COORDINATOR_ONLY|SELECTED_A_EVIDENCE|VERIFIER_ONLY/);
+  assert.match(f.loop.projects.context(verifier.id), /SELECTED_A_EVIDENCE/);
+  assert.doesNotMatch(f.loop.projects.context(f.coordinator().id), /A_ONLY|B_ONLY|SELECTED_A_EVIDENCE|VERIFIER_ONLY/);
+  assert.doesNotMatch(f.loop.projects.context(f.coordinator('docs').id), /PROJECT_SHARED/);
+  const page = z.object({ counts: z.object({ records: z.number() }), items: projectStateSchema.shape.records, nextOffset: z.number().nullable() });
+  const first = page.parse(await f.loop.projectAction(a.id, { action: 'status', section: 'records', limit: 1 }));
+  const second = page.parse(await f.loop.projectAction(a.id, { action: 'status', section: 'records', limit: 1, offset: 1 }));
+  assert.equal(first.counts.records, 2); assert.equal(first.items[0]?.text, 'A_ONLY'); assert.equal(first.nextOffset, 1);
+  assert.equal(second.items[0]?.text, 'PROJECT_SHARED'); assert.equal(second.nextOffset, null);
+  const before = f.state(); const context = f.loop.projects.context(a.id);
+  await f.restart();
+  assert.deepEqual(f.state(), before); assert.equal(f.loop.projects.context(a.id), context);
+  await assert.rejects(f.loop.projectAction(a.id, { action: 'record', requestId: 'a', key: 'same-key', text: 'A_ONLY', expectedVersion: 0, scope: { kind: 'project' } }), /different content/);
+});
+
+test('legacy unscoped records remain query-only for coordinators without rewriting stored originals', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('legacy-scope', 'Continue original task.');
+  const legacy = { requestId: 'legacy-original', key: 'legacy', text: 'LEGACY_UNSCOPED_SENTINEL', authorTaskId: worker.id, version: 1, createdAt: 1 };
+  const state = f.state();
+  f.loop.projects.ledger.save({ ...state, version: 1, records: [legacy] });
+  const key = `project:${JSON.stringify(['state', state.id])}`;
+  const raw = f.loop.store.meta(key);
+  assert.doesNotMatch(f.loop.projects.context(worker.id), /LEGACY_UNSCOPED/);
+  assert.doesNotMatch(f.loop.projects.context(f.coordinator().id), /LEGACY_UNSCOPED/);
+  assert.doesNotMatch(JSON.stringify(await f.loop.projectAction(worker.id, { action: 'status', section: 'records' })), /LEGACY_UNSCOPED/);
+  assert.match(JSON.stringify(await f.loop.projectAction(f.coordinator().id, { action: 'status', section: 'records' })), /LEGACY_UNSCOPED/);
+  assert.equal(f.loop.store.meta(key), raw);
+  await f.restart();
+  assert.deepEqual(f.state().records, [legacy]);
 });
