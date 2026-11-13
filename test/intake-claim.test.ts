@@ -597,4 +597,30 @@ test('independent attachment retry preserves Operator pause before coordinator d
   assert.equal(afterRetry.reason, 'Operator paused');
   assert.match(dispatchError ?? '', /paused/i, 'coordinator dispatch must require explicit Operator resume');
   assert.deepEqual(after, beforeDispatch, 'paused intake must not create a Worker Thread or start a turn');
+  assert.deepEqual(beforeDispatch, before, 'attachment retry itself must not create or start a Worker');
+  await f.loop.control(saved.id, 'resume');
+  await f.loop.projectAction(coordinator.id, { action: 'dispatch', requestId: 'explicitly-resumed-attachment',
+    intakeTaskId: saved.id, role: 'worker', prompt: 'Continue only after the explicit resume.' });
+  await f.loop.tick();
+  assert.equal(f.loop.store.task(saved.id).purpose, 'execution');
+  assert.equal(f.codex.created.length, before.created + 1); assert.equal(f.codex.starts.length, before.starts + 1);
+});
+
+test('an unpaused failed intake can retry its original attachment and be delegated normally', async t => {
+  const f = await fixture(t), saved = f.saved('unpaused-attachment-retry'), coordinator = f.coordinator();
+  await f.loop.projectAction(coordinator.id, { action: 'claim_intake', requestId: 'unpaused-claim', taskId: saved.id,
+    messageId: await f.decision('unpaused-attachment-owner') });
+  await f.loop.tick();
+  const input = f.loop.store.inputs(saved.id).find(item => item.message.id === 'unpaused-attachment-retry');
+  assert.ok(input); assert.equal(input.status, 'failed'); assert.equal(f.loop.store.task(saved.id).status, 'failed');
+  f.feishu.resources.set('old-file', Buffer.from('Recovered original evidence\n'));
+  await f.loop.retryAttachment(saved.id, input.id);
+  assert.equal(f.loop.store.task(saved.id).status, 'idle');
+  assert.deepEqual(f.loop.store.task(saved.id).source, saved.source);
+  assert.deepEqual(f.loop.store.inputs(saved.id).find(item => item.id === input.id)?.message, input.message);
+  await f.loop.projectAction(coordinator.id, { action: 'dispatch', requestId: 'unpaused-retry-dispatch',
+    intakeTaskId: saved.id, role: 'worker', prompt: 'Use the recovered original evidence.' });
+  await f.loop.tick();
+  const worker = f.loop.store.task(saved.id); assert.equal(worker.purpose, 'execution'); assert.ok(worker.threadId);
+  assert.equal(worker.status, 'running');
 });

@@ -52,7 +52,10 @@ node node_modules/typescript/bin/tsc
 启动阶段先完成恢复，再启用输入推进和定时器。期间群消息与审批callback仍保存，不在资源核验前推进Thread。
 恢复核验保存资源不依赖项目归属。选择项目后原地采用旧Thread，以及显式resume，都在执行或清除暂停之前核验保存资源。
 handoff、clarification和adopt保留Operator暂停的status与reason。核验错误记录到recovery，不能覆盖暂停标记。
+附件重试只重新准备失败输入，不清除Operator暂停；恢复执行仍需显式resume，intake仍需协调者单独dispatch。
 内部 `acceptIntake` 接收正文和同一快照的version。提交时重核归属与快照，归属变化按正常接管处理；材料已更新时保留已选项目并重建正文，不占用完整材料的事件key。
+
+Codex并发mutation测试读取持久head-held标记等待fixture就绪，不依赖文件监听通知。RPC期限和历史读取、输入去重断言保持不变。
 
 ## 验证边界
 

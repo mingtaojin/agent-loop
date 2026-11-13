@@ -767,7 +767,7 @@ export class AgentLoop {
       const input = this.store.inputs(taskId).find(item => item.id === inputId);
       if (!input || input.status !== 'failed') throw new Error('Only confirmed undelivered attachments can be retried');
       const task = this.store.task(taskId);
-      if (task.purpose === 'intake') { task.status = 'pending'; task.recovery = recoveryState(); this.persist(task); }
+      if (task.purpose === 'intake' && task.status !== 'paused') { task.status = 'pending'; task.recovery = recoveryState(); this.persist(task); }
       this.store.markInput(inputId, 'pending'); await this.advance(taskId);
     });
   }
