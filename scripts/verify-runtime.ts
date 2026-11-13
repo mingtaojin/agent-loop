@@ -10,6 +10,7 @@ import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { configSchema } from '../src/config.js';
 import { AgentLoop } from '../src/loop.js';
+import { observedCodexConnection } from './codex-connection.js';
 import { CodexAppServer } from '../src/adapters/codex.js';
 import { WorkspaceProvider } from '../src/workspace.js';
 import { taskSchema, type IncomingMessage, type PendingRequest } from '../src/domain.js';
@@ -25,7 +26,7 @@ const protocol = join(root, 'protocol.jsonl');
 const evidence: Record<string, unknown> = { root, startedAt: new Date().toISOString(), scope: 'Actual AgentLoop, SQLite and WorkspaceProvider with real Codex. Feishu and GitHub are local fakes. Only temporary fixture commands may be approved.', sandbox: 'workspace-write', approvals: [] };
 const approvals: { request: PendingRequest; result: string }[] = [];
 const quote = (text: string) => `'${text.replaceAll("'", "'\"'\"'")}'`;
-const config = configSchema.parse({ dataDir: join(root, 'data'), feishu: { userOpenId: 'fixture-owner' }, engineering: { skillPath: '/Users/developer/.codex/packages/pstack/skills/poteto-mode/SKILL.md' }, codex: { command: [process.execPath, resolve('scripts/fixtures/runtime-proxy.mjs'), protocol], approvalPolicy: 'on-request', sandbox: 'workspace-write', requestTimeoutMs: 30000 } });
+const config = configSchema.parse({ dataDir: join(root, 'data'), feishu: { userOpenId: 'fixture-owner' }, engineering: { skillPath: '/Users/developer/.codex/packages/pstack/skills/poteto-mode/SKILL.md' }, codex: { approvalPolicy: 'on-request', sandbox: 'workspace-write', requestTimeoutMs: 30000 } });
 for (const name of ['one', 'two']) {
   const path = join(root, name); await mkdir(path);
   for (const args of [['init', '-b', 'main'], ['config', 'user.name', 'Runtime Fixture'], ['config', 'user.email', 'fixture@example.invalid']]) await execute('git', ['-C', path, ...args]);
@@ -38,7 +39,7 @@ for (const name of ['one', 'two']) {
 config.projects.push(projectConfigSchema.parse({ id: 'fixture', name: 'Fixture', directory: root, repositories: config.repositories.map(repository => ({ name: repository.name, criteria: repository.criteria })), instructions: 'Isolated verification. The harness dispatches intakes explicitly. Do not dispatch additional tasks, access network or real projects, or perform delivery operations.' }));
 const feishu = new FeishuFake(), github = new GitHubFake();
 const servers: CodexAppServer[] = [];
-let codex = new CodexAppServer(config.codex); servers.push(codex);
+let codex = new CodexAppServer(config.codex, observedCodexConnection({ recordPath: protocol }).connector); servers.push(codex);
 let loop = new AgentLoop(config, { codex, feishu, github, workspace: new WorkspaceProvider(config.dataDir) });
 const message = (id: string, text: string, chatId = 'private', chatType: 'p2p' | 'group' = 'p2p'): IncomingMessage => ({ id, text, chatId, chatType, senderId: 'fixture-owner', attachments: [], createdAt: Date.now() });
 const allowed = new Set<string>();
@@ -95,7 +96,7 @@ try {
   await loop.close();
 
   const legacyCwd = join(root, 'legacy-context'); await mkdir(legacyCwd);
-  const legacy = new CodexAppServer({ ...config.codex, command: [...config.codex.command, '--legacy'] }); servers.push(legacy);
+  const legacy = new CodexAppServer(config.codex, observedCodexConnection({ recordPath: protocol, legacy: true }).connector); servers.push(legacy);
   const legacyThread = await legacy.createThread({ cwd: legacyCwd, instructions: 'Harmless temporary fixture. Remember the user memory word. Do not use tools yet. Future engineering uses current Runtime instructions. No network, credentials or real repositories.' });
   await legacy.startTurn({ threadId: legacyThread, deliveryId: 'legacy-memory', input: [{ kind: 'text', text: 'Remember RUNTIME_LEGACY_MEMORY and reply briefly.' }] });
   for (const deadline = Date.now() + 120000; Date.now() < deadline; await delay(1000)) { if ((await legacy.inspect(legacyThread)).status !== 'running') break; }
@@ -104,7 +105,7 @@ try {
   const legacyId = 'legacy-fixture'; const oldMessage = message('legacy-source', '/new legacy discussion');
   store.saveTask(taskSchema.parse({ id: legacyId, sourceId: 'manual-legacy', source: { kind: 'manual', message: oldMessage }, contextDirectory: legacyCwd, resources: [], status: 'idle', reason: null, prompt: 'legacy', promptHash: 'legacy', skillPath: config.engineering?.skillPath ?? null, chatId: 'chat-legacy', threadId: legacyThread, turnId: before.turnId, executionStatus: 'completed', lastHandledTurnId: before.turnId, requests: [], createdAt: Date.now(), updatedAt: Date.now(), legacy: { status: 'waiting_user', prUrl: null } }));
   feishu.groups.set(legacyId, 'chat-legacy');
-  codex = new CodexAppServer(config.codex); servers.push(codex); loop = new AgentLoop(config, { codex, feishu, github, workspace: new WorkspaceProvider(config.dataDir) }, store);
+  codex = new CodexAppServer(config.codex, observedCodexConnection({ recordPath: protocol }).connector); servers.push(codex); loop = new AgentLoop(config, { codex, feishu, github, workspace: new WorkspaceProvider(config.dataDir) }, store);
   await loop.projects.adopt(legacyId, 'fixture');
   await loop.recover();
   await loop.receive(message('legacy-engineering', engineering(legacyId, 'RUNTIME_LEGACY'), 'chat-legacy', 'group'));

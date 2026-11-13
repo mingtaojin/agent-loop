@@ -19,8 +19,8 @@ type SelectionRequest = Omit<Parameters<CodexAppServer['selectWorkspace']>[0], '
 type SelectionEvidence = {
   request: SelectionRequest;
   response: Awaited<ReturnType<CodexAppServer['selectWorkspace']>>;
-  childrenBefore: number[];
-  childrenAfter: number[];
+  daemonBefore: unknown;
+  daemonAfter: unknown;
 };
 type ExecutionExpectation = {
   name: string;
@@ -73,12 +73,9 @@ console.log(JSON.stringify({ fixture: root, report: reportPath }));
 const save = () => writeFile(reportPath, JSON.stringify(report, null, 2), { mode: 0o600 });
 const execute = promisify(execFile);
 
-async function childProcesses(): Promise<number[]> {
-  const { stdout } = await execute('ps', ['-axo', 'pid=,ppid=,comm=']);
-  return stdout.split('\n').flatMap(line => {
-    const [pid, parent, ...command] = line.trim().split(/\s+/);
-    return Number(parent) === process.pid && !/(^|\/)ps$/.test(command.join(' ')) ? [Number(pid)] : [];
-  }).sort((a, b) => a - b);
+async function daemonVersion(): Promise<unknown> {
+  const { stdout } = await execute(config.codex.executable, ['app-server', 'daemon', 'version']);
+  return JSON.parse(stdout);
 }
 
 async function projectFiles(directory = projectRoot, prefix = ''): Promise<Record<string, string | null>> {
@@ -100,12 +97,12 @@ codex.selectWorkspace = async input => {
   assert.deepEqual(captured.candidates.map(candidate => candidate.name).sort(), ['audio', 'portal']);
   assert.ok(captured.candidates.every(candidate => 'kind' in candidate && candidate.kind === 'project'));
   const filesBefore = await projectFiles();
-  const childrenBefore = await childProcesses();
+  const daemonBefore = await daemonVersion();
   const response = await select(input);
-  const childrenAfter = await childProcesses();
-  selections.push({ request: captured, response, childrenBefore, childrenAfter });
+  const daemonAfter = await daemonVersion();
+  selections.push({ request: captured, response, daemonBefore, daemonAfter });
   await save();
-  assert.deepEqual(childrenAfter, childrenBefore, 'Temporary selector process must be released before formal execution');
+  assert.deepEqual(daemonAfter, daemonBefore, 'Directory selection must preserve the shared daemon');
   assert.deepEqual(await projectFiles(), filesBefore, 'Directory selection must leave all project files untouched');
   return response;
 };

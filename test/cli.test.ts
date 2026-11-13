@@ -28,6 +28,7 @@ test('doctor reports discovered projects and source-only collection without requ
   const run = () => execute(process.execPath, [cli, entry, 'doctor', '--config', configPath, '--env-file', join(root, 'fixture.env')], { cwd: root, env });
   const output = JSON.parse((await run()).stdout);
   assert.equal(output.ready, true); assert.equal(output.discovery.readable, true);
+  assert.deepEqual(output.codex, { mode: 'shared-daemon', executable: 'codex' });
   assert.equal(output.discovery.projectRoot, join(root, 'projects'));
   assert.deepEqual(output.discovery.projects.map((project: { name: string }) => project.name), ['multi-repo']);
   assert.equal(output.repositories[0].sourceOnly, true);

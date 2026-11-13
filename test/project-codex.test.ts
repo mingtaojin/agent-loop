@@ -4,7 +4,7 @@ import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test, type TestContext } from 'node:test';
 import { z } from 'zod';
-import { CodexAppServer } from '../src/adapters/codex.js';
+import { CodexAppServer } from './helpers/codex.js';
 import { UncertainOperationError } from '../src/domain.js';
 import type { ProjectRequest } from '../src/ports.js';
 import { projectActionSchema } from '../src/project.js';
@@ -244,6 +244,12 @@ for (const invalid of invalidCalls) test(`project tool rejects ${invalid.name} b
   f.server.setProjectHandler(async () => { calls++; return null; });
   f.server.setWorkspaceHandler(async () => { calls++; throw new Error('Unknown tool reached workspace handler'); });
   await f.start();
+  if (invalid.name === 'unknown thread') {
+    await delay(50);
+    assert.equal((await f.records()).filter(row => !row.method).length, 0);
+    assert.equal(calls, 0);
+    return;
+  }
   const reply = (await f.results())[0];
   assert.ok(reply);
   assert.equal(reply.success, false);
