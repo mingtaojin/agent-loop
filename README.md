@@ -179,7 +179,7 @@ CLI `submit`、`answer` 及机器人私聊接单已经移除。运维 `doctor`�
 
 ## 保留材料和工程目录
 
-截图与 UTF-8 日志保存在 `<dataDir>/attachments/<taskId>`，独立于工程 worktree。相同文件名不会覆盖。下载、大小、编码或格式失败会保留消息并报告，失败消息的文字不伪装成完整送达。后续普通消息可继续投递。确认未送达的附件可通过服务 API `retryAttachment(taskId, inputId)` 重试；结果未知的输入不能直接重发。首版没有群聊附件重试命令。
+截图与文件附件按原文件保存在 `<dataDir>/attachments/<taskId>`，独立于工程 worktree。Runtime 不限制文件格式，压缩包、二进制文件和任意扩展名都以原文件名和本地绝对路径交给任务会话，由 Agent 按需读取或解压。相同文件名不会覆盖。下载失败、空文件或超出大小限制会保留消息并报告，失败消息的文字不伪装成完整送达。后续普通消息可继续投递。确认未送达的附件可通过服务 API `retryAttachment(taskId, inputId)` 重试；结果未知的输入不能直接重发。首版没有群聊附件重试命令。
 
 任务资料保存在 `<dataDir>/tasks/<taskId>`。接单记录中的原文、补充回答和附件保留到协调者派单后，再准备执行环境并创建正式 Thread。发现的项目直接使用已有项目目录，由 Worker 按项目约定创建独立工作树。旧独立 worktree 位于 `<dataDir>/workspaces/<taskId>--<resourceId>`，旧 `project-directory` 策略继续使用保存的完整项目目录。
 
