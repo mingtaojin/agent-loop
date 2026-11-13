@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { errorMessage, type Task } from './domain.js';
-import type { FeishuProgressPort } from './ports.js';
+import { TaskGroupUnavailable, type FeishuProgressPort } from './ports.js';
+import { retireTaskGroup } from './task-groups.js';
 import type { Store } from './store.js';
 import { finished, progressContent, progressViewSchema, projectProgress, taskProgressStatus } from './feishu-progress-view.js';
 
@@ -56,6 +57,7 @@ export class FeishuProgressPublisher {
     this.operationTimes = this.operationTimes.filter(time => now - time < 1000);
     const work: Promise<void>[] = [];
     for (const record of this.store.activeProgressRecords().map(raw => progressPublicationSchema.parse(raw)).sort((a, b) => a.lastAttemptAt - b.lastAttemptAt)) {
+      if (this.store.task(record.taskId).chatId !== record.chatId) { this.disable(record, '任务群已失效'); continue; }
       if (this.inFlight.size >= 4 || this.operationTimes.length >= 12) break;
       if (this.inFlight.has(key(record)) || record.nextAttemptAt > now || !this.needsWrite(record)) continue;
       this.operationTimes.push(now);
@@ -90,12 +92,13 @@ export class FeishuProgressPublisher {
   private saveDelivery(record: ProgressPublication): void {
     const latest = this.load(record.taskId, record.turnId);
     if (!latest) throw new Error('Progress publication disappeared');
+    if (latest.chatId !== record.chatId || this.store.task(record.taskId).chatId !== record.chatId) return;
     this.save({ ...latest, delivery: record.delivery, sequence: record.sequence, lastAttemptAt: record.lastAttemptAt,
       nextAttemptAt: record.nextAttemptAt, failures: record.failures });
   }
   private newRecord(task: Task, turnId: string): ProgressPublication {
     return progressPublicationSchema.parse({ taskId: task.id, turnId, chatId: task.chatId,
-      uuid: hash(`feishu-progress:${key({ taskId: task.id, turnId })}`).slice(0, 32),
+      uuid: hash(`feishu-progress:${key({ taskId: task.id, turnId })}:${task.chatId}`).slice(0, 32),
       sequence: 0, lastAttemptAt: 0, nextAttemptAt: 0, failures: 0, delivery: { kind: 'uncreated' },
       view: { status: 'running', cursor: 0, lastExecutionEventAt: null, assistant: [], tool: null } });
   }
@@ -114,7 +117,8 @@ export class FeishuProgressPublisher {
         if (excluded.has(key({ taskId: event.taskId, turnId: event.turnId }))) continue;
         const task = tasks.get(event.taskId);
         if (!task?.chatId) continue;
-        const record = this.load(task.id, event.turnId) ?? this.newRecord(task, event.turnId);
+        const existing = this.load(task.id, event.turnId);
+        const record = existing?.chatId === task.chatId ? existing : this.newRecord(task, event.turnId);
         projectProgress(record.view, event);
         this.save(record);
       }
@@ -123,12 +127,16 @@ export class FeishuProgressPublisher {
         if (!task.chatId || !task.turnId) continue;
         if (excluded.has(key({ taskId: task.id, turnId: task.turnId }))) continue;
         const status = taskProgressStatus(task);
-        const signature = JSON.stringify([task.turnId, status]);
+        const signature = JSON.stringify([task.turnId, status, task.chatId]);
         const waiting = status === 'waiting_input' || status === 'waiting_approval';
         if (snapshots[task.id] === signature && !waiting) continue;
         const previous = snapshots[task.id];
         snapshots[task.id] = signature;
         let record = this.load(task.id, task.turnId);
+        if (record && record.chatId !== task.chatId) {
+          this.store.setMeta(`retired-progress:${task.id}:${record.chatId}:${record.turnId}`, JSON.stringify(record));
+          record = null;
+        }
         if (!record && (initial ? !finished(status) : previous !== signature)) {
           record = this.newRecord(task, task.turnId);
           for (const event of this.store.recentTurnEvents(task.id, task.turnId)) projectProgress(record.view, event);
@@ -153,14 +161,17 @@ export class FeishuProgressPublisher {
   private disable(record: ProgressPublication, reason: string): void {
     const delivery = record.delivery;
     record.delivery = { kind: 'disabled', reason, cardId: 'cardId' in delivery ? delivery.cardId : null, messageId: 'messageId' in delivery ? delivery.messageId : null };
-    this.saveDelivery(record);
+    const latest = this.load(record.taskId, record.turnId);
+    if (latest?.chatId === record.chatId) this.save({ ...latest, delivery: record.delivery });
     this.report(`${record.taskId}/${record.turnId}: ${reason}`);
   }
   private async deliver(record: ProgressPublication): Promise<void> {
     try {
+      if (this.store.task(record.taskId).chatId !== record.chatId) { this.disable(record, '任务群已失效'); return; }
       let delivery = record.delivery;
       if (delivery.kind === 'sending') {
         const messageId = await this.transport.findProgressMessage({ chatId: record.chatId, cardId: delivery.cardId, since: delivery.firstAttemptAt });
+        if (this.store.task(record.taskId).chatId !== record.chatId) return;
         if (messageId !== null) {
           record.delivery = { kind: 'published', cardId: delivery.cardId, createdAt: delivery.createdAt, messageId,
             streamingAt: delivery.createdAt, content: '', pending: null };
@@ -214,6 +225,10 @@ export class FeishuProgressPublisher {
       record.failures = 0; record.nextAttemptAt = 0;
       this.saveDelivery(record);
     } catch (error) {
+      if (error instanceof TaskGroupUnavailable) {
+        retireTaskGroup(this.store, record.taskId, record.chatId);
+        this.disable(record, error.message); return;
+      }
       record.failures++;
       record.nextAttemptAt = this.now() + Math.min(30_000, 1000 * 2 ** Math.min(record.failures - 1, 5));
       this.saveDelivery(record);

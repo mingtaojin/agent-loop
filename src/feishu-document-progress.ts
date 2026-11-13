@@ -5,7 +5,8 @@ import { errorMessage, type Task } from './domain.js';
 import { finished, progressViewSchema, taskProgressStatus } from './feishu-progress-view.js';
 import { documentConversationText, projectDocumentConversation } from './feishu-document-conversation.js';
 import { documentChunks } from './feishu-document-text.js';
-import { DocumentRequestRejected, type FeishuDocumentProgressPort } from './ports.js';
+import { DocumentRequestRejected, TaskGroupUnavailable, type FeishuDocumentProgressPort } from './ports.js';
+import { retireTaskGroup } from './task-groups.js';
 import { documentSourcePositionSchema, type DocumentSourcePosition, type Store } from './store.js';
 
 const id = z.string().min(1);
@@ -78,6 +79,7 @@ export class FeishuDocumentProgressPublisher {
     const work: Promise<void>[] = [];
     const records = this.options.store.documentProgressRecords().map(raw => documentPublicationSchema.parse(raw));
     for (const record of records.sort((a, b) => a.lastAttemptAt - b.lastAttemptAt)) {
+      if (this.options.store.task(record.taskId).chatId !== record.chatId) continue;
       if (this.inFlight.size >= 2) break;
       if (this.inFlight.has(record.taskId) || record.nextAttemptAt > this.now()) continue;
       const delivery = record.delivery;
@@ -103,6 +105,7 @@ export class FeishuDocumentProgressPublisher {
   private saveDelivery(record: DocumentPublication): void {
     const latest = this.load(record.taskId);
     if (!latest) throw new Error('Document publication disappeared');
+    if (latest.chatId !== record.chatId || this.options.store.task(record.taskId).chatId !== record.chatId) return;
     this.save({ ...latest, delivery: record.delivery, lastAttemptAt: record.lastAttemptAt,
       nextAttemptAt: record.nextAttemptAt, failures: record.failures });
   }
@@ -122,7 +125,10 @@ export class FeishuDocumentProgressPublisher {
       for (const task of tasks) {
         if (!task.chatId || !task.turnId || excluded.has(turnKey(task.id, task.turnId))) continue;
         let record = this.load(task.id);
-        if (record && record.chatId !== task.chatId) throw new Error(`Document chat binding changed for ${task.id}`);
+        if (record && record.chatId !== task.chatId) {
+          store.setMeta(`retired-document-progress:${task.id}:${record.chatId}`, JSON.stringify(record));
+          record = null;
+        }
         if (!record) {
           record = { version: 1, taskId: task.id, chatId: task.chatId, turnId: task.turnId,
             view: emptyView(), text: '', projectionRevision: null, delivery: { kind: 'document', title: '执行进度', pending: false },
@@ -143,6 +149,7 @@ export class FeishuDocumentProgressPublisher {
     });
   }
   private async deliver(record: DocumentPublication): Promise<void> {
+    if (this.options.store.task(record.taskId).chatId !== record.chatId) return;
     const transport = this.options.transport;
     let rollback: DocumentPublication['delivery'] | undefined;
     record.lastAttemptAt = this.now();
@@ -177,6 +184,7 @@ export class FeishuDocumentProgressPublisher {
         case 'access': {
           const input = { documentId: delivery.documentId, chatId: record.chatId };
           if (!await transport.hasGroupRead(input)) {
+            if (this.options.store.task(record.taskId).chatId !== record.chatId) return;
             if (delivery.pending) throw new Error('Group permission remains unknown');
             rollback = structuredClone(delivery);
             delivery.pending = true;
@@ -189,6 +197,7 @@ export class FeishuDocumentProgressPublisher {
         case 'tab': {
           const input = { chatId: record.chatId, documentUrl: delivery.documentUrl };
           let tabId = await transport.findTab(input);
+          if (this.options.store.task(record.taskId).chatId !== record.chatId) return;
           if (!tabId && !delivery.pending) {
             rollback = structuredClone(delivery);
             delivery.pending = true;
@@ -273,6 +282,10 @@ export class FeishuDocumentProgressPublisher {
       record.nextAttemptAt = this.now() + this.intervalMs;
       this.saveDelivery(record);
     } catch (error) {
+      if (error instanceof TaskGroupUnavailable) {
+        retireTaskGroup(this.options.store, record.taskId, record.chatId);
+        this.report(`${record.taskId}: ${error.message}`); return;
+      }
       // Only a definitive rejection permits a new dispatch. Read failures never erase pending intent.
       if (error instanceof DocumentRequestRejected && rollback) record.delivery = rollback;
       record.failures++;

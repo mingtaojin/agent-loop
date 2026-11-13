@@ -15,7 +15,7 @@ const operationSchema = z.object({ id: z.string(), task_id: z.string(), kind: z.
 export type Operation = z.infer<typeof operationSchema>;
 const inboxRow = z.object({ seq: z.number(), id: z.string(), task_id: z.string(), payload: z.string(), status: z.enum(['pending', 'delivering', 'delivered', 'failed', 'uncertain', 'held']), origin: z.enum(['user', 'source', 'initial', 'resume']), error: z.string().nullable() });
 export type Inbox = Omit<z.infer<typeof inboxRow>, 'payload'> & { message: IncomingMessage; provenance: InputProvenance; requestId: string | null; route: 'task' | 'workspace-selection'; selectionHandled: boolean };
-const outboxSchema = z.object({ id: z.string(), task_id: z.string(), text: z.string(), status: z.enum(['pending', 'sending', 'sent', 'uncertain']), error: z.string().nullable() });
+const outboxSchema = z.object({ id: z.string(), task_id: z.string(), text: z.string(), status: z.enum(['pending', 'sending', 'sent', 'uncertain', 'dropped']), error: z.string().nullable() });
 export type Outbox = z.infer<typeof outboxSchema>;
 
 export class Store {

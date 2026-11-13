@@ -109,6 +109,21 @@ test('progress is opt-in and validates its interval and explicit dashboard URL',
   assert.throws(() => configSchema.parse({ feishu: { userOpenId: 'owner', progress: { dashboardUrl: 'file:///etc/passwd' } } }));
 });
 
+test('saved cards stop publishing after group removal and recreated groups get a fresh card and UUID', async t => {
+  const f = await fixture(t); f.store.saveTask(task()); await f.pump(3);
+  const original = f.publication(), calls = f.transport.calls.length;
+  f.store.saveTask({ ...f.store.task('task'), chatId: null });
+  await f.pump(3);
+  assert.equal(f.publication().delivery.kind, 'disabled');
+  assert.equal(f.transport.calls.length, calls);
+  f.store.saveTask({ ...f.store.task('task'), chatId: 'replacement' });
+  await f.pump(3);
+  assert.equal(f.publication().chatId, 'replacement');
+  assert.notEqual(f.publication().uuid, original.uuid);
+  assert.equal(f.transport.cards.size, 2);
+  assert.ok([...f.transport.messages.values()].some(message => message.chatId === 'replacement'));
+});
+
 test('one card coalesces deltas, replaces completed assistant items, and closes at completion', async t => {
   const f = await fixture(t); f.store.saveTask(task());
   f.event('turn_start', 'running');

@@ -14,6 +14,8 @@ interface ProjectHost {
   makeTask(sourceId: string, prompt: string): Promise<Task>;
   releaseWorkspace(taskId: string, resourceId: string): Promise<unknown>;
   control(taskId: string, action: 'pause' | 'resume'): Promise<void>;
+  openGroup(taskId: string): Promise<string>;
+  groupCleanup(callerId: string, action: Extract<ProjectAction, { action: 'plan_group_cleanup' | 'confirm_group_cleanup' | 'apply_group_cleanup' }>): Promise<unknown>;
 }
 
 export class ProjectRuntime {
@@ -199,6 +201,17 @@ export class ProjectRuntime {
         this.enqueue(action.taskId, `instruction:${callerId}:${action.requestId}`, action.text,
           { kind: 'agent', projectId: state.id, taskId: callerId, eventId: action.requestId, category: 'instruction' });
         return { accepted: true, taskId: action.taskId };
+      }
+      case 'open_group': {
+        if (member.role !== 'coordinator') throw new Error('Only the coordinator can open worker groups');
+        const target = this.ledger.membership(action.taskId);
+        if (!target || target.projectId !== state.id || target.role === 'coordinator') throw new Error('Target is not a worker in this project');
+        const chatId = await this.host.openGroup(action.taskId);
+        return { taskId: action.taskId, chatId };
+      }
+      case 'plan_group_cleanup': case 'confirm_group_cleanup': case 'apply_group_cleanup': {
+        if (member.role !== 'coordinator') throw new Error('Only the coordinator can manage group cleanup');
+        return this.host.groupCleanup(callerId, action);
       }
       case 'report': {
         if (member.role === 'coordinator') throw new Error('Coordinator reports directly to the project group');

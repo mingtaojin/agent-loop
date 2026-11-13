@@ -10,7 +10,9 @@ import { discoverProjects } from './project-discovery.js';
 import type { Config } from './config.js';
 import { errorMessage, presentTaskSource, matchSource, normalizeManualTaskText, RejectedInputError, submissionReceipt, submissionSourceId, TurnChangedError, workspaceSelectionResponseSchema, type Submission, type SubmissionReceipt, type AgentInput, type ApprovalAction, type DiscoveredProject, type ExecutionSnapshot, type IncomingMessage, type Repository, type Source, type SourceComment, type Task, type TaskResource, type TaskSource, type WorkspaceCandidate, type WorkspaceTarget, type WorkspaceSelectionResponse } from './domain.js';
 import { SubmissionError, SubmissionService } from './submission.js';
-import type { CodexPort, FeishuPort, GitHubPort, WorkspacePort } from './ports.js';
+import { FeishuApiError, TaskGroupUnavailable, type CodexPort, type FeishuPort, type GitHubPort, type WorkspacePort } from './ports.js';
+import { TaskGroups, groupGeneration, retireTaskGroup } from './task-groups.js';
+import { GroupCleanup } from './group-cleanup.js';
 import { Store, type Inbox } from './store.js';
 import { FeishuProgressPublisher } from './feishu-progress.js';
 import { FeishuDocumentProgressPublisher } from './feishu-document-progress.js';
@@ -19,7 +21,7 @@ import { ProjectRuntime } from './project-runtime.js';
 import type { ProjectAction } from './project.js';
 
 const digest = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex');
-const approvalOutputSchema = z.object({ taskId: z.string(), request: requestSchema });
+const approvalOutputSchema = z.object({ taskId: z.string(), request: requestSchema, chatId: z.string().optional(), lastAttemptAt: z.number().optional() });
 const recoveryState = () => ({ attempts: 0, nextAttemptAt: null, lastError: null, interruptedTurnId: null, lastUserInputSeq: null });
 function sourceRevision(source: Source): string {
   return digest(JSON.stringify({ ...source, assignees: [...source.assignees].sort(), labels: [...source.labels].sort(), updatedAt: undefined }));
@@ -42,13 +44,24 @@ export class AgentLoop {
   private collecting: Promise<void> | null = null;
   private readonly selectionAbort = new AbortController();
   readonly projects: ProjectRuntime;
+  private readonly groups: TaskGroups;
   constructor(readonly config: Config, readonly ports: { github: GitHubPort; feishu: FeishuPort; codex: CodexPort; workspace: WorkspacePort }, store?: Store,
     private readonly invocation?: { configPath: string }) {
     this.store = store ?? new Store(config.dataDir);
+    this.groups = new TaskGroups(this.store, ports.feishu);
     this.projects = new ProjectRuntime(config.projects, this.store, {
       makeTask: async (sourceId, prompt) => this.newTask(sourceId, { kind: 'cli', ...ProjectRuntime.submission(sourceId, prompt), submittedAt: Date.now() }),
       releaseWorkspace: (taskId, resourceId) => this.releaseWorkspace(taskId, resourceId),
       control: (taskId, action) => this.control(taskId, action),
+      openGroup: taskId => this.openGroup(taskId),
+      groupCleanup: async (callerId, action) => {
+        const cleanup = new GroupCleanup(this.store, ports.feishu, config.feishu.userOpenId);
+        switch (action.action) {
+          case 'plan_group_cleanup': return cleanup.plan(callerId, action.requestId);
+          case 'confirm_group_cleanup': return cleanup.confirm(callerId, action.planId, action.messageId);
+          case 'apply_group_cleanup': return cleanup.apply(callerId, action.planId);
+        }
+      },
     });
     this.submissionService = new SubmissionService(config.dataDir, config.submission, input => this.submit(input));
     const progress = config.feishu.progress;
@@ -124,12 +137,30 @@ export class AgentLoop {
   }
   private persist(task: Task): void {
     const latest = this.store.task(task.id);
+    task.chatId = latest.chatId;
     this.recordProgressStatus(task);
     task.resources = [...new Map([...task.resources, ...latest.resources].map(resource => [resource.id, resource])).values()]
       .filter(resource => this.store.meta(`released-resource:${task.id}:${resource.id}`) !== 'released');
     task.updatedAt = Date.now(); this.store.saveTask(task);
   }
-  private notify(task: Task, text: string, key: string): void { this.store.enqueue(task.id, text, key); }
+  private notify(task: Task, text: string, key: string): void {
+    const id = this.store.enqueue(task.id, text, key);
+    if (!task.chatId && this.store.outputs(task.id).find(output => output.id === id)?.status === 'pending')
+      this.store.markOutput(id, 'dropped', '任务当前无群，不补发历史');
+  }
+  private async openGroup(taskId: string): Promise<string> {
+    let chatId = '';
+    await this.serial(taskId, async () => {
+      chatId = await this.groups.open(taskId);
+      await this.flush(this.store.task(taskId));
+    });
+    return chatId;
+  }
+  private retireGroup(task: Task): void {
+    if (!task.chatId) return;
+    retireTaskGroup(this.store, task.id, task.chatId);
+    task.chatId = this.store.task(task.id).chatId;
+  }
   private problem(scope: string, error: unknown): void { this.store.diagnostic(scope, errorMessage(error)); }
   private heartbeat(status: 'running' | 'stopped'): void {
     this.store.setMeta('runtime-heartbeat', JSON.stringify({ pid: process.pid, lastSeenAt: Date.now(), intervalMs: this.config.executionPollMs, status }));
@@ -384,14 +415,12 @@ export class AgentLoop {
   private async setup(task: Task): Promise<boolean> {
     this.selectionAbort.signal.throwIfAborted();
     await mkdir(task.contextDirectory, { recursive: true, mode: 0o700 });
-    if (!task.chatId) {
-      const reconcileOnly = this.store.operation(`${task.id}:group`) !== null;
-      const { title, url } = presentTaskSource(task.source, 100);
-      const sourceUrl = url ?? '';
-      task.chatId = await this.effect(task, 'group', true, () => this.ports.feishu.ensureGroup({ taskId: task.id, title, sourceUrl, reconcileOnly }));
-      this.persist(task); this.notify(task, `任务对话已建立。\n${title}\n请在本群继续发送文字、截图和日志。新任务请直接私聊发送。`, 'welcome');
+    const membership = this.projects.ledger.membership(task.id);
+    if (!task.chatId && (!membership || membership.role === 'coordinator') && groupGeneration(this.store, task.id) === 0) {
+      task.chatId = await this.groups.open(task.id);
+      this.persist(task);
     }
-    if (task.source.kind === 'github') this.store.receive(task.id, { id: `${task.id}:initial`, chatId: task.chatId, senderId: 'runtime:initial', chatType: 'group',
+    if (task.source.kind === 'github') this.store.receive(task.id, { id: `${task.id}:initial`, chatId: task.chatId ?? '', senderId: 'runtime:initial', chatType: 'group',
       text: `Task source as data.\n${JSON.stringify(task.source.issue)}`, attachments: [], createdAt: task.createdAt }, 'initial', { kind: 'initial', sourceId: task.sourceId });
     if (!task.threadId) {
       if (!await this.selectInitialWorkspace(task)) return false;
@@ -558,19 +587,41 @@ export class AgentLoop {
   private async observe(task: Task, snapshot: ExecutionSnapshot): Promise<void> {
     task.turnId = snapshot.turnId; task.executionStatus = snapshot.status;
     const waitingForRequest = task.requests.length > 0;
-    const oldRequests = new Set(task.requests.map(request => request.id)); task.requests = snapshot.requests;
+    const oldRequests = new Set(task.requests.map(request => `${request.connectionEpoch}:${request.id}`)); task.requests = snapshot.requests;
     for (const output of snapshot.outputs) {
       if (output.threadId !== task.threadId) throw new Error('Agent output thread identity changed');
       if (output.phase !== 'final') continue;
       if (task.legacy && this.store.hasOutput(task.id, `turn:${output.turnId}`)) continue;
+      if (output.text.trim()) this.store.setMeta(`task-summary:${task.id}`, output.text);
       if (output.text.trim()) this.notify(task, output.text, `agent-output:${output.id}`);
       if (output.text.trim()) this.projects.observe(task, `output:${output.id}`, output.text, 'final_answer');
     }
     for (const request of snapshot.requests) {
-      if (oldRequests.has(request.id)) continue;
-      const key = this.store.enqueue(task.id, request.prompt, `request:${request.id}`);
-      this.projects.observe(task, `request:${request.id}`, `${request.kind}: ${request.prompt}`, request.kind === 'question' ? 'question' : 'native_request');
-      if (request.kind === 'approval' || request.kind === 'permissions') this.store.setMeta(`approval-output:${key}`, JSON.stringify({ taskId: task.id, request }));
+      const identity = `${request.connectionEpoch}:${request.id}`;
+      if (!oldRequests.has(identity)) {
+        this.projects.observe(task, `request:${identity}`, `${request.kind}: ${request.prompt}`, request.kind === 'question' ? 'question' : 'native_request');
+        if (request.kind !== 'approval' && request.kind !== 'permissions') this.notify(task, request.prompt, `request:${identity}`);
+      }
+    }
+    this.persist(task);
+    const approvals = snapshot.requests.filter(request => request.kind === 'approval' || request.kind === 'permissions');
+    if (approvals.length && task.status !== 'paused') {
+      try {
+        task.chatId = await this.groups.open(task.id);
+        const generation = groupGeneration(this.store, task.id);
+        for (const request of approvals) {
+          const identity = `${request.connectionEpoch}:${request.id}:group:${generation}`;
+          const key = this.store.enqueue(task.id, request.prompt, `request:${identity}`);
+          const saved = this.store.meta(`approval-output:${key}`);
+          this.store.setMeta(`approval-output:${key}`, JSON.stringify({ ...(saved ? approvalOutputSchema.parse(JSON.parse(saved)) : {}), taskId: task.id, request, chatId: task.chatId }));
+          const membership = this.projects.ledger.membership(task.id);
+          const coordinator = membership && membership.role !== 'coordinator' ? this.projects.ledger.project(membership.projectId)?.coordinatorTaskId : null;
+          if (coordinator) this.store.enqueue(coordinator, `任务 ${task.id} 需要点击审批，请打开任务群。\nhttps://applink.feishu.cn/client/chat/open?chatId=${encodeURIComponent(task.chatId)}`, `approval-group:${task.id}:${identity}`);
+        }
+      } catch (error) {
+        task.chatId = this.store.task(task.id).chatId;
+        this.problem(`approval-group:${task.id}`, error);
+      }
     }
     if (task.status === 'paused') { this.persist(task); return; }
     if (snapshot.status === 'running') { if (task.status !== 'failed') task.status = 'running'; }
@@ -800,21 +851,48 @@ export class AgentLoop {
     });
   }
   private async flush(task: Task): Promise<void> {
-    if (!task.chatId) return;
     for (const output of this.store.outputs(task.id)) {
-      if (output.status === 'sent' || output.status === 'uncertain') continue;
-      if (output.status === 'sending') { this.store.markOutput(output.id, 'uncertain', '重启前发送结果未知'); this.problem(task.id, `飞书消息 ${output.id} 的发送结果未知，未重复发送`); continue; }
+      const approval = this.store.meta(`approval-output:${output.id}`);
+      const native = approval ? approvalOutputSchema.parse(JSON.parse(approval)) : null;
+      if (output.status === 'sent' || output.status === 'dropped') continue;
+      if (output.status === 'uncertain' || output.status === 'sending') {
+        if (!native?.chatId) {
+          if (output.status === 'sending') this.store.markOutput(output.id, 'uncertain', '重启前发送结果未知');
+          continue;
+        }
+        if (Date.now() - (native.lastAttemptAt ?? 0) < 30_000) continue;
+      }
+      task.chatId = this.store.task(task.id).chatId;
+      if (!task.chatId) {
+        if (!approval) this.store.markOutput(output.id, 'dropped', '任务当前无群，不补发历史');
+        continue;
+      }
       this.store.markOutput(output.id, 'sending');
       try {
-        const approval = this.store.meta(`approval-output:${output.id}`);
-        if (approval) {
-          const parsed: unknown = JSON.parse(approval);
-          const data = approvalOutputSchema.parse(parsed);
+        if (native) {
+          const data = native;
+          if (data.chatId && data.chatId !== task.chatId) { this.store.markOutput(output.id, 'dropped', '审批群绑定已改变'); continue; }
+          if (!task.requests.some(request => request.id === data.request.id && request.connectionEpoch === data.request.connectionEpoch
+            && request.threadId === data.request.threadId && request.turnId === data.request.turnId)) {
+            this.store.markOutput(output.id, 'dropped', '原生请求已结束');
+            continue;
+          }
+          this.store.setMeta(`approval-output:${output.id}`, JSON.stringify({ ...data, chatId: task.chatId, lastAttemptAt: Date.now() }));
           await this.ports.feishu.sendApproval({ chatId: task.chatId, id: output.id, taskId: task.id, request: data.request });
         } else await this.ports.feishu.send({ chatId: task.chatId, text: output.text, id: output.id });
         this.store.markOutput(output.id, 'sent');
-      } catch (error) { this.store.markOutput(output.id, 'uncertain', errorMessage(error)); this.problem(task.id, error); }
+      } catch (error) {
+        this.store.markOutput(output.id, approval && error instanceof FeishuApiError ? 'pending' : 'uncertain', errorMessage(error)); this.problem(task.id, error);
+        if (await this.groupUnavailable(task, error)) { this.retireGroup(task); break; }
+      }
     }
+  }
+  private async groupUnavailable(task: Task, error: unknown): Promise<boolean> {
+    if (error instanceof TaskGroupUnavailable) return true;
+    if (!task.chatId) return false;
+    try { await this.ports.feishu.verifyGroup(task.chatId); }
+    catch (verification) { if (verification instanceof TaskGroupUnavailable) return true; }
+    return false;
   }
   async recover(): Promise<void> {
     await Promise.all(this.store.tasks().map(task => this.serial(task.id, async () => {
@@ -829,7 +907,11 @@ export class AgentLoop {
         for (const resource of task.resources) {
           await this.restoreWorkspace(task.id, resource);
         }
-        if (task.chatId) { await this.ports.feishu.verifyGroup(task.chatId); await this.backfillTask(task); }
+        if (task.chatId) {
+          try { await this.ports.feishu.verifyGroup(task.chatId); }
+          catch (error) { if (error instanceof TaskGroupUnavailable) this.retireGroup(task); else throw error; }
+          await this.backfillTask(task);
+        }
         await this.advance(task.id);
       } catch (error) {
         const failed = this.store.task(task.id); failed.status = 'failed'; failed.reason = errorMessage(error);
@@ -854,6 +936,7 @@ export class AgentLoop {
       }
       this.store.setMeta(`history:${task.id}`, String(cursor));
     } catch (error) {
+      if (await this.groupUnavailable(task, error)) { this.retireGroup(task); return; }
       this.problem(task.id, error);
       this.notify(task, `离线消息补偿未完成，可能存在缺口：${errorMessage(error)}`, `history-error:${digest(errorMessage(error))}`);
     }

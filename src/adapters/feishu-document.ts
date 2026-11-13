@@ -2,7 +2,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import type { Client } from '@larksuiteoapi/node-sdk';
 import { z } from 'zod';
 import { documentTextElements } from '../feishu-document-text.js';
-import { DocumentRequestRejected, type FeishuDocumentProgressPort } from '../ports.js';
+import { DocumentRequestRejected, TaskGroupUnavailable, type FeishuDocumentProgressPort } from '../ports.js';
 
 export type FeishuDocumentApi = {
   document: Pick<Client['docx']['v1']['document'], 'create'>;
@@ -28,6 +28,7 @@ function check(raw: unknown): unknown {
   const result = envelope.parse(raw);
   if (result.code !== 0) {
     const message = `Feishu document API ${result.code}: ${result.msg ?? 'request failed'}`;
+    if (result.code === 232009 || result.code === 232006) throw new TaskGroupUnavailable(result.code, message);
     if (rejectedCodes.has(result.code)) throw new DocumentRequestRejected(message);
     throw new Error(message);
   }

@@ -9,7 +9,7 @@ import { incomingSchema, submissionRequestIdSchema, taskSchema, type Task } from
 import type { ExecutionEvent } from '../src/execution-events.js';
 import { FeishuDocumentProgressPublisher, documentPublicationSchema } from '../src/feishu-document-progress.js';
 import { documentChunks } from '../src/feishu-document-text.js';
-import { DocumentRequestRejected, type FeishuDocumentProgressPort, type FeishuProgressPort } from '../src/ports.js';
+import { DocumentRequestRejected, TaskGroupUnavailable, type FeishuDocumentProgressPort, type FeishuProgressPort } from '../src/ports.js';
 import { Store } from '../src/store.js';
 import { AgentLoop } from '../src/loop.js';
 import { CodexFake, FeishuFake, GitHubFake } from './fakes.js';
@@ -342,16 +342,32 @@ test('status, turn and thread identity changes invalidate projection without new
   assert.equal(f.record().view.status, 'running'); assert.equal(reads.mock.callCount(), 3);
 });
 
-test('manual source changes invalidate projection and chat binding is checked before an equal revision', async t => {
+test('manual source changes invalidate projection and a new chat binding creates a separate document', async t => {
   const f = await fixture(t); const current = task(); f.store.saveTask(current); await f.pump(5);
   assert.equal(current.source.kind, 'manual'); if (current.source.kind !== 'manual') return;
   f.store.saveTask({ ...current, source: { kind: 'manual', message: { ...current.source.message, text: 'Revised original question' } } });
   await f.pump(); assert.match(f.transport.text(), /Revised original question/); assert.doesNotMatch(f.transport.text(), /Discuss/);
-  const before = f.record(), calls = f.transport.calls.length;
+  const before = f.record();
   f.store.saveTask({ ...f.store.task('task'), chatId: 'other-chat' });
   await f.pump();
-  assert.deepEqual(f.record(), before); assert.equal(f.transport.calls.length, calls);
-  assert.ok(f.store.diagnostics().some(row => row.message.includes('Document chat binding changed')));
+  assert.equal(f.record().chatId, 'other-chat');
+  assert.equal(f.transport.documents.length, 2);
+  assert.equal(f.store.meta('retired-document-progress:task:chat-task'), JSON.stringify(before));
+});
+
+test('dissolved and absent chats stop saved document publications without affecting execution', async t => {
+  const f = await fixture(t); f.store.saveTask(task()); await f.pump(2);
+  const before = f.transport.calls.length;
+  f.store.saveTask({ ...f.store.task('task'), chatId: null });
+  await f.pump(5);
+  assert.equal(f.transport.calls.length, before);
+  f.store.saveTask({ ...f.store.task('task'), chatId: 'chat-task' });
+  f.transport.fail = { kind: 'members', when: 'before', error: new TaskGroupUnavailable(232009, 'dissolved') };
+  await f.pump(4);
+  assert.equal(f.store.task('task').chatId, null);
+  assert.equal(f.store.task('task').status, 'running');
+  const stopped = f.transport.calls.length;
+  await f.pump(5); assert.equal(f.transport.calls.length, stopped);
 });
 
 test('maxLines and renderer revision changes re-render unchanged histories once', async t => {

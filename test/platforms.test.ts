@@ -13,6 +13,7 @@ import { AgentLoop } from '../src/loop.js';
 import { Store } from '../src/store.js';
 import { CodexAppServer } from '../src/adapters/codex.js';
 import { GitHubFake } from './fakes.js';
+import { FeishuApiError, GroupCreationRejected, TaskGroupUnavailable } from '../src/ports.js';
 
 const repository = repositorySchema.parse({ name: 'owner/repo', path: '/repo', baseBranch: 'main' });
 const issue = { node_id: 'I_1', number: 1, html_url: 'https://github.com/owner/repo/issues/1', title: 'Broken',
@@ -102,6 +103,40 @@ function fakeApi(): NonNullable<FeishuDependencies['api']> {
     messageResource: { get: async () => ({ writeFile: async () => {}, getReadableStream: () => Readable.from([Buffer.from('original')]), headers: {} }) },
   };
 }
+
+test('Feishu group generations use distinct create UUIDs and exact generation markers', async () => {
+  const api = fakeApi();
+  const requests: NonNullable<Parameters<typeof api.chat.create>[0]>[] = [];
+  api.chat.list = async () => ({ code: 0, data: { items: [{ chat_id: 'old', description: 'agent-loop:v1:task' }], has_more: false } });
+  api.chat.create = async input => { assert.ok(input); requests.push(input); return { code: 0, data: { chat_id: 'replacement' } }; };
+  const adapter = new FeishuAdapter(options, { api });
+  assert.equal(await adapter.ensureGroup({ taskId: 'task', title: 'Same title', generation: 1 }), 'replacement');
+  assert.equal(await adapter.ensureGroup({ taskId: 'task', title: 'Same title', generation: 2 }), 'replacement');
+  assert.notEqual(requests[0]?.params?.uuid, requests[1]?.params?.uuid);
+  assert.equal(requests[0]?.data?.description, 'agent-loop:v1:task:generation:1\n');
+  api.chat.list = async () => ({ code: 0, data: { items: [{ chat_id: 'replacement', description: 'agent-loop:v1:task:generation:1\n' }], has_more: false } });
+  await adapter.ensureGroup({ taskId: 'task', title: 'Same title', generation: 1, reconcileOnly: true });
+  assert.equal(requests.length, 2);
+});
+
+test('Feishu deletion treats dissolved groups as success but preserves permission and malformed-response errors', async () => {
+  const api = fakeApi(); let calls = 0;
+  api.chat.delete = async () => { calls++; return { code: 232009, msg: 'already dissolved' }; };
+  const adapter = new FeishuAdapter(options, { api });
+  await adapter.dissolveGroup('old'); assert.equal(calls, 1);
+  api.chat.delete = async () => ({ code: 232017, msg: 'permission denied' });
+  await assert.rejects(adapter.dissolveGroup('old'), FeishuApiError);
+  api.chat.delete = async () => ({});
+  await assert.rejects(adapter.dissolveGroup('old'), UncertainOperationError);
+  api.chat.get = async () => ({ code: 232009, msg: 'already dissolved' });
+  await assert.rejects(adapter.verifyGroup('old'), TaskGroupUnavailable);
+  api.chat.get = async () => ({ code: 232011, msg: 'not in chat' });
+  await assert.rejects(adapter.verifyGroup('old'), error => error instanceof FeishuApiError && !(error instanceof TaskGroupUnavailable));
+  api.chat.get = async () => ({ code: 0, data: {} });
+  await assert.rejects(adapter.verifyGroup('old'), error => error instanceof Error && !(error instanceof TaskGroupUnavailable));
+  api.chat.create = async () => ({ code: 232017, msg: 'permission denied' });
+  await assert.rejects(adapter.ensureGroup({ taskId: 'new', title: 'Task' }), GroupCreationRejected);
+});
 
 test('commandless socket events create observable Feishu groups through AgentLoop, SQLite and a Codex fixture', async t => {
   const root = await mkdtemp(join(tmpdir(), 'agent-private-dispatch-'));

@@ -18,8 +18,9 @@ export interface GitHubPort {
 export interface FeishuPort {
   progress?: FeishuProgressPort;
   documentProgress?: FeishuDocumentProgressPort;
-  ensureGroup(input: { taskId: string; title: string; sourceUrl: string; reconcileOnly?: boolean }): Promise<string>;
+  ensureGroup(input: { taskId: string; title: string; sourceUrl: string; generation?: number; reconcileOnly?: boolean }): Promise<string>;
   verifyGroup(chatId: string): Promise<void>;
+  dissolveGroup(chatId: string): Promise<void>;
   send(input: { chatId: string; text: string; id: string }): Promise<void>;
   download(input: { messageId: string; attachment: Attachment; destination: string; maxBytes: number }): Promise<void>;
   history(input: { chatId: string; since: number }): Promise<IncomingMessage[]>;
@@ -27,6 +28,11 @@ export interface FeishuPort {
   sendApproval(input: { chatId: string; id: string; taskId: string; request: PendingRequest }): Promise<void>;
   close(): Promise<void>;
 }
+export class FeishuApiError extends Error {
+  constructor(readonly code: number, message: string) { super(`Feishu API error ${code}: ${message}`); }
+}
+export class TaskGroupUnavailable extends FeishuApiError {}
+export class GroupCreationRejected extends FeishuApiError {}
 export class DocumentRequestRejected extends Error {}
 export interface FeishuDocumentProgressPort {
   createDocument(input: { title: string }): Promise<string>;

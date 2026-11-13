@@ -1,6 +1,6 @@
 # 配置项目协调者
 
-项目协调者统一管理多个仓库，使用 pstack Orchestrate 委派和监督任务。Worker 使用 poteto-mode，自行选择调查、需求澄清、开发和验证方法。项目群是主要交流入口，Worker 的任务群仍可查看和指导。
+项目协调者统一管理多个仓库，使用 pstack Orchestrate 委派和监督任务。Worker 使用 poteto-mode，自行选择调查、需求澄清、开发和验证方法。项目群是日常交流入口。Worker 和 verifier 默认不建群；用户需要直接交流时，由协调者打开指定任务群。
 
 ## 配置项目
 
@@ -53,6 +53,10 @@ Issue 评论先交协调者判断影响，再按需转给原 Worker。Worker 最
 | `status` | 查询项目、任务和持久记录 | 项目成员 |
 | `dispatch` | 按请求身份创建 Worker 或独立 verifier | 协调者 |
 | `send` | 向本项目 Worker 追加指导或回答 | 协调者 |
+| `open_group` | 打开本项目指定 Worker 或 verifier 的任务群，已有有效群则复用 | 协调者 |
+| `plan_group_cleanup` | 冻结既有任务群清单，排除所有项目协调群 | 协调者 |
+| `confirm_group_cleanup` | 核对实际用户对清单的确认消息 | 协调者 |
+| `apply_group_cleanup` | 执行或继续已确认清单，逐群记录结果 | 协调者 |
 | `control` | 暂停或恢复本项目的指定 Worker | 协调者 |
 | `report` | 上报结果、问题或更新 | Worker、verifier |
 | `record` | 追加带版本的项目记录 | 项目成员 |
