@@ -422,7 +422,7 @@ export class AgentLoop {
       project = await this.projects.resolveSelection(selection.choice, candidates);
       task = this.store.task(task.id);
       if (this.projects.ledger.membership(task.id)) return true;
-      if (this.projects.intakeRoute(task.id) || task.status === 'paused'
+      if (this.projects.intakeRoute(task.id) || (task.status === 'paused' && !task.threadId)
         || JSON.stringify(this.store.inputs(task.id).map(input => input.id)) !== JSON.stringify(inputIds)) return false;
       if (!project) {
         const question = selection.choice.kind === 'question' ? selection.choice.question : '这项任务属于哪个项目？请提供项目名称。';

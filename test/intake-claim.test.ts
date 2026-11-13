@@ -280,3 +280,22 @@ test('a stale selection cannot bind its repository after a competing claim has c
     assert.equal(f.loop.store.task(task.id).threadId, null); assert.notEqual(f.loop.store.task(task.id).status, 'failed');
   } finally { release(); await pending; }
 });
+
+for (const initialStatus of ['running', 'paused'] satisfies Array<'running' | 'paused'>) test(`an existing ${initialStatus} Thread is adopted without resuming an operator or migration pause`, async t => {
+  const f = await fixture(t), task = f.saved('legacy-migration');
+  f.feishu.resources.set('old-file', Buffer.from('saved evidence\n'));
+  const app = f.loop.projects.projectConfig('app'); assert.ok(app);
+  const threadId = await f.codex.createThread({ cwd: app.directory, instructions: 'Saved legacy instructions.' });
+  const turnId = await f.codex.startTurn({ threadId, deliveryId: 'legacy-start', input: [{ kind: 'text', text: 'Saved running discussion.' }] });
+  const legacy = taskSchema.parse({ ...task, purpose: 'legacy', threadId, turnId, status: initialStatus, reason: initialStatus === 'paused' ? 'Operator paused' : null, executionStatus: 'running' });
+  f.loop.store.saveTask(legacy);
+  f.codex.selectionResults.push({ kind: 'project', projectId: 'coordinated:app', reason: 'Confirm old Thread project.' });
+  const starts = f.codex.starts.length;
+  await f.loop.tick();
+  assert.deepEqual(f.loop.projects.ledger.membership(task.id), { projectId: 'app', role: 'worker' });
+  const adopted = f.loop.store.task(task.id);
+  assert.equal(adopted.threadId, threadId); assert.equal(adopted.turnId, turnId); assert.equal(adopted.status, 'paused');
+  if (initialStatus === 'paused') assert.equal(adopted.reason, 'Operator paused');
+  assert.equal(f.codex.starts.length, starts); assert.ok(f.codex.interrupts.some(input => input.threadId === threadId));
+  assert.deepEqual(adopted.resources, legacy.resources); assert.deepEqual(adopted.source, legacy.source);
+});
