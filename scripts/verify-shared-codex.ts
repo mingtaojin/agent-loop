@@ -22,8 +22,8 @@ const identity = async () => {
   const processes = execFileSync('ps', ['-axo', 'pid=,command='], { encoding: 'utf8' }).split('\n').filter(line => /^\s*\d+\s+\S*codex app-server .*--managed-daemon\s*$/.test(line)).map(line => line.trim());
   return { version, socketInode: socket.ino, processes };
 };
-const messageSchema = z.object({ id: z.union([z.number(), z.string()]).optional(), method: z.string().optional(), params: z.record(z.string(), z.unknown()).optional(), result: z.record(z.string(), z.unknown()).optional() }).passthrough();
-const records: { method: string; threadId?: string; turnId?: string; status?: unknown; params?: unknown }[] = [];
+const messageSchema = z.object({ id: z.union([z.number(), z.string()]).optional(), method: z.string().optional(), params: z.record(z.string(), z.unknown()).optional(), result: z.record(z.string(), z.unknown()).optional(), error: z.object({ code: z.number(), message: z.string() }).optional() }).passthrough();
+const records: { method: string; threadId?: string; turnId?: string; status?: unknown; params?: unknown; error?: unknown; turns?: unknown }[] = [];
 const connector = transport.sharedDaemonConnector(settings, 30_000);
 let cancelOnTurnStart: AbortController | undefined;
 const observed: CodexConnector = async handlers => {
@@ -35,15 +35,23 @@ const observed: CodexConnector = async handlers => {
     message: data => {
       const message = messageSchema.parse(JSON.parse(data));
       const call = message.id === undefined ? undefined : calls.get(message.id);
-      if (call && message.id !== undefined && !message.method && message.result !== undefined && !('error' in message)) {
+      if (call && message.id !== undefined && !message.method) {
         calls.delete(message.id);
-        if (call.method === 'thread/start') {
+        if (message.error) records.push({ method: `${call.method}/error`, ...(typeof call.params.threadId === 'string' ? { threadId: call.params.threadId } : {}), params: call.params, error: message.error });
+        if (call.method === 'thread/start' && message.result !== undefined && !message.error) {
           const response = z.object({ thread: z.object({ id: z.string() }) }).parse(message.result);
           owned.add(response.thread.id);
           if (call.params.ephemeral === true) ephemeralThread = response.thread.id;
           records.push({ method: 'thread/created', threadId: response.thread.id, params: call.params });
         }
-        if (call.method === 'thread/read') records.push({ method: 'thread/observed', threadId: z.string().parse(call.params.threadId), status: z.object({ thread: z.object({ status: z.unknown() }) }).parse(message.result).thread.status });
+        if (call.method === 'thread/read' && message.result !== undefined && !message.error) {
+          const { thread } = z.object({ thread: z.object({ status: z.unknown(), turns: z.array(z.object({ id: z.string(), status: z.string() })) }) }).parse(message.result);
+          records.push({ method: 'thread/observed', threadId: z.string().parse(call.params.threadId), params: call.params, status: thread.status, turns: thread.turns });
+        }
+      }
+      if (message.method === 'turn/completed' && owned.has(String(message.params?.threadId))) {
+        const { threadId, turn } = z.object({ threadId: z.string(), turn: z.object({ id: z.string(), status: z.string(), error: z.unknown().optional() }) }).parse(message.params);
+        records.push({ method: message.method, threadId, turnId: turn.id, status: turn.status, error: turn.error });
       }
       handlers.message(data);
       if (!message.method && message.result !== undefined && !('error' in message) && call?.method === 'turn/start' && call.params.threadId === ephemeralThread && cancelOnTurnStart) {
@@ -58,7 +66,7 @@ const observed: CodexConnector = async handlers => {
     send: async data => {
       const message = messageSchema.parse(JSON.parse(data));
       if (message.id !== undefined && message.method) calls.set(message.id, { method: message.method, params: message.params ?? {} });
-      if (message.method && owned.has(String(message.params?.threadId))) records.push({ method: message.method, threadId: String(message.params?.threadId), ...(typeof message.params?.turnId === 'string' ? { turnId: message.params.turnId } : {}) });
+      if (message.method && owned.has(String(message.params?.threadId))) records.push({ method: message.method, threadId: String(message.params?.threadId), params: message.params, ...(typeof message.params?.turnId === 'string' ? { turnId: message.params.turnId } : {}) });
       await connection.send(data);
     },
   };
@@ -127,6 +135,7 @@ try {
   evidence.result = 'failed'; evidence.error = error instanceof Error ? error.stack : String(error); process.exitCode = 1;
 } finally {
   const results = await Promise.allSettled([formal.close(), unrelated.close()]);
+  evidence.records = records;
   evidence.cleanup = results.map(result => result.status === 'fulfilled' ? 'closed' : String(result.reason));
   if (results.some(result => result.status === 'rejected')) { evidence.result = 'failed'; process.exitCode = 1; }
   evidence.finishedAt = new Date().toISOString();

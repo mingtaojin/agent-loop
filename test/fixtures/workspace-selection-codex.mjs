@@ -28,7 +28,8 @@ createInterface({ input: process.stdin }).on('line', line => {
   if (message.method === 'thread/read' || message.method === 'thread/resume') {
     const saved = threads.get(p.threadId);
     if (!saved || (saved.selection && message.method === 'thread/resume')) throw new Error('Unknown Thread or ephemeral resume');
-    send({ id: message.id, result: { thread: saved.thread } }); return;
+    if (saved.selection && p.includeTurns) { send({ id: message.id, error: { code: -32600, message: 'ephemeral threads do not support includeTurns' } }); return; }
+    send({ id: message.id, result: { thread: { ...saved.thread, turns: p.includeTurns || message.method === 'thread/resume' ? saved.thread.turns : [] } } }); return;
   }
   if (message.method === 'turn/interrupt') {
     const saved = threads.get(p.threadId);

@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { RejectedInputError, TurnChangedError, UncertainOperationError, workspaceTargetSchema, type AgentInput, type AgentOutput, type ExecutionSnapshot, type PendingRequest, type WorkspaceRequest, type WorkspaceSelectionRequest, type WorkspaceSelectionResponse } from '../domain.js';
 import type { Activity, CodexPort, TurnIdentity } from '../ports.js';
 import { executionEvent, type ExecutionEvent } from '../execution-events.js';
-import { workspaceSelectionInput, workspaceSelectionInstructions, workspaceSelectionOutputSchema } from '../workspace-selection.js';
+import { workspaceSelectionInput, workspaceSelectionInstructions, workspaceSelectionOutputSchema, workspaceSelectionWireSchema } from '../workspace-selection.js';
 import { projectActionSchema, type ReasoningEffort } from '../project.js';
 import { normalizeDaemonSettings, sharedDaemonConnector, type CodexConnection, type CodexConnector, type DaemonSettings } from './codex-daemon.js';
 
@@ -185,9 +185,11 @@ export class CodexAppServer implements CodexPort {
   private ready(): Promise<void> {
     if (this.closed) return Promise.reject(new UncertainOperationError('Codex connection closed'));
     if (this.failure) return Promise.reject(this.failure);
+    const epoch = this.epoch;
     this.initialized ??= this.connect().catch(error => {
-      this.fail(error instanceof Error ? error : new Error(String(error)));
-      throw this.failure;
+      const failure = error instanceof Error ? error : new Error(String(error));
+      if (this.epoch === epoch) this.fail(failure);
+      throw failure;
     });
     return this.initialized;
   }
@@ -370,11 +372,13 @@ export class CodexAppServer implements CodexPort {
     const abort = () => selector.fail(new Error('Temporary directory selection aborted'));
     input.signal?.addEventListener('abort', abort, { once: true });
     const timer = setTimeout(() => selector.fail(new UncertainOperationError('Temporary directory selection timed out; cleanup must be confirmed')), this.options.requestTimeoutMs);
+    let failure = new Error('Temporary directory selection closed');
     try { return await selector.runWorkspaceSelection(input); }
+    catch (error) { failure = error instanceof Error ? error : new Error(String(error)); throw error; }
     finally {
       clearTimeout(timer);
       input.signal?.removeEventListener('abort', abort);
-      await selector.dispose(new Error(input.signal?.aborted ? 'Temporary directory selection aborted' : 'Temporary directory selection closed'));
+      await selector.dispose(failure);
       this.selectors.delete(selector);
     }
   }
@@ -398,7 +402,7 @@ export class CodexAppServer implements CodexPort {
     const { turn: started } = z.object({ turn: turnSchema }).parse(await this.rpc('turn/start', {
       threadId, cwd: input.cwd, approvalPolicy: 'never', sandboxPolicy: { type: 'readOnly', networkAccess: false },
       input: wireInput(workspaceSelectionInput(input), `directory-selection:${input.taskId}`),
-      outputSchema: z.toJSONSchema(workspaceSelectionOutputSchema),
+      outputSchema: workspaceSelectionWireSchema,
     }));
     this.selectionTurnId = started.id;
     if (!this.activeTurns.has(threadId) && this.endedTurns.get(threadId) !== started.id) this.activeTurns.set(threadId, started.id);
@@ -443,6 +447,14 @@ export class CodexAppServer implements CodexPort {
       if (thread.id !== threadId) throw new Error('Codex returned a different cleanup Thread');
       return thread;
     };
+    const stopped = (thread: z.infer<typeof threadSchema>) => {
+      if (thread.turns.some(turn => turn.status === 'inProgress')) return false;
+      if (thread.status.type === 'idle' || thread.status.type === 'notLoaded') return true;
+      if (thread.status.type !== 'systemError') return false;
+      return threadId === this.selectionThreadId
+        ? this.selectionTurnId !== undefined && this.endedTurns.get(threadId) === this.selectionTurnId
+        : thread.turns.length > 0;
+    };
     let thread = await read();
     if (thread.status.type === 'active') {
       const turnId = (threadId === this.selectionThreadId ? this.selectionTurnId : this.activeTurns.get(threadId)) ?? thread.turns.findLast(turn => turn.status === 'inProgress')?.id;
@@ -451,12 +463,12 @@ export class CodexAppServer implements CodexPort {
       const deadline = Date.now() + this.options.requestTimeoutMs;
       do {
         thread = await read();
-        if (thread.status.type !== 'active' && thread.turns.every(turn => turn.status !== 'inProgress')) return;
+        if (stopped(thread)) return;
         if (Date.now() >= deadline) throw new Error('Owned Turn interruption was not confirmed');
         await delay(50);
       } while (true);
     }
-    if (thread.status.type !== 'idle' || thread.turns.some(turn => turn.status === 'inProgress')) throw new Error('Owned Thread terminal state could not be confirmed');
+    if (!stopped(thread)) throw new Error('Owned Thread terminal state could not be confirmed');
   }
 
   private runtimeContext(threadId: string, additionalContext?: string) {
@@ -834,7 +846,6 @@ export class CodexAppServer implements CodexPort {
     const results = await Promise.allSettled([...this.selectors].map(selector => selector.dispose(new Error('Codex owner is closing'))));
     for (const result of results) if (result.status === 'rejected') failures.push(result.reason);
     try {
-      if (this.failure && this.threads.size) await this.recover();
       for (const threadId of [...this.threads.keys()]) {
         try {
           if (this.failure) await this.recover();
@@ -842,8 +853,7 @@ export class CodexAppServer implements CodexPort {
           await this.rpc('thread/unsubscribe', { threadId });
         } catch (error) { failures.push(error); }
       }
-    } catch (error) { failures.push(error); }
-    finally {
+    } finally {
       this.closed = true;
       const connection = this.connection;
       this.fail(new UncertainOperationError('Codex connection closed'));

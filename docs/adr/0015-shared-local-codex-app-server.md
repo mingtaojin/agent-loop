@@ -6,4 +6,4 @@
 
 本决策替换 [ADR 0008](0008-temporary-workspace-selection.md) 中“每次选择使用独立临时 App Server，随进程释放”的要求。该 ADR 中独立临时上下文、只读、无审批、无动态工具、选择模型可配置，以及原始材料和用户答复完整进入正式任务的约定继续适用。原任务的 Thread 身份和工程资源继续保留；共享服务不意味着合并任务上下文或调整业务授权。
 
-已确认设计尚未实现。当前契约、验证范围和后续代码设计记录在[共享 Codex 服务规格](../../.scratch/shared-codex-app-server/spec.md)。
+本决策的执行约定与验证范围记录在[共享 Codex 服务规格](../../.scratch/shared-codex-app-server/spec.md)。

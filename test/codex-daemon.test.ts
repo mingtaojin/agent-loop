@@ -7,14 +7,14 @@ import { test, type TestContext } from 'node:test';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { z } from 'zod';
 import { CodexAppServer } from '../src/adapters/codex.js';
-import { normalizeDaemonSettings } from '../src/adapters/codex-daemon.js';
+import { normalizeDaemonSettings, sharedDaemonConnector, type CodexConnector } from '../src/adapters/codex-daemon.js';
 import { configSchema } from '../src/config.js';
 import { UncertainOperationError } from '../src/domain.js';
 
 const messageSchema = z.object({ id: z.union([z.string(), z.number()]).optional(), method: z.string().optional(), params: z.record(z.string(), z.unknown()).optional(), result: z.unknown().optional() });
 const inputSchema = z.array(z.object({ type: z.string(), text: z.string().optional() }));
-type Turn = { id: string; status: 'inProgress' | 'completed' | 'interrupted'; items: object[] };
-type Thread = { id: string; status: { type: 'idle' | 'active' }; turns: Turn[] };
+type Turn = { id: string; status: 'inProgress' | 'completed' | 'interrupted' | 'failed'; items: object[]; error?: { message: string } };
+type Thread = { id: string; status: { type: 'idle' | 'active' | 'systemError' | 'notLoaded' }; turns: Turn[] };
 
 async function fixture(t: TestContext, initialStatus = 'running') {
   const root = await mkdtemp('/tmp/shared-codex-');
@@ -36,11 +36,16 @@ async function fixture(t: TestContext, initialStatus = 'running') {
   let holdSelections = false;
   let failReadThread: string | undefined;
   let failInitialization = false;
+  let selectionFailure: string | undefined;
+  let selectionTerminalStatus: Thread['status']['type'] | undefined;
+  let strictSelectionSchema = false;
   const send = (socket: WebSocket, value: object) => { if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(value)); };
   const broadcast = (value: object) => { for (const socket of service.clients) send(socket, value); };
-  const terminal = (saved: { thread: Thread }, status: 'completed' | 'interrupted') => {
+  const terminal = (saved: { thread: Thread }, status: 'completed' | 'interrupted' | 'failed', error?: string) => {
     const turn = saved.thread.turns.at(-1)!;
-    turn.status = status; saved.thread.status = { type: 'idle' };
+    turn.status = status;
+    if (error) turn.error = { message: error };
+    saved.thread.status = { type: status === 'failed' ? 'systemError' : 'idle' };
     broadcast({ method: 'turn/completed', params: { threadId: saved.thread.id, turn } });
   };
   service.on('connection', socket => {
@@ -81,13 +86,23 @@ async function fixture(t: TestContext, initialStatus = 'running') {
           saved.thread.turns.push(turn); saved.thread.status = { type: 'active' };
           if (!silentStart) broadcast({ method: 'turn/started', params: { threadId, turn } });
         } else saved.thread.turns.at(-1)!.items.push(item);
-        if (loseNext === message.method) { loseNext = undefined; socket.terminate(); return; }
+        if (loseNext === message.method) {
+          loseNext = undefined;
+          if (saved.ephemeral && selectionTerminalStatus) saved.thread.status = { type: selectionTerminalStatus };
+          socket.terminate(); return;
+        }
         reply(message.method === 'turn/start' ? { turn: saved.thread.turns.at(-1) } : { turnId: saved.thread.turns.at(-1)!.id });
         if (saved.ephemeral && !holdSelections) {
+          const invalidSchema = strictSelectionSchema && JSON.stringify(params.outputSchema).includes('"oneOf":');
+          if (selectionFailure || invalidSchema) {
+            terminal(saved, 'failed', selectionFailure ?? 'Invalid schema: oneOf is not permitted when strict is true');
+            return;
+          }
           const answer = { id: `answer-${threadId}`, type: 'agentMessage', phase: 'final_answer', text: JSON.stringify({ choice: { kind: 'none', reason: 'Discussion only' } }) };
           saved.thread.turns.at(-1)!.items.push(answer);
           broadcast({ method: 'item/completed', params: { threadId, turnId: saved.thread.turns.at(-1)!.id, item: answer } });
           terminal(saved, 'completed');
+          if (selectionTerminalStatus) saved.thread.status = { type: selectionTerminalStatus };
         }
         return;
       }
@@ -101,8 +116,8 @@ async function fixture(t: TestContext, initialStatus = 'running') {
     await new Promise<void>(resolve => http.close(() => resolve()));
     await rm(root, { recursive: true, force: true });
   });
-  const client = (options: Partial<ConstructorParameters<typeof CodexAppServer>[0]> = {}) => {
-    const value = new CodexAppServer({ executable, approvalPolicy: 'on-request', sandbox: 'workspace-write', requestTimeoutMs: 1000, ...options });
+  const client = (options: Partial<ConstructorParameters<typeof CodexAppServer>[0]> = {}, connector?: CodexConnector) => {
+    const value = new CodexAppServer({ executable, approvalPolicy: 'on-request', sandbox: 'workspace-write', requestTimeoutMs: 1000, ...options }, connector);
     clients.push(value); return value;
   };
   const selection = (server: CodexAppServer, signal?: AbortSignal) => server.selectWorkspace({ taskId: 'selector', cwd: root, input: [{ kind: 'text', text: 'Discuss architecture' }], answers: [], candidates: [], signal });
@@ -110,6 +125,9 @@ async function fixture(t: TestContext, initialStatus = 'running') {
   return { root, socketPath, client, selection, threads, records, broadcast, terminal, wait,
     failRead: (threadId: string) => { failReadThread = threadId; },
     initialization: (fail: boolean) => { failInitialization = fail; },
+    failSelection: (message: string) => { selectionFailure = message; },
+    selectionStatus: (status: Thread['status']['type']) => { selectionTerminalStatus = status; },
+    enforceSelectionSchema: () => { strictSelectionSchema = true; },
     hold: () => { holdSelections = true; }, lose: (method: typeof loseNext, silent = false) => { loseNext = method; silentStart = silent; },
     state: (value: object) => writeFile(statePath, JSON.stringify(value)),
     controls: async () => (await readFile(callsPath, 'utf8')).trim().split('\n').map(line => z.array(z.string()).parse(JSON.parse(line))),
@@ -191,6 +209,48 @@ test('selector response loss cleans its exact notified Turn through a replacemen
   assert.ok(!f.records.some(row => row.message.method === 'thread/resume'));
 });
 
+test('selector structured output uses the supported strict schema and returns its validated choice', async t => {
+  const f = await fixture(t); const server = f.client(); f.enforceSelectionSchema();
+  const result = await f.selection(server);
+  assert.deepEqual(result.choice, { kind: 'none', reason: 'Discussion only' });
+  assert.ok(f.records.some(row => row.message.method === 'thread/unsubscribe' && row.message.params?.threadId === result.temporaryThreadId));
+});
+
+test('a failed selector preserves its original model error and releases the stopped Thread', async t => {
+  const f = await fixture(t); const server = f.client();
+  f.failSelection('HTTP 400 invalid_json_schema from the selection model');
+  await assert.rejects(f.selection(server), error => error instanceof Error && error.message === 'HTTP 400 invalid_json_schema from the selection model');
+  const temporary = [...f.threads.values()].find(saved => saved.ephemeral)!;
+  assert.equal(temporary.thread.status.type, 'systemError');
+  assert.ok(f.records.some(row => row.message.method === 'thread/unsubscribe' && row.message.params?.threadId === temporary.thread.id));
+  await server.close();
+});
+
+test('selector cleanup failure retains both the original model error and the cleanup cause', async t => {
+  const f = await fixture(t); const server = f.client();
+  f.failSelection('HTTP 400 invalid_json_schema from the selection model'); f.failRead('thread-1');
+  await assert.rejects(f.selection(server), error => error instanceof UncertainOperationError
+    && error.message.includes('HTTP 400 invalid_json_schema from the selection model')
+    && error.message.includes('Fixture history unavailable'));
+  assert.ok(!f.records.some(row => row.message.method === 'thread/unsubscribe'));
+  await assert.rejects(server.close(), /cleanup could not be confirmed/);
+});
+
+test('an unloaded selector is released after its exact Turn completed', async t => {
+  const f = await fixture(t); const server = f.client(); f.selectionStatus('notLoaded');
+  const result = await f.selection(server);
+  assert.equal(result.choice.kind, 'none');
+  assert.ok(f.records.some(row => row.message.method === 'thread/unsubscribe' && row.message.params?.threadId === result.temporaryThreadId));
+});
+
+test('a selector system error without terminal Turn evidence remains uncertain', async t => {
+  const f = await fixture(t); const server = f.client(); f.hold(); f.lose('turn/start', true); f.selectionStatus('systemError');
+  await assert.rejects(f.selection(server), error => error instanceof UncertainOperationError && /terminal state could not be confirmed/.test(error.message));
+  const temporary = [...f.threads.values()].find(saved => saved.ephemeral)!;
+  assert.ok(!f.records.some(row => row.message.method === 'thread/unsubscribe'));
+  f.terminal(temporary, 'interrupted');
+});
+
 test('selector abort stops only its owned active Turn and drains its subscription', async t => {
   const f = await fixture(t); f.hold(); const server = f.client(); const unrelated = f.client();
   const otherId = await create(unrelated, f.root); await start(unrelated, otherId);
@@ -251,6 +311,60 @@ test('shutdown attempts every owned Thread after one cleanup failure and preserv
   assert.equal(f.threads.get(second)?.thread.status.type, 'idle');
   assert.equal((await unrelated.inspect(third)).status, 'running');
   f.terminal(f.threads.get(first)!, 'interrupted');
+});
+
+test('shutdown retries recovery for later owned Threads after a transient discovery failure', async t => {
+  const f = await fixture(t);
+  const connect = sharedDaemonConnector(normalizeDaemonSettings({ socketPath: f.socketPath }), 1000);
+  let attempts = 0;
+  let disconnect: () => void = () => { throw new Error('No owned connection'); };
+  const connector: CodexConnector = async handlers => {
+    if (++attempts === 2) throw new Error('Transient daemon discovery failure');
+    disconnect = () => handlers.error(new Error('Owned transport failed'));
+    return await connect(handlers);
+  };
+  const owner = f.client({}, connector), unrelated = f.client();
+  const first = await create(owner, f.root), second = await create(owner, f.root), foreign = await create(unrelated, f.root);
+  await start(owner, first); await start(owner, second); await start(unrelated, foreign);
+  disconnect();
+  await assert.rejects(owner.close(), /Transient daemon discovery failure/);
+  assert.equal(attempts, 3);
+  assert.equal(f.threads.get(second)?.thread.status.type, 'idle');
+  assert.equal((await unrelated.inspect(foreign)).status, 'running');
+  assert.ok(f.records.some(row => row.message.method === 'turn/interrupt' && row.message.params?.threadId === second));
+  assert.ok(!f.records.some(row => row.message.method === 'turn/interrupt' && row.message.params?.threadId === foreign));
+  f.terminal(f.threads.get(first)!, 'interrupted');
+});
+
+test('late failure of an obsolete connection attempt preserves the recovered connection', async t => {
+  let finishOldClose = () => {}, beginOldClose = () => {};
+  const oldClosed = new Promise<void>(resolve => { finishOldClose = resolve; });
+  const closing = new Promise<void>(resolve => { beginOldClose = resolve; });
+  let attempts = 0, nextThread = 0;
+  const connector: CodexConnector = async handlers => {
+    if (++attempts === 1) {
+      queueMicrotask(() => handlers.error(new Error('First connection failed after opening')));
+      return { send: async () => {}, close: async () => { beginOldClose(); await oldClosed; } };
+    }
+    return {
+      close: async () => {},
+      send: async data => {
+        const message = messageSchema.parse(JSON.parse(data));
+        const reply = (result: unknown) => queueMicrotask(() => handlers.message(JSON.stringify({ id: message.id, result })));
+        if (message.method === 'initialize' || message.method === 'thread/unsubscribe') reply({});
+        if (message.method === 'thread/start') reply({ thread: { id: `replacement-${++nextThread}`, status: { type: 'idle' }, turns: [] } });
+      },
+    };
+  };
+  const owner = new CodexAppServer({ approvalPolicy: 'never', sandbox: 'read-only', requestTimeoutMs: 1000 }, connector);
+  t.after(async () => { finishOldClose(); await owner.close(); });
+  const first = assert.rejects(create(owner, '/tmp'), UncertainOperationError);
+  await closing;
+  await owner.recover();
+  assert.equal(await create(owner, '/tmp'), 'replacement-1');
+  finishOldClose(); await first;
+  assert.equal(await create(owner, '/tmp'), 'replacement-2');
+  assert.equal(attempts, 2);
 });
 
 test('initial handshake failure is recoverable and explicit socket configuration skips daemon control', async t => {
