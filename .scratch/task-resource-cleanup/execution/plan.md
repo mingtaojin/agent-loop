@@ -11,7 +11,7 @@
 
 ## Throughput checkpoint
 
-- Blocking first steps. The shared-daemon integration is based on 884fd307. Typecheck, build, full681 and closeout46 pass. The f131edd source-review FAIL is accepted and its three ownership findings have executable regressions. Merge waits for fresh independent source and behavioral verdicts, then exact-head/base checks. Final verification and merge state are recorded on PR31.
+- Blocking first steps. The shared-daemon integration is based on 884fd307. Typecheck, build, full682 and closeout47 pass. The f131edd ownership findings and fd96cb4 stale-ledger-write finding have executable red/green regressions. Merge waits for fresh independent source and behavioral verdicts, then exact-head/base checks. Final verification and merge state are recorded on PR31.
 - Independent workstreams. Enforced read-only source review and disposable Runtime verification read frozen code and write separate external reports. Lead owns documentation and forge operations.
 - Shared mutable state. No code writers run during review. Code and build manifests detect drift. Original dirty checkout stays protected.
 - Smallest safe decomposition. One coherent feature PR31. Documentation-only evidence updates may follow if code/build identity stays equal to the verified candidate.
