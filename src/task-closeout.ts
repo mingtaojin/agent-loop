@@ -173,10 +173,10 @@ export class TaskCloseout {
     const common = await realpath(await git(association.workspace, 'rev-parse', '--path-format=absolute', '--git-common-dir'));
     const gitDirectory = await realpath(await git(association.workspace, 'rev-parse', '--absolute-git-dir'));
     if (common === gitDirectory) throw new Error('Original repository cannot be enrolled');
-    const state = this.read(taskId);
-    state.scopes.push({ id: randomUUID(), allocationRequestId: null, location: await location(association.workspace), createdAt: Date.now(), sealed: false,
-      resource: { kind: 'worktree', association, common: await location(common), gitDirectory: await location(gitDirectory), branchGeneration: await branchGeneration(common, `refs/heads/${association.branch}`) }, artifacts: [] });
-    this.save(state);
+    const scope: Scope = { id: randomUUID(), allocationRequestId: null, location: await location(association.workspace), createdAt: Date.now(), sealed: false,
+      resource: { kind: 'worktree', association, common: await location(common), gitDirectory: await location(gitDirectory), branchGeneration: await branchGeneration(common, `refs/heads/${association.branch}`) }, artifacts: [] };
+    this.assertOpen(taskId);
+    const state = this.read(taskId); state.scopes.push(scope); this.save(state);
   }
   async register(taskId: string, scopeId: string, path: string, disposition: Scope['artifacts'][number]['disposition'], reference?: string) {
     const state = this.read(taskId), scope = state.scopes.find(scope => scope.id === scopeId);

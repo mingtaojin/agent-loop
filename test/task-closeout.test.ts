@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdirSync, writeFileSync } from 'node:fs';
+import fs from 'node:fs/promises';
 import { access, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { test, type TestContext } from 'node:test';
@@ -146,6 +148,50 @@ test('unique delivery holds survive completion and only matching authorized deli
   assert.equal((await f.state(worker.id)).operations[0]?.targets[0]?.state, 'protected'); assert.equal(await exists(file), true);
   await f.action({ action: 'register_artifact', requestId: 'delivered', taskId: worker.id, scopeId: scope.id, path: file, disposition: 'delivered', reference: 'https://example.test/download' });
   await f.loop.tick(); assert.equal(await exists(file), false);
+});
+
+test('concurrent worktree enrollment preserves a successful delivery hold and its cached registration receipt', async t => {
+  const f = await fixture(t), worker = await f.worker(), scope = await f.scope(worker.id), file = join(scope.location.root.path, 'only.zip');
+  await writeFile(file, 'only deliverable');
+  let enter!: () => void, resume!: () => void;
+  const entered = new Promise<void>(resolve => { enter = resolve; }), gate = new Promise<void>(resolve => { resume = resolve; });
+  const ensure = f.workspace.ensure.bind(f.workspace);
+  let branchLog: string | undefined;
+  f.workspace.ensure = async input => {
+    const path = await ensure(input);
+    if (input.kind === 'git-worktree') branchLog = join(f.project, '.git', 'logs', 'refs', 'heads', input.branch);
+    return path;
+  };
+  const reader = t.mock.method(fs, 'readFile', new Proxy(fs.readFile, {
+    apply(target, receiver, args) {
+      if (args[0] !== branchLog) return Reflect.apply(target, receiver, args);
+      enter();
+      return gate.then(() => Reflect.apply(target, receiver, args));
+    },
+  }));
+  syncBuiltinESMExports();
+  const acquisition = f.loop.ensureWorkspace(worker.id, 'example/app');
+  const registration: ProjectAction = { action: 'register_artifact', requestId: 'concurrent-hold', scopeId: scope.id, path: file, disposition: 'undelivered' };
+  try {
+    await entered;
+    const receipt = await f.action(registration, worker.id);
+    assert.equal((await f.scope(worker.id)).artifacts[0]?.disposition, 'undelivered');
+    resume();
+    await acquisition;
+    assert.deepEqual(await f.action(registration, worker.id), receipt);
+  } finally {
+    resume();
+    try { await acquisition; }
+    finally { reader.mock.restore(); syncBuiltinESMExports(); }
+  }
+  const afterEnrollment = (await f.scope(worker.id)).artifacts;
+  await f.finish(worker.id); await f.complete(worker.id);
+  const target = (await f.state(worker.id)).operations[0]?.targets.find(target => target.scope.id === scope.id);
+  assert.deepEqual({ disposition: afterEnrollment[0]?.disposition, cleanup: target?.state, retained: await exists(file) },
+    { disposition: 'undelivered', cleanup: 'protected', retained: true });
+  await f.restart();
+  assert.equal(await readFile(file, 'utf8'), 'only deliverable');
+  assert.equal((await f.scope(worker.id)).artifacts[0]?.disposition, 'undelivered');
 });
 
 test('delivery status cannot release a replacement file and arbitrary external paths cannot be adopted', async t => {
