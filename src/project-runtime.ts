@@ -539,7 +539,7 @@ export class ProjectRuntime {
       const task = this.store.task(member.taskId);
       if (['paused', 'failed'].includes(task.status) || task.requests.some(request => request.isBlocking)) return false;
       return task.executionStatus === 'running' || task.recovery.nextAttemptAt !== null
-        || this.store.inputs(task.id).some(input => ['pending', 'delivering', 'uncertain'].includes(input.status));
+        || this.store.inputs(task.id).some(input => input.status === 'pending');
     }) ?? false;
   }
   supersedeUnsentSupervision(taskId: string): void {
