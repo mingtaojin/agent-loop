@@ -97,6 +97,7 @@ test('approval group creation retries after an unknown result and a dissolved gr
   const first = f.loop.store.task(worker.id); assert.ok(first.chatId);
   assert.equal(f.feishu.approvals.length, 1);
   assert.equal(f.feishu.approvals[0]?.request.id, request.id);
+  await f.loop.tick();
   const notice = f.feishu.sent.filter(output => output.chatId === f.coordinator().chatId && output.text.includes('需要点击审批'));
   assert.equal(notice.length, 1);
   await f.loop.tick(); assert.equal(f.feishu.approvals.length, 1);
@@ -110,6 +111,34 @@ test('approval group creation retries after an unknown result and a dissolved gr
   assert.notEqual(recreated.status, 'failed');
   await assert.rejects(f.loop.approve({ id: 'old-click', taskId: worker.id, chatId: first.chatId, senderId: 'owner',
     threadId: request.threadId, turnId: request.turnId, requestId: request.id, epoch: request.connectionEpoch, decision: 'approve' }), /association expired/);
+});
+
+test('approval notices use the current group when retirement races with old-group verification', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('verification-retirement', 'Wait for approval.');
+  const current = await f.openGroup(worker.id); assert.ok(current.chatId && current.threadId);
+  const snapshot = f.codex.snapshot(current.threadId); assert.ok(snapshot.turnId);
+  snapshot.requests = [{ id: 'approval', kind: 'approval', threadId: current.threadId, turnId: snapshot.turnId,
+    prompt: 'Allow?', method: 'item/commandExecution/requestApproval', payload: {}, isBlocking: true, connectionEpoch: 'live' }];
+  let entered = () => {}, release = () => {}, once = true;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const verify = f.feishu.verifyGroup.bind(f.feishu);
+  f.feishu.verifyGroup = async chatId => {
+    await verify(chatId);
+    if (chatId === current.chatId && once) { once = false; entered(); await held; }
+  };
+  const observing = f.loop.tick(); await started;
+  await f.feishu.dissolveGroup(current.chatId);
+  retireTaskGroup(f.loop.store, worker.id, current.chatId);
+  release(); await observing; await f.loop.tick(); await f.loop.tick();
+  const replacement = f.loop.store.task(worker.id); assert.ok(replacement.chatId);
+  assert.notEqual(replacement.chatId, current.chatId);
+  assert.equal(f.feishu.approvals.at(-1)?.chatId, replacement.chatId);
+  const notices = f.feishu.sent.filter(output => output.chatId === f.coordinator().chatId && output.text.includes('需要点击审批'));
+  assert.equal(notices.length, 1);
+  assert.ok(notices[0]?.text.includes(encodeURIComponent(replacement.chatId)));
+  assert.ok(!notices[0]?.text.includes(encodeURIComponent(current.chatId)));
 });
 
 test('a manually dissolved direct-worker group stays absent through recovery and can be reopened explicitly', async t => {

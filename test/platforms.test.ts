@@ -13,7 +13,7 @@ import { AgentLoop } from '../src/loop.js';
 import { Store } from '../src/store.js';
 import { CodexAppServer } from '../src/adapters/codex.js';
 import { GitHubFake } from './fakes.js';
-import { FeishuApiError, GroupCreationRejected, TaskGroupUnavailable } from '../src/ports.js';
+import { FeishuApiError, GroupCreationRejected, TaskGroupBindingChanged, TaskGroupUnavailable, type FeishuProgressPort, type ProgressWriteGuard } from '../src/ports.js';
 
 const repository = repositorySchema.parse({ name: 'owner/repo', path: '/repo', baseBranch: 'main' });
 const issue = { node_id: 'I_1', number: 1, html_url: 'https://github.com/owner/repo/issues/1', title: 'Broken',
@@ -103,6 +103,32 @@ function fakeApi(): NonNullable<FeishuDependencies['api']> {
     messageResource: { get: async () => ({ writeFile: async () => {}, getReadableStream: () => Readable.from([Buffer.from('original')]), headers: {} }) },
   };
 }
+
+const guardedCardWrites: { name: string; run(port: FeishuProgressPort, guard: ProgressWriteGuard): Promise<unknown> }[] = [
+  { name: 'create', run: (port, guard) => port.createProgressCard({ content: 'Progress' }, guard) },
+  { name: 'send', run: (port, guard) => port.sendProgressCard({ chatId: 'group', cardId: 'card', uuid: 'send' }, guard) },
+  { name: 'content', run: (port, guard) => port.updateProgressContent({ cardId: 'card', content: 'Progress', sequence: 1, uuid: 'content' }, guard) },
+  { name: 'settings', run: (port, guard) => port.setProgressStreaming({ cardId: 'card', enabled: true, sequence: 1, uuid: 'settings' }, guard) },
+];
+for (const operation of guardedCardWrites) test(`retiring a binding during card pacing cancels ${operation.name} dispatch`, async () => {
+  const calls: string[] = [];
+  const api = fakeApi();
+  api.message.create = async () => { calls.push('send'); return { code: 0, data: { message_id: 'message' } }; };
+  const adapter = new FeishuAdapter(options, { api, cardkit: {
+    card: {
+      create: async () => { calls.push('create'); return { code: 0, data: { card_id: 'card' } }; },
+      settings: async () => { calls.push('settings'); return { code: 0, data: {} }; },
+      idConvert: async () => { throw new Error('Unexpected read'); },
+    },
+    cardElement: { content: async () => { calls.push('content'); return { code: 0, data: {} }; } },
+  } });
+  await adapter.createProgressCard({ content: 'Initial' });
+  let current = true;
+  const writing = operation.run(adapter, () => { if (!current) throw new TaskGroupBindingChanged(); });
+  current = false;
+  await assert.rejects(writing, TaskGroupBindingChanged);
+  assert.deepEqual(calls, ['create']);
+});
 
 test('Feishu group generations use distinct create UUIDs and exact generation markers', async () => {
   const api = fakeApi();

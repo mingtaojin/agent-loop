@@ -9,7 +9,9 @@ import { incomingSchema, submissionRequestIdSchema, taskSchema, type Task } from
 import type { ExecutionEvent } from '../src/execution-events.js';
 import { FeishuDocumentProgressPublisher, documentPublicationSchema } from '../src/feishu-document-progress.js';
 import { documentChunks } from '../src/feishu-document-text.js';
-import { DocumentRequestRejected, TaskGroupUnavailable, type FeishuDocumentProgressPort, type FeishuProgressPort } from '../src/ports.js';
+import { DocumentRequestRejected, TaskGroupUnavailable, type FeishuDocumentProgressPort, type FeishuProgressPort, type ProgressWriteGuard } from '../src/ports.js';
+import { FeishuDocumentAdapter, type FeishuDocumentApi } from '../src/adapters/feishu-document.js';
+import { retireTaskGroup } from '../src/task-groups.js';
 import { Store } from '../src/store.js';
 import { AgentLoop } from '../src/loop.js';
 import { CodexFake, FeishuFake, GitHubFake } from './fakes.js';
@@ -383,6 +385,38 @@ test('retiring a task group during unknown-write readback prevents a later write
   f.store.saveTask({ ...f.store.task('task'), chatId: null });
   hold.resolve(); await reading; f.transport.hold = null;
   assert.equal(f.transport.count('write'), writes, 'detaching during readback must stop the old publication');
+});
+
+test('group retirement cancels document writes still waiting in the real adapter pacing queue', async t => {
+  const f = await fixture(t); f.store.saveTask(task());
+  let hold = false;
+  const entered = gate(), release = gate();
+  const patches: { retired: boolean; text: string }[] = [];
+  const unused = async (): Promise<never> => { throw new Error('Unexpected API request'); };
+  const api: FeishuDocumentApi = {
+    document: { create: unused }, children: { create: unused, get: unused, batchDelete: unused },
+    members: { create: unused, list: unused }, tabs: { create: unused, listTabs: unused },
+    block: { get: unused, patch: async input => {
+      assert.ok(input?.path && input.data?.update_text_elements?.elements);
+      const elements = input.data.update_text_elements.elements;
+      const text = elements.map(element => element.text_run?.content ?? '').join('');
+      patches.push({ retired: f.store.task('task').chatId === null, text });
+      const clientToken = input.params?.client_token; assert.ok(clientToken);
+      return { code: 0, data: { block: { block_id: input.path.block_id, block_type: 2, text: { elements } }, client_token: clientToken } };
+    } },
+  };
+  const adapter = new FeishuDocumentAdapter(() => api, { now: () => 0, sleep: async () => {
+    if (hold) { entered.resolve(); await release.promise; }
+  } });
+  f.transport.replaceContent = (input, guard?: ProgressWriteGuard) => adapter.replaceContent(input, guard);
+  f.event('agent_message', 'First content'); await f.pump(8);
+  assert.ok(patches.length > 0);
+  const before = patches.length; hold = true;
+  f.event('agent_message', 'New content', { itemId: 'new-item' });
+  const writing = f.publisher.poll(); await entered.promise;
+  retireTaskGroup(f.store, 'task', 'chat-task'); release.resolve(); await writing;
+  assert.equal(patches.length, before);
+  assert.ok(patches.every(patch => !patch.retired));
 });
 
 test('maxLines and renderer revision changes re-render unchanged histories once', async t => {

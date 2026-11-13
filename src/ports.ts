@@ -33,26 +33,28 @@ export class FeishuApiError extends Error {
 }
 export class TaskGroupUnavailable extends FeishuApiError {}
 export class GroupCreationRejected extends FeishuApiError {}
+export class TaskGroupBindingChanged extends Error {}
+export type ProgressWriteGuard = () => void;
 export class DocumentRequestRejected extends Error {}
 export interface FeishuDocumentProgressPort {
-  createDocument(input: { title: string }): Promise<string>;
-  createBlock(input: { documentId: string; parentBlockId?: string; index?: number; text: string; clientToken: string }): Promise<string>;
+  createDocument(input: { title: string }, guard?: ProgressWriteGuard): Promise<string>;
+  createBlock(input: { documentId: string; parentBlockId?: string; index?: number; text: string; clientToken: string }, guard?: ProgressWriteGuard): Promise<string>;
   findBlock(input: { documentId: string; parentBlockId?: string; index?: number; text: string }): Promise<string | null>;
-  removeBlocks(input: { documentId: string; parentBlockId: string; blockIds: string[]; clientToken: string }): Promise<void>;
+  removeBlocks(input: { documentId: string; parentBlockId: string; blockIds: string[]; clientToken: string }, guard?: ProgressWriteGuard): Promise<void>;
   readBlock(input: { documentId: string; blockId: string }): Promise<string>;
-  replaceContent(input: { documentId: string; blockId: string; text: string; clientToken: string }): Promise<void>;
-  grantGroupRead(input: { documentId: string; chatId: string }): Promise<void>;
+  replaceContent(input: { documentId: string; blockId: string; text: string; clientToken: string }, guard?: ProgressWriteGuard): Promise<void>;
+  grantGroupRead(input: { documentId: string; chatId: string }, guard?: ProgressWriteGuard): Promise<void>;
   hasGroupRead(input: { documentId: string; chatId: string }): Promise<boolean>;
   findTab(input: { chatId: string; documentUrl: string }): Promise<string | null>;
-  createTab(input: { chatId: string; documentUrl: string }): Promise<string>;
+  createTab(input: { chatId: string; documentUrl: string }, guard?: ProgressWriteGuard): Promise<string>;
 }
 export interface FeishuProgressPort {
-  createProgressCard(input: { content: string; dashboardUrl?: string }): Promise<string>;
-  sendProgressCard(input: { chatId: string; cardId: string; uuid: string }): Promise<string>;
+  createProgressCard(input: { content: string; dashboardUrl?: string }, guard?: ProgressWriteGuard): Promise<string>;
+  sendProgressCard(input: { chatId: string; cardId: string; uuid: string }, guard?: ProgressWriteGuard): Promise<string>;
   // Null means a complete scan found no match. Failed or incomplete reads reject.
   findProgressMessage(input: { chatId: string; cardId: string; since: number }): Promise<string | null>;
-  updateProgressContent(input: { cardId: string; content: string; sequence: number; uuid: string }): Promise<void>;
-  setProgressStreaming(input: { cardId: string; enabled: boolean; sequence: number; uuid: string }): Promise<void>;
+  updateProgressContent(input: { cardId: string; content: string; sequence: number; uuid: string }, guard?: ProgressWriteGuard): Promise<void>;
+  setProgressStreaming(input: { cardId: string; enabled: boolean; sequence: number; uuid: string }, guard?: ProgressWriteGuard): Promise<void>;
 }
 export interface CodexPort {
   selectWorkspace(input: WorkspaceSelectionRequest): Promise<WorkspaceSelectionResponse>;

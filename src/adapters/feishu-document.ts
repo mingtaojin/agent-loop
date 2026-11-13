@@ -2,7 +2,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import type { Client } from '@larksuiteoapi/node-sdk';
 import { z } from 'zod';
 import { documentTextElements } from '../feishu-document-text.js';
-import { DocumentRequestRejected, TaskGroupUnavailable, type FeishuDocumentProgressPort } from '../ports.js';
+import { DocumentRequestRejected, TaskGroupUnavailable, type FeishuDocumentProgressPort, type ProgressWriteGuard } from '../ports.js';
 
 export type FeishuDocumentApi = {
   document: Pick<Client['docx']['v1']['document'], 'create'>;
@@ -50,7 +50,7 @@ export class FeishuDocumentAdapter implements FeishuDocumentProgressPort {
   private lane: Promise<void> = Promise.resolve();
   constructor(private readonly api: () => FeishuDocumentApi,
     private readonly clock: { now(): number; sleep(ms: number): Promise<void> } = { now: Date.now, sleep: delay }) {}
-  private async call(request: () => Promise<unknown>): Promise<unknown> {
+  private async call(request: () => Promise<unknown>, guard?: ProgressWriteGuard): Promise<unknown> {
     const slot = this.lane.catch(() => undefined).then(async () => {
       const wait = this.nextRequestAt - this.clock.now();
       if (wait > 0) await this.clock.sleep(wait);
@@ -58,6 +58,7 @@ export class FeishuDocumentAdapter implements FeishuDocumentProgressPort {
     });
     this.lane = slot;
     await slot;
+    guard?.();
     let raw: unknown;
     try { raw = await request(); }
     catch (error) {
@@ -67,16 +68,16 @@ export class FeishuDocumentAdapter implements FeishuDocumentProgressPort {
     }
     return check(raw);
   }
-  async createDocument(input: Parameters<FeishuDocumentProgressPort['createDocument']>[0]): Promise<string> {
-    const data = await this.call(() => this.api().document.create({ data: { title: input.title } }));
+  async createDocument(input: Parameters<FeishuDocumentProgressPort['createDocument']>[0], guard?: ProgressWriteGuard): Promise<string> {
+    const data = await this.call(() => this.api().document.create({ data: { title: input.title } }), guard);
     return z.object({ document: z.object({ document_id: id }) }).parse(data).document.document_id;
   }
-  async createBlock(input: Parameters<FeishuDocumentProgressPort['createBlock']>[0]): Promise<string> {
+  async createBlock(input: Parameters<FeishuDocumentProgressPort['createBlock']>[0], guard?: ProgressWriteGuard): Promise<string> {
     const index = z.number().int().min(-1).parse(input.index ?? -1);
     const elements = documentTextElements(input.text);
     const data = await this.call(() => this.api().children.create({ path: { document_id: input.documentId, block_id: input.parentBlockId ?? input.documentId },
       params: { document_revision_id: -1, client_token: input.clientToken },
-      data: { children: [{ block_type: 2, text: { elements } }], index } }));
+      data: { children: [{ block_type: 2, text: { elements } }], index } }), guard);
     const result = z.object({ children: z.array(textBlock).length(1), client_token: z.literal(input.clientToken) }).parse(data);
     const block = result.children[0];
     if (!block || blockText(block) !== input.text) throw new Error('Created document block does not match intent');
@@ -114,7 +115,7 @@ export class FeishuDocumentAdapter implements FeishuDocumentProgressPort {
       pageToken = result.page_token; seen.add(pageToken);
     }
   }
-  async removeBlocks(input: Parameters<FeishuDocumentProgressPort['removeBlocks']>[0]): Promise<void> {
+  async removeBlocks(input: Parameters<FeishuDocumentProgressPort['removeBlocks']>[0], guard?: ProgressWriteGuard): Promise<void> {
     if (!input.blockIds.length) return;
     if (new Set(input.blockIds).size !== input.blockIds.length) throw new Error('Duplicate owned document block identity');
     const children = await this.children(input);
@@ -126,23 +127,23 @@ export class FeishuDocumentAdapter implements FeishuDocumentProgressPort {
       throw new Error('Owned document blocks are not the complete expected suffix');
     }
     const data = await this.call(() => this.api().children.batchDelete({ path: { document_id: input.documentId, block_id: input.parentBlockId },
-      params: { document_revision_id: -1, client_token: input.clientToken }, data: { start_index: start, end_index: children.length } }));
+      params: { document_revision_id: -1, client_token: input.clientToken }, data: { start_index: start, end_index: children.length } }), guard);
     z.object({ client_token: z.literal(input.clientToken) }).parse(data);
   }
   async readBlock(input: Parameters<FeishuDocumentProgressPort['readBlock']>[0]): Promise<string> {
     const data = await this.call(() => this.api().block.get({ path: { document_id: input.documentId, block_id: input.blockId }, params: { document_revision_id: -1 } }));
     return blockText(z.object({ block: z.unknown() }).parse(data).block, input.blockId);
   }
-  async replaceContent(input: Parameters<FeishuDocumentProgressPort['replaceContent']>[0]): Promise<void> {
+  async replaceContent(input: Parameters<FeishuDocumentProgressPort['replaceContent']>[0], guard?: ProgressWriteGuard): Promise<void> {
     const elements = documentTextElements(input.text);
     const data = await this.call(() => this.api().block.patch({ path: { document_id: input.documentId, block_id: input.blockId },
-      params: { document_revision_id: -1, client_token: input.clientToken }, data: { update_text_elements: { elements } } }));
+      params: { document_revision_id: -1, client_token: input.clientToken }, data: { update_text_elements: { elements } } }), guard);
     const result = z.object({ block: textBlock, client_token: z.literal(input.clientToken) }).parse(data);
     if (blockText(result.block, input.blockId) !== input.text) throw new Error('Document write response does not match intent');
   }
-  async grantGroupRead(input: Parameters<FeishuDocumentProgressPort['grantGroupRead']>[0]): Promise<void> {
+  async grantGroupRead(input: Parameters<FeishuDocumentProgressPort['grantGroupRead']>[0], guard?: ProgressWriteGuard): Promise<void> {
     const data = await this.call(() => this.api().members.create({ path: { token: input.documentId }, params: { type: 'docx', need_notification: false },
-      data: { member_type: 'openchat', member_id: input.chatId, perm: 'view' } }));
+      data: { member_type: 'openchat', member_id: input.chatId, perm: 'view' } }), guard);
     z.object({ member: member.extend({ member_type: z.literal('openchat'), member_id: z.literal(input.chatId), perm: z.literal('view') }) }).parse(data);
   }
   async hasGroupRead(input: Parameters<FeishuDocumentProgressPort['hasGroupRead']>[0]): Promise<boolean> {
@@ -153,9 +154,9 @@ export class FeishuDocumentAdapter implements FeishuDocumentProgressPort {
     const data = await this.call(() => this.api().tabs.listTabs({ path: { chat_id: input.chatId } }));
     return unique(tabsSchema.parse(data).chat_tabs.filter(tab => tab.tab_type === 'doc' && tab.tab_content?.doc === input.documentUrl).map(tab => tab.tab_id));
   }
-  async createTab(input: Parameters<FeishuDocumentProgressPort['createTab']>[0]): Promise<string> {
+  async createTab(input: Parameters<FeishuDocumentProgressPort['createTab']>[0], guard?: ProgressWriteGuard): Promise<string> {
     const data = await this.call(() => this.api().tabs.create({ path: { chat_id: input.chatId },
-      data: { chat_tabs: [{ tab_name: '执行进度', tab_type: 'doc', tab_content: { doc: input.documentUrl } }] } }));
+      data: { chat_tabs: [{ tab_name: '执行进度', tab_type: 'doc', tab_content: { doc: input.documentUrl } }] } }), guard);
     const tabId = unique(tabsSchema.parse(data).chat_tabs.filter(tab => tab.tab_type === 'doc' && tab.tab_content?.doc === input.documentUrl).map(tab => tab.tab_id));
     if (!tabId) throw new Error('Created tab response does not match document');
     return tabId;

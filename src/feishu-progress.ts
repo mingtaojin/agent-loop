@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { errorMessage, type Task } from './domain.js';
-import { TaskGroupUnavailable, type FeishuProgressPort } from './ports.js';
-import { retireTaskGroup } from './task-groups.js';
+import { TaskGroupBindingChanged, TaskGroupUnavailable, type FeishuProgressPort } from './ports.js';
+import { assertGroupBinding, retireTaskGroup } from './task-groups.js';
 import type { Store } from './store.js';
 import { finished, progressContent, progressViewSchema, projectProgress, taskProgressStatus } from './feishu-progress-view.js';
 
@@ -166,6 +166,7 @@ export class FeishuProgressPublisher {
     this.report(`${record.taskId}/${record.turnId}: ${reason}`);
   }
   private async deliver(record: ProgressPublication): Promise<void> {
+    const guard = () => assertGroupBinding(this.store, record.taskId, record.chatId);
     try {
       if (this.store.task(record.taskId).chatId !== record.chatId) { this.disable(record, '任务群已失效'); return; }
       let delivery = record.delivery;
@@ -186,7 +187,7 @@ export class FeishuProgressPublisher {
       if (delivery.kind === 'uncreated') {
         // An unacknowledged entity is unsent. Retrying creation can only leave an orphan.
         const createdAt = this.now();
-        const cardId = await this.transport.createProgressCard({ content: progressContent(record.view), dashboardUrl: this.options.dashboardUrl });
+        const cardId = await this.transport.createProgressCard({ content: progressContent(record.view), dashboardUrl: this.options.dashboardUrl }, guard);
         record.delivery = { kind: 'entity', cardId, createdAt };
       } else if (delivery.kind === 'entity' || delivery.kind === 'sending') {
         const firstAttemptAt = delivery.kind === 'sending' ? delivery.firstAttemptAt : this.now();
@@ -195,7 +196,7 @@ export class FeishuProgressPublisher {
         }
         record.delivery = { kind: 'sending', cardId: delivery.cardId, createdAt: delivery.createdAt, firstAttemptAt };
         this.saveDelivery(record);
-        const messageId = await this.transport.sendProgressCard({ chatId: record.chatId, cardId: delivery.cardId, uuid: record.uuid });
+        const messageId = await this.transport.sendProgressCard({ chatId: record.chatId, cardId: delivery.cardId, uuid: record.uuid }, guard);
         record.delivery = { kind: 'published', cardId: delivery.cardId, createdAt: delivery.createdAt, messageId,
           streamingAt: delivery.createdAt, content: '', pending: null };
       } else if (delivery.kind === 'published') {
@@ -215,16 +216,17 @@ export class FeishuProgressPublisher {
         this.saveDelivery(record);
         const attemptedAt = this.now();
         if (operation.kind === 'content') {
-          await this.transport.updateProgressContent({ cardId: delivery.cardId, ...operation });
+          await this.transport.updateProgressContent({ cardId: delivery.cardId, ...operation }, guard);
           record.delivery = { ...delivery, content, pending: null };
         } else {
-          await this.transport.setProgressStreaming({ cardId: delivery.cardId, ...operation });
+          await this.transport.setProgressStreaming({ cardId: delivery.cardId, ...operation }, guard);
           record.delivery = { ...delivery, kind: operation.enabled ? 'published' : 'closed', streamingAt: operation.enabled ? attemptedAt : null, pending: null };
         }
       }
       record.failures = 0; record.nextAttemptAt = 0;
       this.saveDelivery(record);
     } catch (error) {
+      if (error instanceof TaskGroupBindingChanged) { this.disable(record, error.message); return; }
       if (error instanceof TaskGroupUnavailable) {
         retireTaskGroup(this.store, record.taskId, record.chatId);
         this.disable(record, error.message); return;

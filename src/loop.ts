@@ -11,7 +11,7 @@ import type { Config } from './config.js';
 import { errorMessage, presentTaskSource, matchSource, normalizeManualTaskText, RejectedInputError, submissionReceipt, submissionSourceId, TurnChangedError, workspaceSelectionResponseSchema, type Submission, type SubmissionReceipt, type AgentInput, type ApprovalAction, type DiscoveredProject, type ExecutionSnapshot, type IncomingMessage, type Repository, type Source, type SourceComment, type Task, type TaskResource, type TaskSource, type WorkspaceCandidate, type WorkspaceTarget, type WorkspaceSelectionResponse } from './domain.js';
 import { SubmissionError, SubmissionService } from './submission.js';
 import { FeishuApiError, TaskGroupUnavailable, type CodexPort, type FeishuPort, type GitHubPort, type WorkspacePort } from './ports.js';
-import { TaskGroups, groupGeneration, retireTaskGroup } from './task-groups.js';
+import { TaskGroups, assertGroupBinding, groupGeneration, retireTaskGroup } from './task-groups.js';
 import { GroupCleanup } from './group-cleanup.js';
 import { Store, type Inbox } from './store.js';
 import { FeishuProgressPublisher } from './feishu-progress.js';
@@ -153,6 +153,7 @@ export class AgentLoop {
     await this.serial(taskId, async () => {
       chatId = await this.groups.open(taskId);
       await this.flush(this.store.task(taskId));
+      assertGroupBinding(this.store, taskId, chatId);
     });
     return chatId;
   }
@@ -609,6 +610,7 @@ export class AgentLoop {
     if (approvals.length && task.status !== 'paused') {
       try {
         task.chatId = await this.groups.open(task.id);
+        assertGroupBinding(this.store, task.id, task.chatId);
         const generation = groupGeneration(this.store, task.id);
         for (const request of approvals) {
           const identity = `${request.connectionEpoch}:${request.id}:group:${generation}`;

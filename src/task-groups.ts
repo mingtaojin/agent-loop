@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { errorMessage, presentTaskSource } from './domain.js';
-import { GroupCreationRejected, TaskGroupUnavailable, type FeishuPort } from './ports.js';
+import { GroupCreationRejected, TaskGroupBindingChanged, TaskGroupUnavailable, type FeishuPort } from './ports.js';
 import type { Store } from './store.js';
 import { ProjectLedger } from './project.js';
 
@@ -11,6 +11,10 @@ function state(store: Store, taskId: string): z.infer<typeof groupStateSchema> {
   return raw === null ? { generation: 0, retiredChatIds: [] } : groupStateSchema.parse(JSON.parse(raw));
 }
 export function groupGeneration(store: Store, taskId: string): number { return state(store, taskId).generation; }
+export function assertGroupBinding(store: Store, taskId: string, chatId: string | null, generation?: number): void {
+  if (store.task(taskId).chatId !== chatId || (generation !== undefined && groupGeneration(store, taskId) !== generation))
+    throw new TaskGroupBindingChanged('Task group binding changed while awaiting an operation');
+}
 export function retireTaskGroup(store: Store, taskId: string, chatId: string): boolean {
   return store.transaction(() => {
     const task = store.task(taskId);
@@ -41,7 +45,12 @@ export class TaskGroups {
   private async ensure(taskId: string): Promise<string> {
     let task = this.store.task(taskId);
     if (task.chatId) {
-      try { await this.transport.verifyGroup(task.chatId); return task.chatId; }
+      const chatId = task.chatId, generation = groupGeneration(this.store, taskId);
+      try {
+        await this.transport.verifyGroup(chatId);
+        assertGroupBinding(this.store, taskId, chatId, generation);
+        return chatId;
+      }
       catch (error) {
         if (!(error instanceof TaskGroupUnavailable)) throw error;
         retireTaskGroup(this.store, taskId, task.chatId);
@@ -67,6 +76,7 @@ export class TaskGroups {
       try { await this.transport.verifyGroup(chatId); }
       catch (error) {
         if (!(error instanceof TaskGroupUnavailable)) throw error;
+        assertGroupBinding(this.store, taskId, null, generation);
         const current = this.store.task(taskId);
         current.chatId = chatId; this.store.saveTask(current);
         retireTaskGroup(this.store, taskId, chatId);
@@ -77,6 +87,7 @@ export class TaskGroups {
         this.store.uncertainOperation(operationId, error instanceof GroupCreationRejected ? 'rejected' : errorMessage(error));
       throw error;
     }
+    assertGroupBinding(this.store, taskId, null, generation);
     task = this.store.task(taskId);
     this.store.transaction(() => {
       for (const output of this.store.outputs(taskId)) {

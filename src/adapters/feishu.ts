@@ -7,7 +7,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { Client, WSClient, EventDispatcher, Domain, LoggerLevel, defaultHttpInstance, type HttpInstance, type HttpRequestOptions } from '@larksuiteoapi/node-sdk';
 import { z } from 'zod';
 import { UncertainOperationError, errorMessage, type ApprovalAction, type Attachment, type IncomingMessage, type PendingRequest } from '../domain.js';
-import { FeishuApiError, GroupCreationRejected, TaskGroupUnavailable, type FeishuPort, type FeishuProgressPort } from '../ports.js';
+import { FeishuApiError, GroupCreationRejected, TaskGroupUnavailable, type FeishuPort, type FeishuProgressPort, type ProgressWriteGuard } from '../ports.js';
 import { FeishuDocumentAdapter, type FeishuDocumentApi } from './feishu-document.js';
 
 export interface FeishuOptions {
@@ -222,7 +222,7 @@ export class FeishuAdapter implements FeishuPort, FeishuProgressPort {
     this.nextProgressRequestAt = start + 100;
     if (start > now) await delay(start - now);
   }
-  async createProgressCard(input: Parameters<FeishuProgressPort['createProgressCard']>[0]): Promise<string> {
+  async createProgressCard(input: Parameters<FeishuProgressPort['createProgressCard']>[0], guard?: ProgressWriteGuard): Promise<string> {
     const card = { schema: '2.0', config: { update_multi: true, streaming_mode: true, summary: { content: progressCardTitle } },
       header: { title: { tag: 'plain_text', content: progressCardTitle } },
       body: { elements: [
@@ -233,11 +233,13 @@ export class FeishuAdapter implements FeishuPort, FeishuProgressPort {
     const data = JSON.stringify(card);
     if (Buffer.byteLength(data) >= 30_000) throw new Error('Progress card exceeds the 30KB payload budget');
     await this.paceProgressRequest();
+    guard?.();
     const response = checkWrite(await this.cardkit.card.create({ data: { type: 'card_json', data } }));
     return id.parse(response.card_id);
   }
-  async sendProgressCard(input: Parameters<FeishuProgressPort['sendProgressCard']>[0]): Promise<string> {
+  async sendProgressCard(input: Parameters<FeishuProgressPort['sendProgressCard']>[0], guard?: ProgressWriteGuard): Promise<string> {
     await this.paceProgressRequest();
+    guard?.();
     const response = checkWrite(await this.api.message.create({ params: { receive_id_type: 'chat_id' }, data: {
       receive_id: input.chatId, msg_type: 'interactive', content: JSON.stringify({ type: 'card', data: { card_id: input.cardId } }), uuid: input.uuid,
     } }));
@@ -271,14 +273,16 @@ export class FeishuAdapter implements FeishuPort, FeishuProgressPort {
     } while (token);
     return null;
   }
-  async updateProgressContent(input: Parameters<FeishuProgressPort['updateProgressContent']>[0]): Promise<void> {
+  async updateProgressContent(input: Parameters<FeishuProgressPort['updateProgressContent']>[0], guard?: ProgressWriteGuard): Promise<void> {
     if (Buffer.byteLength(JSON.stringify(input.content)) >= 24_000) throw new Error('Progress content exceeds its payload budget');
     await this.paceProgressRequest();
+    guard?.();
     checkWrite(await this.cardkit.cardElement.content({ path: { card_id: input.cardId, element_id: 'progress' },
       data: { content: input.content, sequence: input.sequence, uuid: input.uuid } }));
   }
-  async setProgressStreaming(input: Parameters<FeishuProgressPort['setProgressStreaming']>[0]): Promise<void> {
+  async setProgressStreaming(input: Parameters<FeishuProgressPort['setProgressStreaming']>[0], guard?: ProgressWriteGuard): Promise<void> {
     await this.paceProgressRequest();
+    guard?.();
     checkWrite(await this.cardkit.card.settings({ path: { card_id: input.cardId },
       data: { settings: JSON.stringify({ config: { streaming_mode: input.enabled } }), sequence: input.sequence, uuid: input.uuid } }));
   }
