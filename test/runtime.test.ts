@@ -519,3 +519,22 @@ test('GitHub outage during recovery preserves the original conversation for new 
   assert.equal(f.workerSteers().at(-1)?.deliveryId, 'offline-source-user');
   assert.ok(f.loop.store.diagnostics().some(item => item.message.includes('GitHub unavailable')));
 });
+
+
+test('shell capabilities reject a changed turn or epoch before provisioning a resource', async t => {
+  const f = await fixture(t); await f.githubTask();
+  const capability = join(f.root, 'workspace-capabilities', `${f.task().id}.json`);
+  const activity = f.codex.activity.bind(f.codex);
+  const workspaces = f.workspaces.length;
+  for (const change of ['turn', 'epoch'] as const) {
+    f.codex.activity = async (...args) => {
+      const result = await activity(...args);
+      assert.equal(result.kind, 'running');
+      if (result.kind !== 'running') return result;
+      if (change === 'turn') f.snapshot().turnId = 'replacement-turn';
+      return change === 'epoch' ? { ...result, connectionEpoch: 'expired-epoch' } : result;
+    };
+    await assert.rejects(promisify(execFile)(process.execPath, [resolve('src/workspace-client.ts'), capability, 'example/project']), /original active task turn/);
+    assert.equal(f.workspaces.length, workspaces);
+  }
+});

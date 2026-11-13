@@ -14,6 +14,7 @@ import { FeishuApiError, GroupCreationRejected, type CodexPort, type WorkspacePo
 import { GroupCleanup } from '../src/group-cleanup.js';
 import { groupGeneration, retireTaskGroup, TaskGroups } from '../src/task-groups.js';
 import { ProjectLedger, projectStateSchema, type ProjectAction } from '../src/project.js';
+import { ProjectRuntime } from '../src/project-runtime.js';
 import type { ReasoningEffort } from '../src/project.js';
 import { Store } from '../src/store.js';
 import { CodexFake, FeishuFake, GitHubFake, issue } from './fakes.js';
@@ -1057,7 +1058,11 @@ test('independent startup race: recovery must validate saved resources before in
 
 test('task record sentinels stay out of unrelated instructions and every status section', async t => {
   const f = await fixture(t); await f.initialize();
-  const a = await f.dispatch('private-a', 'Task A.');
+  const privateIssue = projectIssue(91, 'example/frontend', { title: 'A_PRIVATE_ISSUE_TITLE', body: 'A_PRIVATE_ISSUE_BODY' });
+  f.loop.projects.ledger.issue('app', privateIssue);
+  f.loop.projects.ledger.comment('app', sourceCommentSchema.parse({ id: 'private-comment', sourceId: privateIssue.id,
+    url: 'https://example.test/comment', author: 'owner', body: 'A_PRIVATE_COMMENT_BODY', createdAt: '2026-11-14T01:00:00Z', updatedAt: '2026-11-14T01:00:00Z' }));
+  const a = await f.dispatch('private-a', 'Task A.', { issueId: privateIssue.id });
   const b = await f.dispatch('private-b', 'Task B.');
   const verifier = await f.dispatch('private-verifier', 'Verify selected evidence.', { role: 'verifier' });
   const before = f.loop.projects.instructions(b.id);
@@ -1065,6 +1070,15 @@ test('task record sentinels stay out of unrelated instructions and every status 
   assert.equal(f.loop.projects.instructions(b.id), before);
   const saved = f.loop.store.task(a.id);
   saved.reason = 'A_PRIVATE_REASON_SENTINEL';
+  saved.resources.push({ kind: 'project', id: 'private-resource', workspace: '/tmp/A_PRIVATE_RESOURCE_PATH', project: {
+    kind: 'project', id: 'private-project', name: 'private', entryPath: '/tmp/A_PRIVATE_RESOURCE_PATH', canonicalPath: '/tmp/A_PRIVATE_RESOURCE_PATH',
+  } });
+  const intake = taskSchema.parse({ ...a, id: 'private-intake', sourceId: 'private-intake', purpose: 'intake', status: 'pending',
+    source: { kind: 'cli', ...ProjectRuntime.submission('private-intake', 'A_PRIVATE_INTAKE_BODY'), submittedAt: 1 },
+    threadId: null, turnId: null, chatId: null, executionStatus: 'unbound', resources: [] });
+  f.loop.store.saveTask(intake);
+  f.loop.store.setMeta(`project-intake-route:${intake.id}`, JSON.stringify({ projectId: 'app', coordinatorTaskId: f.coordinator().id }));
+  f.loop.store.setMeta(`project-intake-material:${intake.id}`, '/tmp/A_PRIVATE_INTAKE_PATH');
   saved.requests = [{ id: 'private-question', threadId: a.threadId!, turnId: a.turnId!, kind: 'question',
     prompt: 'A_PRIVATE_PROMPT_SENTINEL', method: 'item/tool/requestUserInput', payload: {}, isBlocking: true, connectionEpoch: 'scope-test' }];
   f.loop.store.saveTask(saved);
@@ -1148,6 +1162,8 @@ test('legacy unscoped records remain query-only for coordinators without rewriti
   assert.doesNotMatch(f.loop.projects.context(f.coordinator().id), /LEGACY_UNSCOPED/);
   assert.doesNotMatch(JSON.stringify(await f.loop.projectAction(worker.id, { action: 'status', section: 'records' })), /LEGACY_UNSCOPED/);
   assert.match(JSON.stringify(await f.loop.projectAction(f.coordinator().id, { action: 'status', section: 'records' })), /LEGACY_UNSCOPED/);
+  const replay = await f.loop.projectAction(worker.id, { action: 'record', requestId: legacy.requestId, key: legacy.key, text: legacy.text, expectedVersion: 0 });
+  assert.deepEqual(replay, { accepted: true, requestId: legacy.requestId, key: legacy.key, version: 1 });
   assert.equal(f.loop.store.meta(key), raw);
   await f.restart();
   assert.deepEqual(f.state().records, [legacy]);

@@ -1,0 +1,43 @@
+✖ a request timeout preserves another thread and its native approval on the same process and epoch (192.853709ms)
+✖ an uncertain resume is quarantined until its late original response without replaying it (191.43025ms)
+✖ real transport recovery initializes once and loads each original thread only on demand (89.207542ms)
+ℹ tests 3
+ℹ suites 0
+ℹ pass 0
+ℹ fail 3
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 654.431583
+
+✖ failing tests:
+
+test at test/codex-isolation.test.ts:76:1073
+✖ a request timeout preserves another thread and its native approval on the same process and epoch (192.853709ms)
+  Error: Codex thread/read timed out; reconcile before retrying
+      at Timeout.<anonymous> (/Users/developer/.codex/worktrees/agent-loop-task-scoped-context-20261113/src/adapters/codex.ts:228:48)
+      at listOnTimeout (node:internal/timers:605:17)
+      at process.processTimers (node:internal/timers:541:7)
+
+test at test/codex-isolation.test.ts:76:2057
+✖ an uncertain resume is quarantined until its late original response without replaying it (191.43025ms)
+  Error: Codex thread/resume timed out; reconcile before retrying
+      at Timeout.<anonymous> (/Users/developer/.codex/worktrees/agent-loop-task-scoped-context-20261113/src/adapters/codex.ts:228:48)
+      at listOnTimeout (node:internal/timers:605:17)
+      at process.processTimers (node:internal/timers:541:7)
+
+test at test/codex-isolation.test.ts:76:2828
+✖ real transport recovery initializes once and loads each original thread only on demand (89.207542ms)
+  Error: thread/resume: Thread not found
+      at CodexAppServer.receive (/Users/developer/.codex/worktrees/agent-loop-task-scoped-context-20261113/src/adapters/codex.ts:278:36)
+      at Interface.<anonymous> (/Users/developer/.codex/worktrees/agent-loop-task-scoped-context-20261113/src/adapters/codex.ts:188:18)
+      at Interface.emit (node:events:509:28)
+      at [_onLine] [as _onLine] (node:internal/readline/interface:465:12)
+      at [_normalWrite] [as _normalWrite] (node:internal/readline/interface:647:22)
+      at Socket.ondata (node:internal/readline/interface:263:23)
+      at Socket.emit (node:events:509:28)
+      at addChunk (node:internal/streams/readable:563:12)
+      at readableAddChunkPushByteMode (node:internal/streams/readable:514:3)
+      at Readable.push (node:internal/streams/readable:394:5) {
+    code: -32000
+  }

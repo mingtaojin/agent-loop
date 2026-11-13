@@ -109,7 +109,6 @@ export class AgentLoop {
     if (this.stopping || ['paused', 'failed'].includes(task.status) || !task.threadId) throw new Error('Capability requires an active conversation');
     const activity = await this.ports.codex.activity(task.threadId);
     if (activity.kind !== 'running') throw new Error('Capability requires a proven active turn');
-    this.assertActiveTask(taskId, activity);
     return activity;
   }
   async projectAction(taskId: string, action: ProjectAction): Promise<unknown> {
@@ -996,7 +995,13 @@ export class AgentLoop {
   }
   async recover(): Promise<void> {
     await this.projects.ensure();
-    await Promise.all(this.store.tasks().map(task => this.serial(task.id, async () => {
+    const priority = (task: Task) => {
+      if (task.status === 'paused' || task.status === 'failed') return 3;
+      if (this.store.inputs(task.id).some(input => input.origin === 'user' && ['pending', 'delivering', 'uncertain'].includes(input.status))) return 0;
+      return task.executionStatus === 'running' ? 1 : 2;
+    };
+    const tasks = this.store.tasks().sort((a, b) => priority(a) - priority(b));
+    await Promise.all(tasks.map(task => this.serial(task.id, async () => {
       try {
         for (const resource of task.resources) await this.restoreWorkspace(task.id, resource);
         if (!this.projects.ledger.membership(task.id)) {
