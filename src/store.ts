@@ -3,6 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
+import { inboxStatusSchema, inputDispositionSchema, type InputDisposition } from './input-delivery.js';
 import { executionEventSchema, storedExecutionEventSchema, type ExecutionEvent, type StoredExecutionEvent } from './execution-events.js';
 import { approvalActionSchema, inputProvenanceSchema, incomingSchema, repositorySchema, sourceSchema, taskSchema, type ApprovalAction, type IncomingMessage, type InputProvenance, type Source, type Task } from './domain.js';
 
@@ -13,8 +14,8 @@ export const documentSourcePositionSchema = z.strictObject({
 export type DocumentSourcePosition = z.infer<typeof documentSourcePositionSchema>;
 const operationSchema = z.object({ id: z.string(), task_id: z.string(), kind: z.string(), status: z.enum(['attempting', 'confirmed', 'uncertain']), result: z.string().nullable(), error: z.string().nullable() });
 export type Operation = z.infer<typeof operationSchema>;
-const inboxRow = z.object({ seq: z.number(), id: z.string(), task_id: z.string(), payload: z.string(), status: z.enum(['pending', 'delivering', 'delivered', 'failed', 'uncertain', 'held']), origin: z.enum(['user', 'source', 'initial', 'resume']), error: z.string().nullable() });
-export type Inbox = Omit<z.infer<typeof inboxRow>, 'payload'> & { message: IncomingMessage; provenance: InputProvenance; requestId: string | null; route: 'task' | 'workspace-selection'; selectionHandled: boolean };
+const inboxRow = z.object({ seq: z.number(), id: z.string(), task_id: z.string(), payload: z.string(), status: inboxStatusSchema, origin: z.enum(['user', 'source', 'initial', 'resume']), error: z.string().nullable() });
+export type Inbox = Omit<z.infer<typeof inboxRow>, 'payload'> & { message: IncomingMessage; provenance: InputProvenance; requestId: string | null; route: 'task' | 'workspace-selection'; selectionHandled: boolean; disposition?: InputDisposition };
 const outboxSchema = z.object({ id: z.string(), task_id: z.string(), text: z.string(), status: z.enum(['pending', 'sending', 'sent', 'uncertain']), error: z.string().nullable() });
 export type Outbox = z.infer<typeof outboxSchema>;
 
@@ -106,7 +107,9 @@ export class Store {
   }
   inputs(taskId: string): Inbox[] {
     return this.db.prepare('SELECT * FROM inbox WHERE task_id=? ORDER BY seq').all(taskId).map(raw => {
-      const { payload, ...row } = inboxRow.parse(raw);
+      const { payload, ...saved } = inboxRow.parse(raw);
+      const disposition = this.inputDisposition(taskId, saved.id);
+      const row = { ...saved, ...(disposition ? { disposition } : {}) };
       const json: unknown = JSON.parse(payload);
       const wrapped = z.object({ message: incomingSchema, provenance: inputProvenanceSchema, requestId: z.string().nullable().default(null), route: z.enum(['task', 'workspace-selection']).default('task'), selectionHandled: z.boolean().default(false) }).safeParse(json);
       if (wrapped.success) return { ...row, ...wrapped.data };
@@ -129,6 +132,18 @@ export class Store {
     this.db.prepare('UPDATE inbox SET payload=? WHERE id=?').run(JSON.stringify({ message: input.message, provenance: input.provenance, requestId: input.requestId, route: input.route, selectionHandled: true }), id);
   }
   markInput(id: string, status: Inbox['status'], error: string | null = null): void { this.db.prepare('UPDATE inbox SET status=?,error=? WHERE id=?').run(status, error, id); }
+  inputDisposition(taskId: string, inputId: string): InputDisposition | null {
+    const raw = this.meta(`input-disposition:${JSON.stringify([taskId, inputId])}`);
+    if (raw === null) return null;
+    const disposition = inputDispositionSchema.parse(JSON.parse(raw));
+    if (disposition.request.taskId !== taskId || disposition.request.inputId !== inputId) throw new Error('Input disposition identity changed');
+    return disposition;
+  }
+  saveInputDisposition(disposition: InputDisposition): void {
+    const value = inputDispositionSchema.parse(disposition);
+    this.db.prepare('INSERT INTO meta(key,value) VALUES(?,?)').run(
+      `input-disposition:${JSON.stringify([value.request.taskId, value.request.inputId])}`, JSON.stringify(value));
+  }
   enqueue(taskId: string, text: string, key: string): string {
     const id = createHash('sha256').update(`${taskId}:${key}`).digest('hex').slice(0, 32);
     this.db.prepare("INSERT OR IGNORE INTO outbox VALUES(?,?,?,'pending',NULL)").run(id, taskId, text);

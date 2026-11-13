@@ -210,6 +210,8 @@ npm start -- run --config config.json
 
 旧版因来源或群命令暂停的任务在升级后仍等待。所有者的新群消息可继续原 Thread。嵌入服务 API 的显式 `control(taskId, 'pause')` 是独立的操作员控制，保持暂停直到同 API 的 `resume`，不解释聊天文字。首版 CLI 不提供在线操作员控制或不确定结果的自动修复。
 
+用户明确批准后，项目协调者可对已被后续指令接替的普通未知输入提交 `supersede_input` 审计处置。原投递仍为 unknown，目标保持暂停，旧输入不重放。前提、来源校验、恢复和回滚步骤见[终止未知投递](docs/agents/input-delivery.md)。
+
 ## 验证
 
 ```sh

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
+import { supersedeInputSchema } from './input-delivery.js';
 import { sourceSchema, sourceCommentSchema, type Source, type SourceComment } from './domain.js';
 import type { Store } from './store.js';
 
@@ -42,6 +43,7 @@ export const projectActionSchema = z.discriminatedUnion('action', [
   z.strictObject({ action: z.literal('rotate'), requestId: idSchema, checkpoint: textSchema }),
   z.strictObject({ action: z.literal('release_workspace'), requestId: idSchema, resourceId: idSchema }),
   z.strictObject({ action: z.literal('control'), requestId: idSchema, taskId: idSchema, operation: z.enum(['pause', 'resume']) }),
+  supersedeInputSchema,
 ]);
 export type ProjectAction = z.infer<typeof projectActionSchema>;
 const roleSchema = z.enum(['coordinator', 'worker', 'verifier']);

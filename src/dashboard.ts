@@ -73,7 +73,7 @@ export async function startDashboard(options: { dataDir: string; port: number; h
         const db = readStore();
         if (!db?.tasks().some(task => task.id === taskId)) { json(response, 404, { error: '任务不存在' }); return; }
         json(response, 200, {
-          inputs: db.inputs(taskId).map(input => ({ id: input.id, text: input.message.text, createdAt: input.message.createdAt, origin: input.origin, route: input.route, selectionHandled: input.selectionHandled, status: input.status, error: input.error, attachments: input.message.attachments.map(attachment => ({ name: attachment.name, kind: attachment.kind })) })),
+          inputs: db.inputs(taskId).map(input => ({ id: input.id, text: input.message.text, createdAt: input.message.createdAt, origin: input.origin, route: input.route, selectionHandled: input.selectionHandled, status: input.status, error: input.error, disposition: input.disposition ?? null, attachments: input.message.attachments.map(attachment => ({ name: attachment.name, kind: attachment.kind })) })),
           outputs: db.outputs(taskId),
         }); return;
       }

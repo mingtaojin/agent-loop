@@ -80,7 +80,7 @@ async function main(): Promise<void> {
     }
     try { await stat(join(config.dataDir, 'tasks.sqlite')); } catch { output({ tasks: [], diagnostics: [], note: '尚未建立任务数据库' }); return; }
     const store = new Store(config.dataDir, { readOnly: true });
-    try { output({ tasks: store.tasks().map(task => ({ id: task.id, source: task.source.kind === 'github' ? task.source.issue.url : task.sourceId, status: task.status, reason: task.reason, chatId: task.chatId, threadId: task.threadId, resources: task.resources, messages: store.inputs(task.id).map(item => ({ id: item.id, status: item.status, error: item.error })), outgoing: store.outputs(task.id).map(item => ({ id: item.id, status: item.status, error: item.error })) })), diagnostics: store.diagnostics() }); }
+    try { output({ tasks: store.tasks().map(task => ({ id: task.id, source: task.source.kind === 'github' ? task.source.issue.url : task.sourceId, status: task.status, reason: task.reason, chatId: task.chatId, threadId: task.threadId, resources: task.resources, messages: store.inputs(task.id).map(item => ({ id: item.id, status: item.status, error: item.error, disposition: item.disposition ?? null })), outgoing: store.outputs(task.id).map(item => ({ id: item.id, status: item.status, error: item.error })) })), diagnostics: store.diagnostics() }); }
     finally { store.close(); }
     return;
   }
