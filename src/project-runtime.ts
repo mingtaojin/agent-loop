@@ -4,6 +4,7 @@ import { ProjectLedger, matchesProjectIssue, projectActionSchema, reasoningEffor
 import { submissionSchema, type DiscoveredProject, type InputProvenance, type Source, type Task } from './domain.js';
 import type { GitHubPort } from './ports.js';
 import { Store } from './store.js';
+import { inputNeedsDelivery, type InputDisposition, type SupersedeInput } from './input-delivery.js';
 
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
 const stableId = (text: string) => {
@@ -14,6 +15,7 @@ interface ProjectHost {
   makeTask(sourceId: string, prompt: string): Promise<Task>;
   releaseWorkspace(taskId: string, resourceId: string): Promise<unknown>;
   control(taskId: string, action: 'pause' | 'resume'): Promise<void>;
+  supersedeInput(callerId: string, projectId: string, action: SupersedeInput): Promise<InputDisposition>;
 }
 
 export class ProjectRuntime {
@@ -148,6 +150,7 @@ export class ProjectRuntime {
       const task = this.store.task(member.taskId);
       return { ...member, status: task.status, executionStatus: task.executionStatus, reason: task.reason,
         chatId: task.chatId, threadId: task.threadId, model: this.store.meta(`project-task-model:${task.id}`), reasoningEffort: this.reasoningEffort(task.id), resources: task.resources, requests: task.requests.map(request => ({ id: request.id, kind: request.kind, prompt: request.prompt })),
+        inputDispositions: this.store.inputs(task.id).flatMap(input => input.disposition ? [input.disposition] : []),
         outputs: this.store.outputs(task.id).slice(-3).map(output => ({ id: output.id, text: output.text.slice(0, 4000), truncated: output.text.length > 4000, status: output.status })) };
     });
     const counts = { tasks: tasks.length, issues: state.issues.length, comments: state.comments.length, records: state.records.length };
@@ -213,6 +216,12 @@ export class ProjectRuntime {
         return { queued: true, instruction: 'Finish this turn. Rotation waits until no native requests or undelivered inputs remain.' };
       }
       case 'release_workspace': return this.host.releaseWorkspace(callerId, action.resourceId);
+      case 'supersede_input': {
+        if (member.role !== 'coordinator') throw new Error('Only the coordinator can supersede input delivery');
+        const target = this.ledger.membership(action.taskId);
+        if (!target || target.projectId !== state.id || target.role === 'coordinator') throw new Error('Target is not a worker in this project');
+        return this.host.supersedeInput(callerId, state.id, action);
+      }
       case 'control': {
         if (member.role !== 'coordinator') throw new Error('Only the coordinator can control workers');
         const target = this.ledger.membership(action.taskId);
@@ -226,7 +235,7 @@ export class ProjectRuntime {
   rotateIfReady(task: Task): boolean {
     const raw = this.store.meta(`project-rotation:${task.id}`);
     if (!raw || this.ledger.membership(task.id)?.role !== 'coordinator' || task.status !== 'idle' || task.requests.length
-      || this.store.inputs(task.id).some(input => ['pending', 'delivering', 'uncertain', 'held'].includes(input.status))) return false;
+      || this.store.inputs(task.id).some(inputNeedsDelivery)) return false;
     const action = projectActionSchema.parse(JSON.parse(raw));
     if (action.action !== 'rotate') throw new Error('Invalid rotation record');
     this.store.transaction(() => {

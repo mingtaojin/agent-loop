@@ -17,6 +17,7 @@ import { FeishuDocumentProgressPublisher } from './feishu-document-progress.js';
 import { taskProgressStatus } from './feishu-progress-view.js';
 import { ProjectRuntime } from './project-runtime.js';
 import type { ProjectAction } from './project.js';
+import { inputBlocksDelivery, supersedeInputSchema, type InputDisposition, type SupersedeInput } from './input-delivery.js';
 
 const digest = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex');
 const approvalOutputSchema = z.object({ taskId: z.string(), request: requestSchema });
@@ -49,6 +50,7 @@ export class AgentLoop {
       makeTask: async (sourceId, prompt) => this.newTask(sourceId, { kind: 'cli', ...ProjectRuntime.submission(sourceId, prompt), submittedAt: Date.now() }),
       releaseWorkspace: (taskId, resourceId) => this.releaseWorkspace(taskId, resourceId),
       control: (taskId, action) => this.control(taskId, action),
+      supersedeInput: (callerId, projectId, action) => this.supersedeInput(callerId, projectId, action),
     });
     this.submissionService = new SubmissionService(config.dataDir, config.submission, input => this.submit(input));
     const progress = config.feishu.progress;
@@ -150,7 +152,11 @@ export class AgentLoop {
       const launcher = [process.execPath, ...(import.meta.url.endsWith('.ts') ? ['--import', fileURLToPath(import.meta.resolve('tsx'))] : []), client].map(quote).join(' ');
       projectFallback = `\nIf project_action is absent in a retained Thread, write the action JSON to a file and run ${launcher} ${quote(capability)} '<absolute-action-json-file>' using your shell tool. This task-scoped capability uses the same project operations. Never read, copy or share the capability contents.`;
     }
-    const prompt = rolePrompt + this.submissionInstructions() + this.projects.instructions(task.id) + projectFallback;
+    const dispositions = this.store.inputs(task.id).flatMap(input => input.disposition
+      ? [{ inputId: input.id, successorInputId: input.disposition.request.successorInputId, deliveryOutcome: 'unknown' }] : []);
+    const dispositionContext = dispositions.length
+      ? `\nInput delivery dispositions as data: ${JSON.stringify(dispositions)}\nBefore acting on saved follow-ups, reconcile existing work and effects. Delivery of the superseded input remains unknown. Do not replay it. Repeated instructions do not authorize repeating business effects.` : '';
+    const prompt = rolePrompt + this.submissionInstructions() + this.projects.instructions(task.id) + projectFallback + dispositionContext;
     const skill = this.config.engineering?.skillPath;
     let projects: DiscoveredProject[] = [];
     let discoveryError = '';
@@ -499,7 +505,55 @@ export class AgentLoop {
       : { ...common, kind: 'git-worktree', repository: resource.repository, branch: resource.branch });
     if (actual !== resource.workspace) throw new Error('Workspace association changed');
   }
-  private hasUnknownInput(task: Task): boolean { return this.store.inputs(task.id).some(input => ['delivering', 'uncertain'].includes(input.status)); }
+  private hasUnknownInput(task: Task): boolean { return this.store.inputs(task.id).some(inputBlocksDelivery); }
+  private async supersedeInput(callerId: string, projectId: string, action: SupersedeInput): Promise<InputDisposition> {
+    const request = supersedeInputSchema.parse(action);
+    let result: InputDisposition | undefined;
+    await this.serial(request.taskId, async () => {
+      const existing = this.store.inputDisposition(request.taskId, request.inputId);
+      if (existing) {
+        if (existing.actorTaskId !== callerId || existing.projectId !== projectId || JSON.stringify(existing.request) !== JSON.stringify(request))
+          throw new Error('Input already has a different disposition');
+        result = existing;
+        return;
+      }
+      const task = this.store.task(request.taskId);
+      if (this.stopping || task.threadId !== request.threadId) throw new Error('Input disposition Thread does not match');
+      if (task.status !== 'paused' || task.reason !== 'Operator paused' || task.requests.length || task.recovery.nextAttemptAt !== null)
+        throw new Error('Input disposition requires an explicitly paused task without pending requests or recovery');
+      const authorization = this.store.inputs(callerId).find(input => input.id === request.authorizationInputId);
+      if (!authorization || authorization.origin !== 'user' || authorization.provenance.kind !== 'user'
+        || authorization.message.senderId !== this.config.feishu.userOpenId || authorization.status !== 'delivered')
+        throw new Error('Input disposition requires a delivered authorization from the configured user in the coordinator inbox');
+      const inputs = this.store.inputs(task.id);
+      const input = inputs.find(item => item.id === request.inputId);
+      if (!input || input.status !== 'uncertain' || input.origin !== 'user' || input.provenance.kind !== 'user'
+        || input.route !== 'task' || input.requestId !== null)
+        throw new Error('Only an uncertain ordinary user input can be superseded');
+      const successor = inputs.find(item => item.id === request.successorInputId);
+      if (!successor || successor.seq <= input.seq || !['pending', 'held'].includes(successor.status) || successor.disposition
+        || successor.route !== 'task' || successor.requestId !== null)
+        throw new Error('Successor must be a later saved input still awaiting delivery');
+      const source = successor.provenance;
+      const authorizedSuccessor = source.kind === 'user' && successor.origin === 'user' && successor.message.senderId === this.config.feishu.userOpenId
+        || source.kind === 'agent' && source.category === 'instruction' && source.projectId === projectId && source.taskId === callerId;
+      if (!authorizedSuccessor) throw new Error('Successor must come from the configured user or the project coordinator');
+      if (this.store.approvals(task.id).some(item => ['pending', 'processing', 'uncertain'].includes(item.status)))
+        throw new Error('Native approval outcomes must be reconciled before superseding input');
+      const snapshot = await this.inspect(request.threadId);
+      if (snapshot.threadId !== request.threadId || !['idle', 'completed'].includes(snapshot.status) || snapshot.requests.length)
+        throw new Error('Input disposition requires confirmed native idle state without pending requests');
+      if (snapshot.seenInputIds.includes(input.id)) throw new Error('Native history proves delivery; reconcile it instead of superseding');
+      if (this.stopping) throw new Error('Runtime is stopping');
+      const disposition: InputDisposition = { kind: 'superseded', request, projectId, actorTaskId: callerId,
+        recordedAt: Date.now(), observedTurnId: snapshot.turnId,
+        delivery: { status: 'uncertain', error: input.error, inputDigest: digest(JSON.stringify({ message: input.message, provenance: input.provenance })) } };
+      this.store.transaction(() => this.store.saveInputDisposition(disposition));
+      result = disposition;
+    });
+    if (!result) throw new Error('Input disposition was not recorded');
+    return result;
+  }
   private fault(task: Task, error: unknown, turnId: string | null = task.turnId): void {
     const message = errorMessage(error);
     task.executionStatus = 'unknown'; task.reason = message;
@@ -663,7 +717,7 @@ export class AgentLoop {
     const inputs = this.store.inputs(task.id).sort((a, b) => Number(b.origin === 'initial') - Number(a.origin === 'initial') || a.seq - b.seq);
     if (task.threadId && !this.stopping && task.status !== 'paused' && task.status !== 'failed'
       && inputs.some(input => input.route === 'workspace-selection' && input.selectionHandled && input.status !== 'delivered')
-      && !inputs.some(input => input.status === 'delivering' || input.status === 'uncertain')) {
+      && !inputs.some(inputBlocksDelivery)) {
       const snapshot = await this.inspect(task.threadId);
       if (snapshot.turnId === null && !snapshot.seenInputIds.length) {
         if (inputs.some(input => input.route === 'workspace-selection' && input.selectionHandled && input.status === 'failed')) return;
@@ -700,11 +754,12 @@ export class AgentLoop {
     }
     for (const input of inputs) {
       if (this.stopping) break;
+      if (input.disposition) continue;
       if (input.status === 'delivered') continue;
       if (input.status === 'failed') continue;
       if (!task.threadId) break;
       const snapshot = await this.inspect(task.threadId);
-      if (['delivering', 'uncertain'].includes(input.status)) {
+      if (inputBlocksDelivery(input)) {
         if (snapshot.seenInputIds.includes(input.id)) { this.store.markInput(input.id, 'delivered'); continue; }
         this.store.markInput(input.id, 'uncertain', '上次投递结果无法核对'); break;
       }

@@ -111,6 +111,185 @@ async function fixture(t: TestContext, options: { coordinated?: boolean; secondP
   };
 }
 
+async function blockedInputFixture(t: TestContext) {
+  const f = await fixture(t, { secondProject: true });
+  const coordinator = await f.initialize();
+  const worker = await f.dispatch('disposition-worker', 'Continue only after reconciling existing effects.');
+  assert.ok(worker.threadId && worker.chatId && coordinator.chatId);
+  const threadId = worker.threadId;
+  f.codex.complete(threadId, null); await f.loop.tick();
+  const start = f.codex.startTurn.bind(f.codex);
+  f.codex.startTurn = async input => {
+    if (input.deliveryId === 'old-unknown') throw new Error('turn/start: synthetic provider rejection');
+    return start(input);
+  };
+  await f.loop.receive(f.message('old-unknown', 'Old instruction', worker.chatId));
+  f.codex.startTurn = start;
+  await f.loop.receive(f.message('successor', 'Check existing work before continuing the effective instruction.', worker.chatId));
+  await f.loop.receive(f.message('operator-authorization', 'Authorize this exact input disposition after reviewing the evidence.', coordinator.chatId));
+  await f.loop.projectAction(coordinator.id, { action: 'control', requestId: 'pause-disposition', taskId: worker.id, operation: 'pause' });
+  const original = f.loop.store.inputs(worker.id).find(input => input.id === 'old-unknown'); assert.ok(original);
+  assert.equal(original.status, 'uncertain');
+  const action = { action: 'supersede_input', requestId: 'disposition-1', taskId: worker.id, threadId, inputId: original.id,
+    successorInputId: 'successor', authorizationInputId: 'operator-authorization', reason: 'The saved successor replaces this instruction; do not replay it.',
+    evidence: 'Synthetic explicit turn/start rejection and complete native history without this input.' };
+  return { ...f, worker, coordinator, threadId, original, action,
+    get loop() { return f.loop; },
+    dispose: (changes: object = {}, caller = coordinator.id) => f.loop.projects.action(caller, { ...action, ...changes }),
+  };
+}
+
+test('supersede_input preserves uncertainty and evidence, then resumes saved inputs in the same Thread', async t => {
+  const f = await blockedInputFixture(t);
+  const identities = f.loop.store.task(f.worker.id);
+  const model = f.loop.store.meta(`project-task-model:${f.worker.id}`);
+  f.loop.store.receive(f.worker.id, f.message('successor-repeat', 'Check existing work before continuing the effective instruction.', f.worker.chatId!));
+  const receipts = f.loop.store.outputs(f.worker.id);
+  const created = f.codex.created.length, starts = f.codex.starts.length;
+  const result = await f.dispose();
+  const audit = z.object({ kind: z.literal('superseded'), actorTaskId: z.string(), delivery: z.object({ status: z.literal('uncertain'), error: z.string().nullable() }) }).parse(result);
+  assert.equal(audit.actorTaskId, f.coordinator.id); assert.equal(audit.delivery.error, f.original.error);
+  const current = f.loop.store.inputs(f.worker.id).find(input => input.id === f.original.id); assert.ok(current);
+  const { disposition, ...facts } = current;
+  assert.deepEqual(disposition, result); assert.deepEqual(facts, f.original);
+  assert.deepEqual(f.loop.store.outputs(f.worker.id), receipts);
+  assert.equal(f.codex.starts.length, starts); assert.equal(f.loop.store.task(f.worker.id).status, 'paused');
+  assert.deepEqual(await f.dispose(), result);
+  await f.restart(); assert.deepEqual(await f.dispose(), result);
+  await f.loop.control(f.worker.id, 'resume');
+  assert.equal(f.loop.store.task(f.worker.id).threadId, f.threadId);
+  assert.deepEqual(f.loop.store.task(f.worker.id).resources, identities.resources);
+  assert.equal(f.loop.store.meta(`project-task-model:${f.worker.id}`), model);
+  assert.equal(f.codex.created.length, created);
+  assert.equal(f.codex.starts.filter(input => input.deliveryId === f.original.id).length, 0);
+  assert.equal(f.codex.starts.filter(input => input.deliveryId === 'successor').length, 1);
+  assert.equal(f.loop.store.inputs(f.worker.id).find(input => input.id === f.original.id)?.status, 'uncertain');
+  assert.equal(f.loop.store.inputs(f.worker.id).find(input => input.id === 'successor')?.status, 'delivered');
+  assert.equal(f.loop.store.inputs(f.worker.id).find(input => input.id === 'successor-repeat')?.status, 'delivered');
+  assert.match(f.codex.instructionUpdates.filter(input => input.threadId === f.threadId).at(-1)?.instructions ?? '', /Before acting on saved follow-ups, reconcile existing work and effects/);
+  await assert.rejects(f.dispose({ reason: 'Changed meaning under the same request ID' }), /different content/);
+  await assert.rejects(f.dispose({ requestId: 'other-disposition' }), /different disposition/);
+  const readOnly = new Store(f.root, { readOnly: true });
+  try { assert.deepEqual(readOnly.inputs(f.worker.id).find(input => input.id === f.original.id)?.disposition, result); }
+  finally { readOnly.close(); }
+});
+
+test('supersede_input survives a crash after recording the disposition but before the project receipt', async t => {
+  const f = await blockedInputFixture(t);
+  const save = f.loop.projects.ledger.saveReceipt.bind(f.loop.projects.ledger);
+  f.loop.projects.ledger.saveReceipt = () => { throw new Error('Synthetic receipt acknowledgement lost'); };
+  await assert.rejects(f.dispose(), /acknowledgement lost/);
+  const recorded = f.loop.store.inputs(f.worker.id).find(input => input.id === f.original.id)?.disposition; assert.ok(recorded);
+  f.loop.projects.ledger.saveReceipt = save;
+  await f.restart(); assert.deepEqual(await f.dispose(), recorded);
+  assert.equal(f.loop.store.task(f.worker.id).status, 'paused');
+  assert.equal(f.codex.starts.filter(input => input.deliveryId === f.original.id).length, 0);
+});
+
+for (const invalid of ['worker', 'foreign-project', 'thread', 'input', 'pending-input', 'delivering-input', 'authorization-agent', 'authorization-sender',
+  'authorization-pending', 'successor-missing', 'successor-earlier', 'successor-source', 'successor-delivered', 'not-paused',
+  'native-running', 'native-failed', 'native-interrupted', 'native-request', 'legacy-paused', 'proven-delivered', 'approval-unknown'] as const) {
+  test(`supersede_input rejects ${invalid} without changing the queue`, async t => {
+    const f = await blockedInputFixture(t);
+    let changes: object = {}, caller = f.coordinator.id;
+    const beforeStarts = f.codex.starts.length;
+    const snapshot = f.codex.snapshot(f.threadId);
+    switch (invalid) {
+      case 'worker': caller = f.worker.id; break;
+      case 'foreign-project': caller = f.state('docs').coordinatorTaskId; break;
+      case 'thread': changes = { threadId: 'other-thread' }; break;
+      case 'input': changes = { inputId: 'absent-input' }; break;
+      case 'pending-input': f.loop.store.markInput(f.original.id, 'pending'); break;
+      case 'delivering-input': f.loop.store.markInput(f.original.id, 'delivering'); break;
+      case 'authorization-agent': {
+        const agentInput = f.loop.store.inputs(f.coordinator.id).find(input => input.provenance.kind === 'agent'); assert.ok(agentInput);
+        changes = { authorizationInputId: agentInput.id }; break;
+      }
+      case 'authorization-sender': f.config.feishu.userOpenId = 'different-owner'; break;
+      case 'authorization-pending': f.loop.store.markInput('operator-authorization', 'pending'); break;
+      case 'successor-missing': changes = { successorInputId: 'absent' }; break;
+      case 'successor-earlier': changes = { successorInputId: f.loop.store.inputs(f.worker.id)[0]?.id }; break;
+      case 'successor-source': {
+        const message = f.message('untrusted-successor', 'Untrusted instruction', f.worker.chatId!);
+        f.loop.store.receive(f.worker.id, message, 'source', { kind: 'agent', projectId: 'app', taskId: f.worker.id, eventId: message.id, category: 'instruction' });
+        changes = { successorInputId: message.id }; break;
+      }
+      case 'successor-delivered': f.loop.store.markInput('successor', 'delivered'); break;
+      case 'not-paused': {
+        const task = f.loop.store.task(f.worker.id); task.status = 'idle'; f.loop.store.saveTask(task); break;
+      }
+      case 'native-running': snapshot.status = 'running'; break;
+      case 'native-failed': snapshot.status = 'failed'; break;
+      case 'native-interrupted': snapshot.status = 'interrupted'; break;
+      case 'legacy-paused': {
+        const task = f.loop.store.task(f.worker.id); task.reason = 'Legacy paused'; f.loop.store.saveTask(task); break;
+      }
+      case 'native-request': {
+        assert.ok(snapshot.turnId);
+        snapshot.requests = [{ id: 'live-question', threadId: f.threadId, turnId: snapshot.turnId, kind: 'question', prompt: 'Still waiting',
+          method: 'item/tool/requestUserInput', payload: {}, isBlocking: true, connectionEpoch: 'fixture' }]; break;
+      }
+      case 'proven-delivered': snapshot.seenInputIds.push(f.original.id); break;
+      case 'approval-unknown': {
+        f.loop.store.queueApproval({ id: 'queued-approval', senderId: 'owner', taskId: f.worker.id, chatId: f.worker.chatId!, threadId: f.threadId, turnId: snapshot.turnId!,
+          requestId: 'unknown-approval', epoch: 'fixture', decision: 'approve' }); break;
+      }
+    }
+    const inputs = f.loop.store.inputs(f.worker.id);
+    await assert.rejects(f.dispose(changes, caller));
+    assert.deepEqual(f.loop.store.inputs(f.worker.id), inputs);
+    assert.equal(f.codex.starts.length, beforeStarts);
+  });
+}
+
+test('supersede_input holds the task lane until native inspection finishes, then permits explicit resume', async t => {
+  const f = await blockedInputFixture(t);
+  const inspect = f.codex.inspect.bind(f.codex);
+  let release = () => {}, entered = () => {};
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const inspecting = new Promise<void>(resolve => { entered = resolve; });
+  let blocked = false;
+  f.codex.inspect = async (...args) => {
+    if (args[0] === f.threadId && !blocked) { blocked = true; entered(); await gate; }
+    return inspect(...args);
+  };
+  const disposition = f.dispose(); await inspecting;
+  const resumed = f.loop.control(f.worker.id, 'resume');
+  assert.equal(f.loop.store.task(f.worker.id).status, 'paused');
+  assert.equal(f.loop.store.inputs(f.worker.id).find(input => input.id === f.original.id)?.disposition, undefined);
+  release(); await disposition; await resumed;
+  assert.equal(f.codex.starts.filter(input => input.deliveryId === 'successor').length, 1);
+  assert.equal(f.codex.starts.filter(input => input.deliveryId === f.original.id).length, 0);
+});
+
+test('supersede_input does not block bounded recovery of a later execution failure', async t => {
+  const f = await blockedInputFixture(t);
+  await f.dispose(); await f.loop.control(f.worker.id, 'resume');
+  const snapshot = f.codex.snapshot(f.threadId);
+  snapshot.status = 'failed'; snapshot.error = 'A later execution failed';
+  await f.loop.tick();
+  const task = f.loop.store.task(f.worker.id);
+  assert.notEqual(task.recovery.nextAttemptAt, null);
+  assert.equal(task.recovery.interruptedTurnId, snapshot.turnId);
+  assert.equal(f.loop.store.inputs(f.worker.id).find(input => input.id === f.original.id)?.status, 'uncertain');
+});
+
+test('supersede_input accepts a saved coordinator successor and rejects worker capability use on the Unix socket', async t => {
+  const f = await blockedInputFixture(t);
+  await f.loop.projectAction(f.coordinator.id, { action: 'send', requestId: 'replacement', taskId: f.worker.id, text: 'Reconcile existing work before continuing.' });
+  const successor = f.events(f.worker.id, 'instruction').find(input => input.message.text.includes('Reconcile existing')); assert.ok(successor);
+  const file = join(f.root, 'supersede-action.json');
+  await writeFile(file, JSON.stringify({ ...f.action, successorInputId: successor.id }));
+  const command = /run (.+) '<absolute-action-json-file>'/.exec(f.codex.created.find(input => input.instructions.includes('Project role: coordinator. Project: app.'))?.instructions ?? '')?.[1]; assert.ok(command);
+  const result = await promisify(execFile)('/bin/sh', ['-c', `${command} "$1"`, 'project-disposition', file], { timeout: 10_000 });
+  const audit = z.object({ kind: z.literal('superseded'), request: z.object({ successorInputId: z.string() }) }).parse(JSON.parse(result.stdout));
+  assert.equal(audit.request.successorInputId, successor.id);
+  assert.equal(f.loop.store.task(f.worker.id).status, 'paused');
+  const workerCommand = /run (.+) '<absolute-action-json-file>'/.exec(f.codex.created.find(input => input.instructions.includes('Project role: worker.'))?.instructions ?? '')?.[1];
+  assert.ok(workerCommand);
+  await assert.rejects(promisify(execFile)('/bin/sh', ['-c', `${workerCommand} "$1"`, 'worker-disposition', file], { timeout: 10_000 }), /active conversation|active turn|coordinator/i);
+});
+
 test('project collection uses label OR assignee across repositories without creating ordinary Issue tasks', async t => {
   const f = await fixture(t);
   const matched = [
