@@ -8,6 +8,7 @@ import { criteriaSchema, taskSchema, type Task } from '../src/domain.js';
 import { discoverProjects } from '../src/project-discovery.js';
 import { ProjectCatalog } from '../src/project-catalog.js';
 import { ProjectRuntime, intakeMaterialVersion } from '../src/project-runtime.js';
+import { TaskCloseout } from '../src/task-closeout.js';
 import { Store } from '../src/store.js';
 import { issue } from './fakes.js';
 
@@ -22,6 +23,7 @@ async function fixture(t: TestContext) {
     repositories: [{ name: 'owner/beta', path: beta, baseBranch: 'main', criteria: { assigneesAny: ['alice'] } }],
   });
   let store = new Store(config.dataDir);
+  let closeout = new TaskCloseout(store, { usage: async () => null, protectedPaths: () => [] });
   let created = 0;
   function task(id: string, changes: Partial<Task> = {}): Task {
     return taskSchema.parse({ id, sourceId: id,
@@ -31,6 +33,7 @@ async function fixture(t: TestContext) {
       turnId: null, lastHandledTurnId: null, requests: [], createdAt: 1, updatedAt: 1, ...changes });
   }
   const host = {
+    get closeout() { return closeout; },
     async makeTask(sourceId: string, prompt: string) {
       created++;
       return task(`created-${created}`, { sourceId, purpose: 'execution', prompt,
@@ -48,6 +51,7 @@ async function fixture(t: TestContext) {
     get store() { return store; }, get runtime() { return runtime; }, get created() { return created; },
     async restart() {
       await runtime.close(); store.close(); store = new Store(config.dataDir);
+      closeout = new TaskCloseout(store, { usage: async () => null, protectedPaths: () => [] });
       runtime = new ProjectRuntime(config, store, host); await runtime.ensure();
     },
     events(taskId: string, category: string) {

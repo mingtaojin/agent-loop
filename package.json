@@ -12,6 +12,7 @@
     "test": "tsx --test test/*.test.ts",
     "start": "tsx src/cli.ts",
     "verify:shared-codex": "npm run build && tsx scripts/verify-shared-codex.ts",
+    "verify:closeout": "tsx --test test/task-closeout.test.ts",
     "verify:codex": "tsx scripts/verify-codex.ts",
     "verify:inputs": "tsx scripts/verify-inputs.ts",
     "pair:feishu": "tsx scripts/pair-feishu.ts",

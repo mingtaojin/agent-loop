@@ -110,6 +110,7 @@ type ThreadLoad = { kind: 'unloaded' } | { kind: 'ready' } | { kind: 'pending'; 
   | { kind: 'uncertain'; error: Error } | { kind: 'failed'; error: Error };
 type ThreadEntry = { load: ThreadLoad; untouched: boolean; instructions: string | undefined; model?: string; reasoningEffort?: ReasoningEffort };
 class RpcTimeoutError extends UncertainOperationError {}
+type NativeResponse = { kind: 'result'; value: unknown } | { kind: 'error'; value: { code: number; message: string } };
 type CompletedHistory = { turnId: string; status: 'completed'; error: string | null; seenInputIds: string[]; digest: string };
 type HistoryObservation = { completed?: CompletedHistory };
 class TurnHistoryPendingError extends UncertainOperationError {}
@@ -167,6 +168,7 @@ export class CodexAppServer implements CodexPort {
   private readonly outputs = new Map<string, AgentOutput>();
   private sequence = 0;
   private eventHandler: ((event: ExecutionEvent) => void) | undefined;
+  private completionPolicy: { isCompleted(threadId: string): boolean } | undefined;
   private readonly selectors = new Set<CodexAppServer>();
   private selectorsClosing = false;
   private selectionThreadId: string | undefined;
@@ -175,6 +177,14 @@ export class CodexAppServer implements CodexPort {
   private selectionRun: { threadId: string; resolve: (turn: z.infer<typeof turnSchema>) => void; reject: (error: Error) => void } | undefined;
 
   setEventHandler(handler: (event: ExecutionEvent) => void): void { this.eventHandler = handler; }
+  setThreadCompletionPolicy(policy: { isCompleted(threadId: string): boolean }): void { this.completionPolicy = policy; }
+  assertThreadCompletionAllowed(threadId: string): void {
+    if (this.closed || this.failure || !this.initialized || !this.connection || this.threads.get(threadId)?.load.kind !== 'ready') throw new Error('Native request state is unavailable');
+    if ([...this.requests.values()].some(live => live.request.threadId === threadId)) throw new Error('Reconcile unresolved native requests before completion');
+  }
+  private assertThreadOpen(threadId: string): void {
+    if (this.completionPolicy?.isCompleted(threadId)) throw new RejectedInputError('Task completed; Thread is sealed');
+  }
 
   constructor(private readonly options: CodexOptions, connector?: CodexConnector) {
     if (!Number.isFinite(options.requestTimeoutMs) || options.requestTimeoutMs <= 0) throw new Error('Positive Codex requestTimeoutMs is required');
@@ -230,13 +240,14 @@ export class CodexAppServer implements CodexPort {
     void connection?.close().catch(() => undefined);
   }
 
-  private async write(message: unknown): Promise<void> {
+  private async write(message: unknown, failurePolicy: 'fail-connection' | 'retain-request' = 'fail-connection'): Promise<void> {
     if (this.failure) throw this.failure;
     if (!this.connection) throw new Error('Codex is not connected');
     try { await this.connection.send(JSON.stringify(message)); }
     catch (error) {
       const failure = new UncertainOperationError(`Codex transport write failed: ${error instanceof Error ? error.message : String(error)}`);
-      this.fail(failure); throw failure;
+      if (failurePolicy === 'fail-connection') this.fail(failure);
+      throw failure;
     }
   }
 
@@ -324,7 +335,9 @@ export class CodexAppServer implements CodexPort {
     const id = this.requestId(rpcId);
     if (this.seenRequestIds.has(id)) return;
     this.seenRequestIds.add(id);
-    if (method === 'item/tool/call') {
+    const scope = threadScopeSchema.safeParse(payload);
+    const completed = scope.success && this.completionPolicy?.isCompleted(scope.data.threadId);
+    if (method === 'item/tool/call' && !completed) {
       const epoch = this.epoch;
       const { tool } = z.object({ tool: z.string() }).parse(payload);
       const operation = tool === 'project_action' ? this.projectCall(rpcId, payload, epoch) : this.workspaceCall(rpcId, payload, epoch);
@@ -357,7 +370,16 @@ export class CodexAppServer implements CodexPort {
       prompt = `${params.reason ?? 'Additional permissions requested'}\n${JSON.stringify(params.permissions)}\nUse the approval action to approve or reject this request. Grants apply to this turn only.`;
     }
     const request: PendingRequest = { id: this.requestId(rpcId), isBlocking, connectionEpoch: this.epoch, threadId: base.data.threadId, turnId: base.data.turnId ?? '', kind, method, payload, prompt };
-    this.requests.set(request.id, { rpcId, request, response, responseSent: false, waiters: new Set() });
+    const live: LiveRequest = { rpcId, request, response, responseSent: false, waiters: new Set() };
+    this.requests.set(request.id, live);
+    if (completed) {
+      let denial: NativeResponse;
+      if (response.kind === 'approval') denial = { kind: 'result', value: { decision: 'decline' } };
+      else if (response.kind === 'permissions') denial = { kind: 'result', value: { permissions: {}, scope: 'turn' } };
+      else if (method === 'item/tool/call') denial = { kind: 'result', value: { success: false, contentItems: [{ type: 'inputText', text: 'Task completed' }] } };
+      else denial = { kind: 'error', value: { code: -32000, message: 'Task completed; native input unavailable' } };
+      void this.respond(live, denial, 'retain-request').catch(() => undefined);
+    }
   }
 
   private config() {
@@ -490,9 +512,12 @@ export class CodexAppServer implements CodexPort {
   }
 
   private async resume(threadId: string, instructions?: string, model?: string, reasoningEffort?: ReasoningEffort): Promise<void> {
+    this.assertThreadOpen(threadId);
     await this.ready();
+    this.assertThreadOpen(threadId);
     const entry = this.threads.get(threadId);
     if (entry?.load.kind === 'pending') await entry.load.request;
+    this.assertThreadOpen(threadId);
     if (entry?.load.kind === 'uncertain') throw entry.load.error;
     if (entry?.load.kind === 'ready' && (instructions === undefined || instructions === entry.instructions)
       && (model === undefined || model === entry.model) && (reasoningEffort === undefined || reasoningEffort === entry.reasoningEffort)) return;
@@ -527,6 +552,7 @@ export class CodexAppServer implements CodexPort {
     }).finally(() => { this.historyObservations.delete(threadId); });
     current.load = { kind: 'pending', request };
     await request;
+    this.assertThreadOpen(threadId);
   }
 
   isActiveTurn(identity: TurnIdentity): boolean {
@@ -552,6 +578,28 @@ export class CodexAppServer implements CodexPort {
       requests: [...this.requests.values()].map(live => live.request).filter(request => request.threadId === threadId
         && (request.turnId === turnId || (request.kind === 'unsupported' && !request.turnId))),
       outputs: [...this.outputs.values()].filter(output => output.threadId === threadId && output.turnId === turnId && output.phase === 'progress') };
+  }
+
+  async executionUse(threadId: string): Promise<'idle' | 'busy' | 'unknown'> {
+    await this.ready();
+    const epoch = this.epoch;
+    const pendingRequests = () => [...this.requests.values()].some(live => live.request.threadId === threadId);
+    if (pendingRequests()) return 'busy';
+    const { thread } = threadResponseSchema.parse(await this.rpc('thread/read', { threadId, includeTurns: false }));
+    if (thread.id !== threadId) throw new Error('Codex returned a different thread');
+    if (thread.status.type === 'active' || pendingRequests()) return 'busy';
+    if (thread.status.type !== 'idle' || epoch !== this.epoch) return 'unknown';
+    const expectedTurn = this.awaitingHistory.get(threadId) ?? this.activeTurns.get(threadId);
+    if (expectedTurn) {
+      const turns = thread.historyMode === 'paginated'
+        ? turnPageSchema.parse(await this.rpc('thread/turns/list', { threadId, cursor: null, limit: 1, sortDirection: 'desc', itemsView: 'summary' })).data
+        : threadResponseSchema.parse(await this.rpc('thread/read', { threadId, includeTurns: true })).thread.turns;
+      const latest = turns.at(-1);
+      if (!latest || latest.id !== expectedTurn || latest.status === 'inProgress' || epoch !== this.epoch || pendingRequests()) return 'unknown';
+      this.awaitingHistory.delete(threadId);
+      this.activeTurns.delete(threadId);
+    }
+    return 'idle';
   }
 
   async inspect(threadId: string, instructions?: string, model?: string, reasoningEffort?: ReasoningEffort): Promise<ExecutionSnapshot> {
@@ -660,6 +708,7 @@ export class CodexAppServer implements CodexPort {
   async startTurn(input: Parameters<CodexPort['startTurn']>[0]): Promise<string> {
     this.historyObservations.delete(input.threadId);
     await this.resume(input.threadId);
+    this.assertThreadOpen(input.threadId);
     const entry = this.threads.get(input.threadId);
     if (entry) entry.untouched = false;
     this.historyObservations.delete(input.threadId);
@@ -687,6 +736,7 @@ export class CodexAppServer implements CodexPort {
   async steer(input: Parameters<CodexPort['steer']>[0]): Promise<void> {
     this.historyObservations.delete(input.threadId);
     await this.resume(input.threadId);
+    this.assertThreadOpen(input.threadId);
     try {
       this.historyObservations.delete(input.threadId);
       const response = z.object({ turnId: z.string() }).parse(await this.rpc('turn/steer', {
@@ -702,6 +752,7 @@ export class CodexAppServer implements CodexPort {
   async reply(input: { request: PendingRequest; text: string }): Promise<void> {
     this.historyObservations.delete(input.request.threadId);
     await this.ready();
+    this.assertThreadOpen(input.request.threadId);
     const live = this.liveRequest(input.request);
     if (live.response.kind !== 'question') throw new RejectedInputError('Only native questions can receive ordinary replies');
     let result: unknown;
@@ -715,12 +766,13 @@ export class CodexAppServer implements CodexPort {
         result = answer;
       }
     } catch (error) { throw new RejectedInputError(error instanceof Error ? error.message : String(error)); }
-    if (!await this.respond(live, result)) throw new UncertainOperationError('Codex question response has no native resolution acknowledgement');
+    if (!await this.respond(live, { kind: 'result', value: result })) throw new UncertainOperationError('Codex question response has no native resolution acknowledgement');
   }
 
   async respondApproval(input: Parameters<CodexPort['respondApproval']>[0]): Promise<'confirmed' | 'uncertain'> {
     this.historyObservations.delete(input.request.threadId);
     await this.ready();
+    this.assertThreadOpen(input.request.threadId);
     const live = this.liveRequest(input.request);
     let result: unknown;
     switch (live.response.kind) {
@@ -728,7 +780,7 @@ export class CodexAppServer implements CodexPort {
       case 'permissions': result = { permissions: input.decision === 'approve' ? live.response.permissions : {}, scope: 'turn' }; break;
       default: throw new RejectedInputError('This native request is not an approval');
     }
-    return await this.respond(live, result) ? 'confirmed' : 'uncertain';
+    return await this.respond(live, { kind: 'result', value: result }) ? 'confirmed' : 'uncertain';
   }
 
   private liveRequest(request: PendingRequest): LiveRequest {
@@ -738,7 +790,7 @@ export class CodexAppServer implements CodexPort {
     return live;
   }
 
-  private async respond(live: LiveRequest, result: unknown): Promise<boolean> {
+  private async respond(live: LiveRequest, response: NativeResponse, failurePolicy: 'fail-connection' | 'retain-request' = 'fail-connection'): Promise<boolean> {
     this.historyObservations.delete(live.request.threadId);
     live.responseSent = true;
     const resolved = new Promise<boolean>(resolve => {
@@ -747,7 +799,7 @@ export class CodexAppServer implements CodexPort {
       live.waiters.add(settle);
     });
     try {
-      await this.write({ id: live.rpcId, result });
+      await this.write(response.kind === 'result' ? { id: live.rpcId, result: response.value } : { id: live.rpcId, error: response.value }, failurePolicy);
       return await resolved;
     } finally { this.historyObservations.delete(live.request.threadId); }
   }
@@ -849,7 +901,7 @@ export class CodexAppServer implements CodexPort {
       for (const threadId of [...this.threads.keys()]) {
         try {
           if (this.failure) await this.recover();
-          if (this.needsCleanup.has(threadId) || this.activeTurns.has(threadId)) await this.stopOwnedThread(threadId);
+          if (!this.completionPolicy?.isCompleted(threadId) && (this.needsCleanup.has(threadId) || this.activeTurns.has(threadId))) await this.stopOwnedThread(threadId);
           await this.rpc('thread/unsubscribe', { threadId });
         } catch (error) { failures.push(error); }
       }

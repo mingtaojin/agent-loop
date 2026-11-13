@@ -73,6 +73,9 @@ export interface CodexPort {
   setEventHandler?(handler: (event: ExecutionEvent) => void): void;
   createThread(input: { cwd: string; instructions: string; model?: string; reasoningEffort?: ReasoningEffort }): Promise<string>;
   inspect(threadId: string, instructions?: string, model?: string, reasoningEffort?: ReasoningEffort): Promise<ExecutionSnapshot>;
+  executionUse?(threadId: string): Promise<'idle' | 'busy' | 'unknown'>;
+  setThreadCompletionPolicy?(policy: { isCompleted(threadId: string): boolean }): void;
+  assertThreadCompletionAllowed?(threadId: string): void;
   activity(threadId: string, instructions?: string, model?: string, reasoningEffort?: ReasoningEffort): Promise<Activity>;
   isActiveTurn(identity: TurnIdentity): boolean;
   startTurn(input: { threadId: string; input: AgentInput[]; deliveryId: string; additionalDeliveryIds?: string[]; additionalContext?: string }): Promise<string>;
@@ -86,8 +89,9 @@ export interface CodexPort {
   close(): Promise<void>;
 }
 export interface WorkspacePort {
+  readonly supportsCloseout?: boolean;
   release?(input: { taskId: string; resourceId: string; workspace: string; repository: Repository; branch: string }): Promise<void>;
-  ensure(input: { taskId: string; resourceId: string; workspace?: string } & (
+  ensure(input: { taskId: string; resourceId: string; workspace?: string; fresh?: boolean } & (
     { kind?: 'git-worktree'; repository: Repository; branch: string } |
     { kind: 'project-directory'; directory: string }
   )): Promise<string>;

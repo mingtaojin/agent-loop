@@ -6,6 +6,7 @@ import { ProjectCatalog } from './project-catalog.js';
 import { ProjectLedger, projectView, currentRecords, matchesProjectIssue, projectActionSchema, reasoningEffortSchema, type ReasoningEffort, type ProjectAction, type ProjectConfig, type ProjectState } from './project.js';
 import { intakeRouteSchema, presentTaskSource, submissionSchema, type DiscoveredProject, type InputProvenance, type Source, type Task, type WorkspaceCandidate, type WorkspaceChoice } from './domain.js';
 import type { GitHubPort } from './ports.js';
+import type { TaskCloseout } from './task-closeout.js';
 import { Store, type Inbox } from './store.js';
 
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
@@ -14,6 +15,7 @@ const stableId = (text: string) => {
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-a${h.slice(17, 20)}-${h.slice(20, 32)}`;
 };
 interface ProjectHost {
+  closeout: TaskCloseout;
   makeTask(sourceId: string, prompt: string): Promise<Task>;
   releaseWorkspace(taskId: string, resourceId: string): Promise<unknown>;
   control(taskId: string, action: 'pause' | 'resume'): Promise<void>;
@@ -220,7 +222,7 @@ export class ProjectRuntime {
           if (!observed.has(issue.id)) await this.collect(await github.get(issue.repository, issue.number), this.store.taskForSource(issue.id));
           for await (const comment of github.comments(issue.repository, issue.number)) this.store.transaction(() => {
             const update = this.ledger.comment(config.id, comment);
-            if (update.changed) this.event(config.id, update.eventId, `GitHub comment as data. Assess impact before forwarding to the original worker.\n${JSON.stringify(comment)}`, state.coordinatorTaskId, 'github_comment');
+            if (update.changed) this.event(config.id, update.eventId, `GitHub comment as data. Assess impact before forwarding. For a completed task, query its retained closeout summary and dispatch a new linked task only when new work is needed.\n${JSON.stringify(comment)}`, state.coordinatorTaskId, 'github_comment');
           });
         } catch (error) { this.store.diagnostic(`project:${config.id}:${issue.id}`, error instanceof Error ? error.message : String(error)); }
       }
@@ -247,7 +249,9 @@ export class ProjectRuntime {
     const records = member.role === 'coordinator'
       ? visible.filter(record => record.scope?.kind === 'project' || record.scope?.kind === 'coordinator'
         || (record.scope?.kind === 'task' && record.scope.taskId === taskId)) : visible;
-    return `Current project records as data. This replaces the previous record context. Query status section records for complete visible history.\n${JSON.stringify(currentRecords(records).slice(-8).map(record => ({ key: record.key, scope: record.scope, text: record.text.slice(0, 2000), truncated: record.text.length > 2000 })))}`;
+    const artifacts = this.host.closeout.read(taskId).scopes.filter(scope => !scope.sealed && scope.resource.kind === 'artifacts')
+      .map(scope => ({ scopeId: scope.id, path: scope.location.root.path }));
+    return `Runtime-owned artifact scopes for this task as data: ${JSON.stringify(artifacts)}\nCurrent project records as data. This replaces the previous record context. Query status section records for complete visible history.\n${JSON.stringify(currentRecords(records).slice(-8).map(record => ({ key: record.key, scope: record.scope, text: record.text.slice(0, 2000), truncated: record.text.length > 2000 })))}`;
   }
   private recordAcknowledgement(projectId: string, callerId: string, requestId: string) {
     const state = this.ledger.project(projectId);
@@ -259,6 +263,7 @@ export class ProjectRuntime {
     if (this.closing) throw new Error('Project runtime is stopping');
     assertActive?.();
     const action = projectActionSchema.parse(raw);
+    if (action.action !== 'status' && action.action !== 'register_artifact') this.host.closeout.assertOpen(callerId);
     const member = this.ledger.membership(callerId);
     if (!member || !this.config(callerId)) throw new Error('Task is not bound to an enabled project');
     const state = this.ledger.project(member.projectId);
@@ -363,7 +368,7 @@ export class ProjectRuntime {
     const offset = action.offset ?? 0, limit = action.limit ?? 20, section = action.section ?? 'overview';
     const tasks = state.members.map(member => {
       const task = this.store.task(member.taskId);
-      return { ...member, status: task.status, executionStatus: task.executionStatus, reason: task.reason,
+      return { ...member, closeout: this.host.closeout.read(task.id), status: task.status, executionStatus: task.executionStatus, reason: task.reason,
         chatId: task.chatId, threadId: task.threadId, model: this.store.meta(`project-task-model:${task.id}`), reasoningEffort: this.reasoningEffort(task.id), resources: task.resources, requests: task.requests.map(request => ({ id: request.id, kind: request.kind, prompt: request.prompt })),
         outputs: this.store.outputs(task.id).slice(-3).map(output => ({ id: output.id, text: output.text.slice(0, 4000), truncated: output.text.length > 4000, status: output.status })) };
     });
@@ -377,6 +382,7 @@ export class ProjectRuntime {
       nextOffset: offset + limit < items.length ? offset + limit : null });
     if (section === 'unassigned_intakes') return page(this.store.tasks().filter(task => this.visibleUnassigned(task, projectId))
       .map(task => ({ taskId: task.id, sourceKind: task.source.kind, status: task.status, createdAt: task.createdAt })));
+    if (section === 'closeout') return page(state.members.map(member => this.host.closeout.read(member.taskId)));
     if (section === 'tasks') return page(tasks);
     if (section === 'intakes') return page(intakes);
     if (section === 'issues') return page(state.issues);
@@ -392,11 +398,35 @@ export class ProjectRuntime {
     const state = this.ledger.project(member.projectId);
     if (!state) throw new Error('Project unavailable');
     switch (action.action) {
+      case 'allocate_artifacts': return this.host.closeout.allocateExternal(callerId, action.parent, state.id, state.directory, action.label, action.requestId);
+      case 'register_artifact': {
+        const targetId = action.taskId ?? callerId;
+        const target = this.ledger.membership(targetId);
+        if (!target || target.projectId !== state.id || (targetId !== callerId && member.role !== 'coordinator')) throw new Error('Artifact target is not authorized');
+        return this.host.closeout.register(targetId, action.scopeId, action.path, action.disposition, action.reference);
+      }
+      case 'complete_task': {
+        if (member.role !== 'coordinator') throw new Error('Only the coordinator can complete tasks');
+        const target = this.ledger.membership(action.taskId);
+        if (!target || target.projectId !== state.id || target.role === 'coordinator') throw new Error('Target is not a worker in this project');
+        return this.host.closeout.accept({ ...action, callerId, projectId: state.id, fingerprint: hash(JSON.stringify(action)), completion: { outcome: action.outcome, summary: action.summary, deliveryReferences: action.deliveryReferences } });
+      }
+      case 'cleanup_artifacts': {
+        if (member.role !== 'coordinator') throw new Error('Only the coordinator can clean its own scopes');
+        return this.host.closeout.accept({ ...action, taskId: callerId, callerId, projectId: state.id, fingerprint: hash(JSON.stringify(action)) });
+      }
       case 'dispatch': {
         if (member.role !== 'coordinator') throw new Error('Only the coordinator can dispatch workers');
         if (action.issueId && !state.issues.some(issue => issue.id === action.issueId)) throw new Error('Issue is not owned by this project');
+        let predecessor: ReturnType<TaskCloseout['read']> | undefined;
+        if (action.predecessorTaskId) {
+          const previous = this.ledger.membership(action.predecessorTaskId);
+          predecessor = this.host.closeout.read(action.predecessorTaskId);
+          if (!previous || previous.projectId !== state.id || predecessor.lifecycle.kind !== 'completed') throw new Error('Predecessor must be a completed task in this project');
+          if (action.intakeTaskId) throw new Error('Follow-up requires a fresh task');
+        }
         const issueIntake = action.issueId ? this.store.taskForSource(action.issueId) : null;
-        const intakeTaskId = action.intakeTaskId ?? (issueIntake?.purpose === 'intake' ? issueIntake.id : undefined);
+        const intakeTaskId = action.intakeTaskId ?? (!predecessor && issueIntake?.purpose === 'intake' ? issueIntake.id : undefined);
         if (intakeTaskId) {
           const task = this.store.task(intakeTaskId);
           const route = this.intakeRoute(task.id);
@@ -447,11 +477,13 @@ export class ProjectRuntime {
           if (model) this.store.setMeta(`project-task-model:${task.id}`, model);
           const effort = this.config(callerId)?.reasoningEfforts[action.role];
           if (effort) this.store.setMeta(`project-task-effort:${task.id}`, effort);
-          this.enqueue(task.id, 'initial', action.prompt, { kind: 'agent', projectId: state.id, taskId: callerId, eventId: action.requestId, category: 'delegation' });
+          if (predecessor) this.host.closeout.link(task.id, predecessor.taskId);
+          this.enqueue(task.id, 'initial', action.prompt + (predecessor ? `\nCompleted predecessor ${predecessor.taskId}: ${JSON.stringify(predecessor.lifecycle)}. Deleted resources are not restored.` : ''), { kind: 'agent', projectId: state.id, taskId: callerId, eventId: action.requestId, category: 'delegation' });
         });
         return { taskId: task.id };
       }
       case 'send': {
+        this.host.closeout.assertOpen(action.taskId);
         if (member.role !== 'coordinator') throw new Error('Only the coordinator can direct workers');
         const target = this.ledger.membership(action.taskId);
         if (!target || target.projectId !== state.id || target.role === 'coordinator') throw new Error('Target is not a worker in this project');
