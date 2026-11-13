@@ -139,7 +139,7 @@ export class ProjectCatalog {
       ?? this.effective.find(project => project.repositories.some(repository => repository.name.toLowerCase() === name))?.id ?? null;
   }
 
-  async bindRepository(repositoryName: string, projectId: string): Promise<ProjectConfig> {
+  async bindRepository(repositoryName: string, projectId: string, beforeBind?: () => void): Promise<ProjectConfig> {
     await this.refresh();
     const project = this.effective.find(item => item.id === projectId);
     if (!project) throw new Error('Project configuration unavailable');
@@ -157,7 +157,10 @@ export class ProjectCatalog {
     const previous = bindings.find(item => item.repository.toLowerCase() === repositoryName.toLowerCase());
     if (previous && previous.projectId !== project.id) throw new Error('Repository project ownership is immutable');
     if (!previous) bindings.push({ repository: repository.name, projectId: project.id });
-    this.store.setMeta(bindingsKey, JSON.stringify(bindings));
+    this.store.transaction(() => {
+      beforeBind?.();
+      this.store.setMeta(bindingsKey, JSON.stringify(bindings));
+    });
     await this.refresh();
     const result = this.effective.find(item => item.id === project.id);
     if (!result) throw new Error('Bound project is unavailable');

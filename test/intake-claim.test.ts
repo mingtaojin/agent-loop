@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { ProjectCatalog } from '../src/project-catalog.js';
+import { discoverProjects } from '../src/project-discovery.js';
 import { test, type TestContext } from 'node:test';
 import { z } from 'zod';
 import { configSchema } from '../src/config.js';
@@ -36,7 +38,7 @@ async function fixture(t: TestContext) {
     await loop.receive({ id, chatId: caller.chatId, chatType: 'group', senderId: 'owner', text: 'This identified saved request belongs to this project.', attachments: [], createdAt: Date.now() });
     return id;
   }
-  return { config, ports, codex, feishu, saved, coordinator, decision, get loop() { return loop; },
+  return { root, config, ports, codex, feishu, saved, coordinator, decision, get loop() { return loop; },
     async reopen() { await loop.close(); loop = new AgentLoop(config, ports); await loop.projects.ensure(); } };
 }
 
@@ -209,4 +211,72 @@ test('a hard process exit inside claim cannot commit its route without its recei
   const receipt = await f.loop.projectAction(callerId, action); await f.reopen();
   assert.deepEqual(await f.loop.projectAction(callerId, action), receipt);
   assert.equal(f.loop.store.task(task.id).threadId, null);
+});
+
+
+test('foreign repository ownership cannot be hidden by a saved workspace inside the claimant directory', async t => {
+  const f = await fixture(t), task = f.saved('foreign-resource');
+  const other = f.loop.projects.projectConfig('other'); assert.ok(other);
+  const app = f.loop.projects.projectConfig('app'); assert.ok(app);
+  const workspace = join(app.directory, 'saved-foreign-worktree');
+  f.loop.store.saveTask(taskSchema.parse({ ...task, resources: [{ id: 'foreign', kind: 'git-worktree', branch: 'saved-foreign', workspace,
+    repository: { name: 'owner/other', path: other.directory, baseBranch: 'main', criteria: criteriaSchema.parse({}) } }] }));
+  const messageId = await f.decision('foreign-resource-owner');
+  await assert.rejects(f.loop.projectAction(f.coordinator().id, { action: 'claim_intake', requestId: 'foreign-resource-claim', taskId: task.id, messageId }));
+  const discovery = await f.loop.projectAction(f.coordinator().id, { action: 'status', section: 'unassigned_intakes' });
+  assert.ok(!JSON.stringify(discovery).includes(task.id));
+  assert.equal(f.loop.projects.intakeRoute(task.id), null);
+});
+
+test('a late project question cannot overwrite the workspace selected by an intervening claim and dispatch', async t => {
+  const f = await fixture(t), task = f.saved('late-question');
+  f.feishu.resources.set('old-file', Buffer.from('historical evidence\n'));
+  const messageId = await f.decision('late-question-owner');
+  f.codex.selectionResults.push({ kind: 'question', question: 'Old selection question' });
+  let entered = () => {}, release = () => {};
+  const started = new Promise<void>(done => { entered = done; }), gate = new Promise<void>(done => { release = done; });
+  const resolve = f.loop.projects.resolveSelection.bind(f.loop.projects);
+  f.loop.projects.resolveSelection = async (...args) => { entered(); await gate; return resolve(...args); };
+  const pending = f.loop.tick();
+  try {
+    await started;
+    await f.loop.projectAction(f.coordinator().id, { action: 'claim_intake', requestId: 'late-claim', taskId: task.id, messageId });
+    await f.loop.projectAction(f.coordinator().id, { action: 'dispatch', requestId: 'late-dispatch', intakeTaskId: task.id, role: 'worker', prompt: 'Use the confirmed project and original scope.' });
+    const delegated = f.loop.store.task(task.id); assert.equal(delegated.workspaceSelection.kind, 'selected');
+    release(); await pending; await f.loop.tick();
+    const worker = f.loop.store.task(task.id);
+    assert.equal(worker.purpose, 'execution'); assert.deepEqual(worker.workspaceSelection, delegated.workspaceSelection);
+    assert.ok(worker.threadId); assert.notEqual(worker.status, 'failed'); assert.equal(worker.reason, null);
+  } finally { release(); await pending; }
+});
+
+test('a stale selection cannot bind its repository after a competing claim has committed another route', async t => {
+  const f = await fixture(t), task = f.saved('binding-race');
+  f.feishu.resources.set('old-file', Buffer.from('historical evidence\n'));
+  const projectRoot = join(f.root, 'discovered'); await mkdir(join(projectRoot, 'candidate'), { recursive: true });
+  f.config.engineering = { projectRoot };
+  const repository = configSchema.parse({ feishu: { userOpenId: 'owner' }, repositories: [{ name: 'owner/unbound', criteria: {} }] }).repositories[0]; assert.ok(repository);
+  f.config.repositories.push(repository);
+  f.loop.store.saveTask(taskSchema.parse({ ...task, sourceId: 'binding-race-source', source: {
+    kind: 'github', issue: issue(808, { repository: 'owner/unbound' }), repository, collectionReason: 'historical' } }));
+  const candidate = (await discoverProjects(projectRoot))[0]; assert.ok(candidate);
+  f.codex.selectionResults.push({ kind: 'project', projectId: candidate.id, reason: 'Old selection' });
+  const messageId = await f.decision('binding-owner');
+  let entered = () => {}, release = () => {};
+  const started = new Promise<void>(done => { entered = done; }), gate = new Promise<void>(done => { release = done; });
+  const bind = ProjectCatalog.prototype.bindRepository;
+  t.mock.method(ProjectCatalog.prototype, 'bindRepository', async function(this: ProjectCatalog, ...args: Parameters<ProjectCatalog['bindRepository']>) {
+    entered(); await gate; return bind.apply(this, args);
+  });
+  const pending = f.loop.tick();
+  try {
+    await started;
+    await f.loop.projectAction(f.coordinator().id, { action: 'claim_intake', requestId: 'binding-claim', taskId: task.id, messageId });
+    release(); await pending;
+    assert.deepEqual(f.loop.projects.intakeRoute(task.id), { projectId: 'app', coordinatorTaskId: f.coordinator().id });
+    assert.ok(!f.loop.store.meta('project-catalog:repositories')?.includes('owner/unbound'));
+    await f.loop.tick();
+    assert.ok(f.loop.store.meta(`project-intake-material:${task.id}`));
+    assert.equal(f.loop.store.task(task.id).threadId, null); assert.notEqual(f.loop.store.task(task.id).status, 'failed');
+  } finally { release(); await pending; }
 });

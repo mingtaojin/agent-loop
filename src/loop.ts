@@ -16,7 +16,7 @@ import { Store, type Inbox } from './store.js';
 import { FeishuProgressPublisher } from './feishu-progress.js';
 import { FeishuDocumentProgressPublisher } from './feishu-document-progress.js';
 import { taskProgressStatus } from './feishu-progress-view.js';
-import { ProjectRuntime } from './project-runtime.js';
+import { IntakeOwnershipChanged, ProjectRuntime } from './project-runtime.js';
 import type { ProjectAction, ProjectConfig } from './project.js';
 import { matchesProjectIssue } from './project.js';
 
@@ -420,6 +420,10 @@ export class AgentLoop {
       task = this.store.task(task.id);
       if (JSON.stringify(this.store.inputs(task.id).map(input => input.id)) !== JSON.stringify(inputIds)) return false;
       project = await this.projects.resolveSelection(selection.choice, candidates);
+      task = this.store.task(task.id);
+      if (this.projects.ledger.membership(task.id)) return true;
+      if (this.projects.intakeRoute(task.id) || task.status === 'paused'
+        || JSON.stringify(this.store.inputs(task.id).map(input => input.id)) !== JSON.stringify(inputIds)) return false;
       if (!project) {
         const question = selection.choice.kind === 'question' ? selection.choice.question : '这项任务属于哪个项目？请提供项目名称。';
         this.store.setMeta(questionKey, JSON.stringify({ question, inputIds }));
@@ -443,6 +447,7 @@ export class AgentLoop {
     try { await this.projects.acceptIntake(task.id, project.id, material); }
     catch (error) {
       if (this.projects.ledger.membership(task.id)) return true;
+      if (error instanceof IntakeOwnershipChanged) return false;
       throw error;
     }
     this.store.setMeta(`project-intake-material:${task.id}`, materialPath);

@@ -21,6 +21,8 @@ interface ProjectHost {
   groupCleanup(callerId: string, action: Extract<ProjectAction, { action: 'plan_group_cleanup' | 'confirm_group_cleanup' | 'apply_group_cleanup' }>): Promise<unknown>;
 }
 
+export class IntakeOwnershipChanged extends Error {}
+
 export class ProjectRuntime {
   readonly ledger: ProjectLedger;
   private readonly lanes = new Map<string, Promise<unknown>>();
@@ -103,7 +105,11 @@ export class ProjectRuntime {
     const route = this.intakeRoute(taskId);
     if (route && route.projectId !== projectId) throw new Error('Intake project route is immutable');
     const config = intake.source.kind === 'github' && !route
-      ? await this.catalog.bindRepository(intake.source.issue.repository, projectId) : await this.catalog.byId(projectId);
+      ? await this.catalog.bindRepository(intake.source.issue.repository, projectId, () => {
+        const current = this.store.task(taskId);
+        if (this.intakeRoute(taskId) || this.ledger.membership(taskId) || current.purpose !== 'intake'
+          || current.threadId || current.status === 'paused') throw new IntakeOwnershipChanged('Intake ownership changed before repository binding');
+      }) : await this.catalog.byId(projectId);
     if (!config) throw new Error('Project configuration unavailable');
     await this.initialize(config);
     await this.serial(projectId, async () => this.store.transaction(() => {
@@ -254,9 +260,24 @@ export class ProjectRuntime {
 
   private visibleUnassigned(task: Task, projectId: string): boolean {
     if (task.purpose !== 'intake' || task.threadId || this.ledger.membership(task.id) || this.intakeRoute(task.id)) return false;
-    if (task.source.kind !== 'github') return true;
-    const owner = this.catalog.repositoryOwner(task.source.issue.repository);
-    return owner === null || owner === projectId;
+    const repositories = task.source.kind === 'github' ? [task.source.issue.repository] : [];
+    const directories: string[] = [];
+    for (const resource of task.resources) {
+      if (resource.kind === 'project') directories.push(resource.project.canonicalPath);
+      else repositories.push(resource.repository.name);
+    }
+    if (task.workspaceSelection.kind === 'selected') {
+      const choice = task.workspaceSelection.choice;
+      if (choice.kind === 'repository') repositories.push(choice.repositoryName);
+      if (choice.kind === 'project') directories.push(choice.project.canonicalPath);
+    }
+    return repositories.every(repository => {
+      const owner = this.catalog.repositoryOwner(repository);
+      return owner === null || owner === projectId;
+    }) && directories.every(directory => {
+      const owner = this.configs.find(project => project.directory === directory);
+      return !owner || owner.id === projectId;
+    });
   }
 
   private async claimIntake(callerId: string, member: NonNullable<ReturnType<ProjectLedger['membership']>>,
