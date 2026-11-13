@@ -1,3 +1,6 @@
+import { recoverSavedIntake, openDirectGroup } from '../test/saved-intake.js';
+import { projectConfigSchema } from '../src/project.js';
+import { tickWithCoordinator } from '../test/coordinated-runtime.js';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
@@ -32,6 +35,7 @@ for (const name of ['one', 'two']) {
   await writeFile(join(path, 'tracked.txt'), 'user dirty file\n'); await writeFile(join(path, 'untracked.txt'), 'user untracked file\n');
   config.repositories.push({ name: `fixture/${name}`, path, baseBranch: 'main', criteria: { states: ['open'], assigneesAny: [], taskTypes: ['bug'], labelsAll: [], labelsAny: [], labelsNone: [], nativeTypes: { Bug: 'bug' }, typeLabels: { bug: 'bug' } } });
 }
+config.projects.push(projectConfigSchema.parse({ id: 'fixture', name: 'Fixture', directory: root, repositories: config.repositories.map(repository => ({ name: repository.name, criteria: repository.criteria })), instructions: 'Isolated verification. The harness dispatches intakes explicitly. Do not dispatch additional tasks, access network or real projects, or perform delivery operations.' }));
 const feishu = new FeishuFake(), github = new GitHubFake();
 const servers: CodexAppServer[] = [];
 let codex = new CodexAppServer(config.codex); servers.push(codex);
@@ -75,14 +79,16 @@ function engineering(taskId: string, label: string): string {
   return `Use the configured poteto-mode skill for this tiny authorized engineering task. No delegates, external network, credentials, or real repositories. Obtain fixture/one and fixture/two through ensure_workspace, or the current Runtime shell fallback if native tool is unavailable. Do not create worktrees yourself. Read each returned AGENTS.md. In each returned workspace execute its exact command below using the shell tool, requesting native command permission if the sandbox blocks access. Do not use apply_patch or change other files. Give one progress update and a plain final answer including the project instruction markers and our earlier memory word.\n${commands.join('\n')}`;
 }
 try {
-  await loop.receive(message('new', 'Remember RUNTIME_NEW_MEMORY. Reply briefly without tools.'));
-  const task = loop.tasks()[0]; assert.ok(task);
-  await settle(task.id); assert.equal(loop.store.task(task.id).resources.length, 0);
+  await recoverSavedIntake(loop, message('new', 'This request belongs to the supplied Fixture project. Remember RUNTIME_NEW_MEMORY. Reply briefly without tools.'));
+  await tickWithCoordinator(loop);
+  for (const saved of loop.tasks()) if (loop.projects.ledger.membership(saved.id)?.role === 'worker') await openDirectGroup(loop, saved.id);
+  const task = loop.tasks().find(task => !task.sourceId.startsWith('project:'));  assert.ok(task);
+  await settle(task.id); assert.equal(loop.store.task(task.id).resources.length, 1);
   await loop.receive(message('engineering', engineering(task.id, 'RUNTIME_NEW'), task.chatId!, 'group'));
   await settle(task.id);
-  let current = loop.store.task(task.id); assert.equal(current.resources.length, 2);
-  for (const resource of current.resources) {
-    assert.ok(resource.kind !== 'project', 'This fixture requests configured repository resources');
+  let current = loop.store.task(task.id); assert.equal(current.resources.filter(resource => resource.kind !== 'project').length, 2);
+  for (const resource of current.resources.filter(resource => resource.kind !== 'project')) {
+    assert.equal(resource.kind, 'git-worktree', 'This fixture requests configured repository worktrees');
     assert.equal(await readFile(join(resource.workspace, 'runtime-result.txt'), 'utf8'), `RUNTIME_NEW_${resource.repository.name.endsWith('one') ? 'ONE' : 'TWO'}`);
   }
   evidence.newThread = { task: current, outputs: loop.store.outputs(task.id), approvals: loop.store.approvals(task.id) };
@@ -99,12 +105,13 @@ try {
   store.saveTask(taskSchema.parse({ id: legacyId, sourceId: 'manual-legacy', source: { kind: 'manual', message: oldMessage }, contextDirectory: legacyCwd, resources: [], status: 'idle', reason: null, prompt: 'legacy', promptHash: 'legacy', skillPath: config.engineering?.skillPath ?? null, chatId: 'chat-legacy', threadId: legacyThread, turnId: before.turnId, executionStatus: 'completed', lastHandledTurnId: before.turnId, requests: [], createdAt: Date.now(), updatedAt: Date.now(), legacy: { status: 'waiting_user', prUrl: null } }));
   feishu.groups.set(legacyId, 'chat-legacy');
   codex = new CodexAppServer(config.codex); servers.push(codex); loop = new AgentLoop(config, { codex, feishu, github, workspace: new WorkspaceProvider(config.dataDir) }, store);
+  await loop.projects.adopt(legacyId, 'fixture');
   await loop.recover();
   await loop.receive(message('legacy-engineering', engineering(legacyId, 'RUNTIME_LEGACY'), 'chat-legacy', 'group'));
   await settle(legacyId);
-  current = loop.store.task(legacyId); assert.equal(current.threadId, legacyThread); assert.equal(current.resources.length, 2);
-  for (const resource of current.resources) {
-    assert.ok(resource.kind !== 'project', 'This fixture requests configured repository resources');
+  current = loop.store.task(legacyId); assert.equal(current.threadId, legacyThread); assert.equal(current.resources.filter(resource => resource.kind !== 'project').length, 2);
+  for (const resource of current.resources.filter(resource => resource.kind !== 'project')) {
+    assert.equal(resource.kind, 'git-worktree', 'This fixture requests configured repository worktrees');
     assert.equal(await readFile(join(resource.workspace, 'runtime-result.txt'), 'utf8'), `RUNTIME_LEGACY_${resource.repository.name.endsWith('one') ? 'ONE' : 'TWO'}`);
   }
   const legacyText = loop.store.outputs(legacyId).map(value => value.text).join('\n');

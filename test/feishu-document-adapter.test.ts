@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { FeishuDocumentAdapter, type FeishuDocumentApi } from '../src/adapters/feishu-document.js';
 import { documentChunks, documentTextElements } from '../src/feishu-document-text.js';
-import { DocumentRequestRejected } from '../src/ports.js';
+import { DocumentRequestRejected, TaskGroupBindingChanged, type FeishuDocumentProgressPort, type ProgressWriteGuard } from '../src/ports.js';
 
 const success = (data: unknown) => ({ code: 0, data });
 const block = (text: string, blockId = 'block') => ({ block_id: blockId, block_type: 2, text: { elements: [{ text_run: { content: text } }] } });
@@ -20,11 +20,30 @@ function fixture() {
   const api = { document: { create: request('document') }, children: { create: request('block'), get: request('children'), batchDelete: request('delete') },
     block: { get: request('read'), patch: request('write') }, members: { create: request('grant'), list: request('members') },
     tabs: { create: request('tab'), listTabs: request('tabs') } };
-  // Deliberately inject malformed remote replies across the SDK boundary.
   const adapter = new FeishuDocumentAdapter(() => api as unknown as FeishuDocumentApi,
     { now: () => now, sleep: async ms => { now += ms; } });
   return { adapter, calls, replies, handlers };
 }
+
+const guardedWrites: { name: string; run(port: FeishuDocumentProgressPort, guard: ProgressWriteGuard): Promise<unknown> }[] = [
+  { name: 'document', run: (port, guard) => port.createDocument({ title: 'Progress' }, guard) },
+  { name: 'block', run: (port, guard) => port.createBlock({ documentId: 'doc', text: 'Text', clientToken: 'token' }, guard) },
+  { name: 'write', run: (port, guard) => port.replaceContent({ documentId: 'doc', blockId: 'block', text: 'Text', clientToken: 'token' }, guard) },
+  { name: 'delete', run: (port, guard) => port.removeBlocks({ documentId: 'doc', parentBlockId: 'parent', blockIds: ['owned'], clientToken: 'token' }, guard) },
+  { name: 'grant', run: (port, guard) => port.grantGroupRead({ documentId: 'doc', chatId: 'group' }, guard) },
+  { name: 'tab', run: (port, guard) => port.createTab({ chatId: 'group', documentUrl: 'https://tenant.feishu.cn/docx/doc' }, guard) },
+];
+for (const operation of guardedWrites) test(`retiring a binding before SDK dispatch cancels queued document ${operation.name}`, async () => {
+  const f = fixture();
+  f.replies.set('read', success({ block: block('Original') }));
+  f.replies.set('children', success({ items: [block('Owned', 'owned')], has_more: false }));
+  await f.adapter.readBlock({ documentId: 'doc', blockId: 'block' });
+  let current = true;
+  const writing = operation.run(f.adapter, () => { if (!current) throw new TaskGroupBindingChanged(); });
+  current = false;
+  await assert.rejects(writing, TaskGroupBindingChanged);
+  assert.equal(f.calls.filter(call => call.kind === operation.name).length, 0);
+});
 
 test('SDK arguments use exact persisted tokens, inert text, narrow group permission and explicit document URL', async () => {
   const f = fixture();

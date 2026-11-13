@@ -6,7 +6,7 @@
   },
   "repositories": [
     {
-      "name": "crysound/OpenTest-Internal",
+      "name": "crysound/OpenTest",
       "criteria": {
         "states": [
           "open"

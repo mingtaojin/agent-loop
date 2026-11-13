@@ -1,3 +1,4 @@
+import { seedSavedIntake } from './saved-intake.js';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { mkdtemp, mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
@@ -9,7 +10,9 @@ import { z } from 'zod';
 import { configSchema } from '../src/config.js';
 import { sourceCommentSchema, taskSchema, type IncomingMessage, type PendingRequest, type Source } from '../src/domain.js';
 import { AgentLoop } from '../src/loop.js';
-import type { CodexPort, WorkspacePort } from '../src/ports.js';
+import { FeishuApiError, GroupCreationRejected, type CodexPort, type WorkspacePort } from '../src/ports.js';
+import { GroupCleanup } from '../src/group-cleanup.js';
+import { groupGeneration, retireTaskGroup, TaskGroups } from '../src/task-groups.js';
 import { ProjectLedger, projectStateSchema, type ProjectAction } from '../src/project.js';
 import type { ReasoningEffort } from '../src/project.js';
 import { Store } from '../src/store.js';
@@ -30,7 +33,7 @@ class ProjectCodexFake extends CodexFake {
 const dispatchReceipt = z.object({ taskId: z.string().min(1) });
 const overviewSchema = z.object({
   id: z.string(), coordinatorTaskId: z.string(), version: z.number(),
-  counts: z.object({ issues: z.number(), comments: z.number(), tasks: z.number(), records: z.number() }),
+  counts: z.object({ issues: z.number(), comments: z.number(), tasks: z.number(), records: z.number(), intakes: z.number() }),
   members: projectStateSchema.shape.members,
   records: z.array(projectStateSchema.shape.records.element.extend({ truncated: z.boolean().optional() })),
   tasks: z.array(taskSchema.pick({ status: true, executionStatus: true, reason: true, chatId: true, threadId: true, resources: true })
@@ -45,7 +48,342 @@ function projectIssue(number: number, repository = 'example/frontend', changes: 
   });
 }
 
-async function fixture(t: TestContext, options: { coordinated?: boolean; secondProject?: boolean } = {}) {
+test('delegated workers and verifiers stay group-less until the coordinator opens one without replaying history', async t => {
+  const f = await fixture(t, { secondProject: true }); await f.initialize();
+  const worker = await f.dispatch('lazy-worker', 'Investigate the requested change.');
+  await f.dispatch('lazy-verifier', 'Verify independently.', { role: 'verifier' });
+  assert.equal(f.feishu.groups.size, 2);
+  assert.ok(worker.threadId);
+  const snapshot = f.codex.snapshot(worker.threadId);
+  assert.ok(snapshot.turnId);
+  snapshot.requests = [{ id: 'clarify', threadId: worker.threadId, turnId: snapshot.turnId, kind: 'question',
+    prompt: 'Which behavior is intended?', method: 'item/tool/requestUserInput', payload: {}, isBlocking: true, connectionEpoch: 'live' }];
+  await f.loop.tick();
+  assert.equal(f.loop.store.task(worker.id).chatId, null);
+  assert.equal(f.events(f.coordinator().id, 'question').length, 1);
+  assert.equal(f.feishu.groups.size, 2);
+  snapshot.requests = [];
+  f.codex.complete(worker.threadId, null);
+  snapshot.outputs.push({ id: 'worker-final', threadId: worker.threadId, turnId: snapshot.turnId, phase: 'final', text: 'Current investigation summary.' });
+  await f.loop.tick();
+  assert.ok(f.loop.store.outputs(worker.id).every(output => output.status === 'dropped'));
+  const opened = await f.openGroup(worker.id);
+  assert.ok(opened.chatId);
+  const sent = f.feishu.sent.filter(output => output.chatId === opened.chatId);
+  assert.equal(sent.length, 1);
+  assert.match(sent[0]!.text, /当前摘要：Current investigation summary/);
+  assert.ok(!sent.some(output => output.text === 'Which behavior is intended?'));
+  await f.openGroup(worker.id);
+  await f.openGroup(worker.id, 'another-open');
+  assert.equal(f.feishu.groups.size, 3);
+  assert.equal(f.feishu.sent.filter(output => output.chatId === opened.chatId).length, 1);
+  await assert.rejects(f.loop.projectAction(worker.id, { action: 'open_group', requestId: 'forbidden', taskId: worker.id }), /Only the coordinator/);
+  await assert.rejects(f.loop.projectAction(f.coordinator('docs').id, { action: 'open_group', requestId: 'foreign', taskId: worker.id }), /not a worker/);
+  await assert.rejects(f.loop.projectAction(f.coordinator().id, { action: 'open_group', requestId: 'self', taskId: f.coordinator().id }), /not a worker/);
+});
+
+test('approval group creation retries after an unknown result and a dissolved group recreates with a fresh generation', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('native-lazy', 'Wait for native approval.'); assert.ok(worker.threadId);
+  const snapshot = f.codex.snapshot(worker.threadId); assert.ok(snapshot.turnId);
+  const request: PendingRequest = { id: 'approval', kind: 'approval', threadId: worker.threadId, turnId: snapshot.turnId,
+    prompt: 'Allow this operation?', method: 'item/commandExecution/requestApproval', payload: {}, isBlocking: true, connectionEpoch: 'live' };
+  snapshot.requests = [request];
+  f.feishu.loseGroupAck = true;
+  await f.loop.tick();
+  assert.equal(f.loop.store.task(worker.id).chatId, null);
+  assert.equal(f.loop.store.task(worker.id).requests.length, 1);
+  assert.notEqual(f.loop.store.task(worker.id).status, 'failed');
+  await f.loop.tick();
+  const first = f.loop.store.task(worker.id); assert.ok(first.chatId);
+  assert.equal(f.feishu.approvals.length, 1);
+  assert.equal(f.feishu.approvals[0]?.request.id, request.id);
+  await f.loop.tick();
+  const notice = f.feishu.sent.filter(output => output.chatId === f.coordinator().chatId && output.text.includes('需要点击审批'));
+  assert.equal(notice.length, 1);
+  await f.loop.tick(); assert.equal(f.feishu.approvals.length, 1);
+  await f.feishu.dissolveGroup(first.chatId);
+  await f.restart();
+  const recreated = f.loop.store.task(worker.id); assert.ok(recreated.chatId);
+  assert.notEqual(recreated.chatId, first.chatId);
+  assert.equal(groupGeneration(f.loop.store, worker.id), 1);
+  assert.equal(f.feishu.approvals.length, 2);
+  assert.equal(recreated.threadId, first.threadId);
+  assert.notEqual(recreated.status, 'failed');
+  await assert.rejects(f.loop.approve({ id: 'old-click', taskId: worker.id, chatId: first.chatId, senderId: 'owner',
+    threadId: request.threadId, turnId: request.turnId, requestId: request.id, epoch: request.connectionEpoch, decision: 'approve' }), /association expired/);
+});
+
+test('approval notices use the current group when retirement races with old-group verification', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('verification-retirement', 'Wait for approval.');
+  const current = await f.openGroup(worker.id); assert.ok(current.chatId && current.threadId);
+  const snapshot = f.codex.snapshot(current.threadId); assert.ok(snapshot.turnId);
+  snapshot.requests = [{ id: 'approval', kind: 'approval', threadId: current.threadId, turnId: snapshot.turnId,
+    prompt: 'Allow?', method: 'item/commandExecution/requestApproval', payload: {}, isBlocking: true, connectionEpoch: 'live' }];
+  let entered = () => {}, release = () => {}, once = true;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const verify = f.feishu.verifyGroup.bind(f.feishu);
+  f.feishu.verifyGroup = async chatId => {
+    await verify(chatId);
+    if (chatId === current.chatId && once) { once = false; entered(); await held; }
+  };
+  const observing = f.loop.tick(); await started;
+  await f.feishu.dissolveGroup(current.chatId);
+  retireTaskGroup(f.loop.store, worker.id, current.chatId);
+  release(); await observing; await f.loop.tick(); await f.loop.tick();
+  const replacement = f.loop.store.task(worker.id); assert.ok(replacement.chatId);
+  assert.notEqual(replacement.chatId, current.chatId);
+  assert.equal(f.feishu.approvals.at(-1)?.chatId, replacement.chatId);
+  const notices = f.feishu.sent.filter(output => output.chatId === f.coordinator().chatId && output.text.includes('需要点击审批'));
+  assert.equal(notices.length, 1);
+  assert.ok(notices[0]?.text.includes(encodeURIComponent(replacement.chatId)));
+  assert.ok(!notices[0]?.text.includes(encodeURIComponent(current.chatId)));
+});
+
+test('a manually dissolved direct-worker group stays absent through recovery and can be reopened explicitly', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('manual-dissolve', 'Continue the same task.');
+  const opened = await f.openGroup(worker.id); assert.ok(opened.chatId);
+  await f.feishu.dissolveGroup(opened.chatId);
+  await f.restart();
+  const recovered = f.loop.store.task(worker.id);
+  assert.equal(recovered.chatId, null);
+  assert.equal(recovered.threadId, worker.threadId);
+  assert.notEqual(recovered.status, 'failed');
+  await f.loop.tick(); assert.equal(f.loop.store.task(worker.id).chatId, null);
+  const reopened = await f.openGroup(worker.id, 'reopen-explicit');
+  assert.ok(reopened.chatId);
+  assert.notEqual(reopened.chatId, opened.chatId);
+});
+
+test('definitive create rejection permits retry but a reconciliation read failure cannot authorize a new group', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('creation-retry', 'Keep the same native task.');
+  const ensure = f.feishu.ensureGroup.bind(f.feishu);
+  f.feishu.ensureGroup = async () => { throw new GroupCreationRejected(232017, 'denied'); };
+  await assert.rejects(f.openGroup(worker.id), /denied/);
+  f.feishu.ensureGroup = async input => { assert.equal(input.reconcileOnly, false); return ensure(input); };
+  const opened = await f.openGroup(worker.id); assert.ok(opened.chatId);
+  const another = await f.dispatch('reconciliation-retry', 'Another task.');
+  f.feishu.loseGroupAck = true;
+  f.feishu.ensureGroup = ensure;
+  await assert.rejects(f.openGroup(another.id), /acknowledgement/);
+  f.feishu.ensureGroup = async input => { assert.equal(input.reconcileOnly, true); throw new FeishuApiError(99991672, 'list denied'); };
+  await assert.rejects(f.openGroup(another.id), /list denied/);
+  const groups = new TaskGroups(f.loop.store, f.feishu);
+  f.feishu.ensureGroup = async input => { assert.equal(input.reconcileOnly, true); return ensure(input); };
+  await groups.open(another.id);
+  assert.equal(f.feishu.groups.size, 3);
+});
+
+test('an interrupted retry after a rejected group create must reconcile before another create', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('rejected-create-crash', 'Create safely.');
+  f.feishu.ensureGroup = async () => { throw new GroupCreationRejected(232017, 'known no-create'); };
+  await assert.rejects(new TaskGroups(f.loop.store, f.feishu).open(worker.id), /known no-create/);
+  await f.loop.close();
+  const child = join(f.root, 'group-crash-child.mjs');
+  await writeFile(child, `
+    import { writeSync } from 'node:fs';
+    import { Store } from ${JSON.stringify(new URL('../src/store.ts', import.meta.url).href)};
+    import { TaskGroups } from ${JSON.stringify(new URL('../src/task-groups.ts', import.meta.url).href)};
+    import { FeishuFake } from ${JSON.stringify(new URL('./fakes.ts', import.meta.url).href)};
+    const store = new Store(process.argv[2]), transport = new FeishuFake();
+    transport.ensureGroup = async input => {
+      writeSync(1, JSON.stringify({ reconcileOnly: input.reconcileOnly, operation: store.operation(process.argv[3] + ':group') }));
+      process.exit(42);
+    };
+    await new TaskGroups(store, transport).open(process.argv[3]);
+  `);
+  await assert.rejects(promisify(execFile)(process.execPath, ['--import', 'tsx', child, f.root, worker.id]), error => {
+    const failure = z.object({ code: z.literal(42), stdout: z.string() }).parse(error);
+    const trace = z.object({ reconcileOnly: z.literal(false), operation: z.object({ status: z.literal('attempting'), error: z.null() }) });
+    trace.parse(JSON.parse(failure.stdout));
+    return true;
+  });
+  const recovered = new Store(f.root);
+  try {
+    assert.equal(recovered.operation(`${worker.id}:group`)?.status, 'attempting');
+    assert.equal(recovered.operation(`${worker.id}:group`)?.error, null);
+    f.feishu.ensureGroup = async input => { assert.equal(input.reconcileOnly, true); throw new Error('unknown result remains unresolved'); };
+    await assert.rejects(new TaskGroups(recovered, f.feishu).open(worker.id), /unknown result/);
+  } finally { recovered.close(); }
+});
+
+test('cleanup reconciles a frozen uncertain deletion after another publisher retires its binding', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('cleanup-retired', 'Keep the task.');
+  const opened = await f.openGroup(worker.id); assert.ok(opened.chatId);
+  const cleanup = new GroupCleanup(f.loop.store, f.feishu, 'owner');
+  const plan = cleanup.plan(f.coordinator().id, 'cleanup-retired-plan');
+  await f.loop.receive(f.message('cleanup-retired-confirm', plan.confirmationText, f.coordinator().chatId!));
+  cleanup.confirm(f.coordinator().id, plan.id, 'cleanup-retired-confirm');
+  const dissolve = f.feishu.dissolveGroup.bind(f.feishu);
+  let deletes = 0, verifies = 0;
+  f.feishu.dissolveGroup = async chatId => { deletes++; await dissolve(chatId); throw new Error('delete ack lost'); };
+  assert.equal((await cleanup.apply(f.coordinator().id, plan.id)).items[0]?.status, 'uncertain');
+  retireTaskGroup(f.loop.store, worker.id, opened.chatId);
+  const verify = f.feishu.verifyGroup.bind(f.feishu);
+  f.feishu.verifyGroup = async chatId => { verifies++; return verify(chatId); };
+  assert.equal((await cleanup.apply(f.coordinator().id, plan.id)).items[0]?.status, 'already_gone');
+  assert.equal(verifies, 1); assert.equal(deletes, 1);
+  assert.equal(f.loop.store.task(worker.id).chatId, null);
+});
+
+test('cleanup finishes its frozen old group without retiring a newly opened replacement', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('cleanup-replacement', 'Keep new groups.');
+  const opened = await f.openGroup(worker.id); assert.ok(opened.chatId);
+  const cleanup = new GroupCleanup(f.loop.store, f.feishu, 'owner');
+  const plan = cleanup.plan(f.coordinator().id, 'replacement-plan');
+  await f.loop.receive(f.message('replacement-confirm', plan.confirmationText, f.coordinator().chatId!));
+  cleanup.confirm(f.coordinator().id, plan.id, 'replacement-confirm');
+  const dissolve = f.feishu.dissolveGroup.bind(f.feishu);
+  f.feishu.dissolveGroup = async () => { throw new Error('delete outcome unknown'); };
+  await cleanup.apply(f.coordinator().id, plan.id);
+  retireTaskGroup(f.loop.store, worker.id, opened.chatId);
+  const replacement = await f.openGroup(worker.id, 'open-replacement'); assert.ok(replacement.chatId);
+  f.feishu.dissolveGroup = dissolve;
+  assert.equal((await cleanup.apply(f.coordinator().id, plan.id)).items[0]?.status, 'dissolved');
+  assert.equal(f.loop.store.task(worker.id).chatId, replacement.chatId);
+  assert.ok([...f.feishu.groups.values()].includes(replacement.chatId));
+  assert.ok(![...f.feishu.groups.values()].includes(opened.chatId));
+});
+
+test('an asynchronous workspace release preserves concurrently retired group state and task updates', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('release-retired-binding', 'Use the project.');
+  const opened = await f.openGroup(worker.id); assert.ok(opened.chatId);
+  const resource = await f.loop.ensureWorkspace(worker.id, 'example/frontend');
+  let signalEntered = () => {}, unblock = () => {};
+  const entered = new Promise<void>(resolve => { signalEntered = resolve; });
+  const held = new Promise<void>(resolve => { unblock = resolve; });
+  f.loop.ports.workspace.release = async () => { signalEntered(); await held; };
+  const releasing = f.loop.projectAction(worker.id, { action: 'release_workspace', requestId: 'release-retired', resourceId: resource.id });
+  await entered;
+  retireTaskGroup(f.loop.store, worker.id, opened.chatId);
+  const current = f.loop.store.task(worker.id); current.reason = 'Newer task update'; f.loop.store.saveTask(current);
+  unblock(); await releasing;
+  const after = f.loop.store.task(worker.id);
+  assert.equal(after.chatId, null); assert.equal(groupGeneration(f.loop.store, worker.id), 1);
+  assert.equal(after.reason, 'Newer task update');
+  assert.ok(!after.resources.some(item => item.id === resource.id));
+});
+
+test('approval cards rejected before delivery remain pending and native requests survive no-group recovery', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('approval-card-retry', 'Ask for approval.'); assert.ok(worker.threadId);
+  const snapshot = f.codex.snapshot(worker.threadId); assert.ok(snapshot.turnId);
+  snapshot.requests = [{ id: 'permission', kind: 'permissions', threadId: worker.threadId, turnId: snapshot.turnId,
+    prompt: 'Allow?', method: 'item/permissions/requestApproval', payload: {}, isBlocking: true, connectionEpoch: 'live' }];
+  const send = f.feishu.sendApproval.bind(f.feishu);
+  f.feishu.sendApproval = async () => { throw new FeishuApiError(99991672, 'denied'); };
+  await f.loop.tick();
+  assert.ok(f.loop.store.outputs(worker.id).some(output => output.status === 'pending' && f.loop.store.meta(`approval-output:${output.id}`)));
+  assert.equal(f.loop.store.task(worker.id).requests.length, 1);
+  f.feishu.sendApproval = send;
+  await f.restart();
+  assert.equal(f.feishu.approvals.length, 1);
+  assert.equal(f.loop.store.task(worker.id).requests.length, 1);
+});
+
+test('uncertain approval cards retry the same delivery identity without replaying ordinary uncertain outputs', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('uncertain-approval', 'Ask for approval.'); assert.ok(worker.threadId);
+  const snapshot = f.codex.snapshot(worker.threadId); assert.ok(snapshot.turnId);
+  snapshot.requests = [{ id: 'approval', kind: 'approval', threadId: worker.threadId, turnId: snapshot.turnId,
+    prompt: 'Allow?', method: 'item/commandExecution/requestApproval', payload: {}, isBlocking: true, connectionEpoch: 'live' }];
+  const send = f.feishu.sendApproval.bind(f.feishu);
+  const identities: string[] = [];
+  f.feishu.sendApproval = async input => { identities.push(input.id); throw new Error('connection lost before delivery'); };
+  await f.loop.tick();
+  const pending = f.loop.store.outputs(worker.id).find(output => output.status === 'uncertain'); assert.ok(pending);
+  const raw = f.loop.store.meta(`approval-output:${pending.id}`); assert.ok(raw);
+  const data = z.object({ lastAttemptAt: z.number() }).passthrough().parse(JSON.parse(raw));
+  await f.loop.tick(); assert.equal(identities.length, 1, 'unknown native delivery is rate limited');
+  f.loop.store.setMeta(`approval-output:${pending.id}`, JSON.stringify({ ...data, lastAttemptAt: 0 }));
+  const ordinary = f.loop.store.enqueue(worker.id, 'Unknown ordinary message', 'ordinary-uncertain');
+  f.loop.store.markOutput(ordinary, 'uncertain');
+  f.feishu.sendApproval = async input => { identities.push(input.id); return send(input); };
+  await f.restart();
+  assert.deepEqual(identities, [pending.id, pending.id]);
+  assert.equal(f.feishu.approvals.length, 1);
+  assert.equal(f.loop.store.outputs(worker.id).find(output => output.id === ordinary)?.status, 'uncertain');
+});
+
+test('group creation records its history window before verification so early offline messages are recovered', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('early-history', 'Keep early owner messages.');
+  const verify = f.feishu.verifyGroup.bind(f.feishu);
+  let started = 0;
+  f.feishu.verifyGroup = async chatId => {
+    if (chatId.includes(worker.id)) {
+      const raw = f.loop.store.meta(`task-group-start:${worker.id}:0`); assert.ok(raw);
+      started = Number(raw);
+      f.feishu.offline = [f.message('early-owner', 'Early offline supplement', chatId)];
+    }
+    return verify(chatId);
+  };
+  await f.openGroup(worker.id);
+  assert.equal(Number(f.loop.store.meta(`history:${worker.id}`)), started);
+  await f.restart();
+  assert.ok(f.loop.store.inputs(worker.id).some(input => input.id === 'early-owner'));
+});
+
+test('bulk cleanup freezes its list, requires owner confirmation, protects both coordinators and resumes after unknown deletion', async t => {
+  const f = await fixture(t, { secondProject: true }); await f.initialize();
+  const worker = await f.dispatch('cleanup-one', 'First task.');
+  const second = await f.dispatch('cleanup-two', 'Second task.');
+  await f.openGroup(worker.id); await f.openGroup(second.id);
+  const cleanup = new GroupCleanup(f.loop.store, f.feishu, 'owner');
+  const plan = cleanup.plan(f.coordinator().id, 'cleanup');
+  assert.equal(plan.excluded.length, 2); assert.equal(plan.items.length, 2);
+  assert.deepEqual(cleanup.plan(f.coordinator().id, 'cleanup'), plan);
+  await assert.rejects(cleanup.apply(f.coordinator().id, plan.id), /not been confirmed/);
+  const newer = await f.dispatch('cleanup-new', 'A later task.'); await f.openGroup(newer.id);
+  await f.loop.projectAction(f.coordinator().id, { action: 'send', requestId: 'fake-confirm', taskId: worker.id, text: plan.confirmationText });
+  assert.throws(() => cleanup.confirm(f.coordinator().id, plan.id, 'fake-confirm'), /actual owner/);
+  const confirmation = f.message('cleanup-confirm', plan.confirmationText, f.coordinator().chatId!);
+  confirmation.createdAt = Math.max(Date.now(), plan.createdAt);
+  await f.loop.receive(confirmation);
+  cleanup.confirm(f.coordinator().id, plan.id, confirmation.id);
+  const dissolve = f.feishu.dissolveGroup.bind(f.feishu);
+  let calls = 0;
+  f.feishu.dissolveGroup = async chatId => { calls++; await dissolve(chatId); throw new Error('acknowledgement lost'); };
+  const interrupted = await cleanup.apply(f.coordinator().id, plan.id);
+  assert.equal(calls, 1); assert.equal(interrupted.items[0]?.status, 'uncertain');
+  f.feishu.dissolveGroup = dissolve;
+  const resumed = await cleanup.apply(f.coordinator().id, plan.id);
+  assert.deepEqual(resumed.items.map(item => item.status), ['already_gone', 'dissolved']);
+  assert.ok(f.coordinator().chatId && f.coordinator('docs').chatId);
+  assert.ok(f.loop.store.task(newer.id).chatId);
+  assert.equal(f.loop.store.task(worker.id).chatId, null);
+  assert.equal(f.loop.store.task(second.id).chatId, null);
+  assert.deepEqual(await cleanup.apply(f.coordinator().id, plan.id), resumed);
+});
+
+test('bulk cleanup stops its batch on the first permission error and retries only remaining entries', async t => {
+  const f = await fixture(t); await f.initialize();
+  const one = await f.dispatch('permission-one', 'First.'); await f.openGroup(one.id);
+  const two = await f.dispatch('permission-two', 'Second.'); await f.openGroup(two.id);
+  const cleanup = new GroupCleanup(f.loop.store, f.feishu, 'owner');
+  const plan = cleanup.plan(f.coordinator().id, 'permission-plan');
+  await f.loop.receive(f.message('permission-confirm', plan.confirmationText, f.coordinator().chatId!));
+  cleanup.confirm(f.coordinator().id, plan.id, 'permission-confirm');
+  const dissolve = f.feishu.dissolveGroup.bind(f.feishu);
+  let calls = 0;
+  f.feishu.dissolveGroup = async () => { calls++; throw new FeishuApiError(232017, 'permission denied'); };
+  const stopped = await cleanup.apply(f.coordinator().id, plan.id);
+  assert.equal(calls, 1);
+  assert.equal(stopped.items[1]?.status, 'pending');
+  f.feishu.dissolveGroup = dissolve;
+  const resumed = await cleanup.apply(f.coordinator().id, plan.id);
+  assert.deepEqual(resumed.items.map(item => item.status), ['dissolved', 'dissolved']);
+});
+
+async function fixture(t: TestContext, options: { secondProject?: boolean } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'agent-project-runtime-'));
   const directory = await realpath(root);
   const projectConfigs = configSchema.parse({ feishu: { userOpenId: 'owner' }, projects: [
@@ -59,7 +397,7 @@ async function fixture(t: TestContext, options: { coordinated?: boolean; secondP
   const config = configSchema.parse({ dataDir: root, feishu: { userOpenId: 'owner' },
     recovery: { maxAttempts: 2, retryDelayMs: 1 },
     repositories: ['example/frontend', 'example/backend'].map(name => ({ name, path: directory, baseBranch: 'main', criteria: { taskTypes: ['bug', 'feature'] } })),
-    projects: options.coordinated === false ? [] : projectConfigs,
+    projects: projectConfigs,
   });
   const github = new GitHubFake(), feishu = new FeishuFake(), codex = new ProjectCodexFake();
   const workspaces: Parameters<WorkspacePort['ensure']>[0][] = [];
@@ -89,6 +427,24 @@ async function fixture(t: TestContext, options: { coordinated?: boolean; secondP
   });
   return { root, directory, config, projectConfigs, github, feishu, codex, workspaces, state, coordinator, events, message,
     get loop() { return loop; },
+    async seedLegacy(source: Source) {
+      const repository = configSchema.parse({ feishu: { userOpenId: 'owner' }, repositories: [{ name: source.repository, path: directory, baseBranch: 'main', workspace: { kind: 'project-directory', path: directory } }] }).repositories[0];
+      assert.ok(repository && 'path' in repository && repository.workspace?.kind === 'project-directory');
+      const id = `legacy-${source.number}`, chatId = await feishu.ensureGroup({ taskId: id, title: source.title, sourceUrl: source.url });
+      const threadId = await codex.createThread({ cwd: directory, instructions: 'Saved legacy instructions' });
+      const turnId = await codex.startTurn({ threadId, deliveryId: `${id}:initial`, input: [{ kind: 'text', text: source.body }] });
+      const task = taskSchema.parse({ id, sourceId: source.id, source: { kind: 'github', issue: source, repository, collectionReason: 'legacy' },
+        contextDirectory: join(root, 'tasks', id), resources: [{ id: 'legacy-workspace', kind: 'project-directory', repository, workspace: directory }],
+        workspaceSelection: { kind: 'selected', temporaryThreadId: 'saved-legacy-selection', inputIds: [], choice: { kind: 'repository', repositoryName: repository.name, repository, reason: 'Saved selection' } },
+        status: 'running', reason: null, prompt: 'Saved prompt', promptHash: 'saved-hash', skillPath: null,
+        chatId, threadId, turnId, executionStatus: 'running', lastHandledTurnId: null, requests: [], createdAt: Date.now(), updatedAt: Date.now(),
+      });
+      assert.equal(task.purpose, 'legacy');
+      loop.store.saveTask(task);
+      loop.store.receive(id, { id: `${id}:initial`, chatId, senderId: 'runtime:initial', chatType: 'group', text: source.body, attachments: [], createdAt: task.createdAt }, 'initial');
+      loop.store.markInput(`${id}:initial`, 'delivered');
+      return task;
+    },
     async initialize() { await loop.collect(); await loop.tick(); return coordinator(); },
     async status(callerId = coordinator().id) { return overviewSchema.parse(await loop.projectAction(callerId, { action: 'status' })); },
     async dispatch(requestId: string, prompt: string, extra: { issueId?: string; role?: 'worker' | 'verifier'; callerId?: string } = {}) {
@@ -98,8 +454,13 @@ async function fixture(t: TestContext, options: { coordinated?: boolean; secondP
       await loop.tick();
       const task = loop.store.task(result.taskId);
       assert.equal(task.status, 'running', task.reason ?? 'Delegated task must launch');
-      assert.ok(task.threadId && task.chatId);
+      assert.ok(task.threadId);
+      assert.equal(task.chatId, null);
       return task;
+    },
+    async openGroup(taskId: string, requestId = `open:${taskId}`) {
+      await loop.projectAction(coordinator().id, { action: 'open_group', taskId, requestId });
+      return loop.store.task(taskId);
     },
     async idleCoordinator(projectId = 'app') {
       const task = coordinator(projectId); assert.ok(task.threadId);
@@ -130,31 +491,47 @@ test('project collection uses label OR assignee across repositories without crea
   const coordinator = await f.initialize();
   await Promise.all([f.loop.collect(), f.loop.collect()]); await f.loop.tick();
   assert.deepEqual(f.state().issues.map(source => source.id).sort(), matched.map(source => source.id).sort());
-  assert.deepEqual(f.loop.tasks().map(task => task.id), [coordinator.id]);
+  assert.deepEqual(f.loop.tasks().filter(task => task.purpose === 'execution').map(task => task.id), [coordinator.id]);
+  assert.equal(f.loop.tasks().filter(task => task.purpose === 'intake').length, matched.length);
   assert.equal(f.events(coordinator.id, 'github_issue').length, matched.length);
   assert.equal(f.feishu.groups.size, 1);
   assert.equal(f.workspaces.length, 0);
   assert.equal(f.codex.selections.length, 0);
   assert.equal(f.codex.created[0]?.cwd, coordinator.contextDirectory);
   assert.match(f.codex.created[0]?.instructions ?? '', /Orchestrate/);
-  for (const source of matched) assert.equal(f.loop.store.taskForSource(source.id), null);
+  for (const source of matched) {
+    const intake = f.loop.store.taskForSource(source.id); assert.ok(intake);
+    assert.equal(intake.purpose, 'intake'); assert.equal(intake.threadId, null);
+    assert.equal(f.loop.projects.ledger.membership(intake.id), null);
+  }
   assert.equal((await f.status()).counts.issues, matched.length);
 });
 
-test('enabling a project adopts an existing Issue task and preserves its group, thread and work', async t => {
-  const f = await fixture(t, { coordinated: false });
+test('enabling a project adopts a paused legacy Issue and preserves its group, Thread, work and native approval', async t => {
+  const f = await fixture(t);
   const source = projectIssue(11);
-  f.github.sources = [source]; await f.loop.collect(); await f.loop.tick();
-  const original = f.loop.store.taskForSource(source.id); assert.ok(original?.threadId && original.chatId);
+  f.github.sources = [source]; const original = await f.seedLegacy(source); assert.ok(original.threadId && original.chatId);
+  const native: PendingRequest = { id: 'saved-approval', threadId: original.threadId, turnId: original.turnId!,
+    kind: 'approval', prompt: 'Saved native permission', method: 'item/commandExecution/requestApproval', payload: {}, isBlocking: true, connectionEpoch: 'saved-epoch' };
+  original.status = 'paused'; original.reason = 'Operator paused'; original.requests = [native];
+  f.loop.store.saveTask(original); f.codex.snapshot(original.threadId).requests = [native];
+  const decision = { id: 'saved-click', taskId: original.id, threadId: native.threadId, turnId: native.turnId,
+    requestId: native.id, decision: 'approve' as const, chatId: original.chatId, senderId: 'owner', epoch: native.connectionEpoch };
+  f.loop.store.queueApproval(decision); f.loop.store.markApproval(f.loop.store.approvalKey(decision), 'uncertain');
   const starts = f.codex.starts.filter(turn => turn.threadId === original.threadId).length;
-  f.config.projects = f.projectConfigs;
   await f.restart(); await f.loop.collect(); await f.loop.tick();
   assert.equal(f.loop.tasks().length, 2);
   assert.deepEqual(f.state().members.find(member => member.taskId === original.id), { taskId: original.id, role: 'worker', issueId: source.id });
   assert.equal(f.loop.store.task(original.id).threadId, original.threadId);
   assert.equal(f.loop.store.task(original.id).chatId, original.chatId);
+  assert.equal(f.loop.store.task(original.id).purpose, 'execution');
+  assert.equal(f.loop.store.task(original.id).status, 'paused');
+  assert.deepEqual(f.loop.store.task(original.id).resources, original.resources);
+  assert.deepEqual(f.loop.store.task(original.id).requests, [native]);
+  assert.deepEqual(f.loop.store.approvals(original.id)[0]?.action, decision);
+  assert.equal(f.loop.store.approvals(original.id)[0]?.status, 'uncertain'); assert.equal(f.codex.approvals.length, 0);
   assert.equal(f.codex.starts.filter(turn => turn.threadId === original.threadId).length, starts);
-  assert.equal(f.events(f.coordinator().id, 'github_issue').filter(input => input.message.text.includes(original.id)).length, 1);
+  assert.equal(f.events(f.coordinator().id, 'existing_work').filter(input => input.message.text.includes(original.id)).length, 1);
 });
 
 test('dispatch is idempotent under concurrent requests and restart, rejects conflicts and carries generic worker guidance', async t => {
@@ -168,11 +545,10 @@ test('dispatch is idempotent under concurrent requests and restart, rejects conf
   await f.loop.tick();
   const worker = f.loop.store.task(taskId); assert.ok(worker.threadId);
   assert.deepEqual(f.state().members.find(member => member.taskId === taskId), { taskId, role: 'worker', issueId: f.github.sources[0]!.id });
-  assert.equal(f.events(taskId, 'delegation').length, 1);
-  assert.equal(f.events(taskId, 'delegation')[0]?.message.text, action.prompt);
+  assert.equal(f.loop.store.meta(`project-delegation:${taskId}`), action.prompt);
   const creation = f.codex.created.find(input => input.cwd === f.directory); assert.ok(creation);
   assert.match(creation.instructions, /poteto-mode/);
-  assert.ok(f.codex.starts.some(turn => turn.threadId === worker.threadId && JSON.stringify(turn.input).includes(action.prompt)));
+  assert.ok(creation.instructions.includes(action.prompt));
   assert.equal(worker.resources[0]?.workspace, f.directory);
   assert.equal(f.codex.selections.length, 0);
   await assert.rejects(f.loop.projectAction(coordinator.id, { ...action, prompt: 'Different scope under the same request' }), /different|conflict|already/i);
@@ -283,7 +659,8 @@ test('native Worker questions wake the coordinator and its answer resumes that W
 
 test('a direct owner decision in a Worker group reaches the coordinator with its origin and is deduplicated', async t => {
   const f = await fixture(t); await f.initialize();
-  const worker = await f.dispatch('owner-guidance', 'Investigate batch export.'); await f.idleCoordinator();
+  const dispatched = await f.dispatch('owner-guidance', 'Investigate batch export.'); await f.idleCoordinator();
+  const worker = await f.openGroup(dispatched.id);
   const decision = f.message('worker-decision', 'Use selected rows. Update the backend contract too; do not deploy.', worker.chatId!);
   await f.loop.receive({ ...decision, id: 'untrusted', senderId: 'stranger' });
   assert.equal(f.events(f.coordinator().id, 'owner_input').length, 0);
@@ -446,7 +823,7 @@ test('dispatch persisted before launch is recovered once and an uncertain accept
   await f.restart(); await f.loop.projectAction(f.coordinator().id, action); await f.loop.tick();
   assert.equal(f.events(worker.id, 'delegation')[0]?.status, 'delivered');
   assert.equal(f.codex.starts.filter(input => input.threadId === worker.threadId).length, starts);
-  assert.equal(f.loop.tasks().length, 2); assert.equal(f.feishu.groups.size, 2);
+  assert.equal(f.loop.tasks().length, 2); assert.equal(f.feishu.groups.size, 1);
 });
 
 test('project and role permissions reject cross-project messages, foreign Issues and Worker dispatch or rotation', async t => {
@@ -470,8 +847,9 @@ test('project and role permissions reject cross-project messages, foreign Issues
   assert.equal(appStatus.id, 'app'); assert.ok(appStatus.tasks.every(task => task.taskId !== foreign.id && task.taskId !== docs.id));
   assert.equal(f.loop.store.inputs(foreign.id).length, before); assert.equal(f.loop.tasks().length, 4);
   const manual: IncomingMessage = { ...f.message('ordinary-task', 'Discuss an unrelated idea.', 'private'), chatType: 'p2p' };
-  await f.loop.receive(manual);
+  seedSavedIntake(f.loop, manual);
   const ordinary = f.loop.store.taskForSource('feishu:new:ordinary-task'); assert.ok(ordinary);
+  assert.equal(ordinary.purpose, 'intake'); assert.equal(ordinary.threadId, null);
   await assert.rejects(f.loop.projectAction(ordinary.id, { action: 'status' }), /project|bound/i);
 });
 
@@ -525,7 +903,7 @@ test('only the coordinator can pause and resume its project Worker while other t
     assert.equal(f.loop.store.task(task.id).threadId, task.threadId);
     assert.equal(f.codex.starts.filter(input => input.threadId === task.threadId).length, 1);
   }
-  assert.equal(f.loop.tasks().length, 5); assert.equal(f.feishu.groups.size, 5);
+  assert.equal(f.loop.tasks().length, 5); assert.equal(f.feishu.groups.size, 2);
 });
 
 test('a final investigation report wakes the coordinator while Worker idleness never means successful delivery', async t => {
@@ -580,25 +958,27 @@ test('project intake clears legacy server filters so label-only and assignee-onl
   assert.equal(f.state().issues.length, 2);
 });
 
-test('a legacy Issue outside project selectors remains an ordinary task with its original update routing', async t => {
-  const f = await fixture(t, { coordinated: false });
+test('a legacy Issue outside intake selectors is adopted in place before further execution', async t => {
+  const f = await fixture(t);
   const source = projectIssue(63, 'example/frontend', { labels: ['ordinary'], assignees: ['ordinary-owner'] });
-  f.github.sources = [source]; await f.loop.collect(); await f.loop.tick();
-  const original = f.loop.store.taskForSource(source.id); assert.ok(original?.threadId);
-  f.config.projects = f.projectConfigs;
+  f.github.sources = [source]; const original = await f.seedLegacy(source);
   await f.restart(); await f.loop.collect(); await f.loop.tick();
-  assert.equal(f.state().issues.length, 0); assert.equal(f.loop.projects.ledger.membership(original.id), null);
-  f.github.sources = [{ ...source, body: 'Ordinary task new evidence' }];
-  await f.loop.collect(); await f.loop.tick();
   const retained = f.loop.store.task(original.id);
-  assert.equal(retained.threadId, original.threadId);
-  assert.ok(f.loop.store.inputs(original.id).some(input => input.message.text.includes('Ordinary task new evidence')));
+  assert.equal(retained.purpose, 'execution'); assert.equal(retained.threadId, original.threadId);
+  assert.equal(retained.chatId, original.chatId); assert.deepEqual(retained.resources, original.resources);
+  assert.equal(f.state().issues.length, 0);
+  assert.deepEqual(f.loop.projects.ledger.membership(original.id), { projectId: 'app', role: 'worker' });
+  assert.equal(f.events(f.coordinator().id, 'existing_work').length, 1);
+  await f.loop.receive(f.message('legacy-followup', 'Continue within the original scope', original.chatId!));
+  assert.equal(f.loop.store.task(original.id).threadId, original.threadId);
+  assert.equal(f.codex.steers.filter(input => input.threadId === original.threadId).length, 1);
   assert.equal(f.events(f.coordinator().id, 'github_issue').length, 0);
 });
 
 test('owner input and coordinator notification commit together and duplicate delivery repairs a prior notification gap', async t => {
   const f = await fixture(t); await f.initialize();
-  const worker = await f.dispatch('owner-atomic', 'Investigate requirements.'); assert.ok(worker.chatId);
+  const dispatched = await f.dispatch('owner-atomic', 'Investigate requirements.');
+  const worker = await f.openGroup(dispatched.id); assert.ok(worker.chatId);
   const message = f.message('atomic-decision', 'Keep partial exports.', worker.chatId);
   const receive = f.loop.store.receive.bind(f.loop.store);
   f.loop.store.receive = (...args) => {
@@ -633,4 +1013,41 @@ test('recovery reconciles a removed workspace when its release acknowledgement w
   assert.ok(!f.loop.store.task(worker.id).resources.some(item => item.id === resource.id));
   await assert.rejects(stat(resource.workspace), /ENOENT/);
   assert.deepEqual(await f.loop.projectAction(worker.id, action), { released: true, resourceId: resource.id });
+});
+
+
+test('independent startup race: recovery must validate saved resources before input can start the retained Thread', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('startup-order', 'Retain saved resources.'); await f.openGroup(worker.id);
+  await f.loop.ensureWorkspace(worker.id, 'example/frontend'); assert.ok(worker.threadId);
+  f.codex.complete(worker.threadId, null); await f.loop.tick();
+  const saved = f.loop.store.task(worker.id); assert.equal(saved.status, 'idle'); assert.ok(saved.chatId);
+  const ports = f.loop.ports; await f.loop.close();
+  const entered = { resolve: () => {} }, held = { resolve: () => {} };
+  const blocked = new Promise<void>(done => { entered.resolve = done; });
+  const hold = new Promise<void>(done => { held.resolve = done; });
+  let validations = 0;
+  ports.workspace.ensure = async input => {
+    if (input.kind === 'project-directory') return input.directory;
+    validations++; throw new Error('Saved worktree branch mismatch');
+  };
+  const config = { ...f.config, pollIntervalMs: 3600000, executionPollMs: 3600000 };
+  const restarted = new AgentLoop(config, ports, new Store(f.root));
+  const ensure = restarted.projects.ensure.bind(restarted.projects);
+  let calls = 0;
+  restarted.projects.ensure = async () => {
+    calls++; if (calls === 2) { entered.resolve(); await hold; }
+    return ensure();
+  };
+  const before = f.codex.starts.filter(call => call.threadId === worker.threadId).length;
+  const starting = restarted.start(); await blocked;
+  try {
+    await restarted.receive({ id: 'startup-owner', chatId: saved.chatId, chatType: 'group', senderId: 'owner',
+      text: 'Continue in the saved workspace.', attachments: [], createdAt: Date.now() });
+    assert.equal(f.codex.starts.filter(call => call.threadId === worker.threadId).length, before,
+      'input must not start execution while saved-workspace validation is still blocked');
+    assert.equal(validations, 0);
+  } finally { held.resolve(); await starting; await restarted.close(); }
+  assert.equal(validations, 1);
+  assert.equal(f.codex.starts.filter(call => call.threadId === worker.threadId).length, before);
 });

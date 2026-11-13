@@ -7,7 +7,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { Client, WSClient, EventDispatcher, Domain, LoggerLevel, defaultHttpInstance, type HttpInstance, type HttpRequestOptions } from '@larksuiteoapi/node-sdk';
 import { z } from 'zod';
 import { UncertainOperationError, errorMessage, type ApprovalAction, type Attachment, type IncomingMessage, type PendingRequest } from '../domain.js';
-import type { FeishuPort, FeishuProgressPort } from '../ports.js';
+import { FeishuApiError, GroupCreationRejected, TaskGroupUnavailable, type FeishuPort, type FeishuProgressPort, type ProgressWriteGuard } from '../ports.js';
 import { FeishuDocumentAdapter, type FeishuDocumentApi } from './feishu-document.js';
 
 export interface FeishuOptions {
@@ -17,7 +17,7 @@ export interface FeishuOptions {
   requestTimeoutMs?: number;
 }
 type FeishuApi = {
-  chat: Pick<Client['im']['v1']['chat'], 'list' | 'get' | 'create'>;
+  chat: Pick<Client['im']['v1']['chat'], 'list' | 'get' | 'create'> & Partial<Pick<Client['im']['v1']['chat'], 'delete'>>;
   message: Pick<Client['im']['v1']['message'], 'list' | 'create'>;
   messageResource: Pick<Client['im']['v1']['messageResource'], 'get'>;
 };
@@ -150,7 +150,8 @@ function stableUuid(value: string): string {
   return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-5${hash.slice(13, 16)}-8${hash.slice(17, 20)}-${hash.slice(20)}`;
 }
 function check<T>(response: { code?: number; msg?: string; data?: T }): T {
-  if (!response || response.code !== 0) throw new Error(`Feishu API error ${response?.code ?? 'missing code'}: ${response?.msg ?? 'unknown error'}`);
+  if (response?.code === 232009 || response?.code === 232006) throw new TaskGroupUnavailable(response.code, response.msg ?? 'Task group unavailable');
+  if (!response || response.code !== 0) throw new FeishuApiError(response?.code ?? -1, response?.msg ?? 'unknown error');
   if (response.data == null) throw new Error('Feishu API response is missing data');
   return response.data;
 }
@@ -221,7 +222,7 @@ export class FeishuAdapter implements FeishuPort, FeishuProgressPort {
     this.nextProgressRequestAt = start + 100;
     if (start > now) await delay(start - now);
   }
-  async createProgressCard(input: Parameters<FeishuProgressPort['createProgressCard']>[0]): Promise<string> {
+  async createProgressCard(input: Parameters<FeishuProgressPort['createProgressCard']>[0], guard?: ProgressWriteGuard): Promise<string> {
     const card = { schema: '2.0', config: { update_multi: true, streaming_mode: true, summary: { content: progressCardTitle } },
       header: { title: { tag: 'plain_text', content: progressCardTitle } },
       body: { elements: [
@@ -232,11 +233,13 @@ export class FeishuAdapter implements FeishuPort, FeishuProgressPort {
     const data = JSON.stringify(card);
     if (Buffer.byteLength(data) >= 30_000) throw new Error('Progress card exceeds the 30KB payload budget');
     await this.paceProgressRequest();
+    guard?.();
     const response = checkWrite(await this.cardkit.card.create({ data: { type: 'card_json', data } }));
     return id.parse(response.card_id);
   }
-  async sendProgressCard(input: Parameters<FeishuProgressPort['sendProgressCard']>[0]): Promise<string> {
+  async sendProgressCard(input: Parameters<FeishuProgressPort['sendProgressCard']>[0], guard?: ProgressWriteGuard): Promise<string> {
     await this.paceProgressRequest();
+    guard?.();
     const response = checkWrite(await this.api.message.create({ params: { receive_id_type: 'chat_id' }, data: {
       receive_id: input.chatId, msg_type: 'interactive', content: JSON.stringify({ type: 'card', data: { card_id: input.cardId } }), uuid: input.uuid,
     } }));
@@ -270,53 +273,74 @@ export class FeishuAdapter implements FeishuPort, FeishuProgressPort {
     } while (token);
     return null;
   }
-  async updateProgressContent(input: Parameters<FeishuProgressPort['updateProgressContent']>[0]): Promise<void> {
+  async updateProgressContent(input: Parameters<FeishuProgressPort['updateProgressContent']>[0], guard?: ProgressWriteGuard): Promise<void> {
     if (Buffer.byteLength(JSON.stringify(input.content)) >= 24_000) throw new Error('Progress content exceeds its payload budget');
     await this.paceProgressRequest();
+    guard?.();
     checkWrite(await this.cardkit.cardElement.content({ path: { card_id: input.cardId, element_id: 'progress' },
       data: { content: input.content, sequence: input.sequence, uuid: input.uuid } }));
   }
-  async setProgressStreaming(input: Parameters<FeishuProgressPort['setProgressStreaming']>[0]): Promise<void> {
+  async setProgressStreaming(input: Parameters<FeishuProgressPort['setProgressStreaming']>[0], guard?: ProgressWriteGuard): Promise<void> {
     await this.paceProgressRequest();
+    guard?.();
     checkWrite(await this.cardkit.card.settings({ path: { card_id: input.cardId },
       data: { settings: JSON.stringify({ config: { streaming_mode: input.enabled } }), sequence: input.sequence, uuid: input.uuid } }));
   }
-  async ensureGroup(input: { taskId: string; title: string; sourceUrl?: string; reconcileOnly?: boolean }): Promise<string> {
-    const marker = `agent-loop:v1:${input.taskId}`;
+  async ensureGroup(input: { taskId: string; title: string; sourceUrl?: string; generation?: number; reconcileOnly?: boolean }): Promise<string> {
+    const generation = input.generation ?? 0;
+    const marker = `agent-loop:v1:${input.taskId}${generation ? `:generation:${generation}` : ''}`;
     const description = `${marker}\n${input.sourceUrl ?? ''}`;
     const matches = new Set<string>();
     const seen = new Set<string>();
     let token: string | undefined;
-    do {
-      const page = check(await this.api.chat.list({ params: { page_size: 100, page_token: token, user_id_type: 'open_id' } }));
-      if (!page.items) throw new Error('Feishu chat list is missing items');
-      for (const chat of page.items) {
-        if (chat.description?.split('\n')[0] === marker) matches.add(id.parse(chat.chat_id));
-      }
-      token = nextPage(page, seen);
-    } while (token);
+    try {
+      do {
+        const page = check(await this.api.chat.list({ params: { page_size: 100, page_token: token, user_id_type: 'open_id' } }));
+        if (!page.items) throw new Error('Feishu chat list is missing items');
+        for (const chat of page.items) {
+          if (chat.description?.split('\n')[0] === marker) matches.add(id.parse(chat.chat_id));
+        }
+        token = nextPage(page, seen);
+      } while (token);
+    } catch (error) {
+      if (!input.reconcileOnly) throw new GroupCreationRejected(error instanceof FeishuApiError ? error.code : -1, errorMessage(error));
+      throw error;
+    }
     if (matches.size > 1) throw new Error('Multiple Feishu groups claim the same task');
     const existing = [...matches][0];
     if (existing) { await this.verifyGroup(existing); return existing; }
     if (input.reconcileOnly) throw new UncertainOperationError('Previous group creation could not be reconciled; no replacement group created');
     let response: Awaited<ReturnType<FeishuApi['chat']['create']>>;
     try {
-      response = await this.api.chat.create({ params: { user_id_type: 'open_id', uuid: stableUuid(`group:${input.taskId}`) },
+      response = await this.api.chat.create({ params: { user_id_type: 'open_id', uuid: stableUuid(`group:${input.taskId}${generation ? `:${generation}` : ''}`) },
         data: { name: input.title.slice(0, 80), description, owner_id: this.options.userOpenId,
           user_id_list: [this.options.userOpenId], chat_mode: 'group', chat_type: 'private', external: false } });
     } catch (error) {
       throw new UncertainOperationError(`Feishu group creation outcome is unknown: ${errorMessage(error)}`);
     }
-    const data = checkWrite(response);
+    let data: NonNullable<typeof response.data>;
+    try { data = checkWrite(response); }
+    catch (error) {
+      if (error instanceof FeishuApiError) throw new GroupCreationRejected(error.code, error.message);
+      throw error;
+    }
     const chatId = id.safeParse(data.chat_id);
     if (!chatId.success) throw new UncertainOperationError('Feishu group creation returned no valid chat_id');
     return chatId.data;
   }
   async verifyGroup(chatId: string): Promise<void> {
-    const chat = check(await this.api.chat.get({ path: { chat_id: chatId }, params: { user_id_type: 'open_id' } }));
+    const chat = z.object({ chat_status: id, owner_id: id, chat_mode: id, chat_type: id })
+      .parse(check(await this.api.chat.get({ path: { chat_id: chatId }, params: { user_id_type: 'open_id' } })));
     if (chat.chat_status !== 'normal' || chat.owner_id !== this.options.userOpenId || chat.chat_mode !== 'group' || chat.chat_type !== 'private') {
-      throw new Error('Feishu task group is unavailable or its owner/privacy changed');
+      throw new TaskGroupUnavailable(0, 'Feishu task group is unavailable or its owner/privacy changed');
     }
+  }
+  async dissolveGroup(chatId: string): Promise<void> {
+    if (!this.api.chat.delete) throw new Error('Feishu chat delete is unavailable');
+    const response = await this.api.chat.delete({ path: { chat_id: chatId } });
+    if (typeof response?.code !== 'number') throw new UncertainOperationError('Feishu group deletion returned an incomplete response');
+    if (response?.code === 232009) return;
+    if (response?.code !== 0) check(response);
   }
   async send(input: { chatId: string; text: string; id: string }): Promise<void> {
     let response: Awaited<ReturnType<FeishuApi['message']['create']>>;

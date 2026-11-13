@@ -1,5 +1,6 @@
+import { SurfaceCodex, testProject, restoreSurface, tickSurface } from './coordinated-surfaces.js';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { realpath, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -9,7 +10,9 @@ import { incomingSchema, submissionRequestIdSchema, taskSchema, type Task } from
 import type { ExecutionEvent } from '../src/execution-events.js';
 import { FeishuDocumentProgressPublisher, documentPublicationSchema } from '../src/feishu-document-progress.js';
 import { documentChunks } from '../src/feishu-document-text.js';
-import { DocumentRequestRejected, type FeishuDocumentProgressPort, type FeishuProgressPort } from '../src/ports.js';
+import { DocumentRequestRejected, TaskGroupUnavailable, type FeishuDocumentProgressPort, type FeishuProgressPort, type ProgressWriteGuard } from '../src/ports.js';
+import { FeishuDocumentAdapter, type FeishuDocumentApi } from '../src/adapters/feishu-document.js';
+import { retireTaskGroup } from '../src/task-groups.js';
 import { Store } from '../src/store.js';
 import { AgentLoop } from '../src/loop.js';
 import { CodexFake, FeishuFake, GitHubFake } from './fakes.js';
@@ -75,7 +78,7 @@ function task(id = 'task', turnId = 'turn'): Task {
     chatId: `chat-${id}`, threadId: `thread-${id}`, turnId, executionStatus: 'running', lastHandledTurnId: null, requests: [], createdAt: 1, updatedAt: 1 });
 }
 async function fixture(t: TestContext, initialize = true) {
-  const directory = await mkdtemp(join(tmpdir(), 'document-progress-'));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'document-progress-')));
   let store = new Store(directory), now = Date.UTC(2026, 10, 7);
   const transport = new Documents();
   let publisher = new FeishuDocumentProgressPublisher({ store, transport, documentBaseUrl: baseUrl, intervalMs: 1000, now: () => now });
@@ -342,16 +345,79 @@ test('status, turn and thread identity changes invalidate projection without new
   assert.equal(f.record().view.status, 'running'); assert.equal(reads.mock.callCount(), 3);
 });
 
-test('manual source changes invalidate projection and chat binding is checked before an equal revision', async t => {
+test('manual source changes invalidate projection and a new chat binding creates a separate document', async t => {
   const f = await fixture(t); const current = task(); f.store.saveTask(current); await f.pump(5);
   assert.equal(current.source.kind, 'manual'); if (current.source.kind !== 'manual') return;
   f.store.saveTask({ ...current, source: { kind: 'manual', message: { ...current.source.message, text: 'Revised original question' } } });
   await f.pump(); assert.match(f.transport.text(), /Revised original question/); assert.doesNotMatch(f.transport.text(), /Discuss/);
-  const before = f.record(), calls = f.transport.calls.length;
+  const before = f.record();
   f.store.saveTask({ ...f.store.task('task'), chatId: 'other-chat' });
   await f.pump();
-  assert.deepEqual(f.record(), before); assert.equal(f.transport.calls.length, calls);
-  assert.ok(f.store.diagnostics().some(row => row.message.includes('Document chat binding changed')));
+  assert.equal(f.record().chatId, 'other-chat');
+  assert.equal(f.transport.documents.length, 2);
+  assert.equal(f.store.meta('retired-document-progress:task:chat-task'), JSON.stringify(before));
+});
+
+test('dissolved and absent chats stop saved document publications without affecting execution', async t => {
+  const f = await fixture(t); f.store.saveTask(task()); await f.pump(2);
+  const before = f.transport.calls.length;
+  f.store.saveTask({ ...f.store.task('task'), chatId: null });
+  await f.pump(5);
+  assert.equal(f.transport.calls.length, before);
+  f.store.saveTask({ ...f.store.task('task'), chatId: 'chat-task' });
+  f.transport.fail = { kind: 'members', when: 'before', error: new TaskGroupUnavailable(232009, 'dissolved') };
+  await f.pump(4);
+  assert.equal(f.store.task('task').chatId, null);
+  assert.equal(f.store.task('task').status, 'running');
+  const stopped = f.transport.calls.length;
+  await f.pump(5); assert.equal(f.transport.calls.length, stopped);
+});
+
+test('retiring a task group during unknown-write readback prevents a later write to its document', async t => {
+  const f = await fixture(t); f.store.saveTask(task()); await f.pump(5);
+  f.event('agent_message', 'Changed document content');
+  f.transport.fail = { kind: 'write', when: 'before', error: new Error('write outcome unknown') };
+  await f.pump();
+  const writes = f.transport.count('write');
+  const hold = gate(); f.transport.hold = { kind: 'read', gate: hold };
+  const reading = f.publisher.poll();
+  await Promise.resolve();
+  assert.ok(f.transport.count('read') > 0);
+  f.store.saveTask({ ...f.store.task('task'), chatId: null });
+  hold.resolve(); await reading; f.transport.hold = null;
+  assert.equal(f.transport.count('write'), writes, 'detaching during readback must stop the old publication');
+});
+
+test('group retirement cancels document writes still waiting in the real adapter pacing queue', async t => {
+  const f = await fixture(t); f.store.saveTask(task());
+  let hold = false;
+  const entered = gate(), release = gate();
+  const patches: { retired: boolean; text: string }[] = [];
+  const unused = async (): Promise<never> => { throw new Error('Unexpected API request'); };
+  const api: FeishuDocumentApi = {
+    document: { create: unused }, children: { create: unused, get: unused, batchDelete: unused },
+    members: { create: unused, list: unused }, tabs: { create: unused, listTabs: unused },
+    block: { get: unused, patch: async input => {
+      assert.ok(input?.path && input.data?.update_text_elements?.elements);
+      const elements = input.data.update_text_elements.elements;
+      const text = elements.map(element => element.text_run?.content ?? '').join('');
+      patches.push({ retired: f.store.task('task').chatId === null, text });
+      const clientToken = input.params?.client_token; assert.ok(clientToken);
+      return { code: 0, data: { block: { block_id: input.path.block_id, block_type: 2, text: { elements } }, client_token: clientToken } };
+    } },
+  };
+  const adapter = new FeishuDocumentAdapter(() => api, { now: () => 0, sleep: async () => {
+    if (hold) { entered.resolve(); await release.promise; }
+  } });
+  f.transport.replaceContent = (input, guard?: ProgressWriteGuard) => adapter.replaceContent(input, guard);
+  f.event('agent_message', 'First content'); await f.pump(8);
+  assert.ok(patches.length > 0);
+  const before = patches.length; hold = true;
+  f.event('agent_message', 'New content', { itemId: 'new-item' });
+  const writing = f.publisher.poll(); await entered.promise;
+  retireTaskGroup(f.store, 'task', 'chat-task'); release.resolve(); await writing;
+  assert.equal(patches.length, before);
+  assert.ok(patches.every(patch => !patch.retired));
 });
 
 test('maxLines and renderer revision changes re-render unchanged histories once', async t => {
@@ -409,12 +475,12 @@ test('invalid persisted events roll back all projections and discovery position 
 
 async function runtime(t: TestContext, enabled = true) {
   t.mock.timers.enable({ apis: ['Date', 'setInterval'], now: Date.UTC(2026, 10, 7) });
-  const directory = await mkdtemp(join(tmpdir(), 'document-runtime-'));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'document-runtime-')));
   const documentProgress = new Documents(); let cards = 0;
   const rejectCard = async () => { cards++; throw new Error('card publisher must not run'); };
   const progress: FeishuProgressPort = { createProgressCard: rejectCard, sendProgressCard: rejectCard, findProgressMessage: rejectCard, updateProgressContent: rejectCard, setProgressStreaming: rejectCard };
-  const feishu = Object.assign(new FeishuFake(), { progress, documentProgress }), codex = new CodexFake();
-  const config = configSchema.parse({ dataDir: directory, executionPollMs: 600_000, pollIntervalMs: 600_000,
+  const feishu = Object.assign(new FeishuFake(), { progress, documentProgress }), codex = new SurfaceCodex();
+  const config = configSchema.parse({ dataDir: directory, projects: [testProject(directory)], executionPollMs: 600_000, pollIntervalMs: 600_000,
     feishu: { userOpenId: 'owner', progress: { enabled, surface: 'document', documentBaseUrl: baseUrl, intervalMs: 1000 } } });
   const ports = { feishu, codex, github: new GitHubFake(), workspace: { ensure: async () => directory, head: async () => 'head' } };
   let loop = new AgentLoop(config, ports);
@@ -424,14 +490,24 @@ async function runtime(t: TestContext, enabled = true) {
   return { documentProgress, feishu, codex, config, pump, get loop() { return loop; }, get cards() { return cards; },
     async restart() { await loop.close(); loop = new AgentLoop(config, ports); await loop.start(); },
     async receive(id: string, text: string, chatId = 'private') {
-      await loop.receive({ id, text, chatId, senderId: 'owner', chatType: chatId === 'private' ? 'p2p' : 'group', attachments: [], createdAt: Date.now() });
+      await restoreSurface(loop, { id, text, chatId, senderId: 'owner', chatType: chatId === 'private' ? 'p2p' : 'group', attachments: [], createdAt: Date.now() });
+      if (chatId === 'private') {
+        const worker = loop.store.taskForSource(`feishu:new:${id}`); assert.ok(worker?.threadId);
+        const member = loop.projects.ledger.membership(worker.id); assert.ok(member);
+        const project = loop.projects.ledger.project(member.projectId); assert.ok(project);
+        await loop.projectAction(project.coordinatorTaskId, { action: 'open_group', requestId: `document-surface:${worker.id}`, taskId: worker.id });
+      }
     } };
 }
 
 test('whole AgentLoop runs two turns and restart with one document/tab, zero progress messages and independent final/native delivery', async t => {
   const f = await runtime(t); await f.receive('new', 'Discuss');
-  const current = f.loop.tasks()[0]!; assert.ok(current.threadId && current.chatId && current.turnId);
-  await f.pump(5); assert.equal(f.documentProgress.tabs.size, 1);
+  const current = f.loop.tasks().find(task => !task.sourceId.startsWith('project:'))!; assert.ok(current.threadId && current.chatId && current.turnId);
+  await f.pump(5);
+  const original = documentPublicationSchema.parse(f.loop.store.documentProgressRecord(current.id));
+  assert.equal(original.delivery.kind, 'ready');
+  const tabs = () => [...f.documentProgress.tabs.keys()].filter(key => JSON.parse(key).chatId === current.chatId);
+  assert.equal(tabs().length, 1);
   f.codex.complete(current.threadId, 'First final'); await f.loop.tick(); await f.pump(); await f.restart();
   await f.receive('next', 'Continue', current.chatId);
   const snapshot = f.codex.snapshot(current.threadId); assert.ok(snapshot.turnId);
@@ -439,7 +515,11 @@ test('whole AgentLoop runs two turns and restart with one document/tab, zero pro
     prompt: 'Permission', payload: {}, isBlocking: true, connectionEpoch: 'epoch' }];
   await f.loop.tick(); assert.equal(f.feishu.approvals.length, 1);
   f.codex.complete(current.threadId, 'Second final'); await f.loop.tick(); await f.pump(3);
-  assert.equal(f.documentProgress.documents.length, 1); assert.equal(f.documentProgress.tabs.size, 1); assert.equal(f.cards, 0);
+  const restored = documentPublicationSchema.parse(f.loop.store.documentProgressRecord(current.id));
+  assert.equal(restored.delivery.kind, 'ready');
+  assert.equal('documentId' in restored.delivery && restored.delivery.documentId,
+    'documentId' in original.delivery && original.delivery.documentId);
+  assert.equal(tabs().length, 1); assert.equal(f.cards, 0);
   assert.equal(f.feishu.sent.filter(message => message.text === 'First final').length, 1);
   assert.equal(f.feishu.sent.filter(message => message.text === 'Second final').length, 1);
   assert.ok(f.feishu.sent.every(message => !message.text.includes('执行进度')));
@@ -447,7 +527,7 @@ test('whole AgentLoop runs two turns and restart with one document/tab, zero pro
 
 test('whole AgentLoop keeps final/native delivery working with missing document permission and no fallback', async t => {
   const f = await runtime(t); f.documentProgress.createDocument = async () => { throw new DocumentRequestRejected('99991672 Access denied'); };
-  await f.receive('new', 'Discuss'); const current = f.loop.tasks()[0]!; assert.ok(current.threadId && current.turnId);
+  await f.receive('new', 'Discuss'); const current = f.loop.tasks().find(task => !task.sourceId.startsWith('project:'))!; assert.ok(current.threadId && current.turnId);
   await f.pump();
   const snapshot = f.codex.snapshot(current.threadId);
   snapshot.requests = [{ id: 'question', threadId: current.threadId, turnId: current.turnId, kind: 'question', method: 'item/tool/requestUserInput', prompt: 'Which value?', payload: {}, isBlocking: true, connectionEpoch: 'epoch' }];
@@ -458,9 +538,12 @@ test('whole AgentLoop keeps final/native delivery working with missing document 
 });
 
 test('whole AgentLoop first enable does not backfill historical completed tasks', async t => {
-  const f = await runtime(t, false); await f.receive('old', 'Old'); const current = f.loop.tasks()[0]!; assert.ok(current.threadId && current.chatId);
+  const f = await runtime(t, false); await f.receive('old', 'Old'); const current = f.loop.tasks().find(task => !task.sourceId.startsWith('project:'))!; assert.ok(current.threadId && current.chatId);
   f.codex.complete(current.threadId, 'Old final'); await f.loop.tick(); f.config.feishu.progress.enabled = true;
-  await f.restart(); await f.pump(6); await f.restart(); await f.pump(3); assert.equal(f.documentProgress.calls.length, 0);
+  await f.restart(); await f.pump(6); await f.restart(); await f.pump(3);
+  assert.equal(f.loop.store.documentProgressRecord(current.id), null, 'completed Worker history is not published');
   await f.receive('new', 'New turn', current.chatId); f.codex.complete(current.threadId, 'Fast final'); await f.loop.tick(); await f.pump(6);
-  assert.equal(f.documentProgress.documents.length, 1); assert.equal(f.documentProgress.tabs.size, 1); assert.equal(f.cards, 0);
+  assert.equal(documentPublicationSchema.parse(f.loop.store.documentProgressRecord(current.id)).delivery.kind, 'ready');
+  assert.equal([...f.documentProgress.tabs.keys()].filter(key => JSON.parse(key).chatId === current.chatId).length, 1);
+  assert.equal(f.cards, 0);
 });

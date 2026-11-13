@@ -1,3 +1,4 @@
+import { tickWithDirectGroups, workerCalls } from './coordinated-runtime.js';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
@@ -61,7 +62,7 @@ async function fixture(t: TestContext) {
   function thread() { const id = task().threadId; assert.ok(id); return id; }
   return {
     loop, config, github, feishu, codex, task, thread, close,
-    async launch() { github.sources = [issue(1)]; await loop.collect(); await loop.tick(); },
+    async launch() { github.sources = [issue(1)]; await loop.collect(); await tickWithDirectGroups(loop); },
     message(id: string, text: string): IncomingMessage {
       const chatId = task().chatId;
       assert.ok(chatId);
@@ -85,9 +86,9 @@ test('a rejected native answer leaves the question answerable and does not block
     if (input.text === 'incomplete') throw new RejectedInputError('Both answer fields are required');
     await reply(input);
   };
-  await f.loop.tick();
+  await tickWithDirectGroups(f.loop);
   await f.loop.receive(f.message('bad-answer', 'incomplete'));
-  assert.equal(f.codex.replies.length, 0);
+  assert.equal(workerCalls(f.loop, f.codex).replies.length, 0);
   assert.equal(f.task().status, 'running');
   assert.equal(snapshot.requests.length, 1);
   assert.ok(f.feishu.sent.some(message => message.text.includes('Both answer fields are required')));
@@ -95,10 +96,10 @@ test('a rejected native answer leaves the question answerable and does not block
   const answer = '{"device":"C5010","version":"3"}';
   await f.loop.receive(f.message('correct-answer', answer));
   await f.loop.receive(f.message('follow-up', 'The original reproduction also includes this log.'));
-  assert.deepEqual(f.codex.replies.map(input => [input.request.id, input.text]), [['question-1', answer]]);
-  assert.deepEqual(f.codex.steers.map(input => input.deliveryId), ['follow-up']);
+  assert.deepEqual(workerCalls(f.loop, f.codex).replies.map(input => [input.request.id, input.text]), [['question-1', answer]]);
+  assert.deepEqual(workerCalls(f.loop, f.codex).steers.map(input => input.deliveryId), ['follow-up']);
   assert.equal(f.task().status, 'running');
-  assert.equal(f.codex.starts.length, 1);
+  assert.equal(workerCalls(f.loop, f.codex).starts.length, 1);
 });
 
 test('a source update queued before completion cannot answer the completed turn on behalf of the user', async t => {
@@ -107,16 +108,16 @@ test('a source update queued before completion cannot answer the completed turn 
   f.github.sources = [issue(1, { body: 'Additional reproduction details' })];
   await f.loop.collect();
   f.codex.complete(f.thread(), waiting);
-  await f.loop.tick();
-  await f.loop.tick();
+  await tickWithDirectGroups(f.loop);
+  await tickWithDirectGroups(f.loop);
 
-  assert.equal(f.task().status, 'running');
-  assert.equal(f.codex.starts.length, 2);
-  assert.equal(f.codex.steers.length, 0);
-  assert.equal(f.codex.replies.length, 0);
+  assert.equal(f.task().status, 'idle');
+  assert.equal(workerCalls(f.loop, f.codex).starts.length, 1);
+  assert.equal(workerCalls(f.loop, f.codex).steers.length, 0);
+  assert.equal(workerCalls(f.loop, f.codex).replies.length, 0);
   await f.loop.receive(f.message('explicit-answer', 'Confirmed, proceed with the fix.'));
-  assert.equal(f.codex.starts.length, 2);
-  assert.equal(f.codex.steers.at(-1)?.deliveryId, 'explicit-answer');
+  assert.equal(workerCalls(f.loop, f.codex).starts.length, 2);
+  assert.equal(workerCalls(f.loop, f.codex).starts.at(-1)?.deliveryId, 'explicit-answer');
 });
 
 test('a source update racing with turn completion starts once without manufacturing a user answer', async t => {
@@ -124,14 +125,15 @@ test('a source update racing with turn completion starts once without manufactur
   await f.launch();
   f.github.sources = [issue(1, { body: 'Evidence arrived just as the agent finished' })];
   await f.loop.collect();
+  assert.equal(workerCalls(f.loop, f.codex).steers.length, 0);
   f.codex.raceOnSteer = true;
-  await f.loop.tick();
-  await f.loop.tick();
+  await f.loop.receive(f.message('owner-race', 'Use the additional evidence.'));
+  await tickWithDirectGroups(f.loop);
 
   assert.equal(f.task().status, 'running');
-  assert.equal(f.codex.starts.length, 2);
-  assert.equal(f.codex.steers.length, 0);
-  assert.equal(f.codex.replies.length, 0);
+  assert.equal(workerCalls(f.loop, f.codex).starts.length, 2);
+  assert.equal(workerCalls(f.loop, f.codex).steers.length, 0);
+  assert.equal(workerCalls(f.loop, f.codex).replies.length, 0);
 });
 
 test('periodic collection recovers history-only messages after a connection gap without restarting', async t => {
@@ -142,17 +144,17 @@ test('periodic collection recovers history-only messages after a connection gap 
   f.feishu.offline = [message];
   f.feishu.historyError = new Error('Temporary history failure');
   await f.loop.collect();
-  assert.equal(f.codex.steers.length, 0);
+  assert.equal(workerCalls(f.loop, f.codex).steers.length, 0);
 
   f.feishu.historyError = null;
   await f.loop.collect();
-  await f.loop.tick();
+  await tickWithDirectGroups(f.loop);
   await f.loop.collect();
   assert.ok(f.feishu.receiver);
   await f.feishu.receiver(message);
-  assert.deepEqual(f.codex.steers.map(input => input.deliveryId), ['connection-gap']);
-  assert.equal(f.codex.created.length, 1);
-  assert.equal(f.codex.starts.length, 1);
+  assert.deepEqual(workerCalls(f.loop, f.codex).steers.map(input => input.deliveryId), ['connection-gap']);
+  assert.equal(workerCalls(f.loop, f.codex).created.length, 1);
+  assert.equal(workerCalls(f.loop, f.codex).starts.length, 1);
   assert.equal(f.task().status, 'running');
 });
 
@@ -172,14 +174,14 @@ test('messages received during startup persist until recovery verifies the task'
     assert.ok(f.feishu.receiver);
     await f.feishu.receiver(f.message('during-startup', 'Feedback received before recovery.'));
     assert.equal(f.loop.store.inputs(f.task().id).find(input => input.id === 'during-startup')?.status, 'pending');
-    assert.equal(f.codex.steers.length, 0);
+    assert.equal(workerCalls(f.loop, f.codex).steers.length, 0);
     f.github.sources = [issue(1, { state: 'closed' })];
   } finally {
     release.resolve();
     await starting;
   }
   assert.equal(f.task().status, 'running');
-  assert.equal(f.codex.steers.filter(input => input.deliveryId === 'during-startup').length, 1);
+  assert.equal(workerCalls(f.loop, f.codex).steers.filter(input => input.deliveryId === 'during-startup').length, 1);
   assert.equal(f.loop.store.inputs(f.task().id).find(input => input.id === 'during-startup')?.status, 'delivered');
 });
 
@@ -200,11 +202,11 @@ test('overlapping starts open only one message receiver and launch each task onc
   const second = f.loop.start();
   release.resolve();
   await Promise.all([first, second]);
-  const deadline = Date.now() + 5_000;
-  while (f.codex.starts.length < 1 && Date.now() < deadline) await setTimeout(10);
+  await tickWithDirectGroups(f.loop);
   assert.equal(starts, 1);
-  assert.equal(f.codex.created.length, 1);
-  assert.equal(f.codex.starts.length, 1);
+  assert.equal(workerCalls(f.loop, f.codex).created.length, 1);
+  assert.equal(workerCalls(f.loop, f.codex).starts.length, 1, JSON.stringify(f.loop.tasks().map(task => ({ id: task.id, status: task.status,
+    execution: task.executionStatus, reason: task.reason, inputs: f.loop.store.inputs(task.id).map(input => [input.status, input.error]) }))));
 });
 
 test('repeated close safely releases the same service resources once', async t => {
@@ -247,7 +249,7 @@ for (const previous of ['running', 'waiting_user', 'paused'] as const) {
       const snapshot = f.codex.snapshot(threadId);
       assert.ok(snapshot.turnId);
       snapshot.requests = [{ id: 'old-request', threadId, turnId: snapshot.turnId, kind: 'question', isBlocking: true, connectionEpoch: 'epoch', prompt: 'Need input', method: 'item/tool/requestUserInput', payload: {} }];
-      await f.loop.tick();
+      await tickWithDirectGroups(f.loop);
     }
     if (previous === 'paused') await f.loop.control(f.task().id, 'pause');
     const taskId = f.task().id;
