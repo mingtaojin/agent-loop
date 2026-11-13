@@ -82,6 +82,10 @@ Issue 评论先交协调者判断影响，再按需转给原 Worker。Worker 和
 | `report` | 上报结果、问题或更新 | Worker、verifier |
 | `record` | 按 scope 追加带项目版本的记录，返回有界确认 | 项目成员 |
 | `rotate` | 保存恢复说明并在安全结束后更换协调会话 | 协调者 |
+| `allocate_artifacts` | 分配新任务专属产物目录 | 项目成员 |
+| `register_artifact` | 登记唯一交付物保护和交付状态；协调者可指定本项目 taskId | 项目成员 |
+| `complete_task` | 正式结束 Worker 并冻结新归属资源的清理意图 | 协调者 |
+| `cleanup_artifacts` | 冻结自己的指定 scope，不结束协调 Task | 协调者 |
 | `release_workspace` | 释放调用方拥有的 Runtime 工作树 | 项目成员 |
 
 修改动作携带稳定的 `requestId`。同一调用方使用相同 ID 和内容重试，返回原操作确认；更换内容会报冲突。历史 record 回执也只返回记录确认，不重新暴露过去保存的整份项目状态。`record` 同时携带 `expectedVersion`，版本不符时先重新读取，再决定如何更新。
@@ -168,6 +172,8 @@ Runtime 不生成定时监督提醒。显式汇报、项目群用户输入、原
 自动释放还要求提交已被保全到配置的基线。基线未更新或 squash 合并无法通过提交祖先核对时，保留目录并报告原因，不强制删除。Worker 自建的工作树按 Worktree cleanup 另行核查。
 
 ## 验证
+
+任务结束和新产物目录的工具参数、保护范围及恢复行为见[任务收尾](task-closeout.md)。可重跑验收使用 `npm run verify:closeout`，测试真实 SQLite、文件、Git 和占用资源的子进程，模型与飞书为受控替身。真实模型、飞书及业务实例清理不在该测试结论内。
 
 需求及验收场景见[项目协调者规格](../.scratch/project-coordinator/spec.md)。隔离 Runtime 测试使用真实 SQLite 和受控平台接口，协议测试运行实际适配器及子进程。真实模型探针使用独立临时项目，不对业务仓库或任务群操作。结果分别记录在功能目录的 `execution` 中。
 

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test, type TestContext } from 'node:test';
 import { z } from 'zod';
@@ -820,4 +820,191 @@ test('a resumed active turn waits for native history even without a local start 
   const snapshot = await server.inspect('thread-1');
   assert.equal(snapshot.status, 'running');
   assert.equal(snapshot.turnId, 'turn-1');
+});
+
+test('sealed execution usage probe reads status without resuming or starting a retained thread', async t => {
+  const { server, wire } = await settledAdapter(t);
+  assert.equal(await server.executionUse('thread-1'), 'idle');
+  assert.equal(await server.executionUse('thread-1'), 'idle');
+  const calls = await wire();
+  assert.equal(calls.filter(call => call.method === 'thread/read').length, 2);
+  assert.equal(calls.filter(call => ['thread/resume', 'thread/start', 'turn/start', 'turn/steer'].includes(call.method)).length, 0);
+});
+
+const nativePolicyFixture = String.raw`
+const fs = require('node:fs');
+const { createInterface } = require('node:readline');
+const root = process.argv[1];
+const send = frame => process.stdout.write(JSON.stringify(frame) + '\n');
+const state = fs.existsSync(root + '/state.json') ? JSON.parse(fs.readFileSync(root + '/state.json', 'utf8')) : {};
+const loaded = new Set();
+let deniedWithClosedInput = false;
+setInterval(() => {
+  const file = root + '/deny-with-closed-stdin.json';
+  if (deniedWithClosedInput || !fs.existsSync(file)) return;
+  deniedWithClosedInput = true;
+  const request = JSON.parse(fs.readFileSync(file, 'utf8'));
+  process.stdin.destroy();
+  try { fs.closeSync(0); } catch {}
+  fs.writeFileSync(root + '/alive-pid', String(process.pid));
+  send(request);
+}, 10);
+const persist = () => fs.writeFileSync(root + '/state.json', JSON.stringify(state));
+const thread = (id, includeTurns = false) => ({ id, status: { type: !loaded.has(id) ? 'notLoaded' : state[id]?.at(-1)?.status === 'inProgress' ? 'active' : 'idle' }, turns: includeTurns ? state[id] || [] : [] });
+createInterface({ input: process.stdin }).on('line', line => {
+  const m = JSON.parse(line);
+  fs.appendFileSync(root + '/wire.jsonl', JSON.stringify(m) + '\n');
+  if (!m.method) {
+    if (!fs.existsSync(root + '/unconfirmed')) send({ method: 'serverRequest/resolved', params: { threadId: 'thread-1', requestId: m.id } });
+    return;
+  }
+  if (m.method === 'initialized') return;
+  const p = m.params;
+  let result;
+  switch (m.method) {
+    case 'initialize': result = { userAgent: 'native-policy-fixture' }; break;
+    case 'thread/start': {
+      const id = 'thread-' + (Object.keys(state).length + 1);
+      state[id] = []; loaded.add(id); persist(); result = { thread: thread(id) }; break;
+    }
+    case 'thread/resume':
+      loaded.add(p.threadId);
+      for (const turn of state[p.threadId] || []) if (turn.status === 'inProgress') turn.status = 'interrupted';
+      persist(); result = { thread: thread(p.threadId) }; break;
+    case 'thread/read':
+      if (fs.existsSync(root + '/queue.json')) {
+        const frames = JSON.parse(fs.readFileSync(root + '/queue.json', 'utf8')); fs.unlinkSync(root + '/queue.json');
+        for (const frame of frames) {
+          if (frame.method === 'turn/completed') {
+            const turn = state[frame.params.threadId].find(turn => turn.id === frame.params.turn.id);
+            turn.status = 'completed'; persist();
+          }
+          send(frame);
+        }
+      }
+      result = { thread: thread(p.threadId, p.includeTurns) }; break;
+    case 'turn/start': {
+      const turn = { id: 'turn-' + (state[p.threadId].length + 1), status: 'inProgress', items: [{ id: p.clientUserMessageId, type: 'userMessage', clientId: p.clientUserMessageId, content: [] }] };
+      state[p.threadId].push(turn); persist(); result = { turn }; break;
+    }
+    case 'turn/steer':
+      if (p.clientUserMessageId === 'crash') process.exit(23);
+      result = { turnId: p.expectedTurnId }; break;
+    case 'turn/interrupt': state[p.threadId].at(-1).status = 'interrupted'; persist(); result = {}; break;
+    default: throw new Error('Unexpected method ' + m.method);
+  }
+  send({ id: m.id, result });
+});
+`;
+
+const policyWireSchema = z.object({ id: z.union([z.string(), z.number()]).optional(), method: z.string().optional(), params: z.unknown().optional(), result: z.unknown().optional(), error: z.object({ code: z.number(), message: z.string() }).optional() });
+async function nativePolicyAdapter(t: TestContext) {
+  const root = await mkdtemp('/tmp/agent-loop-native-policy-');
+  const server = new CodexAppServer({ command: [process.execPath, '-e', nativePolicyFixture, root], approvalPolicy: 'on-request', sandbox: 'read-only', requestTimeoutMs: 1500 });
+  t.after(async () => { await server.close(); await rm(root, { recursive: true, force: true }); });
+  const completed = new Set<string>(); server.setThreadCompletionPolicy({ isCompleted: threadId => completed.has(threadId) });
+  const active = await start(server), observer = await server.createThread({ cwd: '/tmp', instructions: 'Observe protocol only' });
+  const wire = async () => (await readFile(`${root}/wire.jsonl`, 'utf8')).trim().split('\n').map(line => policyWireSchema.parse(JSON.parse(line)));
+  const inject = async (frames: { id?: string; method: string; params: unknown }[]) => {
+    await writeFile(`${root}/queue.json`, JSON.stringify(frames)); await server.executionUse(observer);
+  };
+  const responses = async (count: number) => {
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+      const frames = (await wire()).filter(frame => !frame.method);
+      if (frames.length >= count) return frames;
+      await delay(10);
+    }
+    throw new Error(`Expected ${count} native responses`);
+  };
+  return { root, server, completed, active, observer, wire, inject, responses };
+}
+
+test('native completion admission sees authoritative nonblocking and unacknowledged requests', async t => {
+  const f = await nativePolicyAdapter(t);
+  assert.throws(() => f.server.assertThreadCompletionAllowed('unknown-thread'), /state is unavailable/);
+  assert.doesNotThrow(() => f.server.assertThreadCompletionAllowed(f.active.threadId));
+  const params = { ...f.active, itemId: 'question', isBlocking: false, questions: [{ id: 'target', header: 'Target', question: 'Which target?', options: null }] };
+  await f.inject([{ id: 'existing-question', method: 'item/tool/requestUserInput', params }]);
+  assert.throws(() => f.server.assertThreadCompletionAllowed(f.active.threadId), /native requests/);
+  const request = (await f.server.inspect(f.active.threadId)).requests[0]; assert.ok(request); assert.equal(request.isBlocking, false);
+  await writeFile(`${f.root}/unconfirmed`, 'lose resolution acknowledgement');
+  await assert.rejects(f.server.reply({ request, text: 'the actual owner answer' }), /acknowledgement/);
+  assert.throws(() => f.server.assertThreadCompletionAllowed(f.active.threadId), /native requests/);
+  await f.inject([{ method: 'serverRequest/resolved', params: { threadId: f.active.threadId, requestId: 'existing-question' } }]);
+  assert.doesNotThrow(() => f.server.assertThreadCompletionAllowed(f.active.threadId));
+});
+
+test('completed native policy denies late requests without permissions, answers, tool handlers or new turns', async t => {
+  const f = await nativePolicyAdapter(t); f.completed.add(f.active.threadId);
+  let toolCalls = 0; f.server.setWorkspaceHandler(async () => { toolCalls++; throw new Error('Sealed handler reached'); });
+  const params = { ...f.active, itemId: 'late', startedAtMs: 1, cwd: '/tmp', command: 'effect' };
+  const before = (await f.wire()).length;
+  await f.inject([
+    { id: 'command', method: 'item/commandExecution/requestApproval', params },
+    { id: 'file', method: 'item/fileChange/requestApproval', params },
+    { id: 'permissions', method: 'item/permissions/requestApproval', params: { ...params, permissions: { network: { enabled: true } } } },
+    { id: 'question', method: 'item/tool/requestUserInput', params: { ...params, isBlocking: false, questions: [{ id: 'q', header: 'Q', question: 'Continue?', options: null }] } },
+    { id: 'unsupported', method: 'mcpServer/elicitation/request', params },
+    { id: 'dynamic', method: 'item/tool/call', params: { ...params, callId: 'call', tool: 'ensure_workspace', arguments: { repository: 'example/app' } } },
+  ]);
+  const responses = await f.responses(6), byId = new Map(responses.map(frame => [frame.id, frame]));
+  assert.deepEqual(byId.get('command')?.result, { decision: 'decline' }); assert.deepEqual(byId.get('file')?.result, { decision: 'decline' });
+  assert.deepEqual(byId.get('permissions')?.result, { permissions: {}, scope: 'turn' });
+  for (const id of ['question', 'unsupported']) { assert.equal(byId.get(id)?.error?.code, -32000); assert.equal(byId.get(id)?.result, undefined); }
+  assert.deepEqual(byId.get('dynamic')?.result, { success: false, contentItems: [{ type: 'inputText', text: 'Task completed' }] });
+  assert.equal(toolCalls, 0); assert.equal(await f.server.executionUse(f.active.threadId), 'busy');
+  await assert.rejects(f.server.inspect(f.active.threadId), /sealed/);
+  await assert.rejects(f.server.startTurn({ threadId: f.active.threadId, input: [], deliveryId: 'forbidden' }), /sealed/);
+  await assert.rejects(f.server.steer({ ...f.active, input: [], deliveryId: 'forbidden' }), /sealed/);
+  const after = (await f.wire()).slice(before);
+  assert.equal(after.filter(frame => ['thread/resume', 'thread/start', 'turn/start', 'turn/steer', 'turn/interrupt'].includes(frame.method ?? '')).length, 0);
+  assert.equal(await f.server.executionUse(f.observer), 'idle');
+});
+
+test('unacknowledged late native denial stays busy and is never replayed before terminal evidence', async t => {
+  const f = await nativePolicyAdapter(t); await writeFile(`${f.root}/unconfirmed`, 'lose denial acknowledgement');
+  f.completed.add(f.active.threadId);
+  const request = { id: 'late-question', method: 'item/tool/requestUserInput', params: { ...f.active, itemId: 'late', isBlocking: true, questions: [{ id: 'q', header: 'Q', question: 'Continue?', options: null }] } };
+  await f.inject([request]); await f.responses(1); await delay(1550);
+  assert.equal(await f.server.executionUse(f.active.threadId), 'busy');
+  assert.throws(() => f.server.assertThreadCompletionAllowed(f.active.threadId), /native requests/);
+  await f.inject([request]); assert.equal((await f.responses(1)).length, 1);
+  await f.inject([{ method: 'turn/completed', params: { threadId: f.active.threadId, turn: { id: f.active.turnId } } }]);
+  assert.equal(await f.server.executionUse(f.active.threadId), 'idle');
+  assert.equal((await f.responses(1)).length, 1);
+});
+
+test('native completion policy excludes sealed threads from transport recovery and preserves unknown use', async t => {
+  const f = await nativePolicyAdapter(t);
+  const openTurn = await f.server.startTurn({ threadId: f.observer, input: [], deliveryId: 'open-task' });
+  f.completed.add(f.active.threadId);
+  await assert.rejects(f.server.steer({ threadId: f.observer, turnId: openTurn, input: [], deliveryId: 'crash' }), UncertainOperationError);
+  await f.server.recover();
+  assert.equal((await f.wire()).filter(frame => frame.method === 'thread/resume').length, 0);
+  assert.throws(() => f.server.assertThreadCompletionAllowed(f.observer), /state is unavailable/);
+  assert.equal(await f.server.executionUse(f.active.threadId), 'unknown');
+  await assert.rejects(f.server.inspect(f.active.threadId), /sealed/);
+  assert.equal((await f.server.inspect(f.observer)).status, 'interrupted');
+  const resumed = (await f.wire()).filter(frame => frame.method === 'thread/resume').map(frame => z.object({ threadId: z.string() }).parse(frame.params).threadId);
+  assert.deepEqual(resumed, [f.observer]);
+});
+
+
+test('late denial transport failure retains uncertainty without killing the shared app server', async t => {
+  const f = await nativePolicyAdapter(t); f.completed.add(f.active.threadId);
+  await writeFile(`${f.root}/deny-with-closed-stdin.json`, JSON.stringify({ id: 'late-broken-transport', method: 'item/commandExecution/requestApproval', params: { ...f.active, itemId: 'late', startedAtMs: 1, cwd: '/tmp', command: 'effect' } }));
+  let pid: number | undefined;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const saved = await readFile(`${f.root}/alive-pid`, 'utf8').catch(() => '');
+    if (saved) { pid = Number(saved); break; }
+    await delay(10);
+  }
+  assert.ok(pid); await delay(100);
+  assert.equal(await f.server.executionUse(f.active.threadId), 'busy');
+  assert.doesNotThrow(() => process.kill(pid, 0));
+  assert.throws(() => f.server.assertThreadCompletionAllowed(f.active.threadId), /native requests/);
+  const wire = await f.wire();
+  assert.equal(wire.filter(frame => frame.method === 'initialize').length, 1);
+  assert.equal(wire.filter(frame => frame.id === 'late-broken-transport').length, 0);
 });

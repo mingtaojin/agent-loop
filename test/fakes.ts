@@ -1,5 +1,5 @@
 import { writeFile } from 'node:fs/promises';
-import { TurnChangedError, UncertainOperationError, type ExecutionSnapshot, type IncomingMessage, type Source, type SourceComment, type TaskResource, type WorkspaceRequest, type WorkspaceChoice } from '../src/domain.js';
+import { TurnChangedError, UncertainOperationError, type ExecutionSnapshot, type IncomingMessage, type PendingRequest, type Source, type SourceComment, type TaskResource, type WorkspaceRequest, type WorkspaceChoice } from '../src/domain.js';
 export interface LegacyReport { status: 'waiting_user' | 'awaiting_review' | 'failed'; summary: string; question: string | null; prUrl: string | null; validation: string[]; limitations: string[] }
 import { TaskGroupUnavailable, type Activity, type TurnIdentity, type CodexPort, type FeishuPort, type GitHubPort } from '../src/ports.js';
 
@@ -89,6 +89,14 @@ export class FeishuFake implements FeishuPort {
 }
 
 export class CodexFake implements CodexPort {
+  private completionPolicy: { isCompleted(threadId: string): boolean } | undefined;
+  readonly nativeDenials: PendingRequest[] = [];
+  uncertainNativeDenial = false;
+  setThreadCompletionPolicy(policy: { isCompleted(threadId: string): boolean }): void { this.completionPolicy = policy; }
+  assertThreadCompletionAllowed(threadId: string): void {
+    if (this.inspectError) throw new Error('Native request state is unavailable');
+    if (this.snapshot(threadId).requests.length) throw new Error('Reconcile unresolved native requests before completion');
+  }
   readonly selections: Omit<Parameters<CodexPort['selectWorkspace']>[0], 'signal'>[] = [];
   selectionResults: WorkspaceChoice[] = [];
   selectionError: Error | null = null;
@@ -139,6 +147,16 @@ export class CodexFake implements CodexPort {
     this.threads.set(id, { threadId: id, turnId: null, status: 'idle', requests: [], outputs: [], seenInputIds: [], error: null });
     if (this.loseCreateAck) { this.loseCreateAck = false; throw new UncertainOperationError('Thread created; acknowledgement lost'); }
     return id;
+  }
+  async executionUse(threadId: string): Promise<'idle' | 'busy' | 'unknown'> {
+    if (this.inspectError) return 'unknown';
+    const snapshot = this.snapshot(threadId);
+    if (this.completionPolicy?.isCompleted(threadId)) {
+      for (const request of snapshot.requests) if (!this.nativeDenials.some(denied => denied.id === request.id)) this.nativeDenials.push(structuredClone(request));
+      if (!this.uncertainNativeDenial) snapshot.requests = [];
+    }
+    if (snapshot.requests.length || snapshot.status === 'running') return 'busy';
+    return ['idle', 'completed', 'interrupted', 'failed'].includes(snapshot.status) ? 'idle' : 'unknown';
   }
   async inspect(...[threadId]: Parameters<CodexPort['inspect']>): Promise<ExecutionSnapshot> { if (this.inspectError) throw this.inspectError; return structuredClone(this.snapshot(threadId)); }
   async activity(...args: Parameters<CodexPort['activity']>): Promise<Activity> {

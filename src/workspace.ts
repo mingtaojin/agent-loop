@@ -22,6 +22,7 @@ async function exists(path: string): Promise<boolean> {
 }
 
 export class WorkspaceProvider implements WorkspacePort {
+  readonly supportsCloseout = true;
   private readonly root: string;
   private readonly mutations = new Map<string, Promise<unknown>>();
 
@@ -52,6 +53,7 @@ export class WorkspaceProvider implements WorkspacePort {
       if (input.workspace && !await exists(workspace)) throw new Error('Persisted workspace directory is missing');
       if (workspace === repositoryRoot) throw new Error('Task workspace cannot be the original repository');
       if (await exists(workspace)) {
+        if (input.fresh) throw new Error('New ownership requires a newly allocated worktree');
         const info = await lstat(workspace);
         if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`Workspace is not an owned directory: ${workspace}`);
         const actualRoot = await realpath(await git(workspace, 'rev-parse', '--show-toplevel'));

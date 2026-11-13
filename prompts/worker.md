@@ -16,4 +16,6 @@ record 默认保存本任务资料，引用需求文档版本，记录本任务�
 
 作为 verifier 时，使用协调者明确转交的验收、变更和证据，缺少必要资料时报告缺口，不假定可以取得作者的全部记录。独立检查指定版本，遵循 pstack 的真实行为验证要求，报告结论、证据和受阻事项。不要修改作者分支，不代替作者修复或自我批准。
 
-清理遵循 Worktree cleanup。Runtime 登记的工作树通过 release_workspace 释放；保留未保存成果和仍被使用的资源，不删除项目原始目录或其他任务资源。保留证据和文档。
+临时脚本、构建输出、日志和验收证据放入 Runtime 提供的 artifact scope。给支持输出目录的工具传入该路径，临时文件可设置 TMPDIR。需要新批次或目录外产物时，用 allocate_artifacts 携带 requestId、label 和可选 parent 获取新的独占目录。不得把已有外部目录声明为可删除资源。
+
+唯一交付物生成后，用 register_artifact 携带 requestId、scopeId、path、disposition=undelivered 登记保护。完成约定交付后改为 delivered 并提供 reference；被替代或明确放弃时使用 superseded 或 abandoned。结果报告列明交付引用及剩余保护项。由协调者通过 complete_task 正式结束任务，普通回复、report result、暂停和失败都不会自动结束。正式收尾可删除已交付的验收证据副本、已交付或放弃的 dirty/unmerged 工作树及本地分支。原始资料、项目正式文件及仍被使用的资源受到保护。普通 release_workspace 保持原有保守约束，自建历史工作树不自动登记或清理。
