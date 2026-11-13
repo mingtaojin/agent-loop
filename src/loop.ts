@@ -9,6 +9,7 @@ import { criteriaSchema, requestSchema, workspaceTargetSchema } from './domain.j
 import { discoverProjects } from './project-discovery.js';
 import type { Config } from './config.js';
 import { errorMessage, presentTaskSource, matchSource, RejectedInputError, TurnChangedError, type AgentInput, type ApprovalAction, type DiscoveredProject, type ExecutionSnapshot, type IncomingMessage, type Repository, type Source, type SourceComment, type Task, type TaskResource, type TaskSource, type WorkspaceTarget } from './domain.js';
+import { fitsTaskTitle, parseTaskTitle } from './task-title.js';
 import { CodexProviderMismatchError, FeishuApiError, TaskGroupUnavailable, type FeishuReconnectEvent, type RunningActivity, type TurnIdentity, type CodexPort, type FeishuPort, type GitHubPort, type WorkspacePort } from './ports.js';
 import { TaskGroups, assertGroupBinding, groupGeneration, retireTaskGroup } from './task-groups.js';
 import { CleanupAdmissionBusy, TaskCloseout } from './task-closeout.js';
@@ -64,6 +65,7 @@ export class AgentLoop {
   private running = false;
   private started = false;
   private stopping = false;
+  private readonly titleAbort = new AbortController();
   private starting: Promise<void> | null = null;
   private closing: Promise<void> | null = null;
   private collecting: Promise<void> | null = null;
@@ -94,7 +96,7 @@ export class AgentLoop {
       const task = this.store.taskForThread(threadId);
       return task ? this.closeout.completed(task.id) : false;
     } });
-    this.groups = new TaskGroups(this.store, ports.feishu);
+    this.groups = new TaskGroups(this.store, ports.feishu, task => this.groupTitle(task));
     this.projects = new ProjectRuntime(config, this.store, {
       closeout: this.closeout,
       makeTask: async (sourceId, prompt) => this.allocateTask(sourceId, { kind: 'cli', ...ProjectRuntime.submission(sourceId, prompt), submittedAt: Date.now() }, 'execution'),
@@ -204,6 +206,21 @@ export class AgentLoop {
       assertGroupBinding(this.store, taskId, chatId);
     });
     return chatId;
+  }
+  private async groupTitle(task: Task): Promise<string> {
+    const fallback = presentTaskSource(task.source, 100).title;
+    const text = task.source.kind === 'manual' ? task.source.message.text.trim().replace(/^\/new(?:\s|$)/, '').trim()
+      : task.source.kind === 'cli' ? task.source.prompt.trim() : '';
+    const titleTimeoutMs = this.config.execution.backends.codex.titleTimeoutMs;
+    if (!text || fitsTaskTitle(text) || !this.ports.codex.summarizeTitle) return fallback;
+    try {
+      const signal = AbortSignal.any([this.titleAbort.signal, AbortSignal.timeout(titleTimeoutMs)]);
+      return parseTaskTitle(await this.ports.codex.summarizeTitle({ taskId: task.id, cwd: task.contextDirectory, text, signal })) ?? fallback;
+    } catch (error) {
+      this.titleAbort.signal.throwIfAborted();
+      this.problem(`title:${task.id}`, `Group title summary failed; using the task text: ${errorMessage(error)}`);
+      return fallback;
+    }
   }
   private retireGroup(task: Task): void {
     if (!task.chatId) return;
@@ -1198,6 +1215,7 @@ export class AgentLoop {
   }
   private async closeService(): Promise<void> {
     this.stopping = true;
+    this.titleAbort.abort(new Error('Agent Loop is closing'));
     this.running = false;
     for (const timer of this.timers) clearInterval(timer);
     await this.starting?.catch(() => undefined);
