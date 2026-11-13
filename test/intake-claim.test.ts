@@ -328,7 +328,7 @@ for (const oldChoice of ['question', 'other-project']) test(`queued Operator pau
   const f = await fixture(t), task = f.saved(`queued-${oldChoice}`);
   f.feishu.resources.set('old-file', Buffer.from('saved evidence\n'));
   const app = f.loop.projects.projectConfig('app'); assert.ok(app);
-  const chatId = await f.feishu.ensureGroup({ taskId: task.id, title: 'Saved legacy group' });
+  const chatId = await f.feishu.ensureGroup({ taskId: task.id, title: 'Saved legacy group', sourceUrl: '' });
   const threadId = await f.codex.createThread({ cwd: app.directory, instructions: 'Saved legacy instructions.' });
   const turnId = await f.codex.startTurn({ threadId, deliveryId: 'queued-start', input: [{ kind: 'text', text: 'Saved old turn.' }] });
   f.loop.store.saveTask(taskSchema.parse({ ...task, purpose: 'legacy', chatId, threadId, turnId, status: 'running',
