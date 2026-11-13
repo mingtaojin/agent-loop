@@ -170,7 +170,7 @@ export class AgentLoop {
       const client = fileURLToPath(new URL(import.meta.url.endsWith('.ts') ? './project-client.ts' : './project-client.js', import.meta.url));
       const quote = (text: string) => `'${text.replaceAll("'", "'\"'\"'")}'`;
       const launcher = [process.execPath, ...(import.meta.url.endsWith('.ts') ? ['--import', fileURLToPath(import.meta.resolve('tsx'))] : []), client].map(quote).join(' ');
-      projectFallback = `\nIf project_action is absent in a retained Thread, write the action JSON to a file and run ${launcher} ${quote(capability)} '<absolute-action-json-file>' using your shell tool. This task-scoped capability uses the same project operations. Never read, copy or share the capability contents.`;
+      projectFallback = `\nIf project_action is absent or its retained schema lacks the required action or fields, write the action JSON to a file and run ${launcher} ${quote(capability)} '<absolute-action-json-file>' using your shell tool. This task-scoped capability uses the same project operations. Never read, copy or share the capability contents.`;
     }
     const delegation = this.store.meta(`project-delegation:${task.id}`);
     const prompt = rolePrompt + this.projects.instructions(task.id) + projectFallback

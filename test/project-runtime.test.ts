@@ -981,21 +981,59 @@ test('a final investigation reply stays local and an explicit report wakes the c
   assert.equal(f.loop.store.task(worker.id).status, 'idle');
 });
 
-test('the project shell fallback accepts the scoped task token only during an active turn', async t => {
+test('retained task shell fallback writes scoped records without native tools and requires the current active turn', async t => {
   const f = await fixture(t); const coordinator = await f.initialize(); assert.ok(coordinator.threadId);
+  const worker = await f.dispatch('fallback-worker', 'Receive selected evidence.'); assert.ok(worker.threadId);
+  await f.restart();
+  f.codex.projectHandler = null;
   const actionFile = join(f.root, 'project-action.json');
   await writeFile(actionFile, JSON.stringify({ action: 'status' }));
-  const instructions = f.codex.created[0]?.instructions ?? '';
+  const instructions = f.codex.instructionUpdates.findLast(update => update.threadId === coordinator.threadId)?.instructions ?? '';
+  assert.match(instructions, /project_action is absent or its retained schema lacks the required action or fields/);
   const command = /write the action JSON to a file and run (.+?) '<absolute-action-json-file>' using your shell tool/.exec(instructions)?.[1];
   assert.ok(command, 'The coordinator must receive an executable project fallback command');
-  const run = () => promisify(execFile)('/bin/sh', ['-c', `${command} "$1"`, 'project-fallback', actionFile], { timeout: 10_000 });
+  const run = (fallback = command) => promisify(execFile)('/bin/sh', ['-c', `${fallback} "$1"`, 'project-fallback', actionFile], { timeout: 10_000 });
   const active = await run();
   assert.equal(overviewSchema.parse(JSON.parse(active.stdout)).coordinatorTaskId, coordinator.id);
+  const action = { action: 'record', requestId: 'fallback-scoped-record', key: 'selected-evidence', text: 'SELECTED_FALLBACK_EVIDENCE',
+    expectedVersion: f.state().version, scope: { kind: 'task', taskId: worker.id } } satisfies ProjectAction;
+  await writeFile(actionFile, JSON.stringify(action));
+  const written = await run();
+  const acknowledgement = { accepted: true, requestId: action.requestId, key: action.key, version: action.expectedVersion + 1, scope: action.scope };
+  assert.deepEqual(JSON.parse(written.stdout), acknowledgement);
+  const saved = new Store(f.root, { readOnly: true });
+  try {
+    const records = new ProjectLedger(saved).project('app')?.records;
+    assert.equal(records?.length, 1);
+    assert.equal(records[0]?.text, action.text);
+    assert.equal(records[0]?.authorTaskId, coordinator.id);
+    assert.deepEqual(records[0]?.scope, action.scope);
+  } finally { saved.close(); }
+  const workerInstructions = f.codex.instructionUpdates.findLast(update => update.threadId === worker.threadId)?.instructions ?? '';
+  const workerCommand = /write the action JSON to a file and run (.+?) '<absolute-action-json-file>' using your shell tool/.exec(workerInstructions)?.[1];
+  assert.ok(workerCommand);
+  await writeFile(actionFile, JSON.stringify({ ...action, requestId: 'forbidden-fallback', expectedVersion: f.state().version,
+    scope: { kind: 'task', taskId: coordinator.id } }));
+  const beforeDenied = f.state();
+  await assert.rejects(run(workerCommand), /Only the coordinator/);
+  assert.deepEqual(f.state(), beforeDenied);
+  await writeFile(actionFile, JSON.stringify(action));
+  const oldActivity = await f.codex.activity(coordinator.threadId); assert.equal(oldActivity.kind, 'running');
   await f.idleCoordinator();
   await assert.rejects(run(), /active turn/i);
   await f.loop.receive(f.message('resume-project', 'Review current project work.', coordinator.chatId!));
-  const resumed = await run(); assert.equal(overviewSchema.parse(JSON.parse(resumed.stdout)).id, 'app');
+  const activity = f.codex.activity.bind(f.codex);
+  f.codex.activity = async () => oldActivity;
+  await assert.rejects(run(), /original active task turn/i);
+  const currentActivity = await activity(coordinator.threadId); assert.equal(currentActivity.kind, 'running');
+  f.codex.activity = async () => ({ ...currentActivity, connectionEpoch: 'stale-epoch' });
+  await assert.rejects(run(), /original active task turn/i);
+  f.codex.activity = activity;
+  const resumed = await run(); assert.deepEqual(JSON.parse(resumed.stdout), acknowledgement);
+  assert.deepEqual(f.state(), beforeDenied);
   assert.equal(f.coordinator().threadId, coordinator.threadId);
+  assert.equal(f.loop.store.task(worker.id).threadId, worker.threadId);
+  assert.equal(f.codex.created.length, 2);
 });
 
 test('project intake clears legacy server filters so label-only and assignee-only Issues remain visible', async t => {

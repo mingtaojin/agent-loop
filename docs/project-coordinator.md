@@ -66,6 +66,7 @@ Issue 评论先交协调者判断影响，再按需转给原 Worker。Worker 和
 ## 项目工具
 
 新正式 Thread 提供 `project_action`。工具从当前 Thread 确定调用方，Runtime 检查项目与角色。不能在参数中冒充另一个 Task。
+保留的 Thread 缺少工具，或其旧 schema 缺少所需 action 或字段时，按当前 Runtime 指令使用 `project-client` 回退命令；该命令仍检查同一 Task 的活动 turn、连接 epoch 和调用方角色。
 
 | action | 作用 | 允许角色 |
 | --- | --- | --- |
