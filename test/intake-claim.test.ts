@@ -550,3 +550,16 @@ test('explicit resume validates unassigned saved resources before clearing Opera
   assert.equal(f.starts(), before); assert.ok(f.validations > 0);
   assert.equal(after.threadId, f.threadId); assert.deepEqual(after.resources, f.original.resources);
 });
+
+test('resource recovery failure cannot turn into an automatically resumable legacy pause', async t => {
+  const f = await retainedResource(t, { changed: true, status: 'paused' });
+  const task = f.loop.store.task(f.original.id);
+  task.reason = '来源不再符合条件'; task.legacy = { status: 'paused', prUrl: null };
+  f.loop.store.saveTask(task); await f.loop.projects.adopt(task.id, 'app');
+  const before = f.starts();
+  await f.loop.recover(); await f.loop.tick();
+  const after = f.loop.store.task(task.id);
+  assert.equal(f.starts(), before, 'failed resource recovery must not become a resumable legacy pause');
+  assert.equal(after.status, 'failed'); assert.ok(f.validations > 0);
+  assert.equal(after.threadId, f.threadId); assert.deepEqual(after.resources, f.original.resources);
+});

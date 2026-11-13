@@ -991,7 +991,7 @@ export class AgentLoop {
         await this.advance(task.id);
       } catch (error) {
         const failed = this.store.task(task.id);
-        if (failed.status !== 'paused') { failed.status = 'failed'; failed.reason = errorMessage(error); }
+        if (failed.status !== 'paused' || failed.reason !== 'Operator paused') { failed.status = 'failed'; failed.reason = errorMessage(error); }
         failed.recovery.nextAttemptAt = null; failed.recovery.lastError = errorMessage(error);
         failed.recovery.lastUserInputSeq = this.store.inputs(task.id).filter(input => input.origin === 'user').at(-1)?.seq ?? 0; this.persist(failed);
         this.problem(task.id, error); this.notify(failed, `任务关联核对失败，保留现场。\n${errorMessage(error)}`, `association:${digest(errorMessage(error))}`);
