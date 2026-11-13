@@ -437,6 +437,13 @@ test('Feishu rich posts preserve text and every original image/file resource', (
     { key: 'img_1', name: 'image', kind: 'image' }, { key: 'img_2', name: 'image', kind: 'image' }, { key: 'file_1', name: '../log.txt', kind: 'file' },
   ]);
 });
+test('Feishu standalone file messages keep the original archive name', () => {
+  const message = parseFeishuEvent({ ...event, message: { ...event.message, chat_type: 'p2p', message_type: 'file',
+    content: JSON.stringify({ file_key: 'file_rar', file_name: '新建文件夹 (3) (8).rar' }) } }, owner);
+  assert.equal(message?.chatType, 'p2p');
+  assert.equal(message?.text, '');
+  assert.deepEqual(message?.attachments, [{ key: 'file_rar', name: '新建文件夹 (3) (8).rar', kind: 'file' }]);
+});
 for (const title of [undefined, '', ' \t']) test(`Feishu rich posts omit blank titles (${JSON.stringify(title)}) without dropping body lines`, () => {
   const post = { title, content: [
     [{ tag: 'text', text: 'Analyze the recording' }],
