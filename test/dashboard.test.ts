@@ -1,3 +1,4 @@
+import { SurfaceCodex, testProject, restoreSurface } from './coordinated-surfaces.js';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { mkdtemp, mkdir, rm, access } from 'node:fs/promises';
@@ -23,7 +24,7 @@ test('dashboard projects discovered resource identity and workspace without repo
   const root = await mkdtemp(join(tmpdir(), 'agent-dashboard-project-'));
   const projectRoot = join(root, 'projects'); await mkdir(join(projectRoot, 'local'), { recursive: true });
   const config = configSchema.parse({ dataDir: join(root, 'data'), engineering: { projectRoot }, feishu: { userOpenId: 'owner' } });
-  const codex = new CodexFake();
+  const codex = new SurfaceCodex();
   codex.selectWorkspace = async input => {
     const candidate = input.candidates[0]; assert.ok(candidate && 'kind' in candidate);
     return { temporaryThreadId: 'dashboard-selector', choice: { kind: 'project', projectId: candidate.id, reason: 'fits' } };
@@ -31,7 +32,7 @@ test('dashboard projects discovered resource identity and workspace without repo
   const loop = new AgentLoop(config, { codex, feishu: new FeishuFake(), github: new GitHubFake(), workspace: new WorkspaceProvider(config.dataDir) });
   const dashboard = await startDashboard({ dataDir: config.dataDir, port: 0 });
   t.after(async () => { await dashboard.close(); await loop.close(); await rm(root, { recursive: true, force: true }); });
-  await loop.receive({ id: 'dashboard-project-input', chatId: 'private', chatType: 'p2p', senderId: 'owner',
+  await restoreSurface(loop, { id: 'dashboard-project-input', chatId: 'private', chatType: 'p2p', senderId: 'owner',
     text: 'Inspect the local project', attachments: [], createdAt: Date.now() });
   const task = loop.tasks()[0]; assert.ok(task);
   const resource = task.resources[0]; assert.ok(resource && resource.kind === 'project');
@@ -68,13 +69,13 @@ test('dashboard serves a read-only local page before the runtime database exists
 
 test('group and dashboard titles share normalization while persisted manual source text stays original', async t => {
   const root = await mkdtemp(join(tmpdir(), 'agent-dashboard-title-'));
-  const config = configSchema.parse({ dataDir: root, feishu: { userOpenId: 'owner' } });
+  const config = configSchema.parse({ dataDir: root, projects: [testProject(root)], feishu: { userOpenId: 'owner' } });
   const feishu = new FeishuFake();
   const groupTitles = new Map<string, string>();
   const ensureGroup = feishu.ensureGroup.bind(feishu);
   feishu.ensureGroup = async input => { groupTitles.set(input.taskId, input.title); return ensureGroup(input); };
   feishu.resources.set('title-file', Buffer.from('original attachment\n'));
-  const loop = new AgentLoop(config, { codex: new CodexFake(), feishu, github: new GitHubFake(), workspace: new WorkspaceProvider(root) });
+  const loop = new AgentLoop(config, { codex: new SurfaceCodex(), feishu, github: new GitHubFake(), workspace: new WorkspaceProvider(root) });
   const dashboard = await startDashboard({ dataDir: root, port: 0 });
   t.after(async () => { await dashboard.close(); await loop.close(); await rm(root, { recursive: true, force: true }); });
   const cases = [
@@ -85,7 +86,7 @@ test('group and dashboard titles share normalization while persisted manual sour
     { text: ' \n/new ' + 'x'.repeat(220), title: 'x'.repeat(220) },
     { text: '', title: '新讨论' },
   ];
-  for (const [index, input] of cases.entries()) await loop.receive({ id: `title-${index}`, chatId: 'private', chatType: 'p2p', senderId: 'owner',
+  for (const [index, input] of cases.entries()) await restoreSurface(loop, { id: `title-${index}`, chatId: 'private', chatType: 'p2p', senderId: 'owner',
     text: input.text, attachments: input.text ? [] : [{ key: 'title-file', name: 'evidence.log', kind: 'file' }], createdAt: Date.now() });
   const response = await fetch(dashboard.url + '/api/snapshot'); assert.equal(response.status, 200);
   const snapshot = await response.json();
@@ -100,32 +101,33 @@ test('group and dashboard titles share normalization while persisted manual sour
 
 test('real adapter to SQLite to SSE streams partial text, tools and capacity errors, resumes and isolates tasks', async t => {
   const root = await mkdtemp(join(tmpdir(), 'agent-dashboard-live-'));
-  const config = configSchema.parse({ dataDir: root, feishu: { userOpenId: 'owner' } });
+  const config = configSchema.parse({ dataDir: root, projects: [testProject(root)], feishu: { userOpenId: 'owner' } });
   const codex = new CodexAppServer({ command: [process.execPath, resolve('test/fixtures/debug-codex.mjs')], approvalPolicy: 'never', sandbox: 'read-only', requestTimeoutMs: 2000 });
   const feishu = new FeishuFake();
-  const loop = new AgentLoop(config, { codex, feishu, github: new GitHubFake(), workspace: { async ensure() { throw new Error('No workspace needed'); }, async head() { return 'unused'; } } });
+  const loop = new AgentLoop(config, { codex, feishu, github: new GitHubFake(), workspace: { async ensure(input) { if (input.kind === 'project-directory') return input.directory; throw new Error('No workspace needed'); }, async head() { return 'unused'; } } });
   const dashboard = await startDashboard({ dataDir: root, port: 0 });
   const abort = new AbortController();
   t.after(async () => { abort.abort(); await dashboard.close(); await loop.close(); await rm(root, { recursive: true, force: true }); });
   const message = (id: string, text: string, chatId = 'private', chatType: 'p2p' | 'group' = 'p2p') => ({ id, text, chatId, chatType, senderId: 'owner', attachments: [], createdAt: Date.now() });
-  await loop.receive(message('one', 'First task')); await loop.tick();
-  await loop.receive(message('two', '<img src=x onerror=alert(1)>')); await loop.tick();
-  const [first, second] = loop.tasks(); assert.ok(first?.threadId && first.chatId && second?.threadId);
+  await restoreSurface(loop, message('one', 'First task')); await loop.tick();
+  await restoreSurface(loop, message('two', '<img src=x onerror=alert(1)>')); await loop.tick();
+  const [first, second] = loop.tasks().filter(task => !task.sourceId.startsWith('project:')); assert.ok(first?.threadId && first.chatId && second?.threadId);
   assert.throws(() => new Store(root), /已有 Agent Loop/);
   const initial = await (await fetch(dashboard.url + '/api/snapshot')).json();
-  assert.equal(initial.tasks.length, 2);
+  assert.equal(initial.tasks.length, 3);
   const response = await fetch(dashboard.url + '/api/events?taskId=' + first.id, { signal: abort.signal });
   assert.equal(response.status, 200); assert.ok(response.body);
   const reader = response.body.getReader();
   const chunk = await reader.read();
   const raw = new TextDecoder().decode(chunk.value);
   assert.match(raw, /agent_delta/); assert.match(raw, /tool_output/); assert.match(raw, /Selected model is at capacity/);
-  assert.doesNotMatch(raw, /private reasoning|thread-2/);
+  assert.doesNotMatch(raw, /private reasoning/);
+  assert.ok(!raw.includes(second.threadId));
   const before = loop.store.executionEvents(first.id);
   assert.equal(before.some(event => event.kind === 'agent_message'), false);
   assert.equal(before.some(event => event.kind === 'turn_end'), false);
   assert.equal(loop.tasks()[0]?.status, 'running');
-  await loop.receive(message('finish', 'finish', first.chatId, 'group')); await loop.tick();
+  await restoreSurface(loop, message('finish', 'finish', first.chatId, 'group')); await loop.tick();
   const events = loop.store.executionEvents(first.id);
   assert.equal(events.filter(event => event.kind === 'agent_message').length, 1);
   assert.equal(events.at(-1)?.kind, 'turn_end');
@@ -143,7 +145,7 @@ test('real adapter to SQLite to SSE streams partial text, tools and capacity err
   assert.equal((await (await fetch(dashboard.url + '/api/tasks/' + first.id)).json()).outputs.some((row: { text: string }) => row.text === '正在检查运行状态，校验已完成。'), true);
   const readOnly = new Store(root, { readOnly: true });
   assert.deepEqual(readOnly.executionEvents(first.id), events); readOnly.close();
-  assert.equal(loop.tasks()[1]?.status, 'running');
+  assert.equal(loop.store.task(second.id).status, 'running');
 });
 
 test('debug event projection excludes untrusted protocol configuration and private reasoning', () => {
@@ -160,11 +162,11 @@ test('debug event projection excludes untrusted protocol configuration and priva
 
 test('dashboard close is idempotent and terminates active SSE and incomplete HTTP connections', { timeout: 5000 }, async t => {
   const root = await mkdtemp(join(tmpdir(), 'agent-dashboard-close-'));
-  const config = configSchema.parse({ dataDir: root, feishu: { userOpenId: 'owner' } });
-  const loop = new AgentLoop(config, { codex: new CodexFake(), feishu: new FeishuFake(), github: new GitHubFake(), workspace: new WorkspaceProvider(root) });
+  const config = configSchema.parse({ dataDir: root, projects: [testProject(root)], feishu: { userOpenId: 'owner' } });
+  const loop = new AgentLoop(config, { codex: new SurfaceCodex(), feishu: new FeishuFake(), github: new GitHubFake(), workspace: new WorkspaceProvider(root) });
   const dashboard = await startDashboard({ dataDir: root, port: 0 });
   t.after(async () => { await dashboard.close(); await loop.close(); await rm(root, { recursive: true, force: true }); });
-  await loop.receive({ id: 'shutdown-task', chatId: 'private', chatType: 'p2p', senderId: 'owner', text: 'Inspect shutdown', attachments: [], createdAt: Date.now() });
+  await restoreSurface(loop, { id: 'shutdown-task', chatId: 'private', chatType: 'p2p', senderId: 'owner', text: 'Inspect shutdown', attachments: [], createdAt: Date.now() });
   const task = loop.tasks()[0]; assert.ok(task);
   const response = await new Promise<import('node:http').IncomingMessage>((done, reject) => {
     const call = request(dashboard.url + '/api/events?taskId=' + task.id, done);

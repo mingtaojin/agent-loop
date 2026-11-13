@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
-import { watch } from 'node:fs';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 import { test, type TestContext } from 'node:test';
 import { z } from 'zod';
 import { CodexAppServer } from '../src/adapters/codex.js';
@@ -248,12 +248,9 @@ async function settledAdapter(t: TestContext, mode = 'settled') {
   const server = new CodexAppServer({ command: [process.execPath, '-e', settledFixture, mode, logFile], approvalPolicy: 'on-request', sandbox: 'read-only', requestTimeoutMs: 2000 });
   t.after(async () => { await server.close(); await rm(directory, { recursive: true, force: true }); });
   const wire = async () => (await readFile(logFile, 'utf8')).trim().split('\n').map(line => wireCallSchema.parse(JSON.parse(line)));
-  const headHeld = () => new Promise<void>((resolve, reject) => {
-    const check = () => { void wire().then(calls => { if (calls.some(call => call.method === 'head-held')) { watcher.close(); resolve(); } }, reject); };
-    const watcher = watch(directory, check);
-    t.after(() => watcher.close());
-    check();
-  });
+  const headHeld = async () => {
+    while (!(await wire()).some(call => call.method === 'head-held')) await delay(5, undefined, { signal: t.signal });
+  };
   const fullReads = async () => (await wire()).filter(call => call.params?.itemsView === 'full' || call.params?.includeTurns).length;
   return { server, wire, headHeld, fullReads };
 }

@@ -6,6 +6,7 @@ const send = message => process.stdout.write(JSON.stringify(message) + '\n');
 let current;
 let selection = false;
 let cwd;
+const threads = new Map();
 const record = message => appendFileSync(recordPath, JSON.stringify({ pid: process.pid, ...message }) + '\n');
 createInterface({ input: process.stdin }).on('line', line => {
   const message = JSON.parse(line);
@@ -17,18 +18,23 @@ createInterface({ input: process.stdin }).on('line', line => {
     selection = p.ephemeral === true;
     cwd = p.cwd;
     if (selection && (p.sandbox !== 'read-only' || p.approvalPolicy !== 'never' || p.dynamicTools?.length !== 0)) throw new Error('Selector permissions or tools were not isolated');
-    current = { id: `${selection ? 'temporary' : 'formal'}-${process.pid}`, status: { type: 'idle' }, turns: [] };
+    current = { id: `${selection ? 'temporary' : 'formal'}-${process.pid}-${threads.size + 1}`, status: { type: 'idle' }, turns: [] };
+    threads.set(current.id, { thread: current, selection, cwd });
     send({ id: message.id, result: { thread: current, cwd: selection && mode === 'wrong-cwd' ? '/unexpected' : cwd, approvalPolicy: selection && mode === 'wrong-policy' ? 'on-request' : p.approvalPolicy, approvalsReviewer: 'user', sandbox: { type: selection && mode !== 'wrong-sandbox' ? 'readOnly' : 'workspaceWrite', networkAccess: false }, model: 'fixture', modelProvider: 'fixture' } });
     return;
   }
   if (message.method === 'thread/read' || message.method === 'thread/resume') {
-    if (selection) throw new Error('Ephemeral history must not be read or resumed');
-    send({ id: message.id, result: { thread: current } }); return;
+    const saved = threads.get(p.threadId);
+    if (!saved || saved.selection) throw new Error('Ephemeral or unknown history must not be read or resumed');
+    send({ id: message.id, result: { thread: saved.thread } }); return;
   }
   if (message.method === 'turn/start') {
+    const saved = threads.get(p.threadId);
+    if (!saved) throw new Error('Unknown Thread');
+    ({ thread: current, selection, cwd } = saved);
     if (selection && (!p.outputSchema?.properties?.choice || p.approvalPolicy !== 'never' || p.sandboxPolicy?.type !== 'readOnly' || p.sandboxPolicy.networkAccess !== false)) throw new Error('Selector turn lacks structured output or read-only policy');
-    const turn = { id: `turn-${process.pid}`, status: 'inProgress', items: [] };
-    current.turns = [turn]; current.status = { type: 'active' };
+    const turn = { id: `turn-${process.pid}-${current.turns.length + 1}`, status: 'inProgress', items: [] };
+    current.turns.push(turn); current.status = { type: 'active' };
     const scope = { threadId: current.id, turnId: turn.id };
     const complete = () => {
       if (selection && mode === 'crash') process.exit(27);

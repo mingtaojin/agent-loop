@@ -1,7 +1,7 @@
 import { writeFile } from 'node:fs/promises';
 import { TurnChangedError, UncertainOperationError, type ExecutionSnapshot, type IncomingMessage, type Source, type SourceComment, type TaskResource, type WorkspaceRequest, type WorkspaceChoice } from '../src/domain.js';
 export interface LegacyReport { status: 'waiting_user' | 'awaiting_review' | 'failed'; summary: string; question: string | null; prUrl: string | null; validation: string[]; limitations: string[] }
-import type { CodexPort, FeishuPort, GitHubPort } from '../src/ports.js';
+import { TaskGroupUnavailable, type CodexPort, type FeishuPort, type GitHubPort } from '../src/ports.js';
 
 export function issue(number: number, changes: Partial<Source> = {}): Source {
   return {
@@ -57,13 +57,17 @@ export class FeishuFake implements FeishuPort {
   loseSendAck = false;
   receiver: ((message: IncomingMessage) => Promise<void>) | null = null;
   async ensureGroup(input: Parameters<FeishuPort['ensureGroup']>[0]): Promise<string> {
-    const group = this.groups.get(input.taskId) ?? `chat-${this.groups.size + 1}`;
-    this.groups.set(input.taskId, group);
+    const key = input.generation ? `${input.taskId}:${input.generation}` : input.taskId;
+    const group = this.groups.get(key) ?? `chat-${input.taskId}-${input.generation ?? 0}`;
+    this.groups.set(key, group);
     if (this.loseGroupAck) { this.loseGroupAck = false; throw new UncertainOperationError('Group created; acknowledgement lost'); }
     return group;
   }
   async verifyGroup(chatId: string): Promise<void> {
-    if (![...this.groups.values()].includes(chatId)) throw new Error('Task group unavailable');
+    if (![...this.groups.values()].includes(chatId)) throw new TaskGroupUnavailable(232009, 'Task group unavailable');
+  }
+  async dissolveGroup(chatId: string): Promise<void> {
+    for (const [key, group] of this.groups) if (group === chatId) this.groups.delete(key);
   }
   async send(input: Parameters<FeishuPort['send']>[0]): Promise<void> {
     this.sent.push(input);

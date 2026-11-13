@@ -8,14 +8,27 @@ import { GitHubAdapter } from './adapters/github.js';
 import { FeishuAdapter } from './adapters/feishu.js';
 import { CodexAppServer } from './adapters/codex.js';
 import { Store } from './store.js';
-import { errorMessage, submissionReceipt, submissionRequestIdSchema, submissionSourceId } from './domain.js';
-import { parseSubmission, readSubmissionPrompt, submitPrompt, SubmissionError } from './submission.js';
+import { errorMessage, intakeRouteSchema, submissionReceipt, submissionRequestIdSchema, submissionSourceId } from './domain.js';
 import { startDashboard } from './dashboard.js';
 import { discoverProjects } from './project-discovery.js';
 
 function output(value: unknown): void { process.stdout.write(`${JSON.stringify(value, null, 2)}\n`); }
 function secret(name: string): string { const value = process.env[name]; if (!value) throw new Error(`缺少环境变量 ${name}`); return value; }
-const usage = `Agent Loop\n\n  npm start -- doctor --config config.json\n  npm start -- collect --config config.json\n  npm start -- status --config config.json [--request-id <lowercase-uuid>]\n  npm start -- submit --config config.json --request-id <lowercase-uuid> --prompt-file <path|->\n  npm start -- run --config config.json\n\ndoctor 检查本地配置与凭证是否存在，不启动任务。\ncollect 仅收集并核对来源，不启动新任务。\nstatus 查看持久化任务、消息和最近异常，或按请求身份查询回执。\nsubmit 从 UTF-8 文件或标准输入创建独立任务，返回 JSON 持久化回执。保留请求身份用于重试。\nrun 启动常驻服务和只读调试网页，自动执行符合条件的任务。\n所有者直接私聊飞书机器人发送文字、图文、截图或日志文件，无需命令前缀。\n每条不同的非空私聊消息各自创建独立任务群；后续在对应群继续，工具审批使用独立按钮。\n`;
+const usage = `Agent Loop
+
+  npm start -- doctor --config config.json
+  npm start -- collect --config config.json
+  npm start -- status --config config.json [--request-id <uuid>]
+  npm start -- run --config config.json
+
+doctor validates local configuration without starting execution.
+collect persists matching sources for project coordination.
+status reads saved request, routing and execution information.
+run starts the resident service and debug page.
+Every project uses a coordinator. Unknown projects require clarification.
+Send new work only in the project group. Only coordinators dispatch Workers.
+`;
+
 async function doctor(config: Config): Promise<void> {
   const credentials = [...(config.repositories.length ? [config.github.tokenEnv] : []), config.feishu.appIdEnv, config.feishu.appSecretEnv].map(name => ({ name, present: Boolean(process.env[name]) }));
   const repositories = await Promise.all(config.repositories.map(async repository => {
@@ -40,27 +53,12 @@ async function doctor(config: Config): Promise<void> {
 }
 async function main(): Promise<void> {
   const args = parseArgs({ options: { config: { type: 'string', default: 'config.json' }, 'env-file': { type: 'string', default: '.env' }, help: { type: 'boolean', short: 'h' },
-    'prompt-file': { type: 'string' }, 'request-id': { type: 'string' } }, allowPositionals: true });
+    'request-id': { type: 'string' } }, allowPositionals: true });
   const command = args.positionals[0];
   if (args.values.help || !command) { process.stdout.write(usage); return; }
-  if (!['doctor', 'collect', 'status', 'submit', 'run'].includes(command)) throw new Error(`未知命令 ${command}`);
+  if (!['doctor', 'collect', 'status', 'run'].includes(command)) throw new Error(`未知命令 ${command}`);
   if (args.positionals.length !== 1) throw new Error('多余的位置参数');
-  if (command === 'submit') {
-    const requestId = args.values['request-id'] ?? null;
-    try {
-      if (!requestId || !args.values['prompt-file']) throw new SubmissionError('invalid_input', 'submit requires --request-id <lowercase-uuid> and --prompt-file <path|->', requestId);
-      const config = await loadConfig(resolve(args.values.config));
-      const prompt = await readSubmissionPrompt(args.values['prompt-file'], config.submission.maxPromptBytes);
-      const input = parseSubmission({ requestId, prompt }, config.submission.maxPromptBytes);
-      output(await submitPrompt({ dataDir: config.dataDir, settings: config.submission, input }));
-    } catch (error) {
-      const failure = error instanceof SubmissionError ? new SubmissionError(error.code, error.message, requestId)
-        : new SubmissionError('invalid_input', errorMessage(error), requestId);
-      process.stderr.write(`${JSON.stringify(failure.toJSON())}\n`); process.exitCode = 1;
-    }
-    return;
-  }
-  if (args.values['prompt-file'] || (args.values['request-id'] && command !== 'status')) throw new Error('提交参数只适用于 submit 或 status --request-id');
+  if (args.values['request-id'] && command !== 'status') throw new Error('--request-id 只适用于 status');
   const config = await loadConfig(resolve(args.values.config));
   if (command === 'status') {
     if (args.values['request-id']) {
@@ -71,10 +69,14 @@ async function main(): Promise<void> {
         try { await stat(join(config.dataDir, 'tasks.sqlite')); }
         catch (error) { if (error instanceof Error && 'code' in error && error.code === 'ENOENT') { output(missing); return; } throw error; }
         const store = new Store(config.dataDir, { readOnly: true });
-        try { const task = store.taskForSource(submissionSourceId(id)); output(task ? submissionReceipt(task) : missing); }
+        try {
+          const task = store.taskForSource(submissionSourceId(id));
+          const route = task ? store.meta(`project-intake-route:${task.id}`) : null;
+          output(task ? submissionReceipt(task, route ? intakeRouteSchema.parse(JSON.parse(route)) : null) : missing);
+        }
         finally { store.close(); }
       } catch (error) {
-        process.stderr.write(`${JSON.stringify(new SubmissionError('invalid_input', errorMessage(error), requestId).toJSON())}\n`); process.exitCode = 1;
+        process.stderr.write(`${JSON.stringify({ requestId, error: { code: 'invalid_input', message: errorMessage(error) } })}\n`); process.exitCode = 1;
       }
       return;
     }
@@ -94,9 +96,9 @@ async function main(): Promise<void> {
     github: new GitHubAdapter({ token, apiUrl: config.github.apiUrl, requestTimeoutMs: config.github.requestTimeoutMs }),
     feishu: new FeishuAdapter({ appId: command === 'run' ? secret(config.feishu.appIdEnv) : '', appSecret: command === 'run' ? secret(config.feishu.appSecretEnv) : '', userOpenId: config.feishu.userOpenId }),
     codex: new CodexAppServer({ ...config.codex, env: Object.fromEntries(Object.entries(process.env).filter(([name]) => ![config.feishu.appIdEnv, config.feishu.appSecretEnv].includes(name))) }), workspace: new WorkspaceProvider(config.dataDir),
-  }, undefined, { configPath: resolve(args.values.config) });
+  });
   if (command === 'collect') {
-    try { await loop.collect(); output({ collectedTasks: loop.tasks().length, diagnostics: loop.store.diagnostics() }); if (loop.store.diagnostics().length) process.exitCode = 1; }
+    try { await loop.collect(); output({ collectedTasks: loop.tasks().filter(task => loop.projects.ledger.membership(task.id)?.role !== 'coordinator').length, diagnostics: loop.store.diagnostics() }); if (loop.store.diagnostics().length) process.exitCode = 1; }
     finally { await loop.close(); }
     return;
   }

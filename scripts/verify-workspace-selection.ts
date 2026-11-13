@@ -1,3 +1,5 @@
+import { recoverSavedIntake, recoverSavedSupplement, openDirectGroup } from '../test/saved-intake.js';
+import { tickWithCoordinator } from '../test/coordinated-runtime.js';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -112,13 +114,14 @@ const formalRequests: { request: Parameters<CodexAppServer['createThread']>[0]; 
 const create = codex.createThread.bind(codex);
 codex.createThread = async input => {
   const threadId = await create(input);
-  formalRequests.push({ request: structuredClone(input), threadId });
+  if (!input.instructions.includes('Project role: coordinator.')) formalRequests.push({ request: structuredClone(input), threadId });
   return threadId;
 };
 const formalStarts: Parameters<CodexAppServer['startTurn']>[0][] = [];
 let expectedExecution: ExecutionExpectation | null = null;
 const start = codex.startTurn.bind(codex);
 codex.startTurn = async input => {
+  if (!formalRequests.some(request => request.threadId === input.threadId)) return start(input);
   assert.ok(expectedExecution, 'Formal execution must belong to a fixture case');
   const expected = expectedExecution;
   assert.equal(input.deliveryId, expected.source.id);
@@ -158,19 +161,28 @@ async function verifyExecution(expected: ExecutionExpectation): Promise<void> {
   if (task.source.kind === 'manual') assert.deepEqual(task.source.message, expected.source);
   const selectionState = task.workspaceSelection;
   assert.ok(selectionState.kind === 'selected' && selectionState.choice.kind === 'project');
-  const selection = selections.find(item => item.response.temporaryThreadId === selectionState.temporaryThreadId);
+  const taskSelections = selections.filter(item => item.request.taskId === task.id);
+  const selection = taskSelections.at(-1);
   assert.ok(selection && selection.response.choice.kind === 'project');
   const choice = selection.response.choice;
   const candidate = selection.request.candidates.find(item => 'kind' in item && item.kind === 'project' && item.id === choice.projectId);
-  assert.ok(candidate, 'Saved selection must refer to an exact captured candidate');
-  assert.equal(selectionState.choice.projectId, choice.projectId);
-  assert.deepEqual(selectionState.choice.project, candidate, 'Saved selection must retain the captured project snapshot');
+  assert.ok(candidate && 'kind' in candidate && candidate.kind === 'project', 'Selection must refer to an exact captured candidate');
+  assert.equal(candidate.canonicalPath, expected.directory);
+  const member = loop.projects.ledger.membership(task.id);
+  assert.ok(member?.role === 'worker');
+  const project = loop.projects.ledger.project(member.projectId);
+  assert.ok(project);
+  assert.equal(project.directory, candidate.canonicalPath, 'Coordinator delegation must retain the selected directory');
+  const delegatedProject = { kind: 'project', id: `coordinated:${project.id}`, name: project.name,
+    entryPath: project.directory, canonicalPath: project.directory };
+  assert.equal(selectionState.temporaryThreadId, 'runtime-delegation');
+  assert.equal(selectionState.choice.projectId, delegatedProject.id);
+  assert.deepEqual(selectionState.choice.project, delegatedProject, 'Saved execution directory must retain its project-scoped delegation');
   assert.equal(task.resources.length, 1);
   const resource = task.resources[0];
   assert.ok(resource && resource.kind === 'project');
   assert.equal(resource.workspace, expected.directory);
-  assert.deepEqual(resource.project, candidate, 'Resource must retain the selected project snapshot');
-  const taskSelections = selections.filter(item => item.request.taskId === task.id);
+  assert.deepEqual(resource.project, delegatedProject, 'Resource must retain the delegated project snapshot');
   assert.ok(taskSelections.every(item => item.response.temporaryThreadId !== task.threadId));
   assert.equal(new Set(taskSelections.map(item => item.response.temporaryThreadId)).size, taskSelections.length);
   const formal = formalRequests.find(item => item.threadId === task.threadId);
@@ -239,7 +251,8 @@ try {
     source: message('fixture-auto-source', 'Locate the first-level project whose README.md identifies service SPECTRAL_DESK_482. Read candidates only as needed to choose the project. Then in the formal task read its README.md and create only automatic-result.json using a running Node process. Set marker="AUTO_DISCOVERY_482", cwd=process.cwd(), evidenceToken to the value read from README.md, and supplements=[]. Read the actual result back and verify it. Do not delegate, access network or real projects, change existing files, commit, deploy, or write into another project. The matching README is sufficient evidence; no owner confirmation is needed.'),
   };
   expectedExecution = automatic;
-  await loop.receive(automatic.source);
+  await recoverSavedIntake(loop, automatic.source); await tickWithCoordinator(loop);
+  for (const saved of loop.tasks()) if (loop.projects.ledger.membership(saved.id)?.role === 'worker') await openDirectGroup(loop, saved.id);
   assert.equal(selections.length, 1);
   assert.equal(selections[0]?.response.choice.kind, 'project');
   assert.equal(formalRequests.length, 1);
@@ -251,23 +264,26 @@ try {
     source: message('fixture-answer-source', 'Create answer-result.json in one of the audio or portal projects, with marker="ORIGINAL_MARKER_761", cwd from the running Node process.cwd(), evidenceToken read from the chosen README.md, and supplements=[]. Read the actual result back and verify it. The target is intentionally unspecified and must first be confirmed by the owner, even if directory inspection suggests a possible target. Ask which directory and wait. Only the chosen project result file may be created. Do not modify existing files, delegate, access network or real projects, commit, or deploy.'),
   };
   expectedExecution = answered;
-  await loop.receive(answered.source);
+  await recoverSavedIntake(loop, answered.source);
   const waiting = loop.tasks().find(item => item.source.kind === 'manual' && item.source.message.id === answered.source.id);
-  assert.ok(waiting?.chatId && !waiting.threadId);
-  assert.equal(waiting.workspaceSelection.kind, 'waiting');
+  assert.ok(waiting && !waiting.chatId && !waiting.threadId);
+  assert.ok(loop.store.meta(`project-intake-question:${waiting.id}`));
   assert.equal(waiting.resources.length, 0);
   assert.equal(selections.length, 2);
   assert.equal(selections[1]?.response.choice.kind, 'question');
   assert.equal(formalRequests.length, 1, 'Directory question must not start a formal task');
   assert.equal(formalStarts.length, 1);
   assert.deepEqual(await projectFiles(), expectedFiles);
-  if (waiting.workspaceSelection.kind === 'waiting') {
-    const question = waiting.workspaceSelection.question;
-    assert.ok(feishu.sent.some(output => output.chatId === waiting.chatId && output.text.includes(question)));
-  }
+  const directoryQuestion = z.object({ question: z.string() }).parse(JSON.parse(loop.store.meta(`project-intake-question:${waiting.id}`)!)).question;
+  assert.ok(directoryQuestion.trim());
+  assert.ok(!feishu.sent.some(output => output.chatId === answered.source.chatId), 'Saved groupless clarification must not reopen private delivery');
+  const questionOutput = loop.store.outputs(waiting.id).find(output => output.text.includes(directoryQuestion));
+  assert.ok(questionOutput);
+  assert.equal(questionOutput.status, 'dropped', 'Groupless clarification must not become a future delivery backlog');
+
   answered.answer = {
     ...message('fixture-directory-answer', 'Use the portal project. Supplement the original task before executing it. Replace the original marker with "ANSWER_DISCOVERY_761". Read both attached evidence files in the supplied order and put their trimmed contents into supplements. Restrictions still apply. Only portal/answer-result.json may be created; do not change existing files, write into audio, delegate, access network or real projects, commit, or deploy. Use the actual running Node process.cwd() and read the portal README.md evidence token.'),
-    chatId: waiting.chatId, chatType: 'group',
+    chatId: answered.source.chatId, chatType: 'p2p',
     attachments: [
       { kind: 'file', key: 'fixture-answer-first', name: 'first-evidence.txt' },
       { kind: 'file', key: 'fixture-answer-second', name: 'second-evidence.txt' },
@@ -278,7 +294,9 @@ try {
     assert.ok(supplement);
     feishu.resources.set(attachment.key, Buffer.from(`${supplement}\n`));
   }
-  await loop.receive(answered.answer);
+  const savedAnswerTask = loop.store.taskForSource(`feishu:new:${answered.source.id}`); assert.ok(savedAnswerTask);
+  await recoverSavedSupplement(loop, savedAnswerTask.id, answered.answer); await tickWithCoordinator(loop);
+  for (const saved of loop.tasks()) if (loop.projects.ledger.membership(saved.id)?.role === 'worker') await openDirectGroup(loop, saved.id);
   assert.equal(selections.length, 3);
   assert.equal(formalRequests.length, 2);
   await verifyExecution(answered);

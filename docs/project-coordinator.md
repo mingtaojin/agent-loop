@@ -1,10 +1,14 @@
 # 配置项目协调者
 
-项目协调者统一管理多个仓库，使用 pstack Orchestrate 委派和监督任务。Worker 使用 poteto-mode，自行选择调查、需求澄清、开发和验证方法。项目群是主要交流入口，Worker 的任务群仍可查看和指导。
+每个项目通过自己的协调者接单，使用 pstack Orchestrate 委派和监督任务。Worker 使用 poteto-mode，自行选择调查、需求澄清、开发和验证方法。用户只在项目协调群交办，包括没有 Issue 的 Bug 和新需求。GitHub 收集作为协调者证据，Runtime 不自动创建普通执行任务。CLI 和私聊不再接单。
+
+Worker 和 verifier 默认不建群；用户需要直接交流时，由协调者打开指定任务群。
 
 ## 配置项目
 
-在 Runtime 配置中添加 `projects`。目录相对于配置文件解析，必须已经存在。账号、标签和路径替换为项目实际值。
+首次建立本地项目协调群前，管理员必须在 `projects` 显式登记项目。空数据库仅配置 `engineering.projectRoot` 不会自动为每个目录建群。发现根目录只提供工程候选，GitHub 和历史请求确定项目归属时仍可复用相应协调者。项目身份按实际目录持久保存，重启复用原协调者。本地发现不扩大 GitHub 采集范围。
+
+需要明确仓库归属、接手条件或项目规则时，在 `projects` 配置项目。目录相对于配置文件解析，必须已经存在。纯本地项目可以设置 `repositories: []`。
 
 ```json
 {
@@ -26,19 +30,25 @@
 }
 ```
 
-每个仓库至少设置一个标签或账号。Issue 带任一指定标签，或者被指派给任一指定账号，即满足接手条件。账号比较不区分大小写，标签按原文匹配。首次运行会接手符合条件的存量未关闭 Issue，不限制为 Bug 类型。PR 不作为 Issue 接手。
+仓库可以设置标签、账号或 `criteria`。设置标签或账号时，Issue 带任一指定标签，或者被指派给任一指定账号，即满足这部分条件。账号比较不区分大小写，标签按原文匹配。仅设置 `criteria` 时使用其收集条件。首次运行会接手符合条件的存量未关闭 Issue。PR 不作为 Issue 接手。
 
-同一仓库只能属于一个协调项目。项目仓库使用项目接手规则，不再同时通过普通收集条件新建任务。未配置项目的仓库保持原收集行为。项目仓库无需重复出现在顶层 `repositories` 中；需要 Runtime 创建独立工作树时，可继续配置顶层仓库的本地路径和基线。
+仓库条目可添加可选的 `criteria`，在标签或指派条件之外再应用普通收集过滤。例如 `{"name":"crysound/OpenTest","assigneesAny":["mingtaojin"],"criteria":{"taskTypes":["bug"]}}` 仅接手同时指派给该账号且分类为 Bug 的 Issue。类型分类沿用 `nativeTypes` 和 `typeLabels`；省略 `criteria` 时保持原来的不限类型行为。
+
+同一仓库只能属于一个协调项目。未显式配置项目的仓库使用顶层收集条件，确定工程后交给该项目的协调者；不能直接启动 Worker。只有来源配置中明确的仓库会被采集。显式项目仓库无需重复出现在顶层 `repositories` 中；需要 Runtime 管理独立工作树时，可继续配置本地路径和基线。
 
 配置在启动时加载。启用实际配置前，按[本机服务操作](agents/operations.md)执行切换并核对。源码测试不代表正式实例已经启用。
 
 协调者默认使用 `gpt-6-astra` 和 `high`，Worker 默认使用 `gpt-6.1-sol` 和 `xhigh`。项目可通过 `models` 和 `reasoningEfforts` 分别覆盖角色模型和推理强度。verifier 未指定时沿用 Codex 默认配置，按 pstack 为独立验证选择不同模型家族。
 
-模型名必须能由本机 Codex 解析。Runtime 不按名称猜测模型家族，也不默默更换不可用模型。任务创建时保存所选模型与推理强度，恢复与协调会话切换继续使用保存值。普通非项目任务保持原 Codex 配置。
+模型名必须能由本机 Codex 解析。Runtime 不按名称猜测模型家族，也不默默更换不可用模型。任务创建时保存所选模型与推理强度，恢复与协调会话切换继续使用保存值。既有任务按保存的项目身份恢复。
 
 ## 对话与角色指导
 
-Runtime 为项目建立一个协调 Task 及项目群。协调者使用 `prompts/coordinator.md`，Worker 使用 `prompts/worker.md`。普通任务继续使用现有工程提示词配置。协调者派单携带目标、背景、范围、禁止动作、验收及交付要求。共享项目入口本身不是隔离工作树。
+Runtime 为项目建立一个协调 Task 及项目群。协调者使用 `prompts/coordinator.md`，Worker 使用 `prompts/worker.md`。用户在项目群交办或补充材料。CLI submit、answer 和私聊接单已经移除。`status --request-id` 保留为旧 CLI 请求的只读查询。
+
+GitHub 和历史接单记录保留原文、来源和附件，不自动创建执行 Thread、工作区或任务群。项目不明确时保留问题和现场，不回退到无项目执行。
+
+协调者派单携带目标、背景、范围、禁止动作、验收及交付要求。接单请求通过 `dispatch` 的 `intakeTaskId` 原地转为 Worker，保留请求身份、原文、附件和范围回答。项目群直接交办的子任务仍可使用普通 `dispatch`。共享项目入口本身不是隔离工作树。
 
 模糊需求由 Worker 使用 grill-with-docs 调查和澄清。协调者把待决问题带到项目群，再把回答交给原 Worker。普通业务回答不是原生工具批准。原生审批仍绑定具体请求与实际任务群，不能通过项目消息代为批准。
 
@@ -51,8 +61,13 @@ Issue 评论先交协调者判断影响，再按需转给原 Worker。Worker 最
 | action | 作用 | 允许角色 |
 | --- | --- | --- |
 | `status` | 查询项目、任务和持久记录 | 项目成员 |
-| `dispatch` | 按请求身份创建 Worker 或独立 verifier | 协调者 |
+| `claim_intake` | 引用本项目群实际用户消息，原地认领明确的未归属旧请求，不启动执行 | 协调者 |
+| `dispatch` | 接管指定 intakeTaskId，或按请求身份创建 Worker、独立 verifier | 协调者 |
 | `send` | 向本项目 Worker 追加指导或回答 | 协调者 |
+| `open_group` | 打开本项目指定 Worker 或 verifier 的任务群，已有有效群则复用 | 协调者 |
+| `plan_group_cleanup` | 冻结既有任务群清单，排除所有项目协调群 | 协调者 |
+| `confirm_group_cleanup` | 核对实际用户对清单的确认消息 | 协调者 |
+| `apply_group_cleanup` | 执行或继续已确认清单，逐群记录结果 | 协调者 |
 | `control` | 暂停或恢复本项目的指定 Worker | 协调者 |
 | `report` | 上报结果、问题或更新 | Worker、verifier |
 | `record` | 追加带版本的项目记录 | 项目成员 |
@@ -61,7 +76,7 @@ Issue 评论先交协调者判断影响，再按需转给原 Worker。Worker 最
 
 修改动作携带稳定的 `requestId`。同一调用方使用相同 ID 和内容重试，返回原结果；更换内容会报冲突。`record` 同时携带 `expectedVersion`，版本不符时先重新读取，再决定如何更新。
 
-默认 `status` 返回有界概览。完整历史按 `section` 分页，支持 `issues`、`comments`、`records` 和 `tasks`。`offset` 从零开始，`limit` 默认 20、最大 100。继续读取 `nextOffset`，不要把概览当作全部历史。
+默认 `status` 返回有界概览。完整历史按 `section` 分页，支持 `issues`、`comments`、`records`、`tasks` 和 `intakes`。协调者还可查询 `unassigned_intakes`，只发现脱敏标识，不提供其他项目的正文和附件路径。`offset` 从零开始，`limit` 默认 20、最大 100。继续读取 `nextOffset`，不要把概览当作全部历史。
 
 ```json
 {"action":"status","section":"records","offset":0,"limit":20}
@@ -69,9 +84,13 @@ Issue 评论先交协调者判断影响，再按需转给原 Worker。Worker 最
 
 旧 Thread 无法补注册动态工具。Runtime 为项目成员提供任务限定的本机客户端命令，接收动作 JSON 文件，调用相同接口。命令只在该任务活跃执行时有效。能力文件不能读取、复制或在任务间共享。
 
+未归属的历史请求先在项目群确认实际归属，再调用 `claim_intake`。动作携带 `taskId`、`messageId` 和稳定 `requestId`，其中 `messageId` 必须指向本项目协调群保存的实际所有者消息。认领仅保存路由，不创建 Worker、启动 Thread 或回答原生请求。已有项目归属、正式 Thread、暂停以及其他项目的 GitHub catalog 绑定都会阻止认领。同一请求安全重试，随后仍需显式 `dispatch(intakeTaskId)`。不要自动认领积压请求。
+
 ## 监督和恢复
 
 项目关系、决定与请求回执通过现有 SQLite 写入者保存。协调者通过 `rotate` 提交恢复说明。当前轮次结束、没有未答原生问题和未确认输入后，Runtime 保留同一项目、Task、群和 Worker 关系，建立新正式 Thread。恢复输入要求读取项目记录并核实当前事实。原会话执行记录仍保留。
+
+升级时，已经存在的正式任务依据保存的工程资源原地纳入协调，保留群、Thread、待处理输入、审批、资源和暂停或失败状态。尚未执行的旧任务作为接单请求交给协调者决定。无法确定项目的历史任务保留现场并等待澄清，不继续无项目归属的执行。`status` 的 `intakes` 分页保存未派发请求入口，协调者更换上下文后仍能找回。
 
 存在 Worker 时，Runtime 按 `supervisionIntervalMs` 发送通用监督提醒。提醒要求核查真实进展，不因静默判定失败。协调者处于暂停、故障、运行中或已有待投递输入时，不叠加监督提醒。具体重规划与恢复方法由 Orchestrate 决定。
 

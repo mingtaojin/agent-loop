@@ -15,7 +15,7 @@ const operationSchema = z.object({ id: z.string(), task_id: z.string(), kind: z.
 export type Operation = z.infer<typeof operationSchema>;
 const inboxRow = z.object({ seq: z.number(), id: z.string(), task_id: z.string(), payload: z.string(), status: z.enum(['pending', 'delivering', 'delivered', 'failed', 'uncertain', 'held']), origin: z.enum(['user', 'source', 'initial', 'resume']), error: z.string().nullable() });
 export type Inbox = Omit<z.infer<typeof inboxRow>, 'payload'> & { message: IncomingMessage; provenance: InputProvenance; requestId: string | null; route: 'task' | 'workspace-selection'; selectionHandled: boolean };
-const outboxSchema = z.object({ id: z.string(), task_id: z.string(), text: z.string(), status: z.enum(['pending', 'sending', 'sent', 'uncertain']), error: z.string().nullable() });
+const outboxSchema = z.object({ id: z.string(), task_id: z.string(), text: z.string(), status: z.enum(['pending', 'sending', 'sent', 'uncertain', 'dropped']), error: z.string().nullable() });
 export type Outbox = z.infer<typeof outboxSchema>;
 
 export class Store {
@@ -142,6 +142,10 @@ export class Store {
   markOutput(id: string, status: Outbox['status'], error: string | null = null): void { this.db.prepare('UPDATE outbox SET status=?,error=? WHERE id=?').run(status, error, id); }
   operation(id: string): Operation | null { const row = this.db.prepare('SELECT * FROM operations WHERE id=?').get(id); return row ? operationSchema.parse(row) : null; }
   beginOperation(id: string, taskId: string, kind: string): void { this.db.prepare("INSERT INTO operations VALUES(?,?,?,'attempting',NULL,NULL)").run(id, taskId, kind); }
+  retryRejectedOperation(id: string): void {
+    const result = this.db.prepare("UPDATE operations SET status='attempting',result=NULL,error=NULL WHERE id=? AND status='uncertain' AND error='rejected'").run(id);
+    if (result.changes !== 1) throw new Error('Operation is not a rejected attempt');
+  }
   finishOperation(id: string, result: string): void { this.db.prepare("UPDATE operations SET status='confirmed',result=?,error=NULL WHERE id=?").run(result, id); }
   uncertainOperation(id: string, error: string): void { this.db.prepare("UPDATE operations SET status='uncertain',error=? WHERE id=?").run(error, id); }
   queueApproval(action: ApprovalAction): boolean {

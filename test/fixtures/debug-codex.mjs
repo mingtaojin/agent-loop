@@ -23,7 +23,12 @@ createInterface({ input: process.stdin }).on('line', line => {
       send({ id, result: { turn } });
       const scope = { threadId: thread.id, turnId: turn.id };
       if (thread.ephemeral) {
-        const answer = { id: 'selection', type: 'agentMessage', phase: 'final_answer', text: JSON.stringify({ choice: { kind: 'none', reason: 'Synthetic discussion needs no engineering directory' } }) };
+        const text = p.input.find(item => item.type === 'text' && item.text.startsWith('Directory-selection data: '))?.text;
+        const data = text ? JSON.parse(text.split('\n')[0].slice('Directory-selection data: '.length)) : {};
+        const candidate = data.candidates?.find(item => item.kind === 'project');
+        const choice = candidate ? { kind: 'project', projectId: candidate.id, reason: 'Configured surface project' }
+          : { kind: 'none', reason: 'No supplied project' };
+        const answer = { id: 'selection', type: 'agentMessage', phase: 'final_answer', text: JSON.stringify({ choice }) };
         turn.items.push(answer); turn.status = 'completed';
         notify('item/completed', { ...scope, item: answer });
         notify('turn/completed', { threadId: thread.id, turn });

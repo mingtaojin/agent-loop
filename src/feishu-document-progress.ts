@@ -5,7 +5,8 @@ import { errorMessage, type Task } from './domain.js';
 import { finished, progressViewSchema, taskProgressStatus } from './feishu-progress-view.js';
 import { documentConversationText, projectDocumentConversation } from './feishu-document-conversation.js';
 import { documentChunks } from './feishu-document-text.js';
-import { DocumentRequestRejected, type FeishuDocumentProgressPort } from './ports.js';
+import { DocumentRequestRejected, TaskGroupBindingChanged, TaskGroupUnavailable, type FeishuDocumentProgressPort } from './ports.js';
+import { assertGroupBinding, retireTaskGroup } from './task-groups.js';
 import { documentSourcePositionSchema, type DocumentSourcePosition, type Store } from './store.js';
 
 const id = z.string().min(1);
@@ -78,6 +79,7 @@ export class FeishuDocumentProgressPublisher {
     const work: Promise<void>[] = [];
     const records = this.options.store.documentProgressRecords().map(raw => documentPublicationSchema.parse(raw));
     for (const record of records.sort((a, b) => a.lastAttemptAt - b.lastAttemptAt)) {
+      if (this.options.store.task(record.taskId).chatId !== record.chatId) continue;
       if (this.inFlight.size >= 2) break;
       if (this.inFlight.has(record.taskId) || record.nextAttemptAt > this.now()) continue;
       const delivery = record.delivery;
@@ -103,6 +105,8 @@ export class FeishuDocumentProgressPublisher {
   private saveDelivery(record: DocumentPublication): void {
     const latest = this.load(record.taskId);
     if (!latest) throw new Error('Document publication disappeared');
+    if (latest.chatId !== record.chatId) throw new TaskGroupBindingChanged();
+    assertGroupBinding(this.options.store, record.taskId, record.chatId);
     this.save({ ...latest, delivery: record.delivery, lastAttemptAt: record.lastAttemptAt,
       nextAttemptAt: record.nextAttemptAt, failures: record.failures });
   }
@@ -122,7 +126,10 @@ export class FeishuDocumentProgressPublisher {
       for (const task of tasks) {
         if (!task.chatId || !task.turnId || excluded.has(turnKey(task.id, task.turnId))) continue;
         let record = this.load(task.id);
-        if (record && record.chatId !== task.chatId) throw new Error(`Document chat binding changed for ${task.id}`);
+        if (record && record.chatId !== task.chatId) {
+          store.setMeta(`retired-document-progress:${task.id}:${record.chatId}`, JSON.stringify(record));
+          record = null;
+        }
         if (!record) {
           record = { version: 1, taskId: task.id, chatId: task.chatId, turnId: task.turnId,
             view: emptyView(), text: '', projectionRevision: null, delivery: { kind: 'document', title: '执行进度', pending: false },
@@ -143,7 +150,9 @@ export class FeishuDocumentProgressPublisher {
     });
   }
   private async deliver(record: DocumentPublication): Promise<void> {
+    if (this.options.store.task(record.taskId).chatId !== record.chatId) return;
     const transport = this.options.transport;
+    const guard = () => assertGroupBinding(this.options.store, record.taskId, record.chatId);
     let rollback: DocumentPublication['delivery'] | undefined;
     record.lastAttemptAt = this.now();
     record.nextAttemptAt = this.now() + this.intervalMs;
@@ -156,7 +165,7 @@ export class FeishuDocumentProgressPublisher {
           rollback = structuredClone(delivery);
           delivery.pending = true;
           this.saveDelivery(record);
-          const documentId = await transport.createDocument({ title: delivery.title });
+          const documentId = await transport.createDocument({ title: delivery.title }, guard);
           record.delivery = { kind: 'block', documentId, documentUrl: `${this.baseUrl}/docx/${encodeURIComponent(documentId)}`,
             write: { clientToken: randomUUID(), text: documentChunks(content(record))[0] ?? '', sent: false } };
           break;
@@ -168,7 +177,7 @@ export class FeishuDocumentProgressPublisher {
             rollback = structuredClone(delivery);
             delivery.write.sent = true;
             this.saveDelivery(record);
-            blockId = await transport.createBlock({ documentId: delivery.documentId, ...delivery.write });
+            blockId = await transport.createBlock({ documentId: delivery.documentId, ...delivery.write }, guard);
           }
           if (!blockId) throw new Error('Managed block creation remains unknown');
           record.delivery = { kind: 'access', documentId: delivery.documentId, documentUrl: delivery.documentUrl, blockId, pending: false };
@@ -177,11 +186,12 @@ export class FeishuDocumentProgressPublisher {
         case 'access': {
           const input = { documentId: delivery.documentId, chatId: record.chatId };
           if (!await transport.hasGroupRead(input)) {
+            if (this.options.store.task(record.taskId).chatId !== record.chatId) return;
             if (delivery.pending) throw new Error('Group permission remains unknown');
             rollback = structuredClone(delivery);
             delivery.pending = true;
             this.saveDelivery(record);
-            await transport.grantGroupRead(input);
+            await transport.grantGroupRead(input, guard);
           }
           record.delivery = { ...delivery, kind: 'tab', pending: false };
           break;
@@ -189,11 +199,12 @@ export class FeishuDocumentProgressPublisher {
         case 'tab': {
           const input = { chatId: record.chatId, documentUrl: delivery.documentUrl };
           let tabId = await transport.findTab(input);
+          if (this.options.store.task(record.taskId).chatId !== record.chatId) return;
           if (!tabId && !delivery.pending) {
             rollback = structuredClone(delivery);
             delivery.pending = true;
             this.saveDelivery(record);
-            tabId = await transport.createTab(input);
+            tabId = await transport.createTab(input, guard);
           }
           if (!tabId) throw new Error('Document tab creation remains unknown');
           record.delivery = { kind: 'ready', documentId: delivery.documentId, documentUrl: delivery.documentUrl,
@@ -207,7 +218,7 @@ export class FeishuDocumentProgressPublisher {
             const input = { documentId: delivery.documentId, blockId: delivery.blockId };
             if (!write.sent || await transport.readBlock(input) !== write.text) {
               rollback = structuredClone(delivery); write.sent = true; this.saveDelivery(record);
-              await transport.replaceContent({ ...input, ...write });
+              await transport.replaceContent({ ...input, ...write }, guard);
             }
             delivery.parts = [{ blockId: delivery.blockId, text: write.text }];
             delivery.content = write.text; delivery.write = null; break;
@@ -233,7 +244,7 @@ export class FeishuDocumentProgressPublisher {
               const input = { documentId: delivery.documentId, blockId: operation.blockId };
               if (!operation.sent || await transport.readBlock(input) !== operation.text) {
                 operation.sent = true; this.saveDelivery(record);
-                await transport.replaceContent({ ...input, text: operation.text, clientToken: operation.clientToken });
+                await transport.replaceContent({ ...input, text: operation.text, clientToken: operation.clientToken }, guard);
               }
               const part = delivery.parts.find(part => part.blockId === operation.blockId);
               if (!part) throw new Error('Document block ownership disappeared');
@@ -246,7 +257,7 @@ export class FeishuDocumentProgressPublisher {
               if (operation.sent) blockId = await transport.findBlock(input);
               else {
                 operation.sent = true; this.saveDelivery(record);
-                blockId = await transport.createBlock({ ...input, clientToken: operation.clientToken });
+                blockId = await transport.createBlock({ ...input, clientToken: operation.clientToken }, guard);
               }
               if (!blockId) throw new Error('Overflow block creation remains unknown');
               delivery.parts.push({ blockId, text: operation.text });
@@ -255,7 +266,7 @@ export class FeishuDocumentProgressPublisher {
             case 'remove': {
               operation.sent = true; this.saveDelivery(record);
               await transport.removeBlocks({ documentId: delivery.documentId, parentBlockId: delivery.blockId,
-                blockIds: operation.blockIds, clientToken: operation.clientToken });
+                blockIds: operation.blockIds, clientToken: operation.clientToken }, guard);
               delivery.parts = delivery.parts.filter(part => !operation.blockIds.includes(part.blockId));
               break;
             }
@@ -273,7 +284,11 @@ export class FeishuDocumentProgressPublisher {
       record.nextAttemptAt = this.now() + this.intervalMs;
       this.saveDelivery(record);
     } catch (error) {
-      // Only a definitive rejection permits a new dispatch. Read failures never erase pending intent.
+      if (error instanceof TaskGroupBindingChanged) return;
+      if (error instanceof TaskGroupUnavailable) {
+        retireTaskGroup(this.options.store, record.taskId, record.chatId);
+        this.report(`${record.taskId}: ${error.message}`); return;
+      }
       if (error instanceof DocumentRequestRejected && rollback) record.delivery = rollback;
       record.failures++;
       record.nextAttemptAt = this.now() + Math.max(this.intervalMs, Math.min(60_000, 3000 * 2 ** Math.min(record.failures - 1, 5)));

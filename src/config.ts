@@ -16,11 +16,6 @@ export const documentBaseUrlSchema = z.url().max(2048).refine(value => {
 
 export const configSchema = z.strictObject({
   dataDir: z.string().min(1).default('./data'),
-  submission: z.strictObject({
-    maxPromptBytes: z.number().int().positive().max(16 * 1024 * 1024).default(1024 * 1024),
-    maxConcurrentRequests: z.number().int().positive().max(128).default(16),
-    requestTimeoutMs: positiveMilliseconds.max(120_000).default(10_000),
-  }).default({ maxPromptBytes: 1024 * 1024, maxConcurrentRequests: 16, requestTimeoutMs: 10_000 }),
   dashboard: z.strictObject({ host: z.enum(['127.0.0.1', '0.0.0.0']).default('127.0.0.1'), port: z.number().int().min(1).max(65535).default(8787) }).default({ host: '127.0.0.1', port: 8787 }),
   repositories: z.array(collectionRepositorySchema).default([]).refine(
     repositories => new Set(repositories.map(repository => repository.name.toLowerCase())).size === repositories.length,
