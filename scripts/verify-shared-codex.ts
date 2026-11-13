@@ -24,11 +24,11 @@ const identity = async () => {
 };
 const messageSchema = z.object({ id: z.union([z.number(), z.string()]).optional(), method: z.string().optional(), params: z.record(z.string(), z.unknown()).optional(), result: z.record(z.string(), z.unknown()).optional(), error: z.object({ code: z.number(), message: z.string() }).optional() }).passthrough();
 const records: { method: string; threadId?: string; turnId?: string; status?: unknown; params?: unknown; error?: unknown; turns?: unknown }[] = [];
+const owned = new Set<string>();
 const connector = transport.sharedDaemonConnector(settings, 30_000);
 let cancelOnTurnStart: AbortController | undefined;
 const observed: CodexConnector = async handlers => {
   const calls = new Map<string | number, { method: string; params: Record<string, unknown> }>();
-  const owned = new Set<string>();
   let ephemeralThread: string | undefined;
   const connection = await connector({
     ...handlers,
