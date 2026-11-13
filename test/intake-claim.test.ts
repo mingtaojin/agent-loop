@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, realpath, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ProjectCatalog } from '../src/project-catalog.js';
@@ -10,6 +10,7 @@ import { z } from 'zod';
 import { configSchema } from '../src/config.js';
 import { taskSchema, criteriaSchema } from '../src/domain.js';
 import { AgentLoop } from '../src/loop.js';
+import { WorkspaceProvider } from '../src/workspace.js';
 import type { WorkspacePort } from '../src/ports.js';
 import { projectConfigSchema, type ProjectAction } from '../src/project.js';
 import { CodexFake, FeishuFake, GitHubFake, issue } from './fakes.js';
@@ -441,4 +442,44 @@ test('independent handoff race: a late owner restriction must reach the coordina
     'late owner scope must be delivered, not deduplicated under an older payload');
   assert.equal(events.length, 1, 'stale material must not reserve the complete payload identity');
   assert.deepEqual(f.loop.store.inputs(task.id).find(input => input.id === message.id)?.message, message);
+});
+
+test('independent threadless legacy pause keeps the Operator reason when existing selected project permits coordinator handoff',async t=>{
+  const f=await fixture(t),saved=f.saved('threadless-legacy-pause');f.feishu.resources.set('old-file',Buffer.from('retained evidence'));
+  const app=f.loop.projects.projectConfig('app');assert.ok(app);
+  const project={kind:'project' as const,id:'coordinated:app',name:'App',entryPath:app.directory,canonicalPath:app.directory};
+  const original=taskSchema.parse({...saved,purpose:'legacy',status:'paused',reason:'Operator paused',legacy:{status:'paused',prUrl:null},workspaceSelection:{kind:'selected',temporaryThreadId:'saved-selection',inputIds:[],choice:{kind:'project',projectId:project.id,reason:'Original project',project}}});
+  f.loop.store.saveTask(original);
+  const coordinators=new Set([f.coordinator().threadId,f.coordinator('other').threadId]);
+  const effects=()=>({created:f.codex.created.length,starts:f.codex.starts.filter(x=>!coordinators.has(x.threadId)).length,steers:f.codex.steers.filter(x=>!coordinators.has(x.threadId)).length,replies:f.codex.replies.filter(x=>!coordinators.has(x.request.threadId)).length,approvals:f.codex.approvals.filter(x=>!coordinators.has(x.request.threadId)).length});
+  const before=effects();
+  await f.loop.tick();const after=f.loop.store.task(saved.id);
+  console.log('THREADLESS_LEGACY_OPERATOR_PAUSE',JSON.stringify({status:after.status,reason:after.reason,purpose:after.purpose,route:f.loop.projects.intakeRoute(saved.id)}));
+  assert.equal(after.status,'paused');assert.equal(after.threadId,null);
+  assert.deepEqual(effects(),before,'the paused request creates or executes no Worker; normal coordinator delivery is allowed');
+  assert.deepEqual(after.source,original.source);assert.deepEqual(after.resources,original.resources);
+  assert.equal(after.reason,'Operator paused','coordinator handoff must not erase the Operator pause marker');
+});
+
+test('independent migration recovery validates preserved project resources before a newly adopted idle Thread can execute',async t=>{
+  const f=await fixture(t),saved=f.saved('unassigned-idle-invalid-resource');f.feishu.resources.set('old-file',Buffer.from('original pending material'));
+  const entry=join(f.root,'saved-workspace'),wrong=join(f.root,'different-workspace');await mkdir(entry);await mkdir(wrong);
+  const canonical=await realpath(entry);
+  const project={kind:'project' as const,id:'retained-project',name:'Retained project',entryPath:entry,canonicalPath:canonical};
+  const resource={kind:'project' as const,id:'retained-resource',project,workspace:canonical};
+  const threadId=await f.codex.createThread({cwd:canonical,instructions:'Saved original Thread.'});
+  const turnId=await f.codex.startTurn({threadId,deliveryId:'retained-initial',input:[{kind:'text',text:'Original turn.'}]});f.codex.complete(threadId,null);
+  const original=taskSchema.parse({...saved,purpose:'legacy',threadId,turnId,status:'idle',executionStatus:'completed',resources:[resource],workspaceSelection:{kind:'selected',temporaryThreadId:'retained-choice',inputIds:[],choice:{kind:'project',projectId:project.id,project,reason:'Saved original workspace'}}});
+  f.loop.store.saveTask(original);await rm(entry,{recursive:true});await symlink(wrong,entry);
+  const actual=await realpath(entry);assert.notEqual(actual,canonical);
+  const provider=new WorkspaceProvider(f.config.dataDir);let validations=0;
+  f.loop.ports.workspace={ensure:async input=>{if(input.resourceId===resource.id)validations++;return provider.ensure(input);},head:workspace=>provider.head(workspace)};
+  f.codex.selectionResults.push({kind:'project',projectId:'coordinated:app',reason:'Confirm App ownership of saved work'});
+  const before=f.codex.starts.filter(x=>x.threadId===threadId).length;
+  await f.loop.recover();
+  const after=f.loop.store.task(saved.id),starts=f.codex.starts.filter(x=>x.threadId===threadId).length;
+  console.log('MIGRATION_RESOURCE_VALIDATION_BYPASS',JSON.stringify({before,after:starts,validations,status:after.status,member:f.loop.projects.ledger.membership(saved.id),savedCanonical:canonical,actualCanonical:actual,resourcesPreserved:JSON.stringify(after.resources)===JSON.stringify(original.resources)}));
+  assert.equal(after.threadId,threadId);assert.deepEqual(after.resources,original.resources);
+  assert.equal(starts,before,'unresolved legacy resources must be validated before selection-based adoption can execute pending input');
+  assert.ok(validations>0,'actual WorkspaceProvider must validate the retained resource');
 });
