@@ -1,4 +1,4 @@
-import { SurfaceCodex, testProject, receiveSurface, tickSurface } from './coordinated-surfaces.js';
+import { SurfaceCodex, testProject, restoreSurface, tickSurface } from './coordinated-surfaces.js';
 import { workerCalls } from './coordinated-runtime.js';
 import assert from 'node:assert/strict';
 import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
@@ -47,7 +47,7 @@ test('initial images reach selection and formal delivery as text references to i
   const bytes = [Buffer.from('first original image\0'), Buffer.from('second original image\0')];
   for (const [index, data] of bytes.entries()) f.feishu.resources.set(`image-${index}`, data);
   const message = f.message('initial-images', ['image-0', 'image-1']);
-  await receiveSurface(f.loop, message);
+  await restoreSurface(f.loop, message);
   const selected = f.codex.selections[0]?.input, formal = workerCalls(f.loop, f.codex).starts[0]?.input;
   assert.ok(selected && formal);
   assert.deepEqual(formal[0], { kind: 'text', text: message.text });
@@ -63,12 +63,12 @@ test('initial images reach selection and formal delivery as text references to i
 test('follow-up images and retries use text paths while later text never reattaches prior images', async t => {
   const f = await fixture(t);
   f.feishu.resources.set('first', Buffer.from('first-image'));
-  await receiveSurface(f.loop, f.message('initial', ['first']));
+  await restoreSurface(f.loop, f.message('initial', ['first']));
   const chatId = f.task().chatId; assert.ok(chatId);
   f.feishu.resources.set('next', Buffer.from('next-image'));
   f.feishu.downloadFailures.add('next');
   const failed = f.message('followup', ['next'], chatId);
-  await receiveSurface(f.loop, failed);
+  await restoreSurface(f.loop, failed);
   assert.equal(workerCalls(f.loop, f.codex).steers.length, 0);
   assert.equal(f.loop.store.inputs(f.task().id).at(-1)?.status, 'failed');
   assert.deepEqual(f.loop.store.inputs(f.task().id).at(-1)?.message, failed);
@@ -80,13 +80,13 @@ test('follow-up images and retries use text paths while later text never reattac
   assert.equal(refs[0]?.messageId, failed.id);
   const ref = refs[0]; assert.ok(ref);
   assert.deepEqual(await readFile(ref.path), Buffer.from('next-image'));
-  await receiveSurface(f.loop, f.message('text-only', [], chatId));
+  await restoreSurface(f.loop, f.message('text-only', [], chatId));
   const textOnly = workerCalls(f.loop, f.codex).steers.at(-1)?.input; assert.ok(textOnly);
   assert.deepEqual(references(textOnly), []);
   assert.ok(!JSON.stringify(textOnly).includes(ref.path));
   const threadId = f.task().threadId; assert.ok(threadId);
   f.codex.complete(threadId, 'Finished'); await tickSurface(f.loop);
-  await receiveSurface(f.loop, f.message('next-turn', ['next'], chatId));
+  await restoreSurface(f.loop, f.message('next-turn', ['next'], chatId));
   const newTurn = workerCalls(f.loop, f.codex).starts.at(-1); assert.ok(newTurn);
   assert.equal(newTurn.deliveryId, 'next-turn');
   assert.equal(references(newTurn.input).length, 1);
@@ -100,7 +100,7 @@ test('image paths remain absolute with a relative data directory and a different
   }] }).repositories;
   f.codex.selectionResults.push({ kind: 'project', projectId: 'coordinated:fixture', reason: 'Fixture workspace' });
   const bytes = Buffer.from('original image bytes'); f.feishu.resources.set('image', bytes);
-  await receiveSurface(f.loop, f.message('workspace-image', ['image']));
+  await restoreSurface(f.loop, f.message('workspace-image', ['image']));
   const input = workerCalls(f.loop, f.codex).starts[0]?.input; assert.ok(input);
   const ref = references(input)[0]; assert.ok(ref);
   const cwd = workerCalls(f.loop, f.codex).created[0]?.cwd; assert.ok(cwd);
@@ -129,7 +129,7 @@ for (const failure of ['missing', 'directory', 'empty', 'unreadable'] as const) 
       return result;
     };
     const message = f.message(`cached-${failure}`, ['cached']);
-    await receiveSurface(f.loop, message);
+    await restoreSurface(f.loop, message);
     assert.equal(workerCalls(f.loop, f.codex).starts.length, 0);
     const saved = f.loop.store.inputs(f.task().id)[0]; assert.ok(saved);
     assert.equal(saved.status, 'failed'); assert.deepEqual(saved.message, message);
@@ -147,8 +147,8 @@ test('assembled input size is independent of image bytes for equal-length text a
   const f = await fixture(t);
   f.feishu.resources.set('small', Buffer.alloc(1024, 0x61));
   f.feishu.resources.set('large', Buffer.alloc(1024 * 1024, 0x62));
-  await receiveSurface(f.loop, f.message('small', ['small']));
-  await receiveSurface(f.loop, f.message('large', ['large']));
+  await restoreSurface(f.loop, f.message('small', ['small']));
+  await restoreSurface(f.loop, f.message('large', ['large']));
   const inputs = workerCalls(f.loop, f.codex).starts.map(start => start.input);
   assert.equal(inputs.length, 2);
   for (const input of inputs) assert.equal(references(input).length, 1);
@@ -171,9 +171,9 @@ test('the actual App Server selector and formal requests contain text paths and 
   const bytes = Buffer.alloc(1024 * 1024, 0x71); feishu.resources.set('original', bytes);
   const message: IncomingMessage = { id: 'wire-image', text: 'Keep this description intact', chatId: 'private', chatType: 'p2p',
     senderId: 'owner', createdAt: Date.now(), attachments: [{ key: 'original', name: 'original.png', kind: 'image' }] };
-  await receiveSurface(loop, message); await tickSurface(loop);
+  await restoreSurface(loop, message); await tickSurface(loop);
   const task = loop.tasks()[0]; assert.ok(task?.chatId);
-  await receiveSurface(loop, { ...message, id: 'wire-text', chatId: task.chatId, chatType: 'group', text: 'Continue with text', attachments: [] });
+  await restoreSurface(loop, { ...message, id: 'wire-text', chatId: task.chatId, chatType: 'group', text: 'Continue with text', attachments: [] });
   const recordSchema = z.object({ direction: z.string(), method: z.string().optional(), params: z.unknown().optional() });
   const inputSchema = z.object({ threadId: z.string(), input: z.array(z.object({ type: z.literal('text'), text: z.string() })) });
   const rows = (await readFile(protocol, 'utf8')).trim().split('\n').map(line => recordSchema.parse(JSON.parse(line)));

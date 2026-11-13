@@ -1,6 +1,6 @@
 # 配置项目协调者
 
-每个项目通过自己的协调者接单，使用 pstack Orchestrate 委派和监督任务。Worker 使用 poteto-mode，自行选择调查、需求澄清、开发和验证方法。GitHub、飞书私聊和 CLI 都先进入项目协调，Runtime 不再创建普通执行任务。项目群是主要交流入口，也可以直接交办没有 Issue 的 Bug 和新需求。
+每个项目通过自己的协调者接单，使用 pstack Orchestrate 委派和监督任务。Worker 使用 poteto-mode，自行选择调查、需求澄清、开发和验证方法。用户只在项目协调群交办，包括没有 Issue 的 Bug 和新需求。GitHub 收集作为协调者证据，Runtime 不自动创建普通执行任务。CLI 和私聊不再接单。
 
 Worker 和 verifier 默认不建群；用户需要直接交流时，由协调者打开指定任务群。
 
@@ -40,11 +40,13 @@ Worker 和 verifier 默认不建群；用户需要直接交流时，由协调者
 
 协调者默认使用 `gpt-6-astra` 和 `high`，Worker 默认使用 `gpt-6.1-sol` 和 `xhigh`。项目可通过 `models` 和 `reasoningEfforts` 分别覆盖角色模型和推理强度。verifier 未指定时沿用 Codex 默认配置，按 pstack 为独立验证选择不同模型家族。
 
-模型名必须能由本机 Codex 解析。Runtime 不按名称猜测模型家族，也不默默更换不可用模型。任务创建时保存所选模型与推理强度，恢复与协调会话切换继续使用保存值。普通非项目任务保持原 Codex 配置。
+模型名必须能由本机 Codex 解析。Runtime 不按名称猜测模型家族，也不默默更换不可用模型。任务创建时保存所选模型与推理强度，恢复与协调会话切换继续使用保存值。既有任务按保存的项目身份恢复。
 
 ## 对话与角色指导
 
-Runtime 为项目建立一个协调 Task 及项目群。协调者使用 `prompts/coordinator.md`，Worker 使用 `prompts/worker.md`。接单记录先保存原文、来源和附件，不创建执行 Thread、工作区或新的任务群。项目不明确时，在原私聊中澄清；只有一项待答请求时可以直接回复，也可用 `/reply <请求编号> 回答` 指定请求。CLI 使用 `status --request-id` 查询问题，再用 `answer --request-id <原请求 UUID> --answer-id <本次回答 UUID> --prompt-file <文件>` 补充材料。
+Runtime 为项目建立一个协调 Task 及项目群。协调者使用 `prompts/coordinator.md`，Worker 使用 `prompts/worker.md`。用户在项目群交办或补充材料。CLI submit、answer 和私聊接单已经移除。`status --request-id` 保留为旧 CLI 请求的只读查询。
+
+GitHub 和历史接单记录保留原文、来源和附件，不自动创建执行 Thread、工作区或任务群。项目不明确时保留问题和现场，不回退到无项目执行。
 
 协调者派单携带目标、背景、范围、禁止动作、验收及交付要求。接单请求通过 `dispatch` 的 `intakeTaskId` 原地转为 Worker，保留请求身份、原文、附件和范围回答。项目群直接交办的子任务仍可使用普通 `dispatch`。共享项目入口本身不是隔离工作树。
 

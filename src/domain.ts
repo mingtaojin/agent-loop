@@ -114,8 +114,6 @@ export const submissionSchema = z.strictObject({
     .refine(text => !/[\uD800-\uDFFF]/u.test(text), 'Prompt contains an unpaired surrogate').brand<'SubmissionPrompt'>(),
 });
 export type Submission = z.infer<typeof submissionSchema>;
-export const submissionAnswerSchema = submissionSchema.extend({ answerId: submissionRequestIdSchema });
-export type SubmissionAnswer = z.infer<typeof submissionAnswerSchema>;
 export interface WorkspaceSelectionRequest {
   taskId: string;
   cwd: string;

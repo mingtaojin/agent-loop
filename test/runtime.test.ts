@@ -1,3 +1,4 @@
+import { recoverSavedIntake, openDirectGroup } from './saved-intake.js';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -49,14 +50,14 @@ async function fixture(t: TestContext) {
   codex.selectionResults = Array.from({ length: 30 }, () => ({ kind: 'project', projectId: 'coordinated:runtime', reason: 'Fixture request belongs to this project' }));
   const snapshot = () => { const id = task().threadId; assert.ok(id); return codex.snapshot(id); };
   return { root, config, ports, github, feishu, codex, workspaces, task, workers, intakes, starts, created, workerSteers, snapshot, message,
-    async delegate(taskId: string) { return delegateIntake(loop, taskId); },
+    async delegate(taskId: string) { await delegateIntake(loop, taskId); return openDirectGroup(loop, taskId); },
     get loop() { return loop; },
-    async manual() { await loop.receive(message('new', 'Explore this idea')); const intake = loop.store.taskForSource('feishu:new:new'); assert.ok(intake); if (intake.purpose === 'intake') await delegateIntake(loop, intake.id); return task(); },
+    async manual() { await recoverSavedIntake(loop, message('new', 'Explore this idea')); const intake = loop.store.taskForSource('feishu:new:new'); assert.ok(intake); if (intake.purpose === 'intake') await delegateIntake(loop, intake.id); await openDirectGroup(loop, intake.id); return task(); },
     async restart() { await loop.close(); loop = new AgentLoop(config, ports); await loop.recover(); },
     async githubTask() { github.sources = [issue(1)]; await loop.collect(); await loop.tick();
       const coordinator = loop.projects.ledger.project('runtime')!.coordinatorTaskId;
       await loop.projectAction(coordinator, { action: 'dispatch', requestId: 'test-issue-1', issueId: 'issue-1', role: 'worker', prompt: 'Investigate Issue 1.' });
-      await loop.tick(); return task(); },
+      await loop.tick(); await openDirectGroup(loop, task().id); return task(); },
   };
 }
 function request(f: Awaited<ReturnType<typeof fixture>>, kind: PendingRequest['kind'] = 'approval'): PendingRequest {
@@ -67,27 +68,17 @@ function action(f: Awaited<ReturnType<typeof fixture>>, native: PendingRequest):
   return { id: 'click', taskId: f.task().id, threadId: native.threadId, turnId: native.turnId, requestId: native.id, decision: 'approve', chatId: f.task().chatId!, senderId: 'owner', epoch: native.connectionEpoch };
 }
 
-test('private ingress persists independent requests and reuses one coordinator across redelivery and restart', async t => {
+test('private text, commands and attachments never admit or modify tasks', async t => {
   const f = await fixture(t);
-  const original = f.message('direct-text', ' \t\nDiscuss this idea.\nKeep the details.  ');
-  await Promise.all([f.loop.receive(original), f.loop.receive(original)]);
-  const intake = f.intakes()[0]; assert.ok(intake);
-  assert.equal(intake.purpose, 'intake'); assert.equal(intake.threadId, null); assert.equal(intake.chatId, null);
-  assert.equal(intake.sourceId, 'feishu:new:direct-text');
-  assert.deepEqual(intake.source, { kind: 'manual', message: original });
-  assert.equal(f.loop.store.inputs(intake.id)[0]?.message.text, 'Discuss this idea.\nKeep the details.');
-  assert.equal(f.workers().length, 0); assert.equal(f.feishu.groups.size, 1);
-  await f.restart(); await f.loop.receive({ ...original, text: `/new ${original.text.trim()}` });
-  assert.equal(f.intakes()[0]?.id, intake.id); assert.equal(f.loop.store.inputs(intake.id).length, 1);
-  assert.deepEqual(f.intakes()[0]?.source, { kind: 'manual', message: original });
-  await f.loop.receive({ ...original, id: 'distinct-text' });
-  assert.equal(f.intakes().length, 2); assert.equal(f.feishu.groups.size, 1);
-  const worker = await f.delegate(intake.id); assert.ok(worker.chatId && worker.threadId);
-  assert.equal(f.feishu.groups.size, 2);
-  const followUp = f.message('group-direct', ' \n/new keep this group text intact  ', worker.chatId, 'group');
-  await f.loop.receive(followUp);
-  assert.deepEqual(f.loop.store.inputs(worker.id).at(-1)?.message, followUp);
-  assert.deepEqual(f.workerSteers().at(-1)?.input[0], { kind: 'text', text: followUp.text });
+  await f.loop.collect(); await f.loop.tick();
+  const before = f.loop.tasks();
+  for (const [index, text] of ['Discuss this idea', '/new work', '/reply old answer', ''].entries()) {
+    const message = { ...f.message(`private-${index}`, text), attachments: [{ key: 'unread', kind: 'file' as const, name: 'scope.log' }] };
+    await f.loop.receive(message); await f.loop.receive(message);
+  }
+  assert.deepEqual(f.loop.tasks(), before);
+  assert.equal(f.codex.selections.length, 0); assert.equal(f.feishu.downloads.length, 0);
+  assert.equal(f.intakes().length, 0); assert.equal(f.feishu.groups.size, 1);
 });
 
 test('empty and unauthorized private inputs create nothing and recovery never imports private history', async t => {
@@ -106,11 +97,11 @@ test('empty and unauthorized private inputs create nothing and recovery never im
   assert.ok(chats.includes(f.task().chatId!));
 });
 
-for (const prefix of ['', ' \t\r\n/new ']) test(`attachment-only intake retains original identity and cached bytes through delegation ${JSON.stringify(prefix)}`, async t => {
+for (const prefix of ['', ' \t\r\n/new ']) test(`saved attachment-only intake retains original identity and cached bytes through delegation ${JSON.stringify(prefix)}`, async t => {
   const f = await fixture(t), bytes = Buffer.from('original log\n');
   f.feishu.resources.set('key', bytes);
   const original = { ...f.message('attachment-new', prefix), attachments: [{ key: 'key', name: 'evidence.log', kind: 'file' as const }] };
-  await f.loop.receive(original); await f.loop.receive(original);
+  await recoverSavedIntake(f.loop, original); await recoverSavedIntake(f.loop, original);
   const intake = f.intakes()[0]; assert.ok(intake);
   assert.deepEqual(intake.source, { kind: 'manual', message: original });
   assert.equal(f.loop.store.inputs(intake.id)[0]?.message.text, '');
@@ -131,7 +122,7 @@ for (const prefix of ['', ' \t\r\n', ' \t\r\n/new ']) test(`rich-post intake pre
     content: JSON.stringify({ title: '', content: [[{ tag: 'text', text: `${prefix}Analyze the recording` }],
       [{ tag: 'text', text: 'Keep the original parameters.' }], [{ tag: 'img', image_key: 'img_1' }], [{ tag: 'img', image_key: 'img_2' }]] }),
   } }, 'owner'); assert.ok(message);
-  await f.loop.receive(message); await f.loop.receive(message);
+  await recoverSavedIntake(f.loop, message); await recoverSavedIntake(f.loop, message);
   const intake = f.intakes()[0]; assert.ok(intake);
   assert.equal(intake.threadId, null); assert.deepEqual(intake.source, { kind: 'manual', message });
   await f.delegate(intake.id);
@@ -149,17 +140,8 @@ for (const prefix of ['', ' \t\r\n', ' \t\r\n/new ']) test(`rich-post intake pre
   assert.equal(f.feishu.downloads.length, 2); assert.equal(f.starts().length, 1);
 });
 
-test('optional /new normalizes only its command boundary and group follow-ups stay verbatim', async t => {
-  const f = await fixture(t);
-  for (const text of [' \n/news task', ' \n/new-task', 'mention /new task', '/new /new Strip only once']) {
-    const original = f.message(text, text); await f.loop.receive(original);
-    const task = f.loop.store.taskForSource(`feishu:new:${text}`); assert.ok(task);
-    assert.equal(task.purpose, 'intake'); assert.equal(task.threadId, null);
-    assert.equal(f.loop.store.inputs(task.id)[0]?.message.text, text === '/new /new Strip only once' ? '/new Strip only once' : text.trim());
-    assert.deepEqual(task.source, { kind: 'manual', message: original });
-  }
-  assert.equal(f.intakes().length, 4); assert.equal(f.feishu.groups.size, 1);
-  const task = await f.manual(); assert.ok(task.chatId);
+test('group follow-ups retain command-looking text verbatim', async t => {
+  const f = await fixture(t); const task = await f.manual(); assert.ok(task.chatId);
   const followUp = ' \n/new is ordinary group text';
   await f.loop.receive(f.message('group-new', followUp, task.chatId, 'group'));
   assert.equal(f.loop.store.inputs(task.id).at(-1)?.message.text, followUp);
@@ -304,7 +286,7 @@ test('Feishu forwards only final answers during execution and after restart', as
 
 test('final answers route once per task and uncertain sends are never blindly replayed', async t => {
   const f = await fixture(t); await f.manual();
-  await f.loop.receive(f.message('new2', 'second topic'));
+  await recoverSavedIntake(f.loop, f.message('new2', 'second topic'));
   const intake = f.loop.store.taskForSource('feishu:new:new2'); assert.ok(intake); await f.delegate(intake.id);
   const [first, second] = f.workers(); assert.ok(first?.threadId && second?.threadId);
   for (const task of [first, second]) {
@@ -343,7 +325,7 @@ test('transport recovery is bounded, does not wake idle tasks, and silence does 
   for (let attempt = 0; attempt < 4; attempt++) { await f.loop.tick(); await setTimeout(5); }
   assert.equal(f.task().status, 'failed'); assert.equal(f.codex.recoveries, 2);
   f.codex.inspect = inspect;
-  await f.loop.receive(f.message('independent', 'independent task'));
+  await recoverSavedIntake(f.loop, f.message('independent', 'independent task'));
   const intake = f.loop.store.taskForSource('feishu:new:independent'); assert.ok(intake); await f.delegate(intake.id);
   const other = f.workers()[1]; assert.ok(other?.threadId);
   f.codex.complete(other.threadId, 'done'); await f.loop.tick(); await f.restart();

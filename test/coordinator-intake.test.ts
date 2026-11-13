@@ -1,3 +1,4 @@
+import { recoverSavedIntake } from './saved-intake.js';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -36,7 +37,7 @@ test('a configured repository without an explicit project never creates an ordin
     'the Runtime must wait for the coordinator to delegate');
 });
 
-test('private requests for the same project reach one coordinator and await its delegation', async t => {
+test('saved requests for the same project reach one coordinator and await its delegation', async t => {
   const root = await mkdtemp(join(tmpdir(), 'coordinator-private-'));
   const projectRoot = join(root, 'projects'), directory = join(projectRoot, 'app');
   await mkdir(directory, { recursive: true });
@@ -58,9 +59,9 @@ test('private requests for the same project reach one coordinator and await its 
   const message = (id: string, text: string): IncomingMessage => ({ id, text, chatId: 'private', chatType: 'p2p',
     senderId: 'owner', attachments: [], createdAt: Date.now() });
   const first = message('first-request', 'Investigate an Application bug');
-  await loop.receive(first);
-  await loop.receive(first);
-  await loop.receive(message('second-request', 'Clarify a new Application requirement'));
+  await recoverSavedIntake(loop, first);
+  await recoverSavedIntake(loop, first);
+  await recoverSavedIntake(loop, message('second-request', 'Clarify a new Application requirement'));
   await loop.tick();
   const ledger = new ProjectLedger(loop.store);
   const state = ledger.project('app');
@@ -120,7 +121,7 @@ test('coordinator promotion during intake handoff keeps the Worker executable wi
     await loop.projectAction(route.coordinatorTaskId, { action: 'dispatch', requestId: 'during-handoff', intakeTaskId: taskId,
       role: 'worker', prompt: 'Follow the original request and preserve its scope.' });
   };
-  await loop.receive({ id: 'handoff-owner-input', text: 'Investigate only; do not edit or deploy.', chatId: 'private', chatType: 'p2p',
+  await recoverSavedIntake(loop, { id: 'handoff-owner-input', text: 'Investigate only; do not edit or deploy.', chatId: 'private', chatType: 'p2p',
     senderId: 'owner', attachments: [], createdAt: Date.now() });
   const worker = loop.store.taskForSource('feishu:new:handoff-owner-input'); assert.ok(worker?.threadId);
   assert.equal(worker.purpose, 'execution'); assert.equal(worker.status, 'running');

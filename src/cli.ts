@@ -9,7 +9,6 @@ import { FeishuAdapter } from './adapters/feishu.js';
 import { CodexAppServer } from './adapters/codex.js';
 import { Store } from './store.js';
 import { errorMessage, intakeRouteSchema, submissionReceipt, submissionRequestIdSchema, submissionSourceId } from './domain.js';
-import { answerSubmission, parseSubmission, parseSubmissionAnswer, readSubmissionPrompt, submitPrompt, SubmissionError } from './submission.js';
 import { startDashboard } from './dashboard.js';
 import { discoverProjects } from './project-discovery.js';
 
@@ -20,18 +19,14 @@ const usage = `Agent Loop
   npm start -- doctor --config config.json
   npm start -- collect --config config.json
   npm start -- status --config config.json [--request-id <uuid>]
-  npm start -- submit --config config.json --request-id <uuid> --prompt-file <path|->
-  npm start -- answer --config config.json --request-id <uuid> --answer-id <uuid> --prompt-file <path|->
   npm start -- run --config config.json
 
 doctor validates local configuration without starting execution.
 collect persists matching sources for project coordination.
-submit accepts a request for its project coordinator, not an independent Worker.
-answer appends a clarification or follow-up to an accepted request.
 status reads saved request, routing and execution information.
 run starts the resident service and debug page.
 Every project uses a coordinator. Unknown projects require clarification.
-Send new work in the project group or a private message. Only coordinators dispatch Workers.
+Send new work only in the project group. Only coordinators dispatch Workers.
 `;
 
 async function doctor(config: Config): Promise<void> {
@@ -58,33 +53,12 @@ async function doctor(config: Config): Promise<void> {
 }
 async function main(): Promise<void> {
   const args = parseArgs({ options: { config: { type: 'string', default: 'config.json' }, 'env-file': { type: 'string', default: '.env' }, help: { type: 'boolean', short: 'h' },
-    'prompt-file': { type: 'string' }, 'request-id': { type: 'string' }, 'answer-id': { type: 'string' } }, allowPositionals: true });
+    'request-id': { type: 'string' } }, allowPositionals: true });
   const command = args.positionals[0];
   if (args.values.help || !command) { process.stdout.write(usage); return; }
-  if (!['doctor', 'collect', 'status', 'submit', 'answer', 'run'].includes(command)) throw new Error(`未知命令 ${command}`);
+  if (!['doctor', 'collect', 'status', 'run'].includes(command)) throw new Error(`未知命令 ${command}`);
   if (args.positionals.length !== 1) throw new Error('多余的位置参数');
-  if (command === 'submit' || command === 'answer') {
-    const requestId = args.values['request-id'] ?? null;
-    try {
-      if (!requestId || !args.values['prompt-file']) throw new SubmissionError('invalid_input', 'submit requires --request-id <lowercase-uuid> and --prompt-file <path|->', requestId);
-      const config = await loadConfig(resolve(args.values.config));
-      const prompt = await readSubmissionPrompt(args.values['prompt-file'], config.submission.maxPromptBytes);
-      if (command === 'answer') {
-        const input = parseSubmissionAnswer({ requestId, answerId: args.values['answer-id'], prompt }, config.submission.maxPromptBytes);
-        output(await answerSubmission({ dataDir: config.dataDir, settings: config.submission, input }));
-      } else {
-        if (args.values['answer-id']) throw new SubmissionError('invalid_input', '--answer-id is only for answer', requestId);
-        const input = parseSubmission({ requestId, prompt }, config.submission.maxPromptBytes);
-        output(await submitPrompt({ dataDir: config.dataDir, settings: config.submission, input }));
-      }
-    } catch (error) {
-      const failure = error instanceof SubmissionError ? new SubmissionError(error.code, error.message, requestId)
-        : new SubmissionError('invalid_input', errorMessage(error), requestId);
-      process.stderr.write(`${JSON.stringify(failure.toJSON())}\n`); process.exitCode = 1;
-    }
-    return;
-  }
-  if (args.values['answer-id'] || args.values['prompt-file'] || (args.values['request-id'] && command !== 'status')) throw new Error('提交参数只适用于 submit、answer 或 status --request-id');
+  if (args.values['request-id'] && command !== 'status') throw new Error('--request-id 只适用于 status');
   const config = await loadConfig(resolve(args.values.config));
   if (command === 'status') {
     if (args.values['request-id']) {
@@ -102,7 +76,7 @@ async function main(): Promise<void> {
         }
         finally { store.close(); }
       } catch (error) {
-        process.stderr.write(`${JSON.stringify(new SubmissionError('invalid_input', errorMessage(error), requestId).toJSON())}\n`); process.exitCode = 1;
+        process.stderr.write(`${JSON.stringify({ requestId, error: { code: 'invalid_input', message: errorMessage(error) } })}\n`); process.exitCode = 1;
       }
       return;
     }
@@ -122,7 +96,7 @@ async function main(): Promise<void> {
     github: new GitHubAdapter({ token, apiUrl: config.github.apiUrl, requestTimeoutMs: config.github.requestTimeoutMs }),
     feishu: new FeishuAdapter({ appId: command === 'run' ? secret(config.feishu.appIdEnv) : '', appSecret: command === 'run' ? secret(config.feishu.appSecretEnv) : '', userOpenId: config.feishu.userOpenId }),
     codex: new CodexAppServer({ ...config.codex, env: Object.fromEntries(Object.entries(process.env).filter(([name]) => ![config.feishu.appIdEnv, config.feishu.appSecretEnv].includes(name))) }), workspace: new WorkspaceProvider(config.dataDir),
-  }, undefined, { configPath: resolve(args.values.config) });
+  });
   if (command === 'collect') {
     try { await loop.collect(); output({ collectedTasks: loop.tasks().filter(task => loop.projects.ledger.membership(task.id)?.role !== 'coordinator').length, diagnostics: loop.store.diagnostics() }); if (loop.store.diagnostics().length) process.exitCode = 1; }
     finally { await loop.close(); }

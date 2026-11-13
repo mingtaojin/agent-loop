@@ -1,3 +1,4 @@
+import { recoverSavedIntake, recoverSavedSupplement, openDirectGroup } from '../test/saved-intake.js';
 import { tickWithCoordinator } from '../test/coordinated-runtime.js';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
@@ -241,7 +242,8 @@ try {
     source: message('fixture-auto-source', 'Locate the first-level project whose README.md identifies service SPECTRAL_DESK_482. Read candidates only as needed to choose the project. Then in the formal task read its README.md and create only automatic-result.json using a running Node process. Set marker="AUTO_DISCOVERY_482", cwd=process.cwd(), evidenceToken to the value read from README.md, and supplements=[]. Read the actual result back and verify it. Do not delegate, access network or real projects, change existing files, commit, deploy, or write into another project. The matching README is sufficient evidence; no owner confirmation is needed.'),
   };
   expectedExecution = automatic;
-  await loop.receive(automatic.source); await tickWithCoordinator(loop);
+  await recoverSavedIntake(loop, automatic.source); await tickWithCoordinator(loop);
+  for (const saved of loop.tasks()) if (loop.projects.ledger.membership(saved.id)?.role === 'worker') await openDirectGroup(loop, saved.id);
   assert.equal(selections.length, 1);
   assert.equal(selections[0]?.response.choice.kind, 'project');
   assert.equal(formalRequests.length, 1);
@@ -253,7 +255,7 @@ try {
     source: message('fixture-answer-source', 'Create answer-result.json in one of the audio or portal projects, with marker="ORIGINAL_MARKER_761", cwd from the running Node process.cwd(), evidenceToken read from the chosen README.md, and supplements=[]. Read the actual result back and verify it. The target is intentionally unspecified and must first be confirmed by the owner, even if directory inspection suggests a possible target. Ask which directory and wait. Only the chosen project result file may be created. Do not modify existing files, delegate, access network or real projects, commit, or deploy.'),
   };
   expectedExecution = answered;
-  await loop.receive(answered.source);
+  await recoverSavedIntake(loop, answered.source);
   const waiting = loop.tasks().find(item => item.source.kind === 'manual' && item.source.message.id === answered.source.id);
   assert.ok(waiting && !waiting.chatId && !waiting.threadId);
   assert.ok(loop.store.meta(`project-intake-question:${waiting.id}`));
@@ -279,7 +281,9 @@ try {
     assert.ok(supplement);
     feishu.resources.set(attachment.key, Buffer.from(`${supplement}\n`));
   }
-  await loop.receive(answered.answer); await tickWithCoordinator(loop);
+  const savedAnswerTask = loop.store.taskForSource(`feishu:new:${answered.source.id}`); assert.ok(savedAnswerTask);
+  await recoverSavedSupplement(loop, savedAnswerTask.id, answered.answer); await tickWithCoordinator(loop);
+  for (const saved of loop.tasks()) if (loop.projects.ledger.membership(saved.id)?.role === 'worker') await openDirectGroup(loop, saved.id);
   assert.equal(selections.length, 3);
   assert.equal(formalRequests.length, 2);
   await verifyExecution(answered);

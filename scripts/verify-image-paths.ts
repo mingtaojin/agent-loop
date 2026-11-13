@@ -1,3 +1,4 @@
+import { recoverSavedIntake, openDirectGroup } from '../test/saved-intake.js';
 import { tickWithCoordinator } from '../test/coordinated-runtime.js';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
@@ -72,12 +73,13 @@ const recordSchema = z.object({ direction: z.enum(['request', 'event']), method:
 const inputSchema = z.object({ threadId: z.string(), input: z.array(z.object({ type: z.literal('text'), text: z.string() })) });
 const refSchema = z.object({ messageId: z.string(), name: z.string(), path: z.string() });
 try {
-  await loop.receive(message('image-start',
+  await recoverSavedIntake(loop, message('image-start',
     'Use fixture/images as the engineering directory. This is an isolated read-only image-input test. '
     + 'Use your image viewing tool to inspect both saved PNG files referenced in this message. '
     + 'Do not guess colors from filenames. In the final answer return FIRST_COLOR and SECOND_COLOR with the observed colors. '
     + 'Do not change files, delegate, contact external services, or read unrelated paths.', ['red-small', 'blue-large']));
   await tickWithCoordinator(loop);
+  for (const saved of loop.tasks()) if (loop.projects.ledger.membership(saved.id)?.role === 'worker') await openDirectGroup(loop, saved.id);
   const initial = loop.tasks().find(task => !task.sourceId.startsWith('project:')); assert.ok(initial);
   const first = await settled(initial.id);
   assert.ok(first.threadId && first.chatId);

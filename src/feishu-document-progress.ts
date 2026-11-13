@@ -289,7 +289,6 @@ export class FeishuDocumentProgressPublisher {
         retireTaskGroup(this.options.store, record.taskId, record.chatId);
         this.report(`${record.taskId}: ${error.message}`); return;
       }
-      // Only a definitive rejection permits a new dispatch. Read failures never erase pending intent.
       if (error instanceof DocumentRequestRejected && rollback) record.delivery = rollback;
       record.failures++;
       record.nextAttemptAt = this.now() + Math.max(this.intervalMs, Math.min(60_000, 3000 * 2 ** Math.min(record.failures - 1, 5)));

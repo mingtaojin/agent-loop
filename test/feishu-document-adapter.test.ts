@@ -20,7 +20,6 @@ function fixture() {
   const api = { document: { create: request('document') }, children: { create: request('block'), get: request('children'), batchDelete: request('delete') },
     block: { get: request('read'), patch: request('write') }, members: { create: request('grant'), list: request('members') },
     tabs: { create: request('tab'), listTabs: request('tabs') } };
-  // Deliberately inject malformed remote replies across the SDK boundary.
   const adapter = new FeishuDocumentAdapter(() => api as unknown as FeishuDocumentApi,
     { now: () => now, sleep: async ms => { now += ms; } });
   return { adapter, calls, replies, handlers };

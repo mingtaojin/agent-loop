@@ -1,4 +1,4 @@
-import { SurfaceCodex, testProject, receiveSurface, tickSurface } from './coordinated-surfaces.js';
+import { SurfaceCodex, testProject, restoreSurface, tickSurface } from './coordinated-surfaces.js';
 import assert from 'node:assert/strict';
 import { realpath, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -490,7 +490,7 @@ async function runtime(t: TestContext, enabled = true) {
   return { documentProgress, feishu, codex, config, pump, get loop() { return loop; }, get cards() { return cards; },
     async restart() { await loop.close(); loop = new AgentLoop(config, ports); await loop.start(); },
     async receive(id: string, text: string, chatId = 'private') {
-      await receiveSurface(loop, { id, text, chatId, senderId: 'owner', chatType: chatId === 'private' ? 'p2p' : 'group', attachments: [], createdAt: Date.now() });
+      await restoreSurface(loop, { id, text, chatId, senderId: 'owner', chatType: chatId === 'private' ? 'p2p' : 'group', attachments: [], createdAt: Date.now() });
       if (chatId === 'private') {
         const worker = loop.store.taskForSource(`feishu:new:${id}`); assert.ok(worker?.threadId);
         const member = loop.projects.ledger.membership(worker.id); assert.ok(member);

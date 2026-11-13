@@ -1,4 +1,4 @@
-import { SurfaceCodex, testProject, receiveSurface, tickSurface } from './coordinated-surfaces.js';
+import { SurfaceCodex, testProject, restoreSurface, tickSurface } from './coordinated-surfaces.js';
 import assert from 'node:assert/strict';
 import { realpath, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -350,7 +350,7 @@ test('whole runtime delivers final answer unchanged while progress API fails', a
   });
   t.after(async () => { await loop.close(); await rm(directory, { recursive: true, force: true }); });
   await loop.start();
-  await receiveSurface(loop, { id: 'new', chatId: 'private', senderId: 'owner', chatType: 'p2p', text: 'test', attachments: [], createdAt: Date.now() });
+  await restoreSurface(loop, { id: 'new', chatId: 'private', senderId: 'owner', chatType: 'p2p', text: 'test', attachments: [], createdAt: Date.now() });
   const current = loop.tasks().find(task => !task.sourceId.startsWith('project:')); assert.ok(current?.threadId);
   await setTimeout(1100);
   assert.ok(progress.calls.length > 0);
@@ -368,7 +368,7 @@ test('enabling progress after completed runtime history ignores recovery observa
   const ports = { feishu, codex, github: new GitHubFake(), workspace: { ensure: async () => directory, head: async () => 'head' } };
   let loop = new AgentLoop(config, ports);
   t.after(async () => { await loop.close(); await rm(directory, { recursive: true, force: true }); });
-  await receiveSurface(loop, { id: 'old', chatId: 'private', senderId: 'owner', chatType: 'p2p', text: 'old discussion', attachments: [], createdAt: Date.now() });
+  await restoreSurface(loop, { id: 'old', chatId: 'private', senderId: 'owner', chatType: 'p2p', text: 'old discussion', attachments: [], createdAt: Date.now() });
   const current = loop.tasks().find(task => !task.sourceId.startsWith('project:')); assert.ok(current?.threadId); assert.ok(current.chatId);
   codex.complete(current.threadId, 'Historical final answer'); await tickSurface(loop); await loop.close();
   config.feishu.progress.enabled = true;
@@ -376,7 +376,7 @@ test('enabling progress after completed runtime history ignores recovery observa
   assert.equal(progress.calls.length, 0, 'recovery status observations cannot create a historical card');
   await loop.close(); loop = new AgentLoop(config, ports); await loop.start(); await setTimeout(1100);
   assert.equal(progress.calls.length, 0, 'history exclusion survives another restart');
-  await receiveSurface(loop, { id: 'new-turn', chatId: current.chatId, senderId: 'owner', chatType: 'group', text: 'Continue now', attachments: [], createdAt: Date.now() });
+  await restoreSurface(loop, { id: 'new-turn', chatId: current.chatId, senderId: 'owner', chatType: 'group', text: 'Continue now', attachments: [], createdAt: Date.now() });
   await setTimeout(2200);
   const workerMessages = [...progress.messages.values()].filter(message => message.chatId === current.chatId);
   assert.equal(workerMessages.length, 1);

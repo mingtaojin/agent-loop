@@ -1,3 +1,4 @@
+import { recoverSavedIntake, recoverSavedSupplement, openDirectGroup } from './saved-intake.js';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { mkdtemp, mkdir, readFile, realpath, rm, writeFile, symlink } from 'node:fs/promises';
@@ -46,9 +47,9 @@ async function fixture(t: TestContext, discovery = false) {
   const created = () => codex.created.filter(input => !loop.tasks().some(task => loop.projects.ledger.membership(task.id)?.role === 'coordinator' && input.cwd === task.contextDirectory));
   return { root, project, other, config, codex, feishu, github, ports, task, requests, starts, created, message,
     get loop() { return loop; },
-    async manual() { await loop.receive(message('initial', 'Investigate the original task'));
-      if (loop.projects.intakeRoute(task().id)) await delegateIntake(loop, task().id); return task(); },
-    async delegate() { if (task().purpose === 'intake') return delegateIntake(loop, task().id); return task(); },
+    async manual() { await recoverSavedIntake(loop, message('initial', 'Investigate the original task'));
+      if (loop.projects.intakeRoute(task().id)) { await delegateIntake(loop, task().id); if (task().threadId) await openDirectGroup(loop, task().id); } return task(); },
+    async delegate() { if (task().purpose === 'intake') { await delegateIntake(loop, task().id); if (task().threadId) await openDirectGroup(loop, task().id); } return task(); },
     async legacy() {
       const repository = config.repositories[0]; assert.ok(repository && 'path' in repository);
       const workspace = await realpath(project);
@@ -106,10 +107,10 @@ test('fresh discovery reflects directory changes while established Threads survi
   };
   const first = await f.manual(); assert.ok(first.threadId);
   await mkdir(join(root, 'second'));
-  await f.loop.receive(f.message('second-task', 'Use the next project'));
+  await recoverSavedIntake(f.loop, f.message('second-task', 'Use the next project'));
   assert.deepEqual(seen[1]?.sort(), ['first', 'second']);
   await rm(join(root, 'second'), { recursive: true });
-  await f.loop.receive(f.message('third-task', 'Use the remaining project'));
+  await recoverSavedIntake(f.loop, f.message('third-task', 'Use the remaining project'));
   assert.deepEqual(seen[2], ['first']);
   assert.ok(f.config.engineering);
   f.config.engineering.projectRoot = join(f.root, 'missing-new-root');
@@ -161,7 +162,7 @@ test('discovery rejects invented identity and a symlink retargeted after the can
   assert.equal(f.task().purpose, 'intake');
   assert.equal(f.task().threadId, null); assert.ok(f.task().reason);
   f.codex.selectWorkspace = async () => ({ temporaryThreadId: 'invented', choice: { kind: 'project', projectId: 'invented-id', reason: 'guess' } });
-  await f.loop.receive(f.message('invented-task', 'Pick a project'));
+  await recoverSavedIntake(f.loop, f.message('invented-task', 'Pick a project'));
   assert.equal(f.created().length, 0);
   assert.ok(f.requests().every(task => task.resources.length === 0));
 });
@@ -181,7 +182,7 @@ test('same-name projects under changed roots never rebind saved resources or est
   assert.equal(f.task().threadId, original.threadId);
   assert.deepEqual(f.task().resources, original.resources);
   assert.deepEqual(await f.loop.ensureWorkspace(original.id, { projectId: resource.project.id }), resource);
-  await f.loop.receive(f.message('new-root-task', 'Use the same named project in the new root'));
+  await recoverSavedIntake(f.loop, f.message('new-root-task', 'Use the same named project in the new root'));
   const intake = f.requests().find(task => task.id !== original.id); assert.ok(intake);
   const newTask = await delegateIntake(f.loop, intake.id);
   const newResource = newTask.resources[0]; assert.ok(newResource && newResource.kind === 'project');
@@ -338,10 +339,12 @@ test('workspace clarification preserves the user scope in the first formal input
   assert.equal(f.created().length, 0);
   await f.loop.tick(); await f.loop.tick(); await f.restart(); await f.loop.tick();
   assert.equal(f.codex.selections.length, 1);
-  assert.equal(f.feishu.sent.filter(output => output.text.includes(question)).length, 1);
+  assert.equal(f.task().reason, question);
+  assert.ok(f.loop.store.meta(`project-intake-question:${task.id}`)?.includes(question));
+  assert.ok(f.feishu.sent.every(output => output.chatId !== 'private'));
   f.codex.selectionResults.push(selected());
   const answer = f.message('directory-answer', 'Use PROJECT_SELECTION_ANSWER_7, but only investigate; do not edit code.', 'private', 'p2p');
-  await f.loop.receive(answer); await f.delegate();
+  await recoverSavedSupplement(f.loop, task.id, answer); await f.delegate();
   assert.equal(f.codex.selections.length, 2);
   assert.ok(f.codex.selections[1]?.answers.some(answer => answer.inputId === 'directory-answer' && answer.text.includes('PROJECT_SELECTION_ANSWER_7')));
   assert.equal(f.created()[0]?.cwd, await realpath(f.project));
@@ -379,7 +382,7 @@ test('GitHub changes remain intake evidence and never supply a project clarifica
 
 test('uncertain formal thread creation cannot replay selection or create another formal thread on restart', async t => {
   const f = await fixture(t); f.codex.selectionResults.push(selected());
-  await f.loop.receive(f.message('initial', 'Investigate the original task'));
+  await recoverSavedIntake(f.loop, f.message('initial', 'Investigate the original task'));
   assert.equal(f.task().threadId, null); assert.equal(f.created().length, 0);
   f.codex.loseCreateAck = true; await f.delegate();
   assert.equal(f.task().workspaceSelection.kind, 'selected');
@@ -413,10 +416,10 @@ test('original attachments keep their identity and bytes through workspace clari
   const f = await fixture(t); const bytes = Buffer.from('original-log-evidence-23\n');
   f.feishu.resources.set('log-key', bytes);
   f.codex.selectionResults.push({ kind: 'question', question: 'Which project contains this log producer?' });
-  await f.loop.receive({ ...f.message('initial-log', 'Investigate this log'), attachments: [{ key: 'log-key', kind: 'file', name: 'evidence.log' }] });
+  await recoverSavedIntake(f.loop, { ...f.message('initial-log', 'Investigate this log'), attachments: [{ key: 'log-key', kind: 'file', name: 'evidence.log' }] });
   const task = f.task(); assert.equal(task.chatId, null);
   f.codex.selectionResults.push(selected());
-  await f.loop.receive(f.message('attachment-project-answer', 'Use the configured engineering project', 'private', 'p2p')); await f.delegate();
+  await recoverSavedSupplement(f.loop, f.task().id, f.message('attachment-project-answer', 'Use the configured engineering project', 'private', 'p2p')); await f.delegate();
   assert.equal(f.feishu.downloads.length, 1);
   assert.equal(f.feishu.downloads[0]?.messageId, 'initial-log');
   const download = f.feishu.downloads[0]; assert.ok(download);
@@ -436,10 +439,10 @@ test('a correction to one waiting request during selection is reconsidered befor
     if (first) { first = false; entered.resolve(); await release.promise; }
     return result;
   };
-  const initial = f.loop.receive(f.message('project-answer', 'Use example/project'));
+  const initial = recoverSavedSupplement(f.loop, f.task().id, f.message('project-answer', 'Use example/project'));
   try {
     await entered.promise;
-    const correction = f.loop.receive(f.message('selection-correction', `/reply ${task.id} Use example/other, investigate only.`));
+    const correction = recoverSavedSupplement(f.loop, f.task().id, f.message('selection-correction', 'Use example/other, investigate only.'));
     await delay(0); release.resolve(); await Promise.all([initial, correction]);
     await f.loop.tick(); await f.delegate();
     assert.equal(f.requests().length, 1); assert.equal(f.created().length, 1);
@@ -476,12 +479,13 @@ test('owner input during delegated directory preparation stays bound to the prom
   const initial = f.manual();
   try {
     await entered.promise;
-    const task = f.task(); assert.equal(task.purpose, 'execution'); assert.ok(task.chatId);
-    const followUp = f.loop.receive(f.message('preparation-scope', 'Preserve local changes.', task.chatId, 'group'));
+    const task = f.task(); assert.equal(task.purpose, 'execution'); assert.equal(task.chatId, null);
+    const route = f.loop.projects.intakeRoute(task.id); assert.ok(route);
+    const followUp = f.loop.projectAction(route.coordinatorTaskId, { action: 'send', requestId: 'preparation-scope', taskId: task.id, text: 'Preserve local changes.' });
     await delay(0); release.resolve(); await Promise.all([initial, followUp]);
     assert.equal(f.codex.selections.length, 1); assert.equal(f.created().length, 1);
     assert.equal(f.created()[0]?.cwd, await realpath(f.project));
-    assert.ok(f.loop.store.inputs(task.id).some(input => input.id === 'preparation-scope' && input.status === 'delivered'));
+    assert.ok(f.loop.store.inputs(task.id).some(input => input.provenance.kind === 'agent' && input.message.text.includes('Preserve local changes.') && input.status === 'delivered'));
   } finally { release.resolve(); await initial; }
 });
 
@@ -505,7 +509,7 @@ test('directory clarification attachments retain their identity in the selector 
   f.feishu.resources.set('answer-evidence', bytes);
   f.codex.selectionResults.push({ kind: 'question', question: 'Which project should be used?' }, selected());
   const task = await f.manual(); assert.equal(task.chatId, null);
-  await f.loop.receive({ ...f.message('answer-with-file', 'Use the project identified by this evidence', 'private', 'p2p'),
+  await recoverSavedSupplement(f.loop, task.id, { ...f.message('answer-with-file', 'Use the project identified by this evidence', 'private', 'p2p'),
     attachments: [{ key: 'answer-evidence', kind: 'file', name: 'selection-evidence.log' }] }); await f.delegate();
   assert.equal(f.feishu.downloads.length, 1);
   const download = f.feishu.downloads[0]; assert.ok(download);
@@ -525,12 +529,12 @@ test('a consumed directory answer stays pending for the formal task without repe
   const f = await fixture(t);
   f.codex.selectionResults.push({ kind: 'question', question: 'Which project?' }, { kind: 'question', question: 'Which of its variants?' }, selected());
   const task = await f.manual(); assert.equal(task.chatId, null);
-  await f.loop.receive(f.message('first-answer', 'Project A; investigate only.', 'private', 'p2p'));
+  await recoverSavedSupplement(f.loop, f.task().id, f.message('first-answer', 'Project A; investigate only.', 'private', 'p2p'));
   const first = f.loop.store.inputs(task.id).find(input => input.id === 'first-answer'); assert.ok(first);
   assert.equal(first.route, 'workspace-selection'); assert.equal(first.status, 'pending');
   await f.loop.tick(); await f.restart(); await f.loop.tick();
   assert.equal(f.codex.selections.length, 2); assert.equal(f.starts().length, 0);
-  await f.loop.receive(f.message('second-answer', 'Use variant A1; preserve local changes.', 'private', 'p2p')); await f.delegate();
+  await recoverSavedSupplement(f.loop, f.task().id, f.message('second-answer', 'Use variant A1; preserve local changes.', 'private', 'p2p')); await f.delegate();
   assert.deepEqual(f.codex.selections[2]?.answers.map(answer => answer.inputId), ['first-answer', 'second-answer']);
   const start = f.starts()[0]; assert.ok(start);
   assert.deepEqual(start.additionalDeliveryIds, ['first-answer', 'second-answer']);
@@ -543,7 +547,7 @@ for (const historyAvailable of [true, false]) test(`initial task and directory s
   const f = await fixture(t);
   f.codex.selectionResults.push({ kind: 'question', question: 'Which project?' }, selected());
   const task = await f.manual(); assert.equal(task.chatId, null);
-  await f.loop.receive(f.message('scope-answer', 'Use project A; do not edit code.', 'private', 'p2p'));
+  await recoverSavedSupplement(f.loop, f.task().id, f.message('scope-answer', 'Use project A; do not edit code.', 'private', 'p2p'));
   f.codex.loseInputAck = true; await f.delegate();
   assert.ok(f.loop.store.inputs(task.id).every(input => input.status === 'uncertain'));
   const established = f.task(); assert.ok(established.threadId);
@@ -568,7 +572,7 @@ test('a missing previously selected attachment holds the first formal turn until
     }
     return create(input);
   };
-  await f.loop.receive({ ...f.message('scope-file-answer', 'Use project A and follow these investigation limits.', 'private', 'p2p'),
+  await recoverSavedSupplement(f.loop, f.task().id, { ...f.message('scope-file-answer', 'Use project A and follow these investigation limits.', 'private', 'p2p'),
     attachments: [{ key: 'scope-log', kind: 'file', name: 'limits.log' }] }); await f.delegate();
   await f.loop.tick(); await f.restart();
   assert.equal(f.starts().length, 0);

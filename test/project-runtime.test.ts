@@ -1,3 +1,4 @@
+import { seedSavedIntake } from './saved-intake.js';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { mkdtemp, mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
@@ -846,7 +847,7 @@ test('project and role permissions reject cross-project messages, foreign Issues
   assert.equal(appStatus.id, 'app'); assert.ok(appStatus.tasks.every(task => task.taskId !== foreign.id && task.taskId !== docs.id));
   assert.equal(f.loop.store.inputs(foreign.id).length, before); assert.equal(f.loop.tasks().length, 4);
   const manual: IncomingMessage = { ...f.message('ordinary-task', 'Discuss an unrelated idea.', 'private'), chatType: 'p2p' };
-  await f.loop.receive(manual);
+  seedSavedIntake(f.loop, manual);
   const ordinary = f.loop.store.taskForSource('feishu:new:ordinary-task'); assert.ok(ordinary);
   assert.equal(ordinary.purpose, 'intake'); assert.equal(ordinary.threadId, null);
   await assert.rejects(f.loop.projectAction(ordinary.id, { action: 'status' }), /project|bound/i);

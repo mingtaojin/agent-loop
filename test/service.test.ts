@@ -1,4 +1,5 @@
-import { tickWithCoordinator, workerCalls, workerGroupCount, instructWorker } from './coordinated-runtime.js';
+import { recoverSavedIntake } from './saved-intake.js';
+import { tickWithCoordinator, tickWithDirectGroups, workerCalls, workerGroupCount, instructWorker } from './coordinated-runtime.js';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { mkdtemp, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
@@ -65,7 +66,7 @@ async function fixture(t: TestContext) {
     async launch(numbers = [1]) {
       github.sources = numbers.map(number => issue(number));
       await loop.collect();
-      await tickWithCoordinator(loop);
+      await tickWithDirectGroups(loop);
     },
     message(number: number, id: string, text: string, changes: Partial<IncomingMessage> = {}): IncomingMessage {
       const task = this.task(number);
@@ -103,7 +104,7 @@ test('collection classifies backlog, records skip reasons, deduplicates, and doe
     ['type_not_enabled', 'conflicting_type', 'unclassified', 'unmapped_native_type', 'pull_request', 'assignee', 'labels_all', 'labels_any', 'labels_none', 'state']);
   assert.equal(workerGroupCount(f.loop, f.feishu), 0);
   assert.equal(workerCalls(f.loop, f.codex).created.length, 0);
-  await tickWithCoordinator(f.loop);
+  await tickWithDirectGroups(f.loop);
   assert.equal(workerGroupCount(f.loop, f.feishu), 2);
   assert.equal(workerCalls(f.loop, f.codex).starts.length, 2);
 });
@@ -131,7 +132,7 @@ test('open issue collection can omit type, assignee and label restrictions', asy
   assert.equal(reasons.has(9), false);
   await f.loop.collect();
   assert.deepEqual(f.requests().map(task => task.id), originalIds);
-  await tickWithCoordinator(f.loop);
+  await tickWithDirectGroups(f.loop);
   assert.equal(workerCalls(f.loop, f.codex).starts.length, 6);
 });
 
@@ -155,7 +156,7 @@ test('partial collection survives retry without interpreting unread sources as c
   f.github.listFailureAfter = null;
   await f.loop.collect();
   assert.deepEqual(f.requests().map(task => (task.source.kind === 'github' ? task.source.issue.number : null)), [1, 2, 3]);
-  await tickWithCoordinator(f.loop);
+  await tickWithDirectGroups(f.loop);
   f.github.listFailureAfter = 1;
   f.github.getError = new Error('GitHub offline');
   await f.loop.collect();
@@ -201,11 +202,11 @@ test('configured Feature collection preserves scope, classification and existing
   f.github.sources.push(feature(15));
   await f.loop.collect();
   assert.deepEqual(f.requests().map(task => (task.source.kind === 'github' ? task.source.issue.number : null)), [1, 2, 15]);
-  await tickWithCoordinator(f.loop);
+  await tickWithDirectGroups(f.loop);
   assert.equal(workerGroupCount(f.loop, f.feishu), 3);
   assert.equal(workerCalls(f.loop, f.codex).starts.length, 3);
   await f.loop.collect();
-  await tickWithCoordinator(f.loop);
+  await tickWithDirectGroups(f.loop);
   assert.deepEqual(f.requests().slice(0, 2).map(task => task.id), originalIds);
   assert.equal(workerGroupCount(f.loop, f.feishu), 3);
   assert.equal(workerCalls(f.loop, f.codex).starts.length, 3);
@@ -217,8 +218,8 @@ test('manual and GitHub requests execute only with the Worker role and coordinat
   f.github.sources = [issue(1), issue(2, { nativeType: 'Feature', labels: ['enhancement'] })];
   await f.loop.collect();
   f.codex.selectionResults.push({ kind: 'repository', repositoryName: 'example/project', reason: 'Requested project' });
-  await f.loop.receive({ id: 'manual-topic', chatId: 'private', senderId: 'ou_owner', chatType: 'p2p', text: 'Discuss this topic', attachments: [], createdAt: Date.now() });
-  await tickWithCoordinator(f.loop);
+  await recoverSavedIntake(f.loop, { id: 'manual-topic', chatId: 'private', senderId: 'ou_owner', chatType: 'p2p', text: 'Discuss this topic', attachments: [], createdAt: Date.now() });
+  await tickWithDirectGroups(f.loop);
   const role = await readFile(new URL('../prompts/worker.md', import.meta.url), 'utf8');
   const calls = workerCalls(f.loop, f.codex);
   assert.equal(calls.created.length, 3);
@@ -262,7 +263,7 @@ test('role templates and latest source remain authoritative when generic prompt 
   f.github.sources = [issue(1, { body: 'Latest source' }), issue(2)];
   const role = await readFile(new URL('../prompts/worker.md', import.meta.url), 'utf8');
   const cwd = process.cwd();
-  try { process.chdir(f.root); await f.loop.collect(); await tickWithCoordinator(f.loop); }
+  try { process.chdir(f.root); await f.loop.collect(); await tickWithDirectGroups(f.loop); }
   finally { process.chdir(cwd); }
   const calls = workerCalls(f.loop, f.codex);
   const initial = calls.starts.find(input => input.threadId === f.task().threadId); assert.ok(initial);
@@ -281,7 +282,7 @@ test('new criteria scope collection without stopping existing sources after repo
   assert.deepEqual(f.requests().map(task => task.source.kind === 'github' ? task.source.issue.number : null), [1, 3]);
   changed.repositories = []; await f.restart(changed);
   f.github.sources[0] = issue(1, { assignees: [], state: 'closed' });
-  await f.loop.collect(); await tickWithCoordinator(f.loop);
+  await f.loop.collect(); await tickWithDirectGroups(f.loop);
   assert.equal(f.task().status, 'running'); assert.equal(workerCalls(f.loop, f.codex).interrupts.length, 0);
   assert.equal(f.task().threadId, original.threadId); assert.equal(f.task().chatId, original.chatId);
   assert.ok(f.codex.steers.some(input => JSON.stringify(input.input).includes('closed')));
@@ -298,7 +299,7 @@ test('workspaces are acquired on demand and remain isolated while another task w
   await writeFile(join(workspace(first), 'tracked.txt'), 'task one change\n');
   assert.equal(await readFile(join(workspace(second), 'tracked.txt'), 'utf8'), 'original commit\n');
   assert.equal(await readFile(join(f.repository, 'tracked.txt'), 'utf8'), 'user dirty change\n');
-  f.codex.complete(thread(first), 'Discussion answer without PR'); await tickWithCoordinator(f.loop);
+  f.codex.complete(thread(first), 'Discussion answer without PR'); await tickWithDirectGroups(f.loop);
   assert.equal(f.task(1).status, 'idle');
   await f.loop.receive(f.message(2, 'other-input', 'more evidence'));
   assert.equal(workerCalls(f.loop, f.codex).steers.at(-1)?.threadId, second.threadId);
@@ -326,7 +327,7 @@ test('project directory policy returns the whole engineering root and preserves 
   assert.equal(await readFile(join(directory.workspace, 'repository', 'tracked.txt'), 'utf8'), 'original commit\n');
   assert.equal(await git(f.repository, 'branch', '--show-current'), 'main');
   const client = fileURLToPath(new URL(import.meta.url.endsWith('.ts') ? '../src/workspace-client.ts' : '../src/workspace-client.js', import.meta.url));
-  secondTask.workspaceSelection = { kind: 'pending' }; f.loop.store.saveTask(secondTask); await tickWithCoordinator(f.loop);
+  secondTask.workspaceSelection = { kind: 'pending' }; f.loop.store.saveTask(secondTask); await tickWithDirectGroups(f.loop);
   const bridged = await execute(process.execPath, [client, join(f.config.dataDir, 'workspace-capabilities', `${secondTask.id}.json`), 'example/project']);
   assert.equal(JSON.parse(bridged.stdout).workspace, root);
   assert.equal((await f.loop.ensureWorkspace(f.task(1).id, 'example/project')).workspace, previous.workspace);
@@ -347,12 +348,12 @@ test('project directory policy returns the whole engineering root and preserves 
 
 test('plain results wait across restart and source edits wake the original conversation once', async t => {
   const f = await fixture(t); await f.launch(); const original = f.task();
-  f.codex.complete(thread(original), 'A complete answer with no delivery gate.'); await tickWithCoordinator(f.loop);
-  await f.restart(); await tickWithCoordinator(f.loop);
+  f.codex.complete(thread(original), 'A complete answer with no delivery gate.'); await tickWithDirectGroups(f.loop);
+  await f.restart(); await tickWithDirectGroups(f.loop);
   assert.equal(f.task().status, 'idle'); assert.equal(workerCalls(f.loop, f.codex).starts.length, 1);
   assert.equal(f.feishu.sent.filter(message => message.text === 'A complete answer with no delivery gate.').length, 1);
   f.github.sources = [issue(1, { body: 'Correction while waiting' })];
-  await f.loop.collect(); await tickWithCoordinator(f.loop); await f.loop.collect(); await tickWithCoordinator(f.loop);
+  await f.loop.collect(); await tickWithDirectGroups(f.loop); await f.loop.collect(); await tickWithDirectGroups(f.loop);
   assert.equal(workerCalls(f.loop, f.codex).starts.length, 1);
   await instructWorker(f.loop, original.id, 'forward-correction', 'Correction while waiting');
   await instructWorker(f.loop, original.id, 'forward-correction', 'Correction while waiting');
@@ -363,12 +364,12 @@ test('plain results wait across restart and source edits wake the original conve
 test('running source edits and closure steer original turn once without pausing', async t => {
   const f = await fixture(t); await f.launch(); const original = f.task();
   f.github.sources = [issue(1, { body: 'New detail' })];
-  await f.loop.collect(); await tickWithCoordinator(f.loop); await f.loop.collect(); await tickWithCoordinator(f.loop);
+  await f.loop.collect(); await tickWithDirectGroups(f.loop); await f.loop.collect(); await tickWithDirectGroups(f.loop);
   assert.equal(workerCalls(f.loop, f.codex).steers.length, 0);
   await instructWorker(f.loop, original.id, 'forward-detail', 'New detail');
   assert.equal(workerCalls(f.loop, f.codex).steers.length, 1);
   f.github.sources = [issue(1, { state: 'closed', body: 'New detail' })];
-  await f.loop.collect(); await tickWithCoordinator(f.loop);
+  await f.loop.collect(); await tickWithDirectGroups(f.loop);
   assert.equal(workerCalls(f.loop, f.codex).steers.length, 1);
   await instructWorker(f.loop, original.id, 'forward-closure', 'The Issue was closed. Check actual delivery.');
   assert.equal(workerCalls(f.loop, f.codex).steers.length, 2); assert.equal(f.task().status, 'running');
@@ -383,7 +384,7 @@ test('native question receives ordinary answer while approval requires bound act
     { ...common, id: 'question', kind: 'question', prompt: 'Which version?', method: 'item/tool/requestUserInput' },
     { ...common, id: 'approval', kind: 'approval', prompt: 'Allow?', method: 'item/commandExecution/requestApproval' },
   ];
-  await tickWithCoordinator(f.loop); assert.equal(f.feishu.approvals.length, 1);
+  await tickWithDirectGroups(f.loop); assert.equal(f.feishu.approvals.length, 1);
   await f.loop.receive(f.message(1, 'answer', 'version 3'));
   assert.equal(workerCalls(f.loop, f.codex).replies[0]?.text, 'version 3');
   await f.loop.receive(f.message(1, 'ordinary-approval', '/approve approval accept'));
@@ -480,7 +481,7 @@ test('turn completion racing with steer continues once in the original conversat
   assert.equal(workerCalls(f.loop, f.codex).starts[1]?.threadId, original.threadId);
   assert.equal(workerCalls(f.loop, f.codex).starts[1]?.deliveryId, 'racing-message');
   assert.equal(workerCalls(f.loop, f.codex).steers.length, 0);
-  await tickWithCoordinator(f.loop);
+  await tickWithDirectGroups(f.loop);
   assert.equal(workerCalls(f.loop, f.codex).starts.length, 2);
   assert.equal(f.task().status, 'running');
 });
@@ -508,18 +509,20 @@ test('one data directory admits only one scheduler and restart reconnects the ac
   assert.equal(f.task().status, 'running');
 });
 
-test('uncertain group creation reconciles the original group on explicit recovery', async t => {
+test('uncertain on-demand group creation reconciles without failing or duplicating the executor', async t => {
   const f = await fixture(t);
-  f.github.sources = [issue(1)]; await f.loop.collect(); await f.loop.tick();
+  f.github.sources = [issue(1)]; await f.loop.collect(); await tickWithCoordinator(f.loop);
+  const original = f.task(); assert.ok(original.threadId); assert.equal(original.chatId, null);
+  const member = f.loop.projects.ledger.membership(original.id); assert.ok(member);
+  const coordinator = f.loop.projects.ledger.project(member.projectId)!.coordinatorTaskId;
   f.feishu.loseGroupAck = true;
-  await tickWithCoordinator(f.loop);
-  assert.equal(f.task().status, 'failed');
+  await assert.rejects(f.loop.projectAction(coordinator, { action: 'open_group', requestId: 'unknown-group', taskId: original.id }));
+  assert.equal(f.task().status, 'running'); assert.equal(f.task().threadId, original.threadId);
   assert.equal(workerGroupCount(f.loop, f.feishu), 1);
-  assert.equal(workerCalls(f.loop, f.codex).created.length, 0);
   await f.restart();
-  await f.loop.control(f.task().id, 'resume');
+  await f.loop.projectAction(coordinator, { action: 'open_group', requestId: 'reconcile-group', taskId: original.id });
   assert.equal(workerGroupCount(f.loop, f.feishu), 1);
-  assert.equal(workerCalls(f.loop, f.codex).created.length, 1);
+  assert.equal(workerCalls(f.loop, f.codex).created.length, 1); assert.equal(workerCalls(f.loop, f.codex).starts.length, 1);
   assert.equal(f.task().chatId, f.feishu.groups.get(f.task().id));
 });
 
@@ -527,11 +530,11 @@ test('uncertain thread creation is reported and cannot create a second executor 
   const f = await fixture(t);
   f.github.sources = [issue(1)]; await f.loop.collect(); await f.loop.tick();
   f.codex.loseCreateAck = true;
-  await tickWithCoordinator(f.loop);
+  await tickWithDirectGroups(f.loop);
   assert.equal(f.task().status, 'failed');
   await f.restart();
   await f.loop.control(f.task().id, 'resume');
-  await tickWithCoordinator(f.loop);
+  await tickWithDirectGroups(f.loop);
   assert.equal(workerCalls(f.loop, f.codex).created.length, 1);
   assert.equal(workerCalls(f.loop, f.codex).starts.length, 0);
   assert.equal(f.task().status, 'failed');
@@ -541,11 +544,11 @@ test('uncertain thread creation is reported and cannot create a second executor 
 test('runtime forwards actual output without checking PR or requiring reports', async t => {
   const f = await fixture(t); await f.launch([1, 2]);
   f.github.validPullRequest = false;
-  f.codex.complete(thread(f.task(1)), review); f.codex.complete(thread(f.task(2)), null); await tickWithCoordinator(f.loop);
+  f.codex.complete(thread(f.task(1)), review); f.codex.complete(thread(f.task(2)), null); await tickWithDirectGroups(f.loop);
   assert.ok(f.requests().every(task => task.status === 'idle'));
   assert.equal(f.github.verifications.length, 0);
   assert.ok(f.feishu.sent.some(message => message.text.includes('Hardware check pending')));
-  await tickWithCoordinator(f.loop); assert.equal(workerCalls(f.loop, f.codex).starts.length, 2);
+  await tickWithDirectGroups(f.loop); assert.equal(workerCalls(f.loop, f.codex).starts.length, 2);
 });
 
 test('history gaps and uncertain outgoing messages are visible without replaying sent messages', async t => {
@@ -566,7 +569,7 @@ test('service start launches backlog and routes live incoming messages through t
   f.github.sources = [issue(1), issue(2)];
   await f.loop.start();
   assert.ok(f.feishu.receiver);
-  await tickWithCoordinator(f.loop);
+  await tickWithDirectGroups(f.loop);
   assert.equal(workerCalls(f.loop, f.codex).starts.length, 2, JSON.stringify(f.requests().map(task => ({ id: task.id, status: task.status,
     execution: task.executionStatus, reason: task.reason, inputs: f.loop.store.inputs(task.id).map(input => [input.status, input.error]) }))));
   assert.ok(f.requests().every(task => task.status === 'running'));
@@ -618,8 +621,8 @@ test('configured custom Issue types use generic conversation and disabled types 
   f.github.sources = [issue(1, { nativeType: 'Refactor', labels: ['refactor'] })];
   await f.loop.collect(); assert.equal(f.requests().length, 0);
   assert.equal(f.loop.store.sources()[0]?.reason, 'type_not_enabled');
-  criteria.taskTypes = ['refactor']; await f.loop.collect(); await tickWithCoordinator(f.loop);
-  const task = f.task(); f.codex.complete(thread(task), 'Refactor investigation answer without PR'); await tickWithCoordinator(f.loop);
+  criteria.taskTypes = ['refactor']; await f.loop.collect(); await tickWithDirectGroups(f.loop);
+  const task = f.task(); f.codex.complete(thread(task), 'Refactor investigation answer without PR'); await tickWithDirectGroups(f.loop);
   assert.equal(f.task().status, 'idle');
   assert.ok(f.feishu.sent.some(output => output.text === 'Refactor investigation answer without PR'));
 });

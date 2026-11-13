@@ -1,4 +1,4 @@
-import { SurfaceCodex, testProject, receiveSurface } from './coordinated-surfaces.js';
+import { SurfaceCodex, testProject, restoreSurface } from './coordinated-surfaces.js';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { mkdtemp, mkdir, rm, access } from 'node:fs/promises';
@@ -32,7 +32,7 @@ test('dashboard projects discovered resource identity and workspace without repo
   const loop = new AgentLoop(config, { codex, feishu: new FeishuFake(), github: new GitHubFake(), workspace: new WorkspaceProvider(config.dataDir) });
   const dashboard = await startDashboard({ dataDir: config.dataDir, port: 0 });
   t.after(async () => { await dashboard.close(); await loop.close(); await rm(root, { recursive: true, force: true }); });
-  await receiveSurface(loop, { id: 'dashboard-project-input', chatId: 'private', chatType: 'p2p', senderId: 'owner',
+  await restoreSurface(loop, { id: 'dashboard-project-input', chatId: 'private', chatType: 'p2p', senderId: 'owner',
     text: 'Inspect the local project', attachments: [], createdAt: Date.now() });
   const task = loop.tasks()[0]; assert.ok(task);
   const resource = task.resources[0]; assert.ok(resource && resource.kind === 'project');
@@ -86,7 +86,7 @@ test('group and dashboard titles share normalization while persisted manual sour
     { text: ' \n/new ' + 'x'.repeat(220), title: 'x'.repeat(220) },
     { text: '', title: '新讨论' },
   ];
-  for (const [index, input] of cases.entries()) await receiveSurface(loop, { id: `title-${index}`, chatId: 'private', chatType: 'p2p', senderId: 'owner',
+  for (const [index, input] of cases.entries()) await restoreSurface(loop, { id: `title-${index}`, chatId: 'private', chatType: 'p2p', senderId: 'owner',
     text: input.text, attachments: input.text ? [] : [{ key: 'title-file', name: 'evidence.log', kind: 'file' }], createdAt: Date.now() });
   const response = await fetch(dashboard.url + '/api/snapshot'); assert.equal(response.status, 200);
   const snapshot = await response.json();
@@ -109,8 +109,8 @@ test('real adapter to SQLite to SSE streams partial text, tools and capacity err
   const abort = new AbortController();
   t.after(async () => { abort.abort(); await dashboard.close(); await loop.close(); await rm(root, { recursive: true, force: true }); });
   const message = (id: string, text: string, chatId = 'private', chatType: 'p2p' | 'group' = 'p2p') => ({ id, text, chatId, chatType, senderId: 'owner', attachments: [], createdAt: Date.now() });
-  await receiveSurface(loop, message('one', 'First task')); await loop.tick();
-  await receiveSurface(loop, message('two', '<img src=x onerror=alert(1)>')); await loop.tick();
+  await restoreSurface(loop, message('one', 'First task')); await loop.tick();
+  await restoreSurface(loop, message('two', '<img src=x onerror=alert(1)>')); await loop.tick();
   const [first, second] = loop.tasks().filter(task => !task.sourceId.startsWith('project:')); assert.ok(first?.threadId && first.chatId && second?.threadId);
   assert.throws(() => new Store(root), /已有 Agent Loop/);
   const initial = await (await fetch(dashboard.url + '/api/snapshot')).json();
@@ -127,7 +127,7 @@ test('real adapter to SQLite to SSE streams partial text, tools and capacity err
   assert.equal(before.some(event => event.kind === 'agent_message'), false);
   assert.equal(before.some(event => event.kind === 'turn_end'), false);
   assert.equal(loop.tasks()[0]?.status, 'running');
-  await receiveSurface(loop, message('finish', 'finish', first.chatId, 'group')); await loop.tick();
+  await restoreSurface(loop, message('finish', 'finish', first.chatId, 'group')); await loop.tick();
   const events = loop.store.executionEvents(first.id);
   assert.equal(events.filter(event => event.kind === 'agent_message').length, 1);
   assert.equal(events.at(-1)?.kind, 'turn_end');
@@ -166,7 +166,7 @@ test('dashboard close is idempotent and terminates active SSE and incomplete HTT
   const loop = new AgentLoop(config, { codex: new SurfaceCodex(), feishu: new FeishuFake(), github: new GitHubFake(), workspace: new WorkspaceProvider(root) });
   const dashboard = await startDashboard({ dataDir: root, port: 0 });
   t.after(async () => { await dashboard.close(); await loop.close(); await rm(root, { recursive: true, force: true }); });
-  await receiveSurface(loop, { id: 'shutdown-task', chatId: 'private', chatType: 'p2p', senderId: 'owner', text: 'Inspect shutdown', attachments: [], createdAt: Date.now() });
+  await restoreSurface(loop, { id: 'shutdown-task', chatId: 'private', chatType: 'p2p', senderId: 'owner', text: 'Inspect shutdown', attachments: [], createdAt: Date.now() });
   const task = loop.tasks()[0]; assert.ok(task);
   const response = await new Promise<import('node:http').IncomingMessage>((done, reject) => {
     const call = request(dashboard.url + '/api/events?taskId=' + task.id, done);

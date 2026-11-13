@@ -1,8 +1,9 @@
+import { seedSavedIntake } from './saved-intake.js';
 import type { AgentLoop } from '../src/loop.js';
 import type { IncomingMessage } from '../src/domain.js';
 import type { CodexPort } from '../src/ports.js';
 import { CodexFake } from './fakes.js';
-import { receiveWithCoordinator, testProject, tickWithCoordinator } from './coordinated-runtime.js';
+import { testProject, tickWithDirectGroups } from './coordinated-runtime.js';
 
 export { testProject };
 
@@ -27,12 +28,13 @@ export class SurfaceCodex extends CodexFake {
   }
 }
 
-export async function receiveSurface(loop: AgentLoop, message: IncomingMessage) {
-  await receiveWithCoordinator(loop, message);
+export async function restoreSurface(loop: AgentLoop, message: IncomingMessage) {
+  if (message.chatType === 'p2p') { seedSavedIntake(loop, message); await tickWithDirectGroups(loop); }
+  else await loop.receive(message);
   await loop.tick();
 }
 
 export async function tickSurface(loop: AgentLoop) {
-  await tickWithCoordinator(loop);
+  await tickWithDirectGroups(loop);
   await loop.tick();
 }

@@ -2,7 +2,7 @@
 
 每个项目都通过自己的协调者接单，委派使用 poteto-mode 的 Worker，并接收问题和成果。配置、项目工具和会话恢复见[项目协调者](docs/project-coordinator.md)。
 
-Agent Loop 保存项目和任务的持续上下文。GitHub Issue、飞书私聊和 CLI 提交都先交给项目协调者。项目群也支持直接交办没有 Issue 的 Bug 和新需求。项目不明确时，独立的只读临时会话负责定位和澄清，不执行工程任务。协调者决定是否派发 Worker，派发后才建立执行 Thread 和任务群。Agent 选择技能、实现和交付流程，Runtime 保存关系、材料、原生请求与恢复记录。
+Agent Loop 保存项目和任务的持续上下文。用户在项目协调群交办新需求，GitHub Issue 作为协调者证据。CLI 和机器人私聊不再接单。协调者决定是否派发 Worker，正式执行复用持续 Thread。Worker 和 verifier 默认无群，需要直接交流或点击审批时按需建群。Agent 选择技能、实现和交付流程，Runtime 保存关系、材料、原生请求与恢复记录。
 
 ## 准备配置
 
@@ -82,42 +82,20 @@ npm start -- status --config config.json
 npm start -- run --config config.json
 ```
 
-`doctor` 检查本地配置和凭证是否存在，不验证远端权限。`collect` 只保存来源与事件，不创建群或启动 Codex。`status` 读取任务、输入、输出和诊断记录。`run` 启动常驻服务并处理已收集任务。`doctor` 通过不能代替[固定进度 Tab 的接入验收](docs/feishu-setup.md#验收新任务群)。
+`doctor` 检查本地配置和凭证是否存在，不验证远端权限。`collect` 保存来源与事件并建立所需的项目协调者，不派发 Worker。`status` 读取任务、输入、输出和诊断记录。`run` 启动常驻服务并处理已收集任务。`doctor` 通过不能代替[固定进度 Tab 的接入验收](docs/feishu-setup.md#验收新任务群)。
 
-## CLI 提交新任务
+## 在项目群交办
 
-原 Agent 可以根据用户要求，把工作说明写入 UTF-8 文件，再通过 CLI 提交给项目协调者。Runtime 保存原文并确定项目，协调者决定如何派发 Worker。spec、工单和原讨论中哪些信息写入 prompt，由原 Agent 决定。
+在项目协调群发送需求及材料。协调者先核对已有工作，再决定是否委派 Worker。
+Worker 和 verifier 默认无群，用户需要直接交流时向协调者提出。
+原生审批自动打开任务群并在项目群通知，普通问题和最终成果交给协调者。
 
-先保存一个请求 ID，再提交文件：
-
-```sh
-task_request_id="$(node -p 'crypto.randomUUID()')"
-npm start -- submit --config config.json --request-id "$task_request_id" --prompt-file ./handoff.md
-npm start -- status --config config.json --request-id "$task_request_id"
-```
-
-从标准输入提交时，将文件参数设为 `-`：
+CLI submit、answer 及机器人私聊接单已移除。运维命令和内部协调工具继续保留。
+旧 CLI 请求可只读查询，不会新建执行者：
 
 ```sh
-npm start -- submit --config config.json --request-id "$task_request_id" --prompt-file - < ./handoff.md
+npm start -- status --config config.json --request-id '<旧请求 UUID>'
 ```
-
-提交成功返回 JSON，包含请求 ID、接单记录 Task ID、当前状态，以及确定项目后的 `projectId` 和 `coordinatorTaskId`。成功只表示请求已保存，不代表已经派发或开始执行。通过同一请求 ID 查询项目澄清与后续状态。
-
-收到项目问题时，保存本次回答 ID，再补充原请求：
-
-```sh
-answer_id="$(node -p 'crypto.randomUUID()')"
-npm start -- answer --config config.json --request-id "$task_request_id" --answer-id "$answer_id" --prompt-file ./answer.md
-```
-
-同一回答 ID 与相同文字可安全重试，不同文字会被拒绝。已经派发的请求收到补充后，先交给协调者判断，再转给原 Worker。
-
-相同请求 ID 与相同 prompt 返回原任务，不重新执行；相同 ID 携带不同文字时报冲突。用户明确要再建一个任务时使用新 ID，即使 prompt 内容相同。提交回执未知时先查询原 ID，再使用同一 ID 和原文件重试。
-
-CLI 连接配置所指数据目录的常驻 Runtime，不启动额外执行者。Runtime 需要运行本次版本；已有服务升级后按[操作说明](docs/agents/operations.md)重启再使用。客户端无需飞书或 GitHub 凭证。提交内容保留原有换行、Unicode 和首尾空白，空白或无效 UTF-8 输入会被拒绝。CLI 来源与飞书、GitHub 来源分别显示，新任务的最终答复、问题和审批仍在自己的任务群中处理。
-
-请求 ID 使用小写 UUID。单条 prompt 默认最多 1 MiB，可通过配置中的 `submission.maxPromptBytes` 调整。`submission.requestTimeoutMs` 控制本机请求超时，`submission.maxConcurrentRequests` 控制同时受理的提交请求数。
 
 ## 本地调试网页
 
@@ -193,9 +171,9 @@ npm start -- run --config config.json
 
 卡片身份和更新顺序持久化，服务恢复后继续更新原卡片。首次启用不补发已结束的历史轮次。进度投递失败记录到诊断，不触发任务重跑，也不阻断最终答复。飞书消息发送结果不明确时，先核对原群消息与已保存的卡片实体；找到原消息便继续更新，确认没有发送且仍在平台去重保证范围内才重试。无法完成核对时不会盲目补建卡片。
 
-在机器人私聊中直接发送文字、富文本、图片或文件，即可提交接单请求，无需命令前缀。相同消息 ID 的重复投递不会重复接单。接单记录先保存材料并定位项目，再交给该项目的协调者；此时不会直接创建 Worker、执行 Thread 或任务群。空白文字且无附件的消息不接单。
+在项目协调群交办新工作或补充文字、图片和文件。协调者评估后决定是否派发 Worker。需要直接与某个 Worker 交流时，在项目群提出，由协调者打开其任务群。正式群内的普通文字继续原会话，包括旧命令文字，停止工作的意图由 Agent 理解。
 
-项目明确后，在项目协调者群交办新工作或补充材料，也可以继续已有 Worker 的任务群。等待项目澄清时，只有一项待答请求可直接私聊回答；多项请求用 `/reply <请求编号> 回答` 指定。正式群内的普通文字继续原会话，包括旧命令文字，停止工作的意图由 Agent 理解。
+CLI `submit`、`answer` 及机器人私聊接单已经移除。运维 `doctor`、`collect`、`status`、`run` 和内部项目、工作区工具保留。`status --request-id` 只读查询旧 CLI 请求，旧 Task、Thread、材料和资源继续保留。
 
 正式执行中，输入追加到当前轮次。没有活跃轮次时，新输入在原 Thread 启动一轮。Issue 更新和评论先交给协调者判断，再按需转给 Worker。关闭、分配与标签变化不直接暂停既有任务。来源事件不会被当作原生问题的人工答案或权限批准。
 

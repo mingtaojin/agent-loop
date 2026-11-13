@@ -1,3 +1,4 @@
+import { openDirectGroup } from './saved-intake.js';
 import assert from 'node:assert/strict';
 import { z } from 'zod';
 import type { AgentLoop } from '../src/loop.js';
@@ -55,9 +56,10 @@ export async function tickWithCoordinator(loop: AgentLoop) {
   }
 }
 
-export async function receiveWithCoordinator(loop: AgentLoop, message: IncomingMessage) {
-  await loop.receive(message);
-  if (message.chatType === 'p2p') await tickWithCoordinator(loop);
+export async function tickWithDirectGroups(loop: AgentLoop) {
+  await tickWithCoordinator(loop);
+  for (const task of loop.tasks()) if (loop.projects.ledger.membership(task.id)?.role === 'worker') await openDirectGroup(loop, task.id);
+  await loop.tick();
 }
 
 export function workerGroupCount(loop: AgentLoop, feishu: FeishuFake) {

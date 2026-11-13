@@ -1,8 +1,10 @@
 ---
-status: accepted
+status: partially superseded by ADR-0013
 ---
 
 # 所有请求先进入项目协调
+
+CLI 和私聊接单由 [ADR 0013](0013-project-group-intake-only.md) 移除。以下保留原决定背景，其余项目归属、GitHub 证据与历史恢复决定继续适用。
 
 2026-11-12，用户明确要求任何项目都由协调者接单，移除 Runtime
 自动创建普通执行任务的路线。本决策取代 ADR 0010 中项目可选、未配置项目

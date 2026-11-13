@@ -1,3 +1,4 @@
+import { recoverSavedIntake, openDirectGroup } from '../test/saved-intake.js';
 import { projectConfigSchema } from '../src/project.js';
 import { tickWithCoordinator } from '../test/coordinated-runtime.js';
 import assert from 'node:assert/strict';
@@ -78,8 +79,9 @@ function engineering(taskId: string, label: string): string {
   return `Use the configured poteto-mode skill for this tiny authorized engineering task. No delegates, external network, credentials, or real repositories. Obtain fixture/one and fixture/two through ensure_workspace, or the current Runtime shell fallback if native tool is unavailable. Do not create worktrees yourself. Read each returned AGENTS.md. In each returned workspace execute its exact command below using the shell tool, requesting native command permission if the sandbox blocks access. Do not use apply_patch or change other files. Give one progress update and a plain final answer including the project instruction markers and our earlier memory word.\n${commands.join('\n')}`;
 }
 try {
-  await loop.receive(message('new', 'This request belongs to the supplied Fixture project. Remember RUNTIME_NEW_MEMORY. Reply briefly without tools.'));
+  await recoverSavedIntake(loop, message('new', 'This request belongs to the supplied Fixture project. Remember RUNTIME_NEW_MEMORY. Reply briefly without tools.'));
   await tickWithCoordinator(loop);
+  for (const saved of loop.tasks()) if (loop.projects.ledger.membership(saved.id)?.role === 'worker') await openDirectGroup(loop, saved.id);
   const task = loop.tasks().find(task => !task.sourceId.startsWith('project:'));  assert.ok(task);
   await settle(task.id); assert.equal(loop.store.task(task.id).resources.length, 1);
   await loop.receive(message('engineering', engineering(task.id, 'RUNTIME_NEW'), task.chatId!, 'group'));

@@ -103,7 +103,7 @@ export class TaskGroups {
       const summary = this.store.meta(`task-summary:${taskId}`);
       this.store.enqueue(taskId, member?.role === 'coordinator' ? `项目协调入口已建立。\n${title}\n你可以在本群直接交办 Bug、新需求，补充文字、截图和日志。协调者负责派发和监督 Worker。`
         : member ? `任务对话已建立。\n${title}\n当前状态：${task.status}${task.reason ? `，${task.reason}` : ''}。\n${summary ? `当前摘要：${summary.slice(0, 1500)}\n` : ''}请在本群继续交流。`
-        : `任务对话已建立。\n${title}\n请在本群继续发送文字、截图和日志。新任务请直接私聊发送。`, `welcome:group:${generation}`);
+        : `任务对话已建立。\n${title}\n请在本群继续发送文字、截图和日志。新任务请在项目协调群交办。`, `welcome:group:${generation}`);
     });
     return chatId;
   }

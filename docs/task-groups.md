@@ -25,10 +25,14 @@
 
 需要 `im:chat:delete` 或更宽的 `im:chat`。机器人不是群主时，还必须是群创建者并具有 `im:chat:operate_as_owner`。官方说明见[解散群](https://open.feishu.cn/document/server-docs/group/chat/delete)。`232009` 表示已解散，`232006` 表示 ID 无效；后者不会作为已成功删除处理。所有计划和逐项结果保存在本地持久记录中。
 
-## 与 coordinator-only intake 的组合
+## 项目协调与接单入口
 
-本变更基于 main 的项目成员机制。未加入项目的独立任务保留既有入口，不复制 coordinator-only intake 的来源选择和晋升逻辑。
+最终代码包含 PR17 `db85f353` 的项目身份、GitHub 证据、材料保存、原地晋升和历史恢复实现。
+新需求只在项目协调群交办。CLI submit、answer、本机接单服务和私聊接单均已移除。
+`status --request-id` 仅查询旧 CLI 回执，内部 project_action 和工程资源工具继续保留。
+未派发的 GitHub 与历史请求无群无正式 Thread，只有协调者决定派发后才执行。
 
-与 PR17 合入时，保留其 `purpose` 和 `advanceUnassigned`、私聊回复、GitHub intake 与 CLI 回执逻辑。`setup` 中项目成员不再一律调用 `ensureGroup`，只有 coordinator 默认开群，其余通过 `TaskGroups.open`。intake 不进入执行 setup，必须保持无群。私聊、GitHub 和 CLI 的后续问题由其协调者入口回答；晋升为 Worker 后也不自动建群。保留本变更的原生审批、失效群恢复和输出策略。
+任务群不是任务身份。进度写入在适配器实际调用远端之前再次核对群绑定与代次，
+停止退役群尚未发送的排队写入。群核对返回后同样检查绑定，避免旧群链接进入新审批通知。
 
 进度总览、群名变更同步和初始群名摘要不在本次变更内。真实群写入验收、部署和既有群清理需要各自授权；离线行为测试不能代替这些操作的真实验收。

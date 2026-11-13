@@ -165,7 +165,7 @@ test('Feishu deletion treats dissolved groups as success but preserves permissio
   await assert.rejects(adapter.ensureGroup({ taskId: 'new', title: 'Task' }), GroupCreationRejected);
 });
 
-test('commandless socket events create observable Feishu groups through AgentLoop, SQLite and a Codex fixture', async t => {
+test('socket private events admit nothing while project-group delivery persists and deduplicates', async t => {
   const root = await mkdtemp(join(tmpdir(), 'agent-private-dispatch-'));
   const api = fakeApi();
   const groups: NonNullable<Parameters<typeof api.chat.create>[0]>[] = [];
@@ -219,24 +219,22 @@ test('commandless socket events create observable Feishu groups through AgentLoo
       message_type: input.type, content: JSON.stringify(input.content),
     } };
     await dispatch(raw); await dispatch(raw); await tickWithCoordinator(loop);
-    assert.equal(groups.length, index + 2);
-    const task = loop.store.taskForSource(`feishu:new:${input.id}`); assert.ok(task?.threadId);
-    assert.deepEqual(groups[index + 1]?.data, { name: input.title, description: `agent-loop:v1:${task.id}\n`,
-      owner_id: owner, user_id_list: [owner], chat_mode: 'group', chat_type: 'private', external: false });
-    assert.deepEqual(task.source, { kind: 'manual', message: parseFeishuEvent(raw, owner) });
-    assert.equal(loop.store.inputs(task.id).length, 1);
-    assert.equal(loop.store.inputs(task.id)[0]?.status, 'delivered');
-    assert.equal((await codex.inspect(task.threadId)).seenInputIds.length, 1);
+    assert.equal(groups.length, 0);
+    assert.equal(loop.store.taskForSource(`feishu:new:${input.id}`), null);
   }
-  assert.deepEqual(downloads.map(input => [input.path.message_id, input.path.file_key]), [
-    ['direct-post', 'img_1'], ['direct-post', 'img_2'], ['direct-image', 'img_only'], ['direct-file', 'file_only'],
-  ]);
-  const attachmentFiles = (await readdir(join(root, 'attachments'), { recursive: true, withFileTypes: true })).filter(entry => entry.isFile());
-  const savedBytes = await Promise.all(attachmentFiles.map(entry => readFile(join(entry.parentPath, entry.name))));
-  assert.deepEqual(savedBytes.map(bytes => bytes.toString('hex')).sort(), [...resources.values()].map(bytes => bytes.toString('hex')).sort());
-  const db = new Store(root, { readOnly: true });
-  try { assert.equal(db.tasks().length, cases.length + 1); } finally { db.close(); }
-  assert.deepEqual(historyChats, []); assert.deepEqual(errors, []);
+  assert.equal(downloads.length, 0); assert.equal(loop.tasks().length, 0);
+  await loop.collect(); await loop.tick();
+  const coordinator = loop.tasks().find(task => loop.projects.ledger.membership(task.id)?.role === 'coordinator');
+  assert.ok(coordinator?.threadId && coordinator.chatId); assert.equal(groups.length, 1);
+  const raw = { sender: { sender_type: 'user', sender_id: { open_id: owner } }, message: {
+    message_id: 'project-input', chat_id: coordinator.chatId, chat_type: 'group', create_time: String(Date.now()),
+    message_type: 'text', content: JSON.stringify({ text: 'Investigate this project requirement' }),
+  } };
+  await dispatch(raw); await dispatch(raw); await loop.tick();
+  assert.equal(loop.store.inputs(coordinator.id).filter(input => input.id === 'project-input').length, 1);
+  assert.ok((await codex.inspect(coordinator.threadId)).seenInputIds.includes('project-input'));
+  assert.equal(loop.tasks().length, 1); assert.equal(downloads.length, 0);
+  assert.ok(!historyChats.includes('oc_private')); assert.deepEqual(errors, []);
 });
 test('Feishu progress uses CardKit streaming plain text, stable message UUID and shared update sequences', async () => {
   const api = fakeApi();
