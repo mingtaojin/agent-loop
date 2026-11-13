@@ -17,6 +17,7 @@ import type { EventDispatcher } from '@larksuiteoapi/node-sdk';
 import type { ApprovalAction, IncomingMessage, PendingRequest } from '../src/domain.js';
 import type { WorkspacePort } from '../src/ports.js';
 import { CodexFake, FeishuFake, GitHubFake, issue } from './fakes.js';
+import { delegateIntake } from './coordinated-fixture.js';
 
 function gate() {
   let resolve = () => {};
@@ -25,7 +26,10 @@ function gate() {
 }
 async function fixture(t: TestContext) {
   const root = await mkdtemp(join(tmpdir(), 'agent-runtime-'));
-  const config = configSchema.parse({ dataDir: root, feishu: { userOpenId: 'owner' }, recovery: { maxAttempts: 2, retryDelayMs: 1 } });
+  const config = configSchema.parse({ dataDir: root, feishu: { userOpenId: 'owner' }, recovery: { maxAttempts: 2, retryDelayMs: 1 },
+    projects: [{ id: 'runtime', name: 'Runtime fixture', directory: root, repositories: [{ name: 'example/project', labelsAny: ['bug'] }] }],
+    repositories: [{ name: 'example/project', path: root, baseBranch: 'main' }],
+  });
   const github = new GitHubFake(), feishu = new FeishuFake(), codex = new CodexFake();
   const workspaces: Parameters<WorkspacePort['ensure']>[0][] = [];
   const workspace: WorkspacePort = {
@@ -36,13 +40,23 @@ async function fixture(t: TestContext) {
   let loop = new AgentLoop(config, ports);
   t.after(async () => { await loop.close(); await rm(root, { recursive: true, force: true }); });
   const message = (id: string, text: string, chatId = 'private', chatType: 'p2p' | 'group' = 'p2p'): IncomingMessage => ({ id, text, chatId, chatType, senderId: 'owner', attachments: [], createdAt: Date.now() });
-  const task = () => { const value = loop.tasks()[0]; assert.ok(value); return value; };
+  const workers = () => loop.tasks().filter(task => loop.projects.ledger.membership(task.id)?.role === 'worker');
+  const intakes = () => loop.tasks().filter(task => task.source.kind === 'manual');
+  const task = () => { const value = workers()[0]; assert.ok(value); return value; };
+  const starts = () => codex.starts.filter(start => workers().some(task => task.threadId === start.threadId));
+  const created = () => codex.created.filter(input => input.cwd !== loop.store.task(loop.projects.ledger.project('runtime')!.coordinatorTaskId).contextDirectory);
+  const workerSteers = () => codex.steers.filter(start => workers().some(task => task.threadId === start.threadId));
+  codex.selectionResults = Array.from({ length: 30 }, () => ({ kind: 'project', projectId: 'coordinated:runtime', reason: 'Fixture request belongs to this project' }));
   const snapshot = () => { const id = task().threadId; assert.ok(id); return codex.snapshot(id); };
-  return { root, config, ports, github, feishu, codex, workspaces, task, snapshot, message,
+  return { root, config, ports, github, feishu, codex, workspaces, task, workers, intakes, starts, created, workerSteers, snapshot, message,
+    async delegate(taskId: string) { return delegateIntake(loop, taskId); },
     get loop() { return loop; },
-    async manual() { await loop.receive(message('new', 'Explore this idea')); return task(); },
+    async manual() { await loop.receive(message('new', 'Explore this idea')); const intake = loop.store.taskForSource('feishu:new:new'); assert.ok(intake); if (intake.purpose === 'intake') await delegateIntake(loop, intake.id); return task(); },
     async restart() { await loop.close(); loop = new AgentLoop(config, ports); await loop.recover(); },
-    async githubTask() { config.repositories = [{ name: 'example/project', path: root, baseBranch: 'main', criteria: configSchema.parse({ feishu: { userOpenId: 'owner' }, repositories: [{ name: 'example/project', path: root, baseBranch: 'main' }] }).repositories[0]!.criteria }]; github.sources = [issue(1)]; await loop.collect(); await loop.tick(); return task(); },
+    async githubTask() { github.sources = [issue(1)]; await loop.collect(); await loop.tick();
+      const coordinator = loop.projects.ledger.project('runtime')!.coordinatorTaskId;
+      await loop.projectAction(coordinator, { action: 'dispatch', requestId: 'test-issue-1', issueId: 'issue-1', role: 'worker', prompt: 'Investigate Issue 1.' });
+      await loop.tick(); return task(); },
   };
 }
 function request(f: Awaited<ReturnType<typeof fixture>>, kind: PendingRequest['kind'] = 'approval'): PendingRequest {
@@ -53,156 +67,101 @@ function action(f: Awaited<ReturnType<typeof fixture>>, native: PendingRequest):
   return { id: 'click', taskId: f.task().id, threadId: native.threadId, turnId: native.turnId, requestId: native.id, decision: 'approve', chatId: f.task().chatId!, senderId: 'owner', epoch: native.connectionEpoch };
 }
 
-test('direct private text creates one task per message ID and deduplicates across restart', async t => {
+test('private ingress persists independent requests and reuses one coordinator across redelivery and restart', async t => {
   const f = await fixture(t);
-  const groups: Parameters<FeishuFake['ensureGroup']>[0][] = [];
-  const ensureGroup = f.feishu.ensureGroup.bind(f.feishu);
-  f.feishu.ensureGroup = async input => { groups.push(input); return ensureGroup(input); };
   const original = f.message('direct-text', ' \t\nDiscuss this idea.\nKeep the details.  ');
   await Promise.all([f.loop.receive(original), f.loop.receive(original)]);
-  const task = f.task(); assert.ok(task.chatId && task.threadId);
-  assert.equal(task.sourceId, 'feishu:new:direct-text');
-  assert.deepEqual(task.source, { kind: 'manual', message: original });
-  assert.deepEqual(f.codex.starts[0]?.input[0], { kind: 'text', text: 'Discuss this idea.\nKeep the details.' });
-  assert.equal(groups[0]?.title, 'Discuss this idea.\nKeep the details.');
-  assert.ok(f.feishu.sent.some(output => output.chatId === task.chatId && output.text.includes('新任务请直接私聊发送')));
-  await f.restart(); await f.loop.receive(original);
-  assert.equal(f.task().id, task.id); assert.equal(f.task().threadId, task.threadId);
-  assert.equal(f.loop.store.inputs(task.id).length, 1);
-  assert.equal(groups.length, 1); assert.equal(f.codex.starts.length, 1);
+  const intake = f.intakes()[0]; assert.ok(intake);
+  assert.equal(intake.purpose, 'intake'); assert.equal(intake.threadId, null); assert.equal(intake.chatId, null);
+  assert.equal(intake.sourceId, 'feishu:new:direct-text');
+  assert.deepEqual(intake.source, { kind: 'manual', message: original });
+  assert.equal(f.loop.store.inputs(intake.id)[0]?.message.text, 'Discuss this idea.\nKeep the details.');
+  assert.equal(f.workers().length, 0); assert.equal(f.feishu.groups.size, 1);
+  await f.restart(); await f.loop.receive({ ...original, text: `/new ${original.text.trim()}` });
+  assert.equal(f.intakes()[0]?.id, intake.id); assert.equal(f.loop.store.inputs(intake.id).length, 1);
+  assert.deepEqual(f.intakes()[0]?.source, { kind: 'manual', message: original });
   await f.loop.receive({ ...original, id: 'distinct-text' });
-  assert.equal(f.loop.tasks().length, 2); assert.equal(groups.length, 2);
-  assert.equal(new Set(f.loop.tasks().map(task => task.chatId)).size, 2);
-  const followUp = f.message('group-direct', ' \n/new keep this group text intact  ', task.chatId, 'group');
+  assert.equal(f.intakes().length, 2); assert.equal(f.feishu.groups.size, 1);
+  const worker = await f.delegate(intake.id); assert.ok(worker.chatId && worker.threadId);
+  assert.equal(f.feishu.groups.size, 2);
+  const followUp = f.message('group-direct', ' \n/new keep this group text intact  ', worker.chatId, 'group');
   await f.loop.receive(followUp);
-  assert.equal(f.loop.tasks().length, 2);
-  assert.deepEqual(f.loop.store.inputs(task.id).at(-1)?.message, followUp);
-  assert.deepEqual(f.codex.steers.at(-1)?.input[0], { kind: 'text', text: followUp.text });
-});
-
-test('commandless attachment-only input preserves download identity, bytes and source evidence', async t => {
-  const f = await fixture(t); const bytes = Buffer.from('attachment-only evidence\n');
-  f.feishu.resources.set('direct-file', bytes);
-  const original: IncomingMessage = { ...f.message('direct-file-id', ' \n '), attachments: [{ key: 'direct-file', name: 'evidence.log', kind: 'file' }] };
-  await f.loop.receive(original);
-  const task = f.task();
-  assert.deepEqual(task.source, { kind: 'manual', message: original });
-  assert.equal(f.loop.store.inputs(task.id)[0]?.message.text, '');
-  const download = f.feishu.downloads[0]; assert.ok(download);
-  assert.equal(download.messageId, original.id);
-  assert.deepEqual(await readFile(download.destination.replace(/\.partial$/, '')), bytes);
-});
-
-test('historical manual source keys deduplicate commandless redelivery without changing saved evidence', async t => {
-  const f = await fixture(t);
-  const legacy = f.message('historical-id', '/new Existing discussion');
-  await f.loop.receive(legacy); const task = f.task();
-  assert.equal(task.sourceId, 'feishu:new:historical-id');
-  await f.restart(); await f.loop.receive({ ...legacy, text: 'Existing discussion' });
-  assert.equal(f.loop.tasks().length, 1); assert.equal(f.task().id, task.id);
-  assert.deepEqual(f.task().source, { kind: 'manual', message: legacy });
-  assert.equal(f.loop.store.inputs(task.id).length, 1); assert.equal(f.feishu.groups.size, 1);
+  assert.deepEqual(f.loop.store.inputs(worker.id).at(-1)?.message, followUp);
+  assert.deepEqual(f.workerSteers().at(-1)?.input[0], { kind: 'text', text: followUp.text });
 });
 
 test('empty and unauthorized private inputs create nothing and recovery never imports private history', async t => {
   const f = await fixture(t);
   for (const [index, text] of ['', ' \t\r\n', '/new', ' \n/new \t'].entries()) await f.loop.receive(f.message(`empty-${index}`, text));
-  await f.loop.receive({ ...f.message('stranger', 'Create an unauthorized task'), senderId: 'stranger' });
+  await f.loop.receive({ ...f.message('stranger', 'Unauthorized'), senderId: 'stranger' });
   await f.loop.receive({ ...f.message('stranger-file', ''), senderId: 'stranger', attachments: [{ key: 'untrusted', name: 'log.txt', kind: 'file' }] });
   await f.loop.receive(f.message('unknown-group', 'Unknown group', 'unknown', 'group'));
-  assert.equal(f.loop.tasks().length, 0); assert.equal(f.feishu.groups.size, 0); assert.equal(f.feishu.downloads.length, 0);
-  await f.loop.receive(f.message('known-task', 'Known discussion'));
+  assert.equal(f.loop.tasks().length, 0); assert.equal(f.feishu.downloads.length, 0);
+  await f.manual();
   f.feishu.offline = [f.message('missed-private', 'Missed private task')];
-  const historyChats: string[] = [];
-  const history = f.feishu.history.bind(f.feishu);
-  f.feishu.history = async input => { historyChats.push(input.chatId); return history(input); };
+  const chats: string[] = [], history = f.feishu.history.bind(f.feishu);
+  f.feishu.history = async input => { chats.push(input.chatId); return history(input); };
   await f.restart();
-  assert.equal(f.loop.tasks().length, 1);
-  assert.deepEqual(historyChats, [f.task().chatId]);
+  assert.equal(f.intakes().length, 1); assert.ok(!chats.includes('private'));
+  assert.ok(chats.includes(f.task().chatId!));
 });
 
-test('manual creation deduplicates and discussions retain identity without repositories or guidance', async t => {
-  const f = await fixture(t);
-  await Promise.all([f.manual(), f.manual()]);
-  const task = f.task(); assert.equal(task.source.kind, 'manual');
-  assert.equal(f.loop.tasks().length, 1); assert.equal(f.feishu.groups.size, 1); assert.equal(f.codex.created.length, 1);
-  assert.deepEqual(task.resources, []); assert.equal(f.workspaces.length, 0);
-  assert.equal(f.codex.starts.length, 1); assert.equal(f.codex.starts[0]?.input[0]?.kind, 'text');
-  assert.match(JSON.stringify(f.codex.starts[0]?.input), /Explore this idea/);
-  f.codex.complete(task.threadId!, 'An exploratory answer.'); await f.loop.tick();
-  await f.restart(); await f.loop.tick(); assert.equal(f.task().status, 'idle'); assert.equal(f.codex.starts.length, 1);
-  await f.loop.receive(f.message('next', '/new is ordinary text inside a group', task.chatId!, 'group'));
-  assert.equal(f.loop.tasks().length, 1); assert.equal(f.codex.starts.length, 2); assert.equal(f.task().threadId, task.threadId);
-});
-
-test('legacy /new attachment-only input retains the original private message identity and bytes', async t => {
-  const f = await fixture(t); const bytes = Buffer.from('original log\n'); f.feishu.resources.set('key', bytes);
-  await f.loop.receive({ ...f.message('attachment-new', '/new'), attachments: [{ key: 'key', name: 'evidence.log', kind: 'file' }] });
-  assert.equal(f.feishu.downloads[0]?.messageId, 'attachment-new');
-  const text = JSON.stringify(f.codex.starts[0]?.input); assert.match(text, /evidence.log/);
+for (const prefix of ['', ' \t\r\n/new ']) test(`attachment-only intake retains original identity and cached bytes through delegation ${JSON.stringify(prefix)}`, async t => {
+  const f = await fixture(t), bytes = Buffer.from('original log\n');
+  f.feishu.resources.set('key', bytes);
+  const original = { ...f.message('attachment-new', prefix), attachments: [{ key: 'key', name: 'evidence.log', kind: 'file' as const }] };
+  await f.loop.receive(original); await f.loop.receive(original);
+  const intake = f.intakes()[0]; assert.ok(intake);
+  assert.deepEqual(intake.source, { kind: 'manual', message: original });
+  assert.equal(f.loop.store.inputs(intake.id)[0]?.message.text, '');
   const download = f.feishu.downloads[0]; assert.ok(download);
+  assert.equal(download.messageId, original.id);
   assert.deepEqual(await readFile(download.destination.replace(/\.partial$/, '')), bytes);
-  assert.equal(f.workspaces.length, 0);
+  await f.delegate(intake.id); await f.restart(); await f.loop.receive(original);
+  assert.equal(f.intakes().length, 1); assert.equal(f.feishu.downloads.length, 1);
+  assert.match(JSON.stringify(f.starts()[0]?.input), /evidence.log/);
 });
 
-for (const prefix of ['', ' \t\r\n', ' \t\r\n/new ']) test(`manual rich-post creation preserves both images and deduplicates with optional prefix ${JSON.stringify(prefix)}`, async t => {
-  const f = await fixture(t);
-  const text = 'Analyze the recording\nKeep the original parameters.';
-  const firstImage = Buffer.from('first screenshot'), secondImage = Buffer.from('second screenshot');
-  const images = [firstImage, secondImage];
-  f.feishu.resources.set('img_1', firstImage); f.feishu.resources.set('img_2', secondImage);
+for (const prefix of ['', ' \t\r\n', ' \t\r\n/new ']) test(`rich-post intake preserves both image files through coordinator delegation ${JSON.stringify(prefix)}`, async t => {
+  const f = await fixture(t), text = 'Analyze the recording\nKeep the original parameters.';
+  const images = [Buffer.from('first screenshot'), Buffer.from('second screenshot')];
+  f.feishu.resources.set('img_1', images[0]!); f.feishu.resources.set('img_2', images[1]!);
   const message = parseFeishuEvent({ sender: { sender_type: 'user', sender_id: { open_id: 'owner' } }, message: {
     message_id: 'rich-post-new', chat_id: 'private', chat_type: 'p2p', create_time: String(Date.now()), message_type: 'post',
-    content: JSON.stringify({ title: '', content: [
-      [{ tag: 'text', text: `${prefix}Analyze the recording` }],
-      [{ tag: 'text', text: 'Keep the original parameters.' }],
-      [{ tag: 'img', image_key: 'img_1' }], [{ tag: 'img', image_key: 'img_2' }],
-    ] }),
-  } }, 'owner');
-  assert.ok(message);
+    content: JSON.stringify({ title: '', content: [[{ tag: 'text', text: `${prefix}Analyze the recording` }],
+      [{ tag: 'text', text: 'Keep the original parameters.' }], [{ tag: 'img', image_key: 'img_1' }], [{ tag: 'img', image_key: 'img_2' }]] }),
+  } }, 'owner'); assert.ok(message);
   await f.loop.receive(message); await f.loop.receive(message);
-  assert.equal(f.loop.tasks().length, 1); assert.equal(f.feishu.groups.size, 1); assert.equal(f.codex.starts.length, 1);
-  const task = f.task(); assert.ok(task.source.kind === 'manual');
-  assert.deepEqual(task.source.message, message);
-  assert.ok(f.feishu.sent.some(output => output.text === `任务对话已建立。\n${text}\n请在本群继续发送文字、截图和日志。新任务请直接私聊发送。`));
-  const inputs = f.loop.store.inputs(task.id);
-  assert.equal(inputs.length, 1); assert.equal(inputs[0]?.status, 'delivered');
-  assert.equal(inputs[0]?.message.text, text); assert.deepEqual(inputs[0]?.message.attachments, message.attachments);
-  const input = f.codex.starts[0]?.input; assert.ok(input);
-  assert.deepEqual(input[0], { kind: 'text', text });
-  assert.ok(input.every(item => item.kind === 'text'));
-  const deliveredImages = input.flatMap(item => {
-    if (item.kind !== 'text' || !item.text.startsWith('Image attachment as data: ')) return [];
-    return [z.object({ path: z.string() }).parse(JSON.parse(item.text.slice('Image attachment as data: '.length).split('\n')[0] ?? ''))];
-  });
+  const intake = f.intakes()[0]; assert.ok(intake);
+  assert.equal(intake.threadId, null); assert.deepEqual(intake.source, { kind: 'manual', message });
+  await f.delegate(intake.id);
+  const inputs = f.loop.store.inputs(intake.id); assert.equal(inputs.length, 1);
+  assert.equal(inputs[0]?.status, 'delivered'); assert.equal(inputs[0]?.message.text, text);
+  assert.deepEqual(inputs[0]?.message.attachments, message.attachments);
+  const input = f.starts()[0]?.input; assert.ok(input);
+  assert.deepEqual(input[0], { kind: 'text', text }); assert.ok(input.every(item => item.kind === 'text'));
+  const deliveredImages = input.flatMap(item => item.kind === 'text' && item.text.startsWith('Image attachment as data: ')
+    ? [z.object({ path: z.string() }).parse(JSON.parse(item.text.slice('Image attachment as data: '.length).split('\n')[0] ?? ''))] : []);
   assert.equal(deliveredImages.length, 2);
   assert.deepEqual(await Promise.all(deliveredImages.map(item => readFile(item.path))), images);
-  assert.deepEqual(f.feishu.downloads.map(download => [download.messageId, download.attachment.key]), [
-    ['rich-post-new', 'img_1'], ['rich-post-new', 'img_2'],
-  ]);
+  assert.deepEqual(f.feishu.downloads.map(item => [item.messageId, item.attachment.key]), [['rich-post-new', 'img_1'], ['rich-post-new', 'img_2']]);
   await f.restart(); await f.loop.receive(message);
-  assert.equal(f.loop.tasks().length, 1); assert.equal(f.feishu.groups.size, 1); assert.equal(f.codex.starts.length, 1);
-  assert.equal(f.feishu.downloads.length, 2);
-  assert.deepEqual(f.task().source, { kind: 'manual', message });
+  assert.equal(f.feishu.downloads.length, 2); assert.equal(f.starts().length, 1);
 });
 
-test('optional /new normalization keeps command boundaries and leaves group follow-ups verbatim', async t => {
+test('optional /new normalizes only its command boundary and group follow-ups stay verbatim', async t => {
   const f = await fixture(t);
   for (const text of [' \n/news task', ' \n/new-task', 'mention /new task', '/new /new Strip only once']) {
-    const original = f.message(text, text);
-    await f.loop.receive(original);
+    const original = f.message(text, text); await f.loop.receive(original);
     const task = f.loop.store.taskForSource(`feishu:new:${text}`); assert.ok(task);
+    assert.equal(task.purpose, 'intake'); assert.equal(task.threadId, null);
     assert.equal(f.loop.store.inputs(task.id)[0]?.message.text, text === '/new /new Strip only once' ? '/new Strip only once' : text.trim());
     assert.deepEqual(task.source, { kind: 'manual', message: original });
   }
-  assert.equal(f.loop.tasks().length, 4); assert.equal(f.feishu.groups.size, 4);
-  await f.loop.receive(f.message('new-whitespace', ' \t\n/new Discuss this'));
-  assert.equal(f.loop.tasks().length, 5);
-  assert.deepEqual(f.codex.starts.at(-1)?.input[0], { kind: 'text', text: 'Discuss this' });
-  const task = f.task(); assert.ok(task.chatId);
+  assert.equal(f.intakes().length, 4); assert.equal(f.feishu.groups.size, 1);
+  const task = await f.manual(); assert.ok(task.chatId);
   const followUp = ' \n/new is ordinary group text';
   await f.loop.receive(f.message('group-new', followUp, task.chatId, 'group'));
-  assert.equal(f.loop.tasks().length, 5);
   assert.equal(f.loop.store.inputs(task.id).at(-1)?.message.text, followUp);
 });
 
@@ -298,31 +257,31 @@ test('restart does not replay an approval whose write may already have happened'
   assert.equal(f.codex.approvals.length, 0); assert.equal(f.loop.store.approvals(f.task().id)[0]?.status, 'uncertain');
 });
 
-test('Issue and comment repeated A to B transitions preserve every change while unchanged polls do not wake', async t => {
+test('Issue and comment changes wake only the coordinator until it sends instructions to the Worker', async t => {
   const f = await fixture(t); await f.githubTask();
+  const coordinatorId = f.loop.projects.ledger.project('runtime')!.coordinatorTaskId;
+  const events = () => f.loop.store.inputs(coordinatorId).filter(input => input.provenance.kind === 'agent' && ['github_issue', 'github_comment'].includes(input.provenance.category));
+  const initial = events().length;
   for (const body of ['B', 'A', 'B']) {
-    f.github.sources = [issue(1, { body })];
-    await f.loop.collect(); await f.loop.tick();
-    await f.loop.collect(); await f.loop.tick();
+    f.github.sources = [issue(1, { body })]; await f.loop.collect(); await f.loop.tick(); await f.loop.collect();
   }
-  assert.equal(f.codex.steers.length, 3);
   for (const body of ['A', 'B', 'A', 'B']) {
-    f.github.sourceComments = [{ id: 'comment', sourceId: 'issue-1', url: 'https://example.invalid/comment', author: 'reviewer', body, createdAt: 'date', updatedAt: body }];
-    await f.loop.collect(); await f.loop.tick(); await f.loop.collect(); await f.loop.tick();
+    f.github.sourceComments = [{ id: 'comment', sourceId: 'issue-1', url: 'url', author: 'reviewer', body, createdAt: 'date', updatedAt: body }];
+    await f.loop.collect(); await f.loop.tick(); await f.loop.collect();
   }
-  assert.equal(f.codex.steers.length, 7);
+  assert.equal(events().length, initial + 7); assert.equal(f.workerSteers().length, 0);
   f.github.sources = [issue(1, { body: 'B', updatedAt: 'timestamp-only-change' })];
   f.github.sourceComments[0]!.updatedAt = 'timestamp-only-change';
-  await f.loop.collect(); await f.loop.tick(); assert.equal(f.codex.steers.length, 7);
-  await f.restart(); await f.loop.collect(); await f.loop.tick(); assert.equal(f.codex.steers.length, 7);
+  await f.loop.collect(); await f.loop.tick(); assert.equal(events().length, initial + 7);
+  await f.restart(); await f.loop.collect(); assert.equal(events().length, initial + 7);
 });
 
-test('external comments do not answer a native question while user input can', async t => {
+test('external comments do not answer a native Worker question while owner input can', async t => {
   const f = await fixture(t); await f.githubTask(); const native = request(f, 'question'); native.isBlocking = false;
   f.snapshot().requests = [native]; await f.loop.tick();
   f.github.sourceComments = [{ id: 'comment', sourceId: 'issue-1', url: 'url', author: 'reviewer', body: 'yes', createdAt: 'date', updatedAt: 'date' }];
   await f.loop.collect(); await f.loop.tick();
-  assert.equal(f.codex.replies.length, 0); assert.equal(f.codex.steers.length, 1);
+  assert.equal(f.codex.replies.length, 0); assert.equal(f.workerSteers().length, 0);
   await f.loop.receive(f.message('answer', 'user answer', f.task().chatId!, 'group'));
   assert.equal(f.codex.replies[0]?.text, 'user answer');
 });
@@ -346,7 +305,8 @@ test('Feishu forwards only final answers during execution and after restart', as
 test('final answers route once per task and uncertain sends are never blindly replayed', async t => {
   const f = await fixture(t); await f.manual();
   await f.loop.receive(f.message('new2', 'second topic'));
-  const [first, second] = f.loop.tasks(); assert.ok(first?.threadId && second?.threadId);
+  const intake = f.loop.store.taskForSource('feishu:new:new2'); assert.ok(intake); await f.delegate(intake.id);
+  const [first, second] = f.workers(); assert.ok(first?.threadId && second?.threadId);
   for (const task of [first, second]) {
     const snapshot = f.codex.snapshot(task.threadId!); assert.ok(snapshot.turnId);
     snapshot.outputs.push({ id: 'same-local-id', threadId: snapshot.threadId, turnId: snapshot.turnId, phase: 'progress', text: `Progress for ${task.id}` });
@@ -366,23 +326,28 @@ for (const status of ['interrupted', 'failed'] as const) test(`confirmed ${statu
     f.snapshot().status = status; f.snapshot().error = status === 'failed' ? 'temporary execution error' : null;
     await f.loop.tick(); await setTimeout(5); await f.loop.tick();
   }
-  assert.equal(f.task().status, 'failed'); assert.equal(f.codex.starts.length, 3);
+  assert.equal(f.task().status, 'failed'); assert.equal(f.starts().length, 3);
   assert.equal(f.codex.recoveries, 2); assert.equal(f.task().threadId, original.threadId);
-  await f.loop.tick(); await f.restart(); assert.equal(f.codex.starts.length, 3);
+  await f.loop.tick(); await f.restart(); assert.equal(f.starts().length, 3);
   assert.ok(f.feishu.sent.some(output => output.text.includes('恢复已停止')));
 });
 
 test('transport recovery is bounded, does not wake idle tasks, and silence does not trigger recovery', async t => {
   const f = await fixture(t); await f.manual();
   await f.loop.tick(); await f.loop.tick(); assert.equal(f.codex.recoveries, 0);
-  f.codex.inspectError = new Error('connection lost');
+  const inspect = f.codex.inspect.bind(f.codex);
+  f.codex.inspect = async threadId => {
+    if (threadId === f.task().threadId) throw new Error('connection lost');
+    return inspect(threadId);
+  };
   for (let attempt = 0; attempt < 4; attempt++) { await f.loop.tick(); await setTimeout(5); }
   assert.equal(f.task().status, 'failed'); assert.equal(f.codex.recoveries, 2);
-  f.codex.inspectError = null;
+  f.codex.inspect = inspect;
   await f.loop.receive(f.message('independent', 'independent task'));
-  const other = f.loop.tasks()[1]; assert.ok(other?.threadId);
+  const intake = f.loop.store.taskForSource('feishu:new:independent'); assert.ok(intake); await f.delegate(intake.id);
+  const other = f.workers()[1]; assert.ok(other?.threadId);
   f.codex.complete(other.threadId, 'done'); await f.loop.tick(); await f.restart();
-  assert.equal(f.loop.tasks()[1]?.status, 'idle'); assert.equal(f.codex.starts.length, 2);
+  assert.equal(f.workers()[1]?.status, 'idle'); assert.equal(f.starts().length, 2);
 });
 
 for (const status of ['interrupted', 'failed'] as const) test(`owner follow-up resumes exhausted ${status} execution in the same Thread once`, async t => {
@@ -394,14 +359,14 @@ for (const status of ['interrupted', 'failed'] as const) test(`owner follow-up r
   await f.loop.receive(followUp);
   assert.equal(f.task().status, 'running');
   assert.equal(f.task().threadId, original.threadId);
-  assert.equal(f.codex.created.length, 1); assert.equal(f.feishu.groups.size, 1);
-  assert.equal(f.codex.starts.length, 2); assert.equal(f.codex.recoveries, 0);
-  assert.deepEqual(f.codex.starts[1]?.input[0], { kind: 'text', text: followUp.text });
+  assert.equal(f.created().length, 1); assert.equal(f.feishu.groups.size, 2);
+  assert.equal(f.starts().length, 2); assert.equal(f.codex.recoveries, 0);
+  assert.deepEqual(f.starts()[1]?.input[0], { kind: 'text', text: followUp.text });
   assert.equal(f.loop.store.inputs(original.id).find(input => input.id === followUp.id)?.status, 'delivered');
   await f.loop.receive(followUp); await f.restart(); await f.loop.tick();
-  assert.equal(f.codex.starts.length, 2);
+  assert.equal(f.starts().length, 2);
   f.snapshot().status = status; await f.loop.tick(); await f.loop.tick();
-  assert.equal(f.task().status, 'failed'); assert.equal(f.codex.starts.length, 2);
+  assert.equal(f.task().status, 'failed'); assert.equal(f.starts().length, 2);
 });
 
 test('persisted owner follow-ups wake an older failed task after restart', async t => {
@@ -414,7 +379,7 @@ test('persisted owner follow-ups wake an older failed task after restart', async
   f.loop.store.receive(original.id, pending);
   await f.restart();
   assert.equal(f.task().status, 'running'); assert.equal(f.task().threadId, original.threadId);
-  assert.equal(f.codex.starts.length, 2);
+  assert.equal(f.starts().length, 2);
   assert.equal(f.loop.store.inputs(original.id).find(input => input.id === pending.id)?.status, 'delivered');
 });
 
@@ -426,12 +391,12 @@ test('owner follow-up revalidates resources and failed validation cannot loop on
   const followUp = f.message('retry-wrong-branch', 'Continue', f.task().chatId!, 'group');
   await f.loop.receive(followUp);
   assert.equal(f.task().status, 'failed'); assert.match(f.task().reason ?? '', /Wrong branch/);
-  assert.equal(f.codex.starts.length, 1);
+  assert.equal(f.starts().length, 1);
   f.ports.workspace.ensure = async input => { assert.ok(input.workspace); return input.workspace; };
   await f.loop.tick(); await f.restart(); await f.loop.tick();
-  assert.equal(f.task().status, 'failed'); assert.equal(f.codex.starts.length, 1);
+  assert.equal(f.task().status, 'failed'); assert.equal(f.starts().length, 1);
   await f.loop.receive(f.message('retry-correct-branch', 'Continue now', f.task().chatId!, 'group'));
-  assert.equal(f.task().status, 'running'); assert.equal(f.codex.starts.length, 2);
+  assert.equal(f.task().status, 'running'); assert.equal(f.starts().length, 2);
 });
 
 test('failed tasks ignore source updates and unauthorized input', async t => {
@@ -439,7 +404,7 @@ test('failed tasks ignore source updates and unauthorized input', async t => {
   f.config.recovery.maxAttempts = 0; f.snapshot().status = 'failed'; await f.loop.tick();
   f.github.sources = [issue(1, { body: 'New source detail' })]; await f.loop.collect(); await f.loop.tick();
   await f.loop.receive({ ...f.message('stranger-retry', 'Continue', f.task().chatId!, 'group'), senderId: 'stranger' });
-  assert.equal(f.task().status, 'failed'); assert.equal(f.codex.starts.length, 1);
+  assert.equal(f.task().status, 'failed'); assert.equal(f.starts().length, 1);
 });
 
 test('owner follow-up retains uncertain delivery barriers', async t => {
@@ -448,7 +413,7 @@ test('owner follow-up retains uncertain delivery barriers', async t => {
   const unknown = f.message('unknown-input', 'Unknown previous delivery', f.task().chatId!, 'group');
   f.loop.store.receive(f.task().id, unknown); f.loop.store.markInput(unknown.id, 'uncertain');
   await f.loop.receive(f.message('continue-after-unknown', 'Continue', f.task().chatId!, 'group'));
-  assert.equal(f.codex.starts.length, 1);
+  assert.equal(f.starts().length, 1);
   assert.equal(f.loop.store.inputs(f.task().id).find(input => input.id === unknown.id)?.status, 'uncertain');
   assert.equal(f.loop.store.inputs(f.task().id).at(-1)?.status, 'pending');
 });
@@ -461,7 +426,7 @@ test('undelivered owner follow-up cannot reset the recovery budget repeatedly', 
   assert.equal(f.task().status, 'failed');
   f.codex.inspectError = null;
   await f.loop.tick(); await f.restart(); await f.loop.tick();
-  assert.equal(f.task().status, 'failed'); assert.equal(f.codex.starts.length, 1);
+  assert.equal(f.task().status, 'failed'); assert.equal(f.starts().length, 1);
   assert.equal(f.loop.store.inputs(f.task().id).at(-1)?.status, 'pending');
 });
 
@@ -470,23 +435,23 @@ test('resource identity failure remains a barrier after recovery retries', async
   await f.loop.ensureWorkspace(f.task().id, 'example/project');
   f.ports.workspace.ensure = async () => { throw new Error('Wrong branch'); };
   await f.restart(); await setTimeout(5); await f.loop.tick();
-  assert.equal(f.task().status, 'failed'); assert.equal(f.codex.recoveries, 0); assert.equal(f.codex.starts.length, 1);
+  assert.equal(f.task().status, 'failed'); assert.equal(f.codex.recoveries, 0); assert.equal(f.starts().length, 1);
   assert.match(f.task().reason ?? '', /Wrong branch/);
 });
 
-test('dynamic workspace request completes while startTurn holds the task lane and preserves two resource associations', async t => {
+test('dynamic workspace request completes while startTurn holds the task lane and retains its project plus two worktrees', async t => {
   const f = await fixture(t);
   const repository = { name: 'example/one', path: f.root, baseBranch: 'main', criteria: configSchema.parse({ feishu: { userOpenId: 'owner' }, repositories: [{ name: 'example/one', path: f.root, baseBranch: 'main' }] }).repositories[0]!.criteria };
   f.config.repositories = [repository, { ...repository, name: 'example/two' }];
   const start = f.codex.startTurn.bind(f.codex);
   f.codex.startTurn = async input => {
-    const turnId = await start(input); assert.ok(f.codex.workspaceHandler);
+    const turnId = await start(input); if (!f.workers().some(task => task.threadId === input.threadId)) return turnId; assert.ok(f.codex.workspaceHandler);
     await Promise.all(['example/one', 'example/two', 'example/one'].map((name, index) => f.codex.workspaceHandler!({ threadId: input.threadId, turnId, callId: String(index), repository: name })));
     return turnId;
   };
   await f.manual();
-  assert.equal(f.task().resources.length, 2); assert.equal(f.workspaces.length, 2);
-  assert.equal(f.codex.created.length, 1); await f.restart(); assert.equal(f.task().resources.length, 2);
+  assert.equal(f.task().resources.length, 3); assert.equal(f.workspaces.length, 3);
+  assert.equal(f.created().length, 1); await f.restart(); assert.equal(f.task().resources.length, 3);
   await assert.rejects(f.loop.ensureWorkspace(f.task().id, 'unconfigured/repo'), /configured/);
 });
 
@@ -523,14 +488,14 @@ test('legacy shell bridge acquires task-bound resources through the live Runtime
   const original = f.task();
   const result = await execute(process.execPath, [client, capability, 'example/project']);
   const resource = JSON.parse(result.stdout);
-  assert.equal(resource.id, f.task().resources[0]?.id); assert.equal(resource.workspace, f.task().resources[0]?.workspace);
-  assert.equal(f.task().threadId, original.threadId); assert.equal(f.codex.created.length, 1);
+  assert.ok(f.task().resources.some(item => item.id === resource.id && item.workspace === resource.workspace));
+  assert.equal(f.task().threadId, original.threadId); assert.equal(f.created().length, 1);
   await assert.rejects(execute(process.execPath, [client, capability, 'unconfigured/repo']), /configured/);
   const copied = join(f.root, 'old-capability.json'); await writeFile(copied, await readFile(capability));
   await f.restart();
   await assert.rejects(execute(process.execPath, [client, copied, 'example/project']));
   await execute(process.execPath, [client, capability, 'example/project']);
-  assert.equal(f.task().resources.length, 1);
+  assert.equal(f.task().resources.length, 2);
   await f.loop.control(f.task().id, 'pause');
   await assert.rejects(execute(process.execPath, [client, capability, 'example/project']), /active/);
 });
@@ -538,12 +503,12 @@ test('legacy shell bridge acquires task-bound resources through the live Runtime
 test('legacy pause waits across restart and fresh human input resumes the same conversation', async t => {
   const f = await fixture(t); await f.manual();
   const task = f.task(); task.status = 'paused'; task.reason = '来源不再符合条件'; task.legacy = { status: 'paused', prUrl: null }; f.loop.store.saveTask(task);
-  f.snapshot().status = 'interrupted'; await f.restart(); assert.equal(f.task().status, 'paused'); assert.equal(f.codex.starts.length, 1);
+  f.snapshot().status = 'interrupted'; await f.restart(); assert.equal(f.task().status, 'paused'); assert.equal(f.starts().length, 1);
   await f.loop.receive(f.message('fresh', 'Continue with this correction', task.chatId!, 'group'));
-  assert.equal(f.task().status, 'running'); assert.equal(f.codex.starts.length, 2); assert.equal(f.task().threadId, task.threadId);
+  assert.equal(f.task().status, 'running'); assert.equal(f.starts().length, 2); assert.equal(f.task().threadId, task.threadId);
   await f.loop.control(task.id, 'pause');
   await f.loop.receive(f.message('held', 'Operator pause remains explicit', task.chatId!, 'group'));
-  assert.equal(f.task().status, 'paused'); assert.equal(f.codex.starts.length, 2);
+  assert.equal(f.task().status, 'paused'); assert.equal(f.starts().length, 2);
 });
 
 
@@ -566,9 +531,9 @@ test('migrated legacy turn notifications do not repeat while newly missed output
 
 test('GitHub outage during recovery preserves the original conversation for new user input', async t => {
   const f = await fixture(t); await f.githubTask(); const original = f.task();
-  f.github.getError = new Error('GitHub unavailable'); await f.restart();
+  f.github.getError = new Error('GitHub unavailable'); f.github.sources = []; await f.restart(); await f.loop.collect();
   await f.loop.receive(f.message('offline-source-user', 'Continue with this local evidence', original.chatId!, 'group'));
   assert.equal(f.task().threadId, original.threadId); assert.equal(f.task().status, 'running');
-  assert.equal(f.codex.steers.at(-1)?.deliveryId, 'offline-source-user');
+  assert.equal(f.workerSteers().at(-1)?.deliveryId, 'offline-source-user');
   assert.ok(f.loop.store.diagnostics().some(item => item.message.includes('GitHub unavailable')));
 });

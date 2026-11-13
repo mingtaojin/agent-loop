@@ -1,3 +1,5 @@
+import { SurfaceCodex, testProject, receiveSurface } from '../test/coordinated-surfaces.js';
+import { tickWithCoordinator, workerCalls } from '../test/coordinated-runtime.js';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -22,10 +24,10 @@ const entry = import.meta.url.endsWith('.ts')
 const receiptSchema = z.object({ requestId: z.string(), taskId: z.string(), status: z.string() });
 const root = await mkdtemp(join(tmpdir(), 'agent-loop-submit-acceptance-'));
 const configPath = join(root, 'config.json');
-const config = configSchema.parse({ dataDir: join(root, 'data'), repositories: [],
+const config = configSchema.parse({ dataDir: join(root, 'data'), repositories: [], projects: [testProject(root)],
   feishu: { userOpenId: 'acceptance-owner' }, pollIntervalMs: 60_000, executionPollMs: 25 });
 await writeFile(configPath, JSON.stringify(config));
-const github = new GitHubFake(), feishu = new FeishuFake(), codex = new CodexFake();
+const github = new GitHubFake(), feishu = new FeishuFake(), codex = new SurfaceCodex();
 const ports = { github, feishu, codex, workspace: new WorkspaceProvider(config.dataDir) };
 const env = Object.fromEntries(Object.entries(process.env).filter(([name]) =>
   !['GITHUB_TOKEN', 'FEISHU_APP_ID', 'FEISHU_APP_SECRET'].includes(name)));
@@ -49,9 +51,9 @@ async function cli(...args: string[]) {
 
 try {
   await loop.start();
-  await loop.receive({ id: 'acceptance-original-task', chatId: 'original-private', senderId: config.feishu.userOpenId,
+  await receiveSurface(loop, { id: 'acceptance-original-task', chatId: 'original-private', senderId: config.feishu.userOpenId,
     chatType: 'p2p', text: 'Original discussion stays here.', attachments: [], createdAt: Date.now() });
-  const original = loop.tasks()[0];
+  const original = loop.tasks().find(task => !task.sourceId.startsWith('project:'));
   assert.ok(original?.threadId && original.chatId);
   codex.complete(original.threadId, 'Original discussion is ready for handoff.');
   await loop.tick();
@@ -65,9 +67,10 @@ try {
   assert.notEqual(accepted.taskId, original.id);
   passed.push('Actual CLI accepts a new task without platform credentials from another cwd.');
 
+  await tickWithCoordinator(loop);
   await waitFor(() => {
     const current = loop.store.task(accepted.taskId);
-    return Boolean(current.threadId) && codex.starts.some(turn => turn.threadId === current.threadId);
+    return Boolean(current.threadId) && workerCalls(loop, codex).starts.some(turn => turn.threadId === current.threadId);
   });
   const task = loop.store.task(accepted.taskId);
   assert.ok(task.threadId && task.chatId);
@@ -76,30 +79,31 @@ try {
   assert.notEqual(task.chatId, original.chatId);
   assert.equal(loop.store.task(original.id).threadId, original.threadId);
   assert.ok(loop.store.inputs(task.id).some(input => input.message.text === prompt));
-  assert.ok(codex.starts.some(turn => turn.threadId === task.threadId && turn.input.some(input => input.kind === 'text' && input.text === prompt)));
-  assert.ok(codex.created.some(thread => thread.instructions.includes(configPath)
+  assert.ok(workerCalls(loop, codex).starts.some(turn => turn.threadId === task.threadId && turn.input.some(input => input.kind === 'text' && input.text === prompt)));
+  assert.ok(workerCalls(loop, codex).created.some(thread => thread.instructions.includes(configPath)
     && thread.instructions.includes('--request-id') && thread.instructions.includes('--prompt-file')));
   passed.push('Exact BOM, CRLF, Unicode and /new text reach an independent formal Thread; original context is unchanged.');
 
-  const starts = codex.starts.length;
+  const starts = workerCalls(loop, codex).starts.length;
   const retries = await Promise.all([submit(), submit(), submit()]);
   for (const retry of retries) assert.equal(receiptSchema.parse(JSON.parse(retry.stdout)).taskId, task.id);
-  assert.equal(loop.tasks().length, 2);
-  assert.equal(codex.starts.length, starts);
+  assert.equal(loop.tasks().filter(task => !task.sourceId.startsWith('project:')).length, 2);
+  assert.equal(workerCalls(loop, codex).starts.length, starts);
   passed.push('Concurrent same-ID retries return one Task without another execution.');
 
   const changedFile = join(root, 'changed.txt');
   await writeFile(changedFile, prompt + 'Changed scope.');
   await assert.rejects(cli('submit', '--request-id', requestId, '--prompt-file', changedFile));
-  assert.equal(loop.tasks().length, 2);
+  assert.equal(loop.tasks().filter(task => !task.sourceId.startsWith('project:')).length, 2);
   assert.ok(loop.store.inputs(task.id).some(input => input.message.text === prompt));
   passed.push('Same-ID changed prompt is rejected without altering accepted work.');
 
   const another = receiptSchema.parse(JSON.parse((await cli('submit', '--request-id', randomUUID(), '--prompt-file', promptFile)).stdout));
   assert.notEqual(another.taskId, task.id);
+  await tickWithCoordinator(loop);
   await waitFor(() => {
     const current = loop.store.task(another.taskId);
-    return Boolean(current.threadId) && codex.starts.some(turn => turn.threadId === current.threadId);
+    return Boolean(current.threadId) && workerCalls(loop, codex).starts.some(turn => turn.threadId === current.threadId);
   });
   passed.push('A new request ID creates another task even when prompt text is identical.');
 
@@ -107,7 +111,7 @@ try {
   await writeFile(emptyFile, ' \r\n\t');
   await writeFile(invalidFile, Uint8Array.of(0xc3, 0x28));
   for (const file of [emptyFile, invalidFile]) await assert.rejects(cli('submit', '--request-id', randomUUID(), '--prompt-file', file));
-  assert.equal(loop.tasks().length, 3);
+  assert.equal(loop.tasks().filter(task => !task.sourceId.startsWith('project:')).length, 3);
   passed.push('Blank and malformed UTF-8 inputs create no tasks.');
 
   codex.complete(task.threadId, 'Synthetic submission acceptance completed.');
@@ -133,10 +137,10 @@ try {
   await loop.start();
   const afterRestart = receiptSchema.parse(JSON.parse((await submit()).stdout));
   assert.equal(afterRestart.taskId, task.id);
-  assert.equal(loop.tasks().length, 3);
+  assert.equal(loop.tasks().filter(task => !task.sourceId.startsWith('project:')).length, 3);
   assert.equal(loop.store.task(task.id).threadId, task.threadId);
   assert.equal(loop.store.task(task.id).chatId, task.chatId);
-  assert.equal(codex.starts.length, starts + 1);
+  assert.equal(workerCalls(loop, codex).starts.length, starts + 1);
   passed.push('Restart and retry preserve Task, group, formal Thread and execution count.');
   process.stdout.write(JSON.stringify({ result: 'PASS', surface: 'actual CLI and isolated Runtime',
     platforms: 'controlled Feishu and Codex ports', checks: passed }, null, 2) + '\n');

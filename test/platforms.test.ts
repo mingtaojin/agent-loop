@@ -1,3 +1,4 @@
+import { testProject, tickWithCoordinator } from './coordinated-runtime.js';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -196,9 +197,9 @@ test('commandless socket events create observable Feishu groups through AgentLoo
   } });
   const codex = new CodexAppServer({ command: [process.execPath, resolve('test/fixtures/debug-codex.mjs')],
     approvalPolicy: 'never', sandbox: 'read-only', requestTimeoutMs: 2000 });
-  const loop = new AgentLoop(configSchema.parse({ dataDir: root, feishu: { userOpenId: owner } }), {
+  const loop = new AgentLoop(configSchema.parse({ dataDir: root, projects: [testProject(root)], feishu: { userOpenId: owner } }), {
     codex, feishu, github: new GitHubFake(),
-    workspace: { async ensure() { throw new Error('No workspace needed'); }, async head() { return 'unused'; } },
+    workspace: { async ensure(input) { if (input.kind === 'project-directory') return input.directory; throw new Error('No workspace needed'); }, async head() { return 'unused'; } },
   });
   t.after(async () => { await loop.close(); await rm(root, { recursive: true, force: true }); });
   await feishu.start(message => loop.receive(message), error => { errors.push(error); });
@@ -217,10 +218,10 @@ test('commandless socket events create observable Feishu groups through AgentLoo
       message_id: input.id, chat_id: 'oc_private', chat_type: 'p2p', create_time: String(Date.now()),
       message_type: input.type, content: JSON.stringify(input.content),
     } };
-    await dispatch(raw); await dispatch(raw);
-    assert.equal(groups.length, index + 1);
+    await dispatch(raw); await dispatch(raw); await tickWithCoordinator(loop);
+    assert.equal(groups.length, index + 2);
     const task = loop.store.taskForSource(`feishu:new:${input.id}`); assert.ok(task?.threadId);
-    assert.deepEqual(groups[index]?.data, { name: input.title, description: `agent-loop:v1:${task.id}\n`,
+    assert.deepEqual(groups[index + 1]?.data, { name: input.title, description: `agent-loop:v1:${task.id}\n`,
       owner_id: owner, user_id_list: [owner], chat_mode: 'group', chat_type: 'private', external: false });
     assert.deepEqual(task.source, { kind: 'manual', message: parseFeishuEvent(raw, owner) });
     assert.equal(loop.store.inputs(task.id).length, 1);
@@ -234,7 +235,7 @@ test('commandless socket events create observable Feishu groups through AgentLoo
   const savedBytes = await Promise.all(attachmentFiles.map(entry => readFile(join(entry.parentPath, entry.name))));
   assert.deepEqual(savedBytes.map(bytes => bytes.toString('hex')).sort(), [...resources.values()].map(bytes => bytes.toString('hex')).sort());
   const db = new Store(root, { readOnly: true });
-  try { assert.equal(db.tasks().length, cases.length); } finally { db.close(); }
+  try { assert.equal(db.tasks().length, cases.length + 1); } finally { db.close(); }
   assert.deepEqual(historyChats, []); assert.deepEqual(errors, []);
 });
 test('Feishu progress uses CardKit streaming plain text, stable message UUID and shared update sequences', async () => {

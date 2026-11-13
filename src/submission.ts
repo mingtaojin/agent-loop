@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { z } from 'zod';
 import type { Config } from './config.js';
-import { submissionSchema, submissionReceiptSchema, type Submission, type SubmissionReceipt } from './domain.js';
+import { submissionSchema, submissionAnswerSchema, submissionReceiptSchema, type Submission, type SubmissionAnswer, type SubmissionReceipt } from './domain.js';
 
 const errorCodeSchema = z.enum(['invalid_input', 'conflict', 'unavailable', 'not_ready', 'busy', 'unauthorized', 'unknown_outcome']);
 const failureSchema = z.strictObject({
@@ -24,6 +24,12 @@ export function decodeSubmissionText(bytes: Uint8Array): string {
 }
 export function parseSubmission(value: unknown, maxPromptBytes: number): Submission {
   const result = submissionSchema.safeParse(value);
+  if (!result.success) throw new SubmissionError('invalid_input', result.error.message);
+  if (Buffer.byteLength(result.data.prompt, 'utf8') > maxPromptBytes) throw new SubmissionError('invalid_input', `Prompt exceeds ${maxPromptBytes} bytes`, result.data.requestId);
+  return result.data;
+}
+export function parseSubmissionAnswer(value: unknown, maxPromptBytes: number): SubmissionAnswer {
+  const result = submissionAnswerSchema.safeParse(value);
   if (!result.success) throw new SubmissionError('invalid_input', result.error.message);
   if (Buffer.byteLength(result.data.prompt, 'utf8') > maxPromptBytes) throw new SubmissionError('invalid_input', `Prompt exceeds ${maxPromptBytes} bytes`, result.data.requestId);
   return result.data;
@@ -58,7 +64,8 @@ export class SubmissionService {
   private opening: Promise<void> | null = null;
   private closing: Promise<void> | null = null;
   constructor(private readonly dataDir: string, private readonly settings: Settings,
-    private readonly submit: (input: Submission) => Promise<SubmissionReceipt>) {
+    private readonly submit: (input: Submission) => Promise<SubmissionReceipt>,
+    private readonly answer?: (input: SubmissionAnswer) => Promise<SubmissionReceipt>) {
     this.server = createServer({ maxHeaderSize: 8192 }, (request, response) => {
       const work = this.handle(request, response);
       this.handlers.add(work);
@@ -99,15 +106,23 @@ export class SubmissionService {
     response.setHeader('content-type', 'application/json');
     response.setHeader('connection', 'close');
     try {
-      if (request.method !== 'POST' || request.url !== '/submit') throw new SubmissionError('invalid_input', 'Use POST /submit');
+      if (request.method !== 'POST' || !['/submit', '/answer'].includes(request.url ?? '')) throw new SubmissionError('invalid_input', 'Use POST /submit or /answer');
       if (!authorized(request.headers.authorization, this.token)) throw new SubmissionError('unauthorized', 'Invalid local submission capability');
       if (this.state !== 'ready') throw new SubmissionError('not_ready', 'Runtime is not accepting submissions');
       if (this.handlers.size >= this.settings.maxConcurrentRequests) throw new SubmissionError('busy', 'Too many submission requests');
       const raw: unknown = JSON.parse(decodeSubmissionText(await boundedBytes(request.iterator({ destroyOnReturn: false }), wireLimit(this.settings))));
-      const input = parseSubmission(raw, this.settings.maxPromptBytes);
-      requestId = input.requestId;
       if (this.state !== 'ready') throw new SubmissionError('not_ready', 'Runtime is stopping', requestId);
-      const receipt = await this.submit(input);
+      let receipt: SubmissionReceipt;
+      if (request.url === '/answer') {
+        const input = parseSubmissionAnswer(raw, this.settings.maxPromptBytes);
+        requestId = input.requestId;
+        if (!this.answer) throw new SubmissionError('unavailable', 'Runtime does not accept intake answers', requestId);
+        receipt = await this.answer(input);
+      } else {
+        const input = parseSubmission(raw, this.settings.maxPromptBytes);
+        requestId = input.requestId;
+        receipt = await this.submit(input);
+      }
       response.writeHead(200).end(JSON.stringify(receipt));
     } catch (error) {
       const failure = error instanceof SubmissionError ? error
@@ -154,7 +169,13 @@ async function readEndpoint(dataDir: string) {
     return endpointSchema.parse(JSON.parse(await file.readFile('utf8')));
   } finally { await file.close(); }
 }
-export async function submitPrompt(options: { dataDir: string; settings: Settings; input: Submission }): Promise<SubmissionReceipt> {
+export function submitPrompt(options: { dataDir: string; settings: Settings; input: Submission }): Promise<SubmissionReceipt> {
+  return requestReceipt({ ...options, operation: 'submit' });
+}
+export function answerSubmission(options: { dataDir: string; settings: Settings; input: SubmissionAnswer }): Promise<SubmissionReceipt> {
+  return requestReceipt({ ...options, operation: 'answer' });
+}
+async function requestReceipt(options: { dataDir: string; settings: Settings; input: Submission | SubmissionAnswer; operation: 'submit' | 'answer' }): Promise<SubmissionReceipt> {
   const { input, settings } = options;
   let endpoint: z.infer<typeof endpointSchema>;
   try { endpoint = await readEndpoint(options.dataDir); }
@@ -163,7 +184,7 @@ export async function submitPrompt(options: { dataDir: string; settings: Setting
     let sent = false;
     const fail = () => reject(new SubmissionError(sent ? 'unknown_outcome' : 'unavailable',
       sent ? 'Submission outcome is unknown; query status or retry the same request ID and prompt' : 'Runtime is unavailable', input.requestId));
-    const call = request({ socketPath: endpoint.socketPath, method: 'POST', path: '/submit', agent: false,
+    const call = request({ socketPath: endpoint.socketPath, method: 'POST', path: `/${options.operation}`, agent: false,
       headers: { authorization: `Bearer ${endpoint.token}`, 'content-type': 'application/json' } }, response => {
       void (async () => {
         const raw: unknown = JSON.parse(decodeSubmissionText(await boundedBytes(response, 65_536)));

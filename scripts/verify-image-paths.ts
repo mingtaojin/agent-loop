@@ -1,3 +1,4 @@
+import { tickWithCoordinator } from '../test/coordinated-runtime.js';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
@@ -76,7 +77,8 @@ try {
     + 'Use your image viewing tool to inspect both saved PNG files referenced in this message. '
     + 'Do not guess colors from filenames. In the final answer return FIRST_COLOR and SECOND_COLOR with the observed colors. '
     + 'Do not change files, delegate, contact external services, or read unrelated paths.', ['red-small', 'blue-large']));
-  const initial = loop.tasks()[0]; assert.ok(initial);
+  await tickWithCoordinator(loop);
+  const initial = loop.tasks().find(task => !task.sourceId.startsWith('project:')); assert.ok(initial);
   const first = await settled(initial.id);
   assert.ok(first.threadId && first.chatId);
   assert.equal(first.resources[0]?.workspace, project);
@@ -89,7 +91,8 @@ try {
   await loop.receive(message('image-followup', 'Inspect this new local image with the image viewing tool. Reply FOLLOWUP_COLOR=<observed color>. Do not change files or read unrelated paths.', ['red-small'], first.chatId));
   await settled(first.id);
   const rows = (await readFile(protocolPath, 'utf8')).trim().split('\n').filter(Boolean).map(line => recordSchema.parse(JSON.parse(line)));
-  const turns = rows.filter(row => row.direction === 'request' && ['turn/start', 'turn/steer'].includes(row.method ?? '')).map(row => inputSchema.parse(row.params));
+  const allTurns = rows.filter(row => row.direction === 'request' && ['turn/start', 'turn/steer'].includes(row.method ?? '')).map(row => inputSchema.parse(row.params));
+  const turns = allTurns.filter(turn => turn.threadId === first.threadId || turn.input.some(item => item.text.startsWith('Image attachment as data: ')));
   assert.equal(turns.length, 4, 'Selector, initial formal input, text follow-up and image follow-up');
   const references = turns.map(turn => turn.input.flatMap(item => item.text.startsWith('Image attachment as data: ')
     ? [refSchema.parse(JSON.parse(item.text.slice('Image attachment as data: '.length).split('\n')[0] ?? ''))] : []));
@@ -102,7 +105,7 @@ try {
     return parsed.success && /image/i.test(parsed.data.item.type) ? [parsed.data.item] : [];
   });
   assert.ok(imageViews.length >= 3, 'Real model must invoke its image viewing tool for the two original images and the new follow-up');
-  const inputJson = JSON.stringify(turns);
+  const inputJson = JSON.stringify(allTurns);
   assert.doesNotMatch(inputJson, /localImage|data:image|base64/);
   evidence.result = 'passed';
   evidence.threadId = first.threadId;

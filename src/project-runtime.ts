@@ -1,7 +1,9 @@
 import { createHash } from 'node:crypto';
 import { realpath } from 'node:fs/promises';
+import type { Config } from './config.js';
+import { ProjectCatalog } from './project-catalog.js';
 import { ProjectLedger, matchesProjectIssue, projectActionSchema, reasoningEffortSchema, type ReasoningEffort, type ProjectAction, type ProjectConfig } from './project.js';
-import { submissionSchema, type DiscoveredProject, type InputProvenance, type Source, type Task } from './domain.js';
+import { intakeRouteSchema, presentTaskSource, submissionSchema, type DiscoveredProject, type InputProvenance, type Source, type Task, type WorkspaceCandidate, type WorkspaceChoice } from './domain.js';
 import type { GitHubPort } from './ports.js';
 import { Store } from './store.js';
 
@@ -21,9 +23,26 @@ interface ProjectHost {
 export class ProjectRuntime {
   readonly ledger: ProjectLedger;
   private readonly lanes = new Map<string, Promise<unknown>>();
+  private readonly catalog: ProjectCatalog;
   private closing = false;
-  constructor(private readonly configs: ProjectConfig[], private readonly store: Store, private readonly host: ProjectHost) {
+  constructor(config: Config, private readonly store: Store, private readonly host: ProjectHost) {
     this.ledger = new ProjectLedger(store);
+    this.catalog = new ProjectCatalog(config, store);
+  }
+  private get configs(): ProjectConfig[] { return this.catalog.configs; }
+  projectConfig(projectId: string): ProjectConfig | null { return this.configs.find(item => item.id === projectId) ?? null; }
+  async resolveRepository(repositoryName: string): Promise<ProjectConfig | null> { return this.catalog.resolveRepository(repositoryName); }
+  async resolveSelection(choice: WorkspaceChoice, candidates: WorkspaceCandidate[]): Promise<ProjectConfig | null> {
+    return this.catalog.resolveSelection(choice, candidates);
+  }
+  async resolveTask(task: Task): Promise<ProjectConfig | null> {
+    const route = this.intakeRoute(task.id);
+    if (route) return this.catalog.byId(route.projectId);
+    return this.catalog.resolveTask(task);
+  }
+  intakeRoute(taskId: string): { projectId: string; coordinatorTaskId: string } | null {
+    const raw = this.store.meta(`project-intake-route:${taskId}`);
+    return raw === null ? null : intakeRouteSchema.parse(JSON.parse(raw));
   }
   private async serial<T>(id: string, run: () => Promise<T>): Promise<T> {
     const previous = this.lanes.get(id) ?? Promise.resolve();
@@ -50,14 +69,22 @@ export class ProjectRuntime {
     this.enqueue(state.coordinatorTaskId, key, text, { kind: 'agent', projectId, taskId, eventId: key, category });
   }
   async ensure(): Promise<void> {
-    for (const config of this.configs) await this.serial(config.id, async () => {
+    await this.catalog.refresh();
+    for (const config of this.configs) {
+      if (!this.catalog.isExplicit(config.id) && !this.ledger.project(config.id)) continue;
+      await this.initialize(config);
+    }
+  }
+  private async initialize(config: ProjectConfig): Promise<void> {
+    await this.serial(config.id, async () => {
       const existing = this.ledger.project(config.id);
       if (existing) {
         if (existing.directory !== await realpath(config.directory)) throw new Error(`Project directory identity changed: ${config.id}`);
         return;
       }
       const prompt = `Coordinate project ${config.name}. Read project status and follow Orchestrate. ${config.instructions}`;
-      const task = await this.host.makeTask(`project:${config.id}:coordinator`, prompt);
+      const sourceId = `project:${config.id}:coordinator`;
+      const task = this.store.taskForSource(sourceId) ?? await this.host.makeTask(sourceId, prompt);
       task.workspaceSelection = { kind: 'selected', temporaryThreadId: 'runtime-project', inputIds: [], choice: { kind: 'none', reason: 'Coordinator records live in the task directory' } };
       const canonical = { ...config, directory: await realpath(config.directory) };
       this.store.transaction(() => {
@@ -69,26 +96,97 @@ export class ProjectRuntime {
       });
     });
   }
+  async acceptIntake(taskId: string, projectId: string, material: string): Promise<void> {
+    const intake = this.store.task(taskId);
+    const config = intake.source.kind === 'github'
+      ? await this.catalog.bindRepository(intake.source.issue.repository, projectId) : await this.catalog.byId(projectId);
+    if (!config) throw new Error('Project configuration unavailable');
+    await this.initialize(config);
+    await this.serial(projectId, async () => this.store.transaction(() => {
+      const task = this.store.task(taskId);
+      if (task.purpose !== 'intake' || task.threadId || this.ledger.membership(taskId)) throw new Error('Task is not an unpromoted intake');
+      const state = this.ledger.project(projectId);
+      if (!state) throw new Error('Project unavailable');
+      const route = { projectId, coordinatorTaskId: state.coordinatorTaskId };
+      const previous = this.intakeRoute(taskId);
+      if (previous && (previous.projectId !== projectId || previous.coordinatorTaskId !== route.coordinatorTaskId)) throw new Error('Intake project route is immutable');
+      let revision: string | null = null;
+      if (task.source.kind === 'github' && (state.issues.some(issue => issue.id === task.sourceId) || matchesProjectIssue(task.source.issue, config))) {
+        revision = this.ledger.issue(projectId, task.source.issue).eventId;
+        this.store.saveSource(task.source.issue, `project:${projectId}`);
+      }
+      const inputs = this.store.inputs(taskId).map(input => ({ id: input.id, provenance: input.provenance }));
+      const key = `intake:${taskId}:${hash(JSON.stringify([inputs, revision]))}`;
+      this.store.setMeta(`project-intake-route:${taskId}`, JSON.stringify(route));
+      this.enqueue(state.coordinatorTaskId, key, `Intake request ${taskId}. Assess this request and existing work before dispatching.\n${material}`, {
+        kind: 'agent', projectId, taskId, eventId: key, category: 'intake_request',
+      });
+      for (const input of this.store.inputs(taskId)) {
+        if (input.route === 'workspace-selection' && input.status !== 'failed') this.store.markSelectionHandled(input.id, taskId);
+      }
+    }));
+  }
+  async adopt(taskId: string, projectId: string): Promise<void> {
+    const config = await this.catalog.byId(projectId);
+    if (!config) throw new Error('Project configuration unavailable');
+    const original = this.store.task(taskId);
+    const source = original.source;
+    if (source.kind === 'github' && config.repositories.some(repository => repository.name.toLowerCase() === source.issue.repository.toLowerCase())) {
+      await this.catalog.bindRepository(source.issue.repository, config.id);
+    }
+    await this.initialize(config);
+    await this.serial(projectId, async () => this.store.transaction(() => {
+      const task = this.store.task(taskId);
+      const member = this.ledger.membership(taskId);
+      if (member) {
+        if (member.projectId !== projectId) throw new Error('Task already belongs to another project');
+        return;
+      }
+      const route = this.intakeRoute(taskId);
+      if (route && route.projectId !== projectId) throw new Error('Intake project route is immutable');
+      if (task.purpose === 'intake' || !task.threadId) throw new Error('Only existing formal execution can be adopted');
+      const state = this.ledger.project(projectId);
+      if (!state) throw new Error('Project unavailable');
+      let issueId: string | undefined;
+      if (task.source.kind === 'github' && (state.issues.some(issue => issue.id === task.sourceId) || matchesProjectIssue(task.source.issue, config))) {
+        this.ledger.issue(projectId, task.source.issue);
+        issueId = task.source.issue.id;
+      }
+      this.ledger.addMember(projectId, taskId, 'worker', issueId);
+      task.purpose = 'execution';
+      this.store.saveTask(task);
+      this.event(projectId, `existing-work:${taskId}`, `Existing work ${taskId} was adopted in place. Preserve its group, Thread, requests, resources, state and model.\n${JSON.stringify(task.source)}`, taskId, 'existing_work');
+    }));
+  }
   ownsRepository(name: string): boolean {
     return this.configs.some(project => project.repositories.some(repository => repository.name.toLowerCase() === name.toLowerCase()));
   }
   async collect(source: Source, existing: Task | null): Promise<void> {
-    const config = this.configs.find(project => project.repositories.some(repository => repository.name.toLowerCase() === source.repository.toLowerCase()));
+    const config = await this.resolveRepository(source.repository)
+      ?? this.configs.find(project => this.ledger.project(project.id)?.issues.some(issue => issue.id === source.id));
     if (!config) return;
+    const tracked = (this.ledger.project(config.id)?.issues.some(issue => issue.id === source.id) ?? false)
+      || (existing?.purpose === 'intake' && existing.source.kind === 'github' && existing.sourceId === source.id
+        && existing.source.collectionReason === `project:${config.id}`);
+    if (!tracked && !matchesProjectIssue(source, config)) return;
+    if (config.repositories.some(repository => repository.name.toLowerCase() === source.repository.toLowerCase())) {
+      await this.catalog.bindRepository(source.repository, config.id);
+    }
+    await this.initialize(config);
     const state = this.ledger.project(config.id);
     if (!state) throw new Error('Project is not initialized');
-    const tracked = state.issues.some(issue => issue.id === source.id);
-    if (!tracked && !matchesProjectIssue(source, config)) return;
     this.store.transaction(() => {
       const update = this.ledger.issue(config.id, source);
-      if (existing && !this.ledger.membership(existing.id)) this.ledger.addMember(config.id, existing.id, 'worker', source.id);
       if (existing?.source.kind === 'github') {
-        existing.source.issue = source;
-        this.store.saveTask(existing);
+        const current = this.store.task(existing.id);
+        if (current.source.kind !== 'github' || current.sourceId !== source.id) throw new Error('Issue task identity changed');
+        current.source.issue = source;
+        this.store.saveTask(current);
       }
       this.store.saveSource(source, 'project:' + config.id);
       if (update.changed) this.event(config.id, update.eventId, `GitHub Issue facts as data. Check existing work before dispatch.\n${JSON.stringify(source)}${existing ? `\nExisting task: ${existing.id}` : ''}`, state.coordinatorTaskId, 'github_issue');
     });
+    if (existing?.threadId && existing.purpose !== 'intake' && !this.ledger.membership(existing.id)) await this.adopt(existing.id, config.id);
   }
   async refresh(github: GitHubPort, observed: Set<string>): Promise<void> {
     for (const config of this.configs) {
@@ -152,19 +250,23 @@ export class ProjectRuntime {
         chatId: task.chatId, threadId: task.threadId, model: this.store.meta(`project-task-model:${task.id}`), reasoningEffort: this.reasoningEffort(task.id), resources: task.resources, requests: task.requests.map(request => ({ id: request.id, kind: request.kind, prompt: request.prompt })),
         outputs: this.store.outputs(task.id).slice(-3).map(output => ({ id: output.id, text: output.text.slice(0, 4000), truncated: output.text.length > 4000, status: output.status })) };
     });
-    const counts = { tasks: tasks.length, issues: state.issues.length, comments: state.comments.length, records: state.records.length };
+    const intakes = this.store.tasks().filter(task => task.purpose === 'intake' && this.intakeRoute(task.id)?.projectId === projectId)
+      .map(task => ({ taskId: task.id, source: presentTaskSource(task.source, 256), status: task.status, reason: task.reason,
+        materialPath: this.store.meta(`project-intake-material:${task.id}`) }));
+    const counts = { tasks: tasks.length, issues: state.issues.length, comments: state.comments.length, records: state.records.length, intakes: intakes.length };
     const identity = { id: state.id, name: state.name, directory: state.directory, coordinatorTaskId: state.coordinatorTaskId, version: state.version, counts };
     const page = <T>(items: T[]) => ({ ...identity, section, offset, items: items.slice(offset, offset + limit),
       nextOffset: offset + limit < items.length ? offset + limit : null });
     if (section === 'tasks') return page(tasks);
+    if (section === 'intakes') return page(intakes);
     if (section === 'issues') return page(state.issues);
     if (section === 'comments') return page(state.comments);
     if (section === 'records') return page(state.records);
-    return { ...identity, members: state.members.slice(offset, offset + limit), tasks: tasks.slice(offset, offset + limit),
+    return { ...identity, members: state.members.slice(offset, offset + limit), tasks: tasks.slice(offset, offset + limit), intakes: intakes.slice(offset, offset + limit),
       issues: state.issues.slice(offset, offset + limit).map(issue => ({ id: issue.id, repository: issue.repository, number: issue.number, title: issue.title, state: issue.state, url: issue.url })),
       records: [...new Map(state.records.map(record => [record.key, record])).values()].slice(-limit).map(record => ({ ...record, text: record.text.slice(0, 2000), truncated: record.text.length > 2000 })),
-      nextOffset: offset + limit < Math.max(tasks.length, state.issues.length) ? offset + limit : null,
-      history: 'Use section issues, comments, records or tasks with offset and limit to read all durable history.' };
+      nextOffset: offset + limit < Math.max(tasks.length, state.issues.length, intakes.length) ? offset + limit : null,
+      history: 'Use section issues, comments, records, tasks or intakes with offset and limit. Intake materialPath preserves the complete request.' };
   }
   private async perform(callerId: string, member: NonNullable<ReturnType<ProjectLedger['membership']>>, action: Exclude<ProjectAction, { action: 'status' }>): Promise<unknown> {
     const state = this.ledger.project(member.projectId);
@@ -173,6 +275,41 @@ export class ProjectRuntime {
       case 'dispatch': {
         if (member.role !== 'coordinator') throw new Error('Only the coordinator can dispatch workers');
         if (action.issueId && !state.issues.some(issue => issue.id === action.issueId)) throw new Error('Issue is not owned by this project');
+        const issueIntake = action.issueId ? this.store.taskForSource(action.issueId) : null;
+        const intakeTaskId = action.intakeTaskId ?? (issueIntake?.purpose === 'intake' ? issueIntake.id : undefined);
+        if (intakeTaskId) {
+          const task = this.store.task(intakeTaskId);
+          const route = this.intakeRoute(task.id);
+          if (!route || route.projectId !== state.id || route.coordinatorTaskId !== callerId) throw new Error('Intake is not routed to this coordinator');
+          const saved = this.ledger.membership(task.id);
+          const promotionKey = `project-intake-promotion:${task.id}`;
+          const promotion = JSON.stringify([callerId, action.requestId]);
+          if (saved) {
+            if (saved.projectId === state.id && this.store.meta(promotionKey) === promotion) return { taskId: task.id };
+            throw new Error('Intake has already been promoted or bound to another project');
+          }
+          if (task.purpose !== 'intake' || task.threadId) throw new Error('Task is not an unpromoted intake');
+          if (task.status === 'paused') throw new Error('An operator-paused request must be resumed before delegation');
+          const project: DiscoveredProject = { kind: 'project', id: `coordinated:${state.id}`, name: state.name, entryPath: state.directory, canonicalPath: state.directory };
+          if (!task.resources.length) task.workspaceSelection = { kind: 'selected', temporaryThreadId: 'runtime-delegation',
+            inputIds: task.workspaceSelection.kind === 'selected' ? task.workspaceSelection.inputIds : [],
+            choice: { kind: 'project', projectId: project.id, reason: 'Project-scoped delegation', project } };
+          this.store.transaction(() => {
+            task.purpose = 'execution';
+            task.status = 'pending'; task.executionStatus = 'unbound'; task.reason = null;
+            task.recovery = { attempts: 0, nextAttemptAt: null, lastError: null, interruptedTurnId: null, lastUserInputSeq: null };
+            this.store.saveTask(task);
+            const issueId = action.issueId ?? (task.source.kind === 'github' && state.issues.some(issue => issue.id === task.sourceId) ? task.sourceId : undefined);
+            this.ledger.addMember(state.id, task.id, action.role, issueId);
+            this.store.setMeta(promotionKey, promotion);
+            this.store.setMeta(`project-delegation:${task.id}`, action.prompt);
+            const config = this.config(callerId);
+            const model = config?.models[action.role], effort = config?.reasoningEfforts[action.role];
+            if (model) this.store.setMeta(`project-task-model:${task.id}`, model);
+            if (effort) this.store.setMeta(`project-task-effort:${task.id}`, effort);
+          });
+          return { taskId: task.id };
+        }
         const sourceId = `project:${member.projectId}:dispatch:${callerId}:${action.requestId}`;
         const existing = this.store.taskForSource(sourceId);
         if (existing) {

@@ -8,9 +8,11 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { test, type TestContext } from 'node:test';
 import { configSchema } from '../src/config.js';
 import { AgentLoop } from '../src/loop.js';
-import { criteriaSchema, type IncomingMessage, type WorkspaceChoice } from '../src/domain.js';
+import { criteriaSchema, taskSchema, type IncomingMessage, type WorkspaceChoice } from '../src/domain.js';
 import { WorkspaceProvider } from '../src/workspace.js';
+import { discoverProjects } from '../src/project-discovery.js';
 import { CodexFake, FeishuFake, GitHubFake, issue } from './fakes.js';
+import { delegateIntake } from './coordinated-fixture.js';
 
 function gate() {
   let resolve = () => {};
@@ -38,10 +40,27 @@ async function fixture(t: TestContext, discovery = false) {
   let loop = new AgentLoop(config, ports);
   t.after(async () => { await loop.close(); await rm(root, { recursive: true, force: true }); });
   const message = (id: string, text: string, chatId = 'private', chatType: 'p2p' | 'group' = 'p2p'): IncomingMessage => ({ id, text, chatId, chatType, senderId: 'owner', attachments: [], createdAt: Date.now() });
-  const task = () => { const value = loop.tasks()[0]; assert.ok(value); return value; };
-  return { root, project, other, config, codex, feishu, github, ports, task, message,
+  const requests = () => loop.tasks().filter(task => !task.sourceId.startsWith('project:'));
+  const task = () => { const value = requests()[0]; assert.ok(value); return value; };
+  const starts = () => codex.starts.filter(input => requests().some(task => task.threadId === input.threadId));
+  const created = () => codex.created.filter(input => !loop.tasks().some(task => loop.projects.ledger.membership(task.id)?.role === 'coordinator' && input.cwd === task.contextDirectory));
+  return { root, project, other, config, codex, feishu, github, ports, task, requests, starts, created, message,
     get loop() { return loop; },
-    async manual() { await loop.receive(message('initial', 'Investigate the original task')); return task(); },
+    async manual() { await loop.receive(message('initial', 'Investigate the original task'));
+      if (loop.projects.intakeRoute(task().id)) await delegateIntake(loop, task().id); return task(); },
+    async delegate() { if (task().purpose === 'intake') return delegateIntake(loop, task().id); return task(); },
+    async legacy() {
+      const repository = config.repositories[0]; assert.ok(repository && 'path' in repository);
+      const workspace = await realpath(project);
+      const id = 'legacy-workspace', chatId = await feishu.ensureGroup({ taskId: id, title: 'Saved task', sourceUrl: '' });
+      const threadId = await codex.createThread({ cwd: workspace, instructions: 'Saved legacy instructions' });
+      const turnId = await codex.startTurn({ threadId, deliveryId: 'saved-initial', input: [{ kind: 'text', text: 'Saved investigation' }] });
+      const saved = taskSchema.parse({ id, sourceId: 'feishu:new:initial', source: { kind: 'manual', message: message('initial', 'Investigate the original task') },
+        contextDirectory: join(config.dataDir, 'tasks', id), resources: [{ id: 'saved-resource', kind: 'project-directory', repository, workspace }],
+        workspaceSelection: { kind: 'selected', temporaryThreadId: 'saved-selection', inputIds: [], choice: { kind: 'repository', repositoryName: repository.name, repository, reason: 'Saved project' } },
+        status: 'running', reason: null, prompt: 'Saved guidance', promptHash: 'hash', skillPath: null, chatId, threadId, turnId, requests: [], lastHandledTurnId: null, createdAt: Date.now(), updatedAt: Date.now() });
+      assert.equal(saved.purpose, 'legacy'); loop.store.saveTask(saved); await loop.recover(); return task();
+    },
     async restart() { await loop.close(); loop = new AgentLoop(config, ports); await loop.recover(); },
   };
 }
@@ -68,12 +87,12 @@ test('discovery selects only first-level projects without Git and starts the for
   };
   const task = await f.manual();
   assert.equal(task.status, 'running');
-  assert.equal(f.codex.created[0]?.cwd, await realpath(project));
+  assert.equal(f.created()[0]?.cwd, await realpath(project));
   const resource = task.resources[0]; assert.ok(resource && resource.kind === 'project');
-  assert.equal(resource.project.entryPath, project);
+  assert.equal(resource.workspace, await realpath(project));
   assert.equal('repository' in resource, false);
   assert.equal(await readFile(join(project, 'local-change.txt'), 'utf8'), 'preserve this work');
-  assert.doesNotMatch(JSON.stringify(f.codex.created) + JSON.stringify(f.codex.starts), /PRIVATE_SELECTION_REASON_ONLY/);
+  assert.doesNotMatch(JSON.stringify(f.created()) + JSON.stringify(f.starts()), /PRIVATE_SELECTION_REASON_ONLY/);
 });
 
 test('fresh discovery reflects directory changes while established Threads survive an unavailable new root', async t => {
@@ -95,8 +114,8 @@ test('fresh discovery reflects directory changes while established Threads survi
   assert.ok(f.config.engineering);
   f.config.engineering.projectRoot = join(f.root, 'missing-new-root');
   await f.restart();
-  assert.equal(f.loop.tasks().find(task => task.id === first.id)?.threadId, first.threadId);
-  assert.ok(f.loop.tasks().every(task => task.status !== 'failed'));
+  assert.equal(f.requests().find(task => task.id === first.id)?.threadId, first.threadId);
+  assert.ok(f.requests().every(task => task.status !== 'failed'));
   assert.equal(seen.length, 3);
 });
 
@@ -114,9 +133,10 @@ test('source-only GitHub collection uses discovered projects without expanding c
   };
   await f.loop.collect(); await f.loop.tick();
   assert.deepEqual(listed, ['example/project']);
-  assert.equal(f.loop.tasks().length, 1);
+  assert.equal(f.requests().length, 1);
   assert.equal(f.task().sourceId, 'issue-1');
-  assert.equal(f.codex.created[0]?.cwd, await realpath(project));
+  assert.equal(f.task().threadId, null); await f.delegate();
+  assert.equal(f.created()[0]?.cwd, await realpath(project));
 });
 
 test('a discovery read failure is reported before any selector or formal Thread can treat it as empty', async t => {
@@ -124,7 +144,7 @@ test('a discovery read failure is reported before any selector or formal Thread 
   await rm(join(f.root, 'projects'), { recursive: true });
   await f.manual();
   assert.equal(f.codex.selections.length, 0);
-  assert.equal(f.codex.created.length, 0);
+  assert.equal(f.created().length, 0);
   assert.ok(f.task().reason);
 });
 
@@ -137,13 +157,13 @@ test('discovery rejects invented identity and a symlink retargeted after the can
     return { temporaryThreadId: 'retarget-selector', choice: { kind: 'project', projectId: candidate.id, reason: 'fits' } };
   };
   await f.manual();
-  assert.equal(f.codex.created.length, 0);
-  assert.equal(f.task().workspaceSelection.kind, 'selected');
-  assert.equal(f.task().status, 'failed');
+  assert.equal(f.created().length, 0);
+  assert.equal(f.task().purpose, 'intake');
+  assert.equal(f.task().threadId, null); assert.ok(f.task().reason);
   f.codex.selectWorkspace = async () => ({ temporaryThreadId: 'invented', choice: { kind: 'project', projectId: 'invented-id', reason: 'guess' } });
   await f.loop.receive(f.message('invented-task', 'Pick a project'));
-  assert.equal(f.codex.created.length, 0);
-  assert.ok(f.loop.tasks().every(task => task.resources.length === 0));
+  assert.equal(f.created().length, 0);
+  assert.ok(f.requests().every(task => task.resources.length === 0));
 });
 
 test('same-name projects under changed roots never rebind saved resources or established Threads', async t => {
@@ -162,12 +182,14 @@ test('same-name projects under changed roots never rebind saved resources or est
   assert.deepEqual(f.task().resources, original.resources);
   assert.deepEqual(await f.loop.ensureWorkspace(original.id, { projectId: resource.project.id }), resource);
   await f.loop.receive(f.message('new-root-task', 'Use the same named project in the new root'));
-  const newTask = f.loop.tasks().find(task => task.id !== original.id); assert.ok(newTask);
+  const intake = f.requests().find(task => task.id !== original.id); assert.ok(intake);
+  const newTask = await delegateIntake(f.loop, intake.id);
   const newResource = newTask.resources[0]; assert.ok(newResource && newResource.kind === 'project');
-  assert.equal(f.codex.created[1]?.cwd, await realpath(secondPath));
+  assert.equal(f.created()[1]?.cwd, await realpath(secondPath));
   assert.notEqual(newResource.project.id, resource.project.id);
   assert.notEqual(newResource.id, resource.id);
-  const additional = await f.loop.ensureWorkspace(original.id, { projectId: newResource.project.id });
+  const [candidate] = await discoverProjects(secondRoot); assert.ok(candidate);
+  const additional = await f.loop.ensureWorkspace(original.id, { projectId: candidate.id });
   assert.equal(additional.workspace, await realpath(secondPath));
   assert.deepEqual(f.task().resources.find(item => item.id === resource.id), resource);
   await rm(firstPath, { recursive: true }); await f.restart();
@@ -190,8 +212,8 @@ test('dynamic project acquisition and retained shell bridge preserve original re
   };
   const task = await f.manual(); assert.ok(task.threadId && task.turnId);
   const original = structuredClone(task.resources);
-  assert.match(f.codex.created[0]?.instructions ?? '', new RegExp(extraId));
-  assert.match(f.codex.created[0]?.instructions ?? '', /ensure_workspace.*projectId/);
+  assert.match(f.created()[0]?.instructions ?? '', new RegExp(extraId));
+  assert.match(f.created()[0]?.instructions ?? '', /ensure_workspace.*projectId/);
   const nativeRequest = { id: 'history-request', threadId: task.threadId, turnId: task.turnId, kind: 'question' as const,
     prompt: 'Preserved native question', method: 'item/tool/requestUserInput', payload: {}, isBlocking: true, connectionEpoch: 'epoch' };
   f.codex.snapshot(task.threadId).requests.push(nativeRequest);
@@ -211,7 +233,7 @@ test('dynamic project acquisition and retained shell bridge preserve original re
   assert.equal(f.task().resources.length, 3);
   assert.equal(f.task().threadId, task.threadId);
   assert.deepEqual(f.task().requests, [nativeRequest]);
-  assert.doesNotMatch(JSON.stringify(f.codex.created) + JSON.stringify(f.codex.starts), /PRIVATE_SELECTION_REASON_ONLY/);
+  assert.doesNotMatch(JSON.stringify(f.created()) + JSON.stringify(f.starts()), /PRIVATE_SELECTION_REASON_ONLY/);
   await f.restart();
   assert.deepEqual(f.task().resources.filter(resource => original.some(saved => saved.id === resource.id)), original);
   assert.deepEqual(f.task().requests, [nativeRequest]);
@@ -219,18 +241,18 @@ test('dynamic project acquisition and retained shell bridge preserve original re
 
 test('saved legacy selections and resources restore after mappings are removed and a new discovery root is unavailable', async t => {
   const f = await fixture(t); f.codex.selectionResults.push(selected());
-  const task = await f.manual(); const original = structuredClone(task.resources);
+  const task = await f.legacy(); const original = structuredClone(task.resources);
   f.config.repositories = [];
   assert.ok(f.config.engineering); f.config.engineering.projectRoot = join(f.root, 'missing-root');
   await f.restart();
   assert.equal(f.task().threadId, task.threadId);
-  assert.notEqual(f.task().status, 'failed');
+  assert.notEqual(f.task().status, 'failed', f.task().reason ?? 'Saved legacy association must restore');
   assert.deepEqual(await f.loop.ensureWorkspace(task.id, 'EXAMPLE/PROJECT'), original[0]);
   assert.deepEqual(f.task().resources, original);
   const preThread = f.task(); preThread.threadId = null; preThread.turnId = null; preThread.status = 'pending';
   f.loop.store.saveTask(preThread); await f.loop.tick();
   assert.notEqual(f.task().status, 'failed');
-  assert.equal(f.codex.selections.length, 1);
+  assert.equal(f.codex.selections.length, 0);
   assert.deepEqual(f.task().resources, original);
 });
 
@@ -245,7 +267,7 @@ test('legacy local mappings do not augment discovery candidates or allow a repos
   };
   await f.manual();
   assert.deepEqual(names, ['only-discovered']);
-  assert.equal(f.codex.created.length, 0); assert.deepEqual(f.task().resources, []);
+  assert.equal(f.created().length, 0); assert.deepEqual(f.task().resources, []);
 });
 
 test('a saved selection resumes its original project snapshot before resource preparation after a root change', async t => {
@@ -261,7 +283,7 @@ test('a saved selection resumes its original project snapshot before resource pr
   assert.ok(f.config.engineering); f.config.engineering.projectRoot = join(f.root, 'unavailable-new-root');
   f.ports.workspace.ensure = ensure;
   await f.loop.control(task.id, 'resume');
-  assert.equal(f.codex.created[0]?.cwd, await realpath(project));
+  assert.equal(f.created()[0]?.cwd, await realpath(project));
   assert.equal(f.task().status, 'running');
 });
 
@@ -273,7 +295,7 @@ test('legacy selection snapshot prepares its saved directory when config mapping
   assert.equal(task.workspaceSelection.kind, 'selected'); assert.deepEqual(task.resources, []);
   f.config.repositories = []; f.ports.workspace.ensure = ensure;
   await f.loop.control(task.id, 'resume');
-  assert.equal(f.codex.created[0]?.cwd, await realpath(f.project));
+  assert.equal(f.created()[0]?.cwd, await realpath(f.project));
   assert.equal(f.task().status, 'running');
   assert.equal(f.codex.selections.length, 1);
 });
@@ -282,98 +304,97 @@ test('temporary workspace choice sets the formal cwd without copying selection h
   const f = await fixture(t); f.codex.selectionResults.push(selected());
   const task = await f.manual();
   assert.equal(f.codex.selections.length, 1);
-  assert.equal(f.codex.created.length, 1);
-  assert.equal(f.codex.created[0]?.cwd, await realpath(f.project));
+  assert.equal(f.created().length, 1);
+  assert.equal(f.created()[0]?.cwd, await realpath(f.project));
   assert.equal(task.resources[0]?.workspace, await realpath(f.project));
   assert.notEqual(task.threadId, task.workspaceSelection.kind === 'selected' ? task.workspaceSelection.temporaryThreadId : null);
-  assert.match(JSON.stringify(f.codex.starts[0]?.input), /Investigate the original task/);
+  assert.match(JSON.stringify(f.starts()[0]?.input), /Investigate the original task/);
   assert.doesNotMatch(JSON.stringify(f.codex.selections[0]?.input), /Formal engineering policy/);
-  assert.doesNotMatch(JSON.stringify(f.codex.created) + JSON.stringify(f.codex.starts), /PRIVATE_SELECTION_REASON_ONLY|workspace-capabilities|workspace-client/);
+  assert.doesNotMatch(JSON.stringify(f.created()) + JSON.stringify(f.starts()), /PRIVATE_SELECTION_REASON_ONLY|workspace-client/);
   assert.equal(f.feishu.sent.some(output => output.text.includes('PRIVATE_SELECTION_REASON_ONLY')), false);
   assert.ok(task.threadId && task.chatId);
   f.codex.complete(task.threadId, 'Completed the investigation'); await f.loop.tick();
   await f.loop.receive(f.message('followup', 'Continue the original matter', task.chatId, 'group'));
   assert.equal(f.codex.selections.length, 1);
-  assert.equal(f.codex.starts.at(-1)?.threadId, task.threadId);
+  assert.equal(f.starts().at(-1)?.threadId, task.threadId);
 });
 
-test('a discussion can choose no engineering directory and retain its formal conversation after restart', async t => {
+test('a none selection remains project clarification without a formal conversation across restart', async t => {
   const f = await fixture(t); f.codex.selectionResults.push({ kind: 'none', reason: 'This is a discussion' });
-  const task = await f.manual(); assert.ok(task.threadId);
-  assert.equal(f.codex.created[0]?.cwd, task.contextDirectory);
-  assert.deepEqual(task.resources, []);
-  f.codex.complete(task.threadId, 'Discussion answer'); await f.loop.tick();
-  const stored = f.task(); stored.workspaceSelection = { kind: 'pending' }; f.loop.store.saveTask(stored);
-  f.codex.selectionError = new Error('An established conversation must not reselect');
-  await f.restart();
-  assert.equal(f.codex.selections.length, 1);
-  assert.equal(f.task().threadId, task.threadId);
-  assert.equal(f.task().status, 'idle');
+  const task = await f.manual(); assert.equal(task.purpose, 'intake'); assert.equal(task.threadId, null); assert.equal(task.chatId, null);
+  assert.deepEqual(task.resources, []); assert.equal(f.feishu.groups.size, 0);
+  assert.match(task.reason ?? '', /项目/);
+  await f.restart(); await f.loop.tick();
+  assert.equal(f.codex.selections.length, 1); assert.equal(f.created().length, 0);
+  assert.equal(f.task().id, task.id); assert.equal(f.task().threadId, null);
+
 });
 
 test('workspace clarification preserves the user scope in the first formal input across restart', async t => {
   const f = await fixture(t); const question = 'Which project should this task use?';
   f.codex.selectionResults.push({ kind: 'question', question });
-  const task = await f.manual(); assert.ok(task.chatId);
+  const task = await f.manual(); assert.equal(task.chatId, null);
   assert.equal(task.threadId, null);
-  assert.equal(f.codex.created.length, 0);
+  assert.equal(f.created().length, 0);
   await f.loop.tick(); await f.loop.tick(); await f.restart(); await f.loop.tick();
   assert.equal(f.codex.selections.length, 1);
   assert.equal(f.feishu.sent.filter(output => output.text.includes(question)).length, 1);
   f.codex.selectionResults.push(selected());
-  const answer = f.message('directory-answer', 'Use PROJECT_SELECTION_ANSWER_7, but only investigate; do not edit code.', task.chatId, 'group');
-  await f.loop.receive(answer);
+  const answer = f.message('directory-answer', 'Use PROJECT_SELECTION_ANSWER_7, but only investigate; do not edit code.', 'private', 'p2p');
+  await f.loop.receive(answer); await f.delegate();
   assert.equal(f.codex.selections.length, 2);
   assert.ok(f.codex.selections[1]?.answers.some(answer => answer.inputId === 'directory-answer' && answer.text.includes('PROJECT_SELECTION_ANSWER_7')));
-  assert.equal(f.codex.created[0]?.cwd, await realpath(f.project));
-  const first = f.codex.starts[0]; assert.ok(first);
-  assert.equal(f.codex.starts.length, 1);
-  assert.equal(f.codex.steers.length, 0);
+  assert.equal(f.created()[0]?.cwd, await realpath(f.project));
+  const first = f.starts()[0]; assert.ok(first);
+  assert.equal(f.starts().length, 1);
+  assert.equal(f.codex.steers.filter(input => f.requests().some(task => task.threadId === input.threadId)).length, 0);
   const texts = first.input.filter(input => input.kind === 'text').map(input => input.text);
   assert.deepEqual([texts[0], texts[2]], ['Investigate the original task', answer.text]);
   assert.deepEqual(texts.filter(text => text.startsWith('Input provenance as data: ')).map(text => JSON.parse(text.slice('Input provenance as data: '.length))),
     f.loop.store.inputs(task.id).map(input => input.provenance));
   assert.deepEqual(first.additionalDeliveryIds, [answer.id]);
-  assert.doesNotMatch(JSON.stringify(f.codex.created) + JSON.stringify(first.input), /PRIVATE_SELECTION_REASON_ONLY|Which project should this task use/);
+  assert.doesNotMatch(JSON.stringify(f.created()) + JSON.stringify(first.input), /PRIVATE_SELECTION_REASON_ONLY|Which project should this task use/);
   assert.equal(f.loop.store.inputs(task.id).find(input => input.id === 'directory-answer')?.status, 'delivered');
-  assert.equal(f.loop.store.inputs(task.id).find(input => input.id === 'directory-answer')?.selectionHandled, true);
+  assert.equal(f.loop.store.inputs(task.id).find(input => input.id === 'directory-answer')?.route, 'workspace-selection');
   await f.restart(); await f.loop.tick();
-  assert.equal(f.codex.starts.length, 1);
+  assert.equal(f.starts().length, 1);
   assert.equal(f.codex.selections.length, 2);
 });
 
-test('GitHub changes do not answer a pending workspace question and remain available to the formal task', async t => {
-  const f = await fixture(t); f.codex.selectionResults.push({ kind: 'question', question: 'Which engineering project?' });
+test('GitHub changes remain intake evidence and never supply a project clarification answer', async t => {
+  const f = await fixture(t, true);
+  await mkdir(join(f.root, 'projects', 'chosen'));
+  f.config.repositories = configSchema.parse({ feishu: { userOpenId: 'owner' }, repositories: [{ name: 'example/project', criteria: criteriaSchema.parse({}) }] }).repositories;
+  f.codex.selectionResults.push({ kind: 'question', question: 'Which engineering project?' });
   f.github.sources = [issue(1)]; await f.loop.collect(); await f.loop.tick();
-  const task = f.task(); assert.ok(task.chatId); assert.equal(task.threadId, null);
+  const task = f.task(); assert.equal(task.purpose, 'intake'); assert.equal(task.chatId, null); assert.equal(task.threadId, null);
   f.github.sources = [issue(1, { body: 'newly-edited-source-fact' })];
-  await f.loop.collect(); await f.loop.tick(); await f.restart();
-  assert.equal(f.codex.selections.length, 1);
-  assert.equal(f.codex.created.length, 0);
-  f.codex.selectionResults.push(selected());
-  await f.loop.receive(f.message('choose-project', 'Use the configured project', task.chatId, 'group'));
-  assert.deepEqual(f.codex.selections[1]?.answers.map(answer => answer.inputId), ['choose-project']);
-  assert.match(JSON.stringify(f.codex.starts) + JSON.stringify(f.codex.steers), /newly-edited-source-fact/);
+  await f.loop.collect(); await f.loop.tick();
+  assert.equal(f.created().length, 0);
+  assert.ok(f.codex.selections.every(input => input.answers.length === 0));
+  assert.ok(f.requests().every(task => task.threadId === null));
+  assert.equal(f.task().source.kind, 'github');
+  assert.match(JSON.stringify(f.task().source), /newly-edited-source-fact/);
 });
 
 test('uncertain formal thread creation cannot replay selection or create another formal thread on restart', async t => {
-  const f = await fixture(t); f.codex.selectionResults.push(selected()); f.codex.loseCreateAck = true;
-  await f.manual();
+  const f = await fixture(t); f.codex.selectionResults.push(selected());
+  await f.loop.receive(f.message('initial', 'Investigate the original task'));
+  assert.equal(f.task().threadId, null); assert.equal(f.created().length, 0);
+  f.codex.loseCreateAck = true; await f.delegate();
   assert.equal(f.task().workspaceSelection.kind, 'selected');
-  assert.equal(f.codex.selections.length, 1);
-  assert.equal(f.codex.created.length, 1);
+  assert.equal(f.codex.selections.length, 1); assert.equal(f.created().length, 1);
   await f.restart(); await f.loop.tick();
-  assert.equal(f.codex.selections.length, 1);
-  assert.equal(f.codex.created.length, 1);
-  assert.equal(f.task().threadId, null);
-  assert.equal(f.task().status, 'failed');
+  assert.equal(f.codex.selections.length, 1); assert.equal(f.created().length, 1);
+  assert.equal(f.task().threadId, null); assert.equal(f.task().status, 'failed');
+
 });
 
 test('an unconfigured model choice never becomes an engineering resource or formal thread', async t => {
   const f = await fixture(t); f.codex.selectionResults.push(selected('outside/unconfigured'));
   await f.manual();
-  assert.equal(f.codex.created.length, 0);
-  assert.equal(f.codex.starts.length, 0);
+  assert.equal(f.created().length, 0);
+  assert.equal(f.starts().length, 0);
   assert.deepEqual(f.task().resources, []);
   assert.ok(f.task().reason);
 });
@@ -384,7 +405,7 @@ test('temporary selector failures exhaust the configured recovery limit before a
   for (let attempt = 0; attempt < 4; attempt++) { await delay(5); await f.loop.tick(); }
   assert.equal(f.codex.selections.length, 3);
   assert.equal(f.task().status, 'failed');
-  assert.equal(f.codex.created.length, 0);
+  assert.equal(f.created().length, 0);
   await f.loop.tick(); assert.equal(f.codex.selections.length, 3);
 });
 
@@ -393,19 +414,21 @@ test('original attachments keep their identity and bytes through workspace clari
   f.feishu.resources.set('log-key', bytes);
   f.codex.selectionResults.push({ kind: 'question', question: 'Which project contains this log producer?' });
   await f.loop.receive({ ...f.message('initial-log', 'Investigate this log'), attachments: [{ key: 'log-key', kind: 'file', name: 'evidence.log' }] });
-  const task = f.task(); assert.ok(task.chatId);
+  const task = f.task(); assert.equal(task.chatId, null);
   f.codex.selectionResults.push(selected());
-  await f.loop.receive(f.message('attachment-project-answer', 'Use the configured engineering project', task.chatId, 'group'));
+  await f.loop.receive(f.message('attachment-project-answer', 'Use the configured engineering project', 'private', 'p2p')); await f.delegate();
   assert.equal(f.feishu.downloads.length, 1);
   assert.equal(f.feishu.downloads[0]?.messageId, 'initial-log');
   const download = f.feishu.downloads[0]; assert.ok(download);
   const path = download.destination.replace(/\.partial$/, '');
   assert.deepEqual(await readFile(path), bytes);
-  assert.ok(f.codex.starts[0]?.input.some(input => input.kind === 'text' && input.text.includes(path)));
+  assert.ok(f.starts()[0]?.input.some(input => input.kind === 'text' && input.text.includes(path)));
 });
 
-test('input arriving during selection is reconsidered before the formal cwd is fixed', { timeout: 3000 }, async t => {
-  const f = await fixture(t); const entered = gate(), release = gate();
+test('a correction to one waiting request during selection is reconsidered before coordinator routing', { timeout: 3000 }, async t => {
+  const f = await fixture(t); f.codex.selectionResults.push({ kind: 'question', question: 'Which project?' });
+  const task = await f.manual(); assert.equal(task.threadId, null);
+  const entered = gate(), release = gate();
   f.codex.selectionResults.push(selected(), selected('example/other'));
   const select = f.codex.selectWorkspace.bind(f.codex); let first = true;
   f.codex.selectWorkspace = async input => {
@@ -413,16 +436,16 @@ test('input arriving during selection is reconsidered before the formal cwd is f
     if (first) { first = false; entered.resolve(); await release.promise; }
     return result;
   };
-  const initial = f.manual();
+  const initial = f.loop.receive(f.message('project-answer', 'Use example/project'));
   try {
     await entered.promise;
-    const task = f.task(); assert.ok(task.chatId);
-    const correction = f.loop.receive(f.message('selection-correction', 'This concerns example/other, not the initial project', task.chatId, 'group'));
+    const correction = f.loop.receive(f.message('selection-correction', `/reply ${task.id} Use example/other, investigate only.`));
     await delay(0); release.resolve(); await Promise.all([initial, correction]);
-    assert.equal(f.codex.created.length, 1);
-    assert.equal(f.codex.created[0]?.cwd, await realpath(f.other));
-    assert.equal(f.codex.selections.length, 2);
-    assert.match(JSON.stringify(f.codex.selections[1]), /selection-correction|example\/other/);
+    await f.loop.tick(); await f.delegate();
+    assert.equal(f.requests().length, 1); assert.equal(f.created().length, 1);
+    assert.equal(f.created()[0]?.cwd, await realpath(f.other));
+    assert.equal(f.codex.selections.length, 3);
+    assert.match(JSON.stringify(f.codex.selections[2]), /selection-correction|example\/other/);
   } finally { release.resolve(); await initial; }
 });
 
@@ -445,24 +468,20 @@ test('closing the service aborts active temporary selection before creating a fo
   } finally { release.resolve(); await initial; }
 });
 
-test('input received while a chosen directory is being prepared is reconsidered before formal creation', { timeout: 3000 }, async t => {
+test('owner input during delegated directory preparation stays bound to the promoted Worker', { timeout: 3000 }, async t => {
   const f = await fixture(t); const entered = gate(), release = gate();
-  const ensure = f.ports.workspace.ensure.bind(f.ports.workspace); let first = true;
-  f.ports.workspace.ensure = async input => {
-    if (first) { first = false; entered.resolve(); await release.promise; }
-    return ensure(input);
-  };
-  f.codex.selectionResults.push(selected(), selected('example/other'));
+  const ensure = f.ports.workspace.ensure.bind(f.ports.workspace);
+  f.ports.workspace.ensure = async input => { entered.resolve(); await release.promise; return ensure(input); };
+  f.codex.selectionResults.push(selected());
   const initial = f.manual();
   try {
     await entered.promise;
-    const task = f.task(); assert.ok(task.chatId);
-    const correction = f.loop.receive(f.message('preparation-correction', 'The engineering directory must be example/other', task.chatId, 'group'));
-    await delay(0); release.resolve(); await Promise.all([initial, correction]);
-    assert.equal(f.codex.selections.length, 2);
-    assert.equal(f.codex.created.length, 1);
-    assert.equal(f.codex.created[0]?.cwd, await realpath(f.other));
-    assert.match(JSON.stringify(f.codex.selections[1]?.input), /preparation-correction|example\/other/);
+    const task = f.task(); assert.equal(task.purpose, 'execution'); assert.ok(task.chatId);
+    const followUp = f.loop.receive(f.message('preparation-scope', 'Preserve local changes.', task.chatId, 'group'));
+    await delay(0); release.resolve(); await Promise.all([initial, followUp]);
+    assert.equal(f.codex.selections.length, 1); assert.equal(f.created().length, 1);
+    assert.equal(f.created()[0]?.cwd, await realpath(f.project));
+    assert.ok(f.loop.store.inputs(task.id).some(input => input.id === 'preparation-scope' && input.status === 'delivered'));
   } finally { release.resolve(); await initial; }
 });
 
@@ -476,8 +495,8 @@ test('shutdown during directory preparation does not create or start a formal co
     await entered.promise;
     const closing = f.loop.close(); await delay(0); release.resolve();
     await Promise.all([initial, closing]);
-    assert.equal(f.codex.created.length, 0);
-    assert.equal(f.codex.starts.length, 0);
+    assert.ok(f.codex.created.every(input => input.cwd !== f.project && !input.cwd.endsWith('/project')));
+    assert.equal(f.codex.starts.length, 1, 'Only the coordinator has started');
   } finally { release.resolve(); await initial; }
 });
 
@@ -485,35 +504,35 @@ test('directory clarification attachments retain their identity in the selector 
   const f = await fixture(t); const bytes = Buffer.from('shared-project-evidence-41\n');
   f.feishu.resources.set('answer-evidence', bytes);
   f.codex.selectionResults.push({ kind: 'question', question: 'Which project should be used?' }, selected());
-  const task = await f.manual(); assert.ok(task.chatId);
-  await f.loop.receive({ ...f.message('answer-with-file', 'Use the project identified by this evidence', task.chatId, 'group'),
-    attachments: [{ key: 'answer-evidence', kind: 'file', name: 'selection-evidence.log' }] });
+  const task = await f.manual(); assert.equal(task.chatId, null);
+  await f.loop.receive({ ...f.message('answer-with-file', 'Use the project identified by this evidence', 'private', 'p2p'),
+    attachments: [{ key: 'answer-evidence', kind: 'file', name: 'selection-evidence.log' }] }); await f.delegate();
   assert.equal(f.feishu.downloads.length, 1);
   const download = f.feishu.downloads[0]; assert.ok(download);
   assert.equal(download.messageId, 'answer-with-file');
   const path = download.destination.replace(/\.partial$/, '');
   assert.deepEqual(await readFile(path), bytes);
   assert.ok(f.codex.selections[1]?.input.some(input => input.kind === 'text' && input.text.includes(path)));
-  assert.ok(f.codex.starts[0]?.input.some(input => input.kind === 'text' && input.text.includes(path)));
-  assert.match(JSON.stringify(f.codex.starts[0]?.input), /selection-evidence\.log|answer-evidence/);
+  assert.ok(f.starts()[0]?.input.some(input => input.kind === 'text' && input.text.includes(path)));
+  assert.match(JSON.stringify(f.starts()[0]?.input), /selection-evidence\.log|answer-evidence/);
   assert.equal(f.loop.store.inputs(task.id).find(input => input.id === 'answer-with-file')?.status, 'delivered');
   await f.restart();
   assert.equal(f.feishu.downloads.length, 1);
-  assert.equal(f.codex.starts.length, 1);
+  assert.equal(f.starts().length, 1);
 });
 
 test('a consumed directory answer stays pending for the formal task without repeating selection on restart', async t => {
   const f = await fixture(t);
   f.codex.selectionResults.push({ kind: 'question', question: 'Which project?' }, { kind: 'question', question: 'Which of its variants?' }, selected());
-  const task = await f.manual(); assert.ok(task.chatId);
-  await f.loop.receive(f.message('first-answer', 'Project A; investigate only.', task.chatId, 'group'));
+  const task = await f.manual(); assert.equal(task.chatId, null);
+  await f.loop.receive(f.message('first-answer', 'Project A; investigate only.', 'private', 'p2p'));
   const first = f.loop.store.inputs(task.id).find(input => input.id === 'first-answer'); assert.ok(first);
-  assert.equal(first.selectionHandled, true); assert.equal(first.status, 'pending');
+  assert.equal(first.route, 'workspace-selection'); assert.equal(first.status, 'pending');
   await f.loop.tick(); await f.restart(); await f.loop.tick();
-  assert.equal(f.codex.selections.length, 2); assert.equal(f.codex.starts.length, 0);
-  await f.loop.receive(f.message('second-answer', 'Use variant A1; preserve local changes.', task.chatId, 'group'));
+  assert.equal(f.codex.selections.length, 2); assert.equal(f.starts().length, 0);
+  await f.loop.receive(f.message('second-answer', 'Use variant A1; preserve local changes.', 'private', 'p2p')); await f.delegate();
   assert.deepEqual(f.codex.selections[2]?.answers.map(answer => answer.inputId), ['first-answer', 'second-answer']);
-  const start = f.codex.starts[0]; assert.ok(start);
+  const start = f.starts()[0]; assert.ok(start);
   assert.deepEqual(start.additionalDeliveryIds, ['first-answer', 'second-answer']);
   const texts = start.input.filter(input => input.kind === 'text').map(input => input.text);
   assert.ok(texts.indexOf('Project A; investigate only.') < texts.indexOf('Use variant A1; preserve local changes.'));
@@ -523,14 +542,14 @@ test('a consumed directory answer stays pending for the formal task without repe
 for (const historyAvailable of [true, false]) test(`initial task and directory supplements reconcile together when acknowledgement is lost (history=${historyAvailable})`, async t => {
   const f = await fixture(t);
   f.codex.selectionResults.push({ kind: 'question', question: 'Which project?' }, selected());
-  const task = await f.manual(); assert.ok(task.chatId);
-  f.codex.loseInputAck = true;
-  await f.loop.receive(f.message('scope-answer', 'Use project A; do not edit code.', task.chatId, 'group'));
+  const task = await f.manual(); assert.equal(task.chatId, null);
+  await f.loop.receive(f.message('scope-answer', 'Use project A; do not edit code.', 'private', 'p2p'));
+  f.codex.loseInputAck = true; await f.delegate();
   assert.ok(f.loop.store.inputs(task.id).every(input => input.status === 'uncertain'));
   const established = f.task(); assert.ok(established.threadId);
   if (!historyAvailable) f.codex.snapshot(established.threadId).seenInputIds = [];
   await f.restart(); await f.loop.tick();
-  assert.equal(f.codex.starts.length, 1); assert.equal(f.codex.steers.length, 0);
+  assert.equal(f.starts().length, 1); assert.equal(f.codex.steers.filter(input => f.requests().some(task => task.threadId === input.threadId)).length, 0);
   assert.equal(f.codex.selections.length, 2);
   assert.ok(f.loop.store.inputs(task.id).every(input => input.status === (historyAvailable ? 'delivered' : 'uncertain')));
 });
@@ -539,22 +558,24 @@ test('a missing previously selected attachment holds the first formal turn until
   const f = await fixture(t); const bytes = Buffer.from('user-scope-evidence\n');
   f.feishu.resources.set('scope-log', bytes);
   f.codex.selectionResults.push({ kind: 'question', question: 'Which project?' }, selected());
-  const task = await f.manual(); assert.ok(task.chatId);
+  const task = await f.manual(); assert.equal(task.chatId, null);
   let path = '';
   const create = f.codex.createThread.bind(f.codex);
   f.codex.createThread = async input => {
-    const download = f.feishu.downloads[0]; assert.ok(download);
-    path = download.destination.replace(/\.partial$/, ''); await rm(path);
+    if (input.cwd.endsWith('/project')) {
+      const download = f.feishu.downloads[0]; assert.ok(download);
+      path = download.destination.replace(/\.partial$/, ''); await rm(path);
+    }
     return create(input);
   };
-  await f.loop.receive({ ...f.message('scope-file-answer', 'Use project A and follow these investigation limits.', task.chatId, 'group'),
-    attachments: [{ key: 'scope-log', kind: 'file', name: 'limits.log' }] });
+  await f.loop.receive({ ...f.message('scope-file-answer', 'Use project A and follow these investigation limits.', 'private', 'p2p'),
+    attachments: [{ key: 'scope-log', kind: 'file', name: 'limits.log' }] }); await f.delegate();
   await f.loop.tick(); await f.restart();
-  assert.equal(f.codex.starts.length, 0);
+  assert.equal(f.starts().length, 0);
   assert.equal(f.loop.store.inputs(task.id).find(input => input.id === 'scope-file-answer')?.status, 'failed');
   await writeFile(path, bytes);
   await f.loop.retryAttachment(task.id, 'scope-file-answer');
-  assert.equal(f.codex.starts.length, 1);
-  assert.ok(f.codex.starts[0]?.input.some(input => input.kind === 'text' && input.text.includes(path)));
+  assert.equal(f.starts().length, 1);
+  assert.ok(f.starts()[0]?.input.some(input => input.kind === 'text' && input.text.includes(path)));
   assert.equal(f.codex.selections.length, 2);
 });

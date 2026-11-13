@@ -66,7 +66,10 @@ export class TaskGroups {
     if (this.store.meta(startKey) === null) this.store.setMeta(startKey, String(startedAt));
     if (!previous) this.store.beginOperation(operationId, taskId, kind);
     else if (previous.error === 'rejected') this.store.retryRejectedOperation(operationId);
-    const { title, url } = presentTaskSource(task.source, 100);
+    const { title: sourceTitle, url } = presentTaskSource(task.source, 100);
+    const ledger = new ProjectLedger(this.store), member = ledger.membership(taskId);
+    const name = member ? ledger.project(member.projectId)?.name ?? member.projectId : sourceTitle;
+    const title = member?.role === 'coordinator' ? (/协调者$/.test(name) ? name : `${name} 项目协调者`) : sourceTitle;
     let chatId: string;
     try {
       chatId = previous?.status === 'confirmed' && previous.result !== null ? previous.result
@@ -98,8 +101,8 @@ export class TaskGroups {
       this.store.saveTask(task);
       this.store.setMeta(`history:${taskId}`, String(startedAt));
       const summary = this.store.meta(`task-summary:${taskId}`);
-      const member = new ProjectLedger(this.store).membership(taskId);
-      this.store.enqueue(taskId, member ? `任务对话已建立。\n${title}\n当前状态：${task.status}${task.reason ? `，${task.reason}` : ''}。\n${summary ? `当前摘要：${summary.slice(0, 1500)}\n` : ''}请在本群继续交流。`
+      this.store.enqueue(taskId, member?.role === 'coordinator' ? `项目协调入口已建立。\n${title}\n你可以在本群直接交办 Bug、新需求，补充文字、截图和日志。协调者负责派发和监督 Worker。`
+        : member ? `任务对话已建立。\n${title}\n当前状态：${task.status}${task.reason ? `，${task.reason}` : ''}。\n${summary ? `当前摘要：${summary.slice(0, 1500)}\n` : ''}请在本群继续交流。`
         : `任务对话已建立。\n${title}\n请在本群继续发送文字、截图和日志。新任务请直接私聊发送。`, `welcome:group:${generation}`);
     });
     return chatId;

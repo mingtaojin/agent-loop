@@ -61,7 +61,7 @@ test('project config applies defaults and rejects empty selectors, duplicate rep
   const invalid: unknown[] = [
     { ...project, id: '' }, { ...project, id: ' ' }, { ...project, id: 'a\0b' },
     { ...project, name: ' ' }, { ...project, directory: '' }, { ...project, directory: 'a\0b' },
-    { ...project, repositories: [] }, { ...project, repositories: [{ name: 'owner/frontend' }] },
+    { ...project, repositories: [{ name: 'owner/frontend' }] },
     { ...project, repositories: [{ name: 'owner/frontend', labelsAny: [' '] }] },
     { ...project, repositories: [{ name: 'invalid', labelsAny: ['project'] }] },
     { ...project, repositories: [{ name: 'owner/frontend', labelsAny: ['project'], taskTypes: ['bug'] }] },
@@ -73,6 +73,18 @@ test('project config applies defaults and rejects empty selectors, duplicate rep
     { ...project, reasoningEfforts: { worker: 'unsupported' } },
   ];
   for (const input of invalid) assert.equal(projectConfigSchema.safeParse(input).success, false);
+  assert.deepEqual(projectConfigSchema.parse({ ...project, repositories: [] }).repositories, []);
+});
+
+test('automatic repositories can use criteria alone while explicit selectors remain an AND gate', () => {
+  const automatic = projectConfigSchema.parse({ ...config(), repositories: [{ name: 'owner/frontend', criteria: { taskTypes: ['bug'], assigneesAny: ['alice'] } }] });
+  const bug = source({ nativeType: 'Bug', labels: [], assignees: ['alice'] });
+  assert.equal(matchesProjectIssue(bug, automatic), true);
+  assert.equal(matchesProjectIssue({ ...bug, assignees: [] }, automatic), false);
+  assert.equal(matchesProjectIssue({ ...bug, nativeType: 'Feature' }, automatic), false);
+  const explicit = projectConfigSchema.parse({ ...automatic, repositories: [{ ...automatic.repositories[0], labelsAny: ['selected'] }] });
+  assert.equal(matchesProjectIssue(bug, explicit), false);
+  assert.equal(matchesProjectIssue({ ...bug, labels: ['selected'] }, explicit), true);
 });
 
 test('project intake uses label OR assignee with no task-type gate, and only open issues in owned repositories', () => {
@@ -85,6 +97,21 @@ test('project intake uses label OR assignee with no task-type gate, and only ope
   assert.equal(matchesProjectIssue(source({ repository: 'other/frontend', assignees: ['alice'] }), project), false);
   assert.equal(matchesProjectIssue(source({ state: 'closed' }), project), false);
   assert.equal(matchesProjectIssue(source({ isPullRequest: true }), project), false);
+});
+
+test('project intake can require an assigned account AND Bug classification', () => {
+  const project = projectConfigSchema.parse({ id: 'opentest', name: 'OpenTest', directory: '/projects/opentest',
+    repositories: [{ name: 'crysound/OpenTest', assigneesAny: ['mingtaojin'], criteria: {
+      taskTypes: ['bug'], typeLabels: { bug: 'bug', '类型:缺陷': 'bug', enhancement: 'feature' },
+    } }] });
+  const bug = source({ repository: 'crysound/OpenTest', assignees: ['mingtaojin'], nativeType: 'Bug', labels: [] });
+  assert.equal(matchesProjectIssue(bug, project), true);
+  assert.equal(matchesProjectIssue({ ...bug, assignees: [] }, project), false);
+  assert.equal(matchesProjectIssue({ ...bug, nativeType: 'Feature' }, project), false);
+  assert.equal(matchesProjectIssue({ ...bug, repository: 'crysound/OpenTest-Internal' }, project), false);
+  assert.equal(matchesProjectIssue({ ...bug, nativeType: null, labels: ['类型:缺陷'] }, project), true);
+  assert.equal(matchesProjectIssue({ ...bug, nativeType: null, labels: [] }, project), false);
+  assert.equal(matchesProjectIssue({ ...bug, state: 'closed' }, project), false);
 });
 
 test('project actions are discriminated strict shapes with a default worker role', () => {
