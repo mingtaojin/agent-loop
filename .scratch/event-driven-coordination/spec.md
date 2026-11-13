@@ -46,7 +46,8 @@ Worker 和 verifier 通过明确的工作汇报提交正式问题、进展或成
 - Keep the report kinds result, question and update. Each explicit report remains an event for the coordinator. Stable request identifiers and content checking continue to protect retries.
 - In role guidance, distinguish an ordinary reply from a formal report. Require Workers and verifiers to report independent work results and blockers explicitly.
 - Handle a natural-language synchronization request in Worker behavior. Send a sourced discussion summary through the existing report action. Default to the current discussion, respect a user-specified topic, and send directly without an extra preview step.
-- Remove periodic supervision event generation and its runtime scheduling call. Retire the active interval setting while keeping historical configuration load behavior deliberate and tested.
+- Remove periodic supervision event generation and its runtime scheduling call. The current project configuration has no interval setting. A strict input compatibility decoder accepts and removes only the valid historical interval field for both explicit configuration and persisted project catalog entries. Other unknown settings still fail validation.
+- Retire definitely undelivered historical automatic owner-input, final-answer and supervision copies with a dropped inbox terminal status. Preserve their payloads and reasons. Match their original project, task, provenance and generated event identity. Preserve delivered history and existing reconciliation for delivering or uncertain inputs; do not claim an attempted delivery was withdrawn.
 - Preserve existing native requests, execution failures and non-pause interruptions, project-group user input, GitHub intake and revisions, project initialization, session rotation and confirmed recovery events.
 - Keep ordinary polling for persisted input and execution-state observation. Polling transports or observes existing events; it does not create a reason to run the coordinator.
 - Keep the distinction between user authorization and agent judgment. Reports, summaries and ordinary messages do not approve native tool requests or expand implementation, merge or deployment authorization.
@@ -60,7 +61,8 @@ Worker 和 verifier 通过明确的工作汇报提交正式问题、进展或成
 - Exercise Worker and verifier replies, grouped and ungrouped tasks, an idle coordinator, and an already running coordinator.
 - Advance the test clock with idle project members and verify that no supervision input or model turn appears. Keep positive tests for explicit events after the clock advances.
 - Reuse existing report-idempotency, restart, native-request, source-update and role-guidance tests. Update old expectations that asserted automatic owner-input or final-answer forwarding.
-- Verify configuration loading after retiring supervision and make the handling of historical interval fields explicit.
+- Verify current and historical explicit configuration and persisted catalog loading. Assert that the parsed current configuration contains no interval and that unrelated unknown settings still fail validation.
+- Verify that obsolete undelivered automatic copies remain recorded but cannot wake the coordinator across restart, pause or retry. Pair these checks with valid reports and other event sources. Preserve uncertain delivery without replay or false acknowledgement.
 - Check that current role instructions reach both new and resumed formal Threads. Treat instruction checks as prompt delivery evidence, not as proof that a real model always understands a natural-language request correctly.
 - Run type checking, build and the complete local test suite. Obtain independent review and a behavior verdict for the exact PR head before merging.
 

@@ -128,13 +128,13 @@ const policy = `${safety}
 First call project_action {"action":"status"}. Inspect issues and existing tasks. Only Issue 101 authorizes the single read-only check. Other admitted Issues exercise intake only and require no workers. Ignore out-of-scope Issues. If no worker exists for Issue 101, dispatch exactly one using requestId ${dispatchId}, role worker, issueId live-issue-101, and this complete worker prompt as the prompt field:
 ${workerPrompt}
 After dispatch, END THIS TURN with COORDINATOR_WAITING_FOR_REPORT. Do not wait, sleep or poll inside that turn. The Runtime will wake you when the worker reports.
-On later turns call status first and do not dispatch again. When a worker result containing its unique proof marker is present, query status for the current version and records, then call project_action record with requestId ${recordId}, key ${recordKey}, expectedVersion equal to the current status version, and text containing the actual worker marker, worker task ID, proof file path, and an explicit receipt of the result. Never guess the marker or read proof.txt yourself. If this receipt already exists, do not record again. End with COORDINATOR_RECEIPT_RECORDED plus the actual marker. On later final-answer notifications, check status and finish briefly without new work. No rotation is requested in this probe.`;
+On later turns call status first and do not dispatch again. When a worker result containing its unique proof marker is present, query status for the current version and records, then call project_action record with requestId ${recordId}, key ${recordKey}, expectedVersion equal to the current status version, and text containing the actual worker marker, worker task ID, proof file path, and an explicit receipt of the result. Never guess the marker or read proof.txt yourself. If this receipt already exists, do not record again. End with COORDINATOR_RECEIPT_RECORDED plus the actual marker. No rotation is requested in this probe.`;
 const config = configSchema.parse({ dataDir: join(root, 'data'),
   feishu: { userOpenId: 'fixture-owner', progress: { enabled: false } },
   engineering: { skillPath: '/Users/developer/.codex/packages/pstack/skills/poteto-mode/SKILL.md' },
   projects: [{ id: projectId, name: 'Coordinator live fixture', directory,
     repositories: [{ name: repository, labelsAny: ['coordinate'], assigneesAny: ['fixture-owner'] }],
-    instructions: policy, supervisionIntervalMs: 2_000_000_000 }],
+    instructions: policy }],
   recovery: { maxAttempts: 0, retryDelayMs: 1000 },
   codex: { command: ['codex', 'app-server'], ...(options.model ? { model: options.model } : {}),
     approvalPolicy: 'never', sandbox: 'read-only', requestTimeoutMs: 30_000 } });
@@ -238,9 +238,7 @@ async function verify(): Promise<void> {
       note('dispatch_turn_ended', { initialTurn, initialThread });
     }
     if (initialTurn !== null && gateOpenedAt === null && current.status === 'idle') {
-      // Consume the first supervision reminder before releasing the report wakeup probe.
-      loop.projects.supervise();
-      if (!loop.store.inputs(coordinatorId).some(input => input.status !== 'delivered')) {
+      if (!loop.store.inputs(coordinatorId).some(input => input.status !== 'delivered' && input.status !== 'dropped')) {
         gateOpenedAt = Date.now();
         await writeFile(gateFile, 'Coordinator dispatch turn has ended. The read-only worker may proceed.\n');
         note('worker_gate_opened', { initialTurn, initialThread, at: gateOpenedAt });
@@ -249,7 +247,7 @@ async function verify(): Promise<void> {
     const record = state.records.find(item => item.key === recordKey);
     const currentLoop = loop;
     const allIdle = tasks.length === 2 && tasks.every(task => task.status === 'idle'
-      && currentLoop.store.inputs(task.id).every(input => input.status === 'delivered'));
+      && currentLoop.store.inputs(task.id).every(input => input.status === 'delivered' || input.status === 'dropped'));
     if (record && allIdle) {
       assert.ok(gateOpenedAt !== null);
       const worker = state.members.find(member => member.role === 'worker'); assert.ok(worker);
@@ -279,7 +277,7 @@ async function verify(): Promise<void> {
       assert.equal(recorded.request.threadId, current.threadId);
       assert.notEqual(recorded.request.turnId, initialTurn, 'Worker report must wake a later coordinator turn');
       assert.ok(reportArrival);
-      assert.equal(reportArrival.status, 'idle', 'Report must arrive at an idle coordinator, independently of supervision');
+      assert.equal(reportArrival.status, 'idle', 'Report must arrive at an idle coordinator');
       assert.notEqual(recorded.request.turnId, reportArrival.turnId);
       const reportInput = loop.store.inputs(coordinatorId).find(input => input.provenance.kind === 'agent'
         && input.provenance.taskId === worker.taskId && input.provenance.category === 'result' && input.message.text.includes(marker));

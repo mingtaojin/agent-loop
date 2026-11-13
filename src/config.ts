@@ -3,7 +3,7 @@ import { constants } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { z } from 'zod';
 import { collectionRepositorySchema } from './domain.js';
-import { projectConfigSchema } from './project.js';
+import { projectConfigInputSchema } from './project.js';
 
 const environmentName = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'Use an environment variable name, not a credential');
 const positiveMilliseconds = z.number().int().positive();
@@ -22,7 +22,7 @@ export const configSchema = z.strictObject({
     'Repository names must be unique',
   ),
   engineering: z.strictObject({ projectRoot: z.string().trim().min(1).optional(), promptPath: z.string().min(1).optional(), skillPath: z.string().min(1).optional() }).optional(),
-  projects: z.array(projectConfigSchema).default([]).superRefine((projects, context) => {
+  projects: z.array(projectConfigInputSchema).default([]).superRefine((projects, context) => {
     const ids = new Set<string>(), repositories = new Set<string>();
     for (const project of projects) {
       if (ids.has(project.id)) context.addIssue({ code: 'custom', message: 'Project IDs must be unique' });
