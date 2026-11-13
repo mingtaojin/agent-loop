@@ -799,6 +799,7 @@ export class AgentLoop {
   }
   private async drain(task: Task): Promise<void> {
     this.requireMember(task);
+    this.projects.supersedeUnsentSupervision(task.id);
     const inputs = this.store.inputs(task.id).sort((a, b) => Number(b.origin === 'initial') - Number(a.origin === 'initial') || a.seq - b.seq);
     if (task.threadId && !this.stopping && task.status !== 'paused' && task.status !== 'failed'
       && (this.store.meta(`project-intake-promotion:${task.id}`) !== null
@@ -840,7 +841,7 @@ export class AgentLoop {
     for (const input of inputs) {
       if (this.stopping) break;
       if (input.status === 'delivered') continue;
-      if (input.status === 'failed') continue;
+      if (input.status === 'failed' || input.status === 'superseded') continue;
       if (input.provenance.kind === 'github_issue' || input.provenance.kind === 'github_comment') {
         this.projects.observe(task, `forward:${input.id}`, input.message.text, input.provenance.kind);
         this.store.markInput(input.id, 'delivered');
@@ -861,6 +862,8 @@ export class AgentLoop {
       const questions = input.provenance.kind === 'user' || agentQuestion ? snapshot.requests.filter(request => request.kind === 'question') : [];
       if (questions.length > 1) { this.store.markInput(input.id, 'failed', '存在多个原生问题，无法唯一关联'); this.notify(task, '存在多个原生问题，回复已保存，需要明确关联后再投递。', `question-ambiguous:${input.id}`); break; }
       if (this.stopping) break;
+      this.projects.supersedeUnsentSupervision(task.id);
+      if (this.store.inputs(task.id).find(current => current.id === input.id)?.status === 'superseded') continue;
       this.store.markInput(input.id, 'delivering');
       try {
         const question = questions[0];

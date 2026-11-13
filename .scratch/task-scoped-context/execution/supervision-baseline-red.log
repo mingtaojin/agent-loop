@@ -1,0 +1,28 @@
+✖ supervision does not wake a coordinator when all workers have no actionable work (50.311917ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 285.571833
+
+✖ failing tests:
+
+test at test/project-runtime.test.ts:12:65668
+✖ supervision does not wake a coordinator when all workers have no actionable work (50.311917ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  1 !== 0
+  
+      at TestContext.<anonymous> (/Users/developer/.codex/worktrees/agent-loop-task-scoped-context-20261113/test/project-runtime.test.ts:1222:10)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 1,
+    expected: 0,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

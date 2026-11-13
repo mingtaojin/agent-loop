@@ -1211,3 +1211,97 @@ test('running observation preserves approval identity and full inspection still 
   assert.ok(fullReads > 0);
   assert.equal(f.loop.store.task(worker.id).threadId, worker.threadId);
 });
+
+test('supervision does not wake a coordinator when all workers have no actionable work', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('settled-worker', 'Complete this round.');
+  f.codex.complete(worker.threadId!, null); await f.loop.tick(); await f.idleCoordinator();
+  f.loop.store.setMeta('project-supervision:app', '0');
+  const before = f.events(f.coordinator().id, 'supervision').length;
+  f.loop.projects.supervise();
+  assert.equal(f.events(f.coordinator().id, 'supervision').length, before);
+});
+
+test('explicit supervision pause survives restart while workers and owner input keep their identities', async t => {
+  const f = await fixture(t); const coordinator = await f.initialize();
+  const worker = await f.dispatch('supervision-live', 'Continue working.');
+  await assert.rejects(f.loop.projectAction(worker.id, { action: 'supervision', requestId: 'forbidden-pause', operation: 'pause' }), /Only the coordinator/);
+  const pause: ProjectAction = { action: 'supervision', requestId: 'pause-supervision', operation: 'pause' };
+  const receipt = await f.loop.projectAction(coordinator.id, pause);
+  assert.equal(f.state().supervision.kind, 'paused');
+  assert.equal(f.loop.store.task(worker.id).status, 'running');
+  assert.equal(f.codex.interrupts.length, 0);
+  const timers = f.events(coordinator.id, 'supervision').length;
+  f.loop.store.setMeta('project-supervision:app', '0');
+  f.loop.projects.supervise();
+  assert.equal(f.events(coordinator.id, 'supervision').length, timers);
+  await f.restart();
+  assert.equal(f.state().supervision.kind, 'paused');
+  assert.deepEqual(await f.loop.projectAction(coordinator.id, pause), receipt);
+  assert.equal(f.loop.store.task(worker.id).threadId, worker.threadId);
+  assert.ok(coordinator.chatId);
+  await f.loop.receive(f.message('paused-supervision-owner', 'Add this acceptance detail.', coordinator.chatId));
+  assert.equal(f.loop.store.inputs(coordinator.id).find(input => input.id === 'paused-supervision-owner')?.status, 'delivered');
+  assert.equal(f.coordinator().threadId, coordinator.threadId);
+  await f.idleCoordinator();
+  await f.loop.projectAction(coordinator.id, { action: 'supervision', requestId: 'resume-supervision', operation: 'resume' });
+  f.loop.store.setMeta('project-supervision:app', '0');
+  f.loop.projects.supervise();
+  assert.equal(f.state().supervision.kind, 'enabled');
+  assert.equal(f.events(coordinator.id, 'supervision').length, timers + 1);
+});
+
+test('supervision supersedes only unsent timers and preserves attempted delivery evidence', async t => {
+  const f = await fixture(t); const coordinator = await f.initialize();
+  await f.dispatch('supervision-pending', 'Keep working.');
+  for (const status of ['pending', 'delivering', 'uncertain'] as const) {
+    f.loop.projects.event('app', `timer-${status}`, 'Timer reminder.', coordinator.id, 'supervision');
+    const input = f.events(coordinator.id, 'supervision').find(input => input.provenance.kind === 'agent' && input.provenance.eventId === `timer-${status}`);
+    assert.ok(input); f.loop.store.markInput(input.id, status);
+  }
+  await f.loop.projectAction(coordinator.id, { action: 'supervision', requestId: 'suppress-pending', operation: 'pause' });
+  const events = f.events(coordinator.id, 'supervision');
+  assert.deepEqual(events.map(input => input.status), ['superseded', 'delivering', 'uncertain']);
+  assert.match(events[0]?.error ?? '', /supervision is paused/);
+  assert.equal(events[1]?.error, null); assert.equal(events[2]?.error, null);
+  await f.restart();
+  assert.equal(f.events(coordinator.id, 'supervision')[0]?.status, 'superseded');
+  assert.ok(!f.events(coordinator.id, 'supervision').some(input => input.status === 'delivered'));
+});
+
+test('paused failed and native-question workers do not create periodic supervision', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('supervision-ineligible', 'Wait for a decision.');
+  await f.idleCoordinator();
+  for (const status of ['paused', 'failed', 'waiting-question'] as const) {
+    const current = f.loop.store.task(worker.id);
+    current.status = status === 'waiting-question' ? 'running' : status;
+    current.requests = status === 'waiting-question' ? [{ id: 'waiting-owner', threadId: worker.threadId!, turnId: worker.turnId!, kind: 'question',
+      prompt: 'Choose the scope.', method: 'item/tool/requestUserInput', payload: {}, isBlocking: true, connectionEpoch: 'fake-epoch' }] : [];
+    f.loop.store.saveTask(current);
+    f.loop.store.setMeta('project-supervision:app', '0');
+    const before = f.events(f.coordinator().id, 'supervision').length;
+    f.loop.projects.supervise();
+    assert.equal(f.events(f.coordinator().id, 'supervision').length, before, status);
+  }
+});
+
+
+test('supervision state and receipt commit atomically and an old pause retry cannot undo a newer resume', async t => {
+  const f = await fixture(t); const coordinator = await f.initialize();
+  await f.dispatch('supervision-atomic', 'Keep working.');
+  f.loop.projects.event('app', 'timer-atomic', 'Timer reminder.', coordinator.id, 'supervision');
+  const pause: ProjectAction = { action: 'supervision', requestId: 'atomic-pause', operation: 'pause' };
+  const saveReceipt = f.loop.projects.ledger.saveReceipt.bind(f.loop.projects.ledger);
+  f.loop.projects.ledger.saveReceipt = () => { throw new Error('Injected receipt write failure'); };
+  await assert.rejects(f.loop.projectAction(coordinator.id, pause), /receipt write failure/);
+  assert.equal(f.state().supervision.kind, 'enabled');
+  assert.equal(f.events(coordinator.id, 'supervision')[0]?.status, 'pending');
+  f.loop.projects.ledger.saveReceipt = saveReceipt;
+  const pausedReceipt = await f.loop.projectAction(coordinator.id, pause);
+  await f.loop.projectAction(coordinator.id, { action: 'supervision', requestId: 'atomic-resume', operation: 'resume' });
+  assert.equal(f.state().supervision.kind, 'enabled');
+  await f.restart();
+  assert.deepEqual(await f.loop.projectAction(coordinator.id, pause), pausedReceipt);
+  assert.equal(f.state().supervision.kind, 'enabled');
+});

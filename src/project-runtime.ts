@@ -3,7 +3,7 @@ import { realpath } from 'node:fs/promises';
 import { isAbsolute, relative } from 'node:path';
 import type { Config } from './config.js';
 import { ProjectCatalog } from './project-catalog.js';
-import { ProjectLedger, projectView, currentRecords, matchesProjectIssue, projectActionSchema, reasoningEffortSchema, type ReasoningEffort, type ProjectAction, type ProjectConfig } from './project.js';
+import { ProjectLedger, projectView, currentRecords, matchesProjectIssue, projectActionSchema, reasoningEffortSchema, type ReasoningEffort, type ProjectAction, type ProjectConfig, type ProjectState } from './project.js';
 import { intakeRouteSchema, presentTaskSource, submissionSchema, type DiscoveredProject, type InputProvenance, type Source, type Task, type WorkspaceCandidate, type WorkspaceChoice } from './domain.js';
 import type { GitHubPort } from './ports.js';
 import { Store, type Inbox } from './store.js';
@@ -279,6 +279,20 @@ export class ProjectRuntime {
         return action.action === 'record' ? this.recordAcknowledgement(member.projectId, callerId, action.requestId) : old.value;
       }
       if (action.action === 'claim_intake') return this.claimIntake(callerId, member, action, intentKey, fingerprint);
+      if (action.action === 'supervision') {
+        if (member.role !== 'coordinator') throw new Error('Only the coordinator can change project supervision');
+        return this.store.transaction(() => {
+          const current = this.ledger.project(member.projectId);
+          if (!current) throw new Error('Project unavailable');
+          const supervision: ProjectState['supervision'] = { kind: action.operation === 'pause' ? 'paused' : 'enabled' };
+          this.store.setMeta(intentKey, fingerprint);
+          this.ledger.save({ ...current, supervision });
+          this.supersedeUnsentSupervision(callerId);
+          const result = { accepted: true, supervision };
+          this.ledger.saveReceipt(member.projectId, callerId, action.requestId, fingerprint, result);
+          return result;
+        });
+      }
       this.store.setMeta(intentKey, fingerprint);
       const result = await this.perform(callerId, member, action);
       this.ledger.saveReceipt(member.projectId, callerId, action.requestId, fingerprint, result);
@@ -372,7 +386,7 @@ export class ProjectRuntime {
       .map(task => ({ taskId: task.id, source: presentTaskSource(task.source, 256), status: task.status, reason: task.reason,
         materialPath: this.store.meta(`project-intake-material:${task.id}`) }));
     const counts = { tasks: tasks.length, issues: state.issues.length, comments: state.comments.length, records: state.records.length, intakes: intakes.length };
-    const identity = { id: state.id, name: state.name, directory: state.directory, coordinatorTaskId: state.coordinatorTaskId, version: state.version, counts };
+    const identity = { id: state.id, name: state.name, directory: state.directory, coordinatorTaskId: state.coordinatorTaskId, version: state.version, supervision: state.supervision, counts };
     const page = <T>(items: T[]) => ({ ...identity, section, offset, items: items.slice(offset, offset + limit),
       nextOffset: offset + limit < items.length ? offset + limit : null });
     if (section === 'unassigned_intakes') return page(this.store.tasks().filter(task => this.visibleUnassigned(task, projectId))
@@ -388,7 +402,7 @@ export class ProjectRuntime {
       nextOffset: offset + limit < Math.max(tasks.length, state.issues.length, intakes.length) ? offset + limit : null,
       history: 'Use section issues, comments, records, tasks or intakes with offset and limit. Intake materialPath preserves the complete request.' };
   }
-  private async perform(callerId: string, member: NonNullable<ReturnType<ProjectLedger['membership']>>, action: Exclude<ProjectAction, { action: 'status' | 'claim_intake' }>): Promise<unknown> {
+  private async perform(callerId: string, member: NonNullable<ReturnType<ProjectLedger['membership']>>, action: Exclude<ProjectAction, { action: 'status' | 'claim_intake' | 'supervision' }>): Promise<unknown> {
     const state = this.ledger.project(member.projectId);
     if (!state) throw new Error('Project unavailable');
     switch (action.action) {
@@ -518,16 +532,40 @@ export class ProjectRuntime {
     });
     return true;
   }
+  private hasActionableWorker(projectId: string): boolean {
+    const state = this.ledger.project(projectId);
+    return state?.members.some(member => {
+      if (member.role === 'coordinator') return false;
+      const task = this.store.task(member.taskId);
+      if (['paused', 'failed'].includes(task.status) || task.requests.some(request => request.isBlocking)) return false;
+      return task.executionStatus === 'running' || task.recovery.nextAttemptAt !== null
+        || this.store.inputs(task.id).some(input => ['pending', 'delivering', 'uncertain'].includes(input.status));
+    }) ?? false;
+  }
+  supersedeUnsentSupervision(taskId: string): void {
+    const member = this.ledger.membership(taskId);
+    if (member?.role !== 'coordinator') return;
+    const state = this.ledger.project(member.projectId);
+    const reason = state?.supervision.kind === 'paused' ? 'Superseded because project supervision is paused'
+      : !this.hasActionableWorker(member.projectId) ? 'Superseded because no project worker has actionable work' : null;
+    if (!reason) return;
+    for (const input of this.store.inputs(taskId)) {
+      if (input.provenance.kind === 'agent' && input.provenance.category === 'supervision')
+        this.store.supersedePendingInput(input.id, reason);
+    }
+  }
   supervise(): void {
     for (const config of this.configs) {
       const state = this.ledger.project(config.id);
-      if (!state || state.members.length < 2) continue;
+      if (!state) continue;
+      this.supersedeUnsentSupervision(state.coordinatorTaskId);
+      if (state.supervision.kind === 'paused' || !this.hasActionableWorker(state.id)) continue;
       const key = `project-supervision:${config.id}`;
       const previous = Number(this.store.meta(key) ?? 0);
       if (Date.now() - previous < config.supervisionIntervalMs) continue;
       const coordinator = this.store.task(state.coordinatorTaskId);
       if (['paused', 'failed', 'running'].includes(coordinator.status) || coordinator.requests.length) continue;
-      const pending = this.store.inputs(coordinator.id).some(input => input.status === 'pending');
+      const pending = this.store.inputs(coordinator.id).some(input => ['pending', 'delivering', 'uncertain', 'held'].includes(input.status));
       if (pending) continue;
       this.store.transaction(() => {
         this.event(config.id, `supervision:${Date.now()}`, 'Review delegated work using project status and live artifacts. Reconcile stalls, blockers, owner changes and next actions according to Orchestrate. Do not infer failure from silence alone.', coordinator.id, 'supervision');
