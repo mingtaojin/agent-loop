@@ -10,12 +10,13 @@ import type { Store } from './store.js';
 const execute = promisify(execFile);
 const identitySchema = z.strictObject({ path: z.string(), dev: z.number(), ino: z.number() });
 const locationSchema = z.strictObject({ root: identitySchema, ancestors: z.array(identitySchema) });
+const branchGenerationSchema = z.strictObject({ path: z.string(), dev: z.string(), ino: z.string(), birthtimeNs: z.string(), parent: locationSchema, firstEntry: z.string() });
 const branchIdentitySchema = z.array(z.strictObject({ path: z.string(), dev: z.string(), ino: z.string(), birthtimeNs: z.string(), ctimeNs: z.string(), parent: locationSchema }));
 const scopeSchema = z.strictObject({
   id: z.string(), allocationRequestId: z.string().nullable(), location: locationSchema, createdAt: z.number(), sealed: z.boolean(),
   resource: z.discriminatedUnion('kind', [
     z.strictObject({ kind: z.literal('artifacts'), label: z.string() }),
-    z.strictObject({ kind: z.literal('worktree'), association: taskResourceSchema, common: locationSchema, gitDirectory: locationSchema }),
+    z.strictObject({ kind: z.literal('worktree'), association: taskResourceSchema, common: locationSchema, gitDirectory: locationSchema, branchGeneration: branchGenerationSchema.nullable().default(null) }),
   ]),
   artifacts: z.array(z.strictObject({ path: z.string(), dev: z.number(), ino: z.number(), disposition: z.enum(['temporary', 'undelivered', 'delivered', 'superseded', 'abandoned']), reference: z.string().nullable() })),
 });
@@ -51,19 +52,17 @@ async function same(expected: z.infer<typeof identitySchema>): Promise<boolean> 
   return actual.dev === expected.dev && actual.ino === expected.ino;
 }
 async function checkLocation(value: z.infer<typeof locationSchema>, allowMissing = false): Promise<boolean> {
-  for (const parent of value.ancestors) if (!await same(parent)) throw new Error(`Ancestor identity changed: ${parent.path}`);
-  try { if (!await same(value.root)) throw new Error(`Resource identity changed: ${value.root.path}`); return true; }
-  catch (error) { if (allowMissing && missing(error)) return false; throw error; }
+  for (const expected of [...value.ancestors].reverse().concat(value.root)) {
+    try { if (!await same(expected)) throw new Error(`Resource identity changed: ${expected.path}`); }
+    catch (error) {
+      if (!allowMissing || !missing(error)) throw error;
+      if (expected.path === value.root.path) return false;
+    }
+  }
+  return true;
 }
 async function absentLocation(value: z.infer<typeof locationSchema>): Promise<boolean> {
-  let present = false;
-  for (const expected of [value.root, ...value.ancestors]) {
-    try {
-      if (!await same(expected)) throw new Error(`Resource identity changed: ${expected.path}`);
-      if (expected.path === value.root.path) present = true;
-    } catch (error) { if (!missing(error)) throw error; }
-  }
-  return !present;
+  return !await checkLocation(value, true);
 }
 async function git(path: string, ...args: string[]) { return (await execute('git', ['-C', path, ...args], { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024 })).stdout.trim(); }
 async function localBranchHead(repository: string, ref: string): Promise<string | null> {
@@ -83,6 +82,19 @@ async function branchIdentity(common: string, ref: string): Promise<z.infer<type
   try { result.push(await file(join(common, 'logs', ref))); }
   catch (error) { if (!missing(error)) throw error; }
   return result;
+}
+async function branchGeneration(common: string, ref: string): Promise<z.infer<typeof branchGenerationSchema> | null> {
+  const path = join(common, 'logs', ref);
+  try {
+    const parent = await location(dirname(path)), info = await lstat(path, { bigint: true });
+    if (!info.isFile() || info.isSymbolicLink() || info.birthtimeNs === 0n) return null;
+    const firstEntry = (await readFile(path, 'utf8')).split('\n')[0];
+    if (!firstEntry || !/^0{40}(?:0{24})? [0-9a-f]+ /.test(firstEntry)) return null;
+    return { path, dev: String(info.dev), ino: String(info.ino), birthtimeNs: String(info.birthtimeNs), parent, firstEntry };
+  } catch (error) { if (missing(error)) return null; throw error; }
+}
+async function checkBranchGeneration(expected: z.infer<typeof branchGenerationSchema> | null, common: string, ref: string) {
+  if (!expected || JSON.stringify(await branchGeneration(common, ref)) !== JSON.stringify(expected)) throw new Error('Task branch generation identity changed or cannot be proven from allocation');
 }
 async function checkBranchIdentity(expected: Target['branchIdentity'], common: string, ref: string) {
   if (!expected || JSON.stringify(await branchIdentity(common, ref)) !== JSON.stringify(expected)) throw new Error('Task branch identity changed after closeout');
@@ -163,7 +175,7 @@ export class TaskCloseout {
     if (common === gitDirectory) throw new Error('Original repository cannot be enrolled');
     const state = this.read(taskId);
     state.scopes.push({ id: randomUUID(), allocationRequestId: null, location: await location(association.workspace), createdAt: Date.now(), sealed: false,
-      resource: { kind: 'worktree', association, common: await location(common), gitDirectory: await location(gitDirectory) }, artifacts: [] });
+      resource: { kind: 'worktree', association, common: await location(common), gitDirectory: await location(gitDirectory), branchGeneration: await branchGeneration(common, `refs/heads/${association.branch}`) }, artifacts: [] });
     this.save(state);
   }
   async register(taskId: string, scopeId: string, path: string, disposition: Scope['artifacts'][number]['disposition'], reference?: string) {
@@ -259,16 +271,34 @@ export class TaskCloseout {
       this.save(current);
     }
   }
-  private async guard(taskId: string, target: Target) {
-    const path = target.scope.location.root.path;
-    for (const protectedPath of this.host.protectedPaths()) if (within(path, protectedPath)) throw new Error('Scope contains protected project or input records');
+  private async guard(taskId: string, target: Target, actualRoot = target.scope.location.root.path) {
+    const path = target.scope.location.root.path, roots = [...new Set([path, actualRoot])];
+    for (const protectedPath of this.host.protectedPaths()) if (roots.some(root => within(root, protectedPath))) throw new Error('Scope contains protected project or input records');
     for (const other of this.store.tasks()) {
-      if (other.id !== taskId && other.resources.some(resource => within(path, resource.workspace) || (resource.kind === 'git-worktree' && overlaps(path, resource.workspace)))) throw new Error('Resource is associated with another task');
-      if (other.id !== taskId && this.read(other.id).scopes.some(scope => overlaps(path, scope.location.root.path))) throw new Error('Resource overlaps another task ownership');
+      if (other.id !== taskId && other.resources.some(resource => roots.some(root => within(root, resource.workspace) || (resource.kind === 'git-worktree' && overlaps(root, resource.workspace))))) throw new Error('Resource is associated with another task');
+      if (other.id !== taskId && this.read(other.id).scopes.some(scope => roots.some(root => overlaps(root, scope.location.root.path)))) throw new Error('Resource overlaps another task ownership');
     }
-    if (this.read(taskId).scopes.some(scope => scope.id !== target.scope.id && within(path, scope.location.root.path) && !scope.sealed)) throw new Error('A newer scope is inside this resource');
+    const ledger = this.read(taskId);
+    const map = (expected: z.infer<typeof identitySchema>) => ({ ...expected, path: within(path, expected.path) ? join(actualRoot, relative(path, expected.path)) : expected.path });
+    for (const child of ledger.scopes.filter(scope => scope.id !== target.scope.id && roots.some(root => within(root, scope.location.root.path)))) {
+      const childTarget = ledger.operations.flatMap(operation => operation.targets).find(item => item.scope.id === child.id);
+      if (!childTarget || childTarget.state !== 'removed') throw new Error(`Nested resource cleanup is unresolved: ${child.id}`);
+      for (const childPath of [child.location.root.path, childTarget.disposalPath]) {
+        const childLocation = { root: map({ ...child.location.root, path: childPath }), ancestors: child.location.ancestors.map(map) };
+        if (!await absentLocation(childLocation)) throw new Error(`Removed nested resource path exists again: ${childPath}`);
+      }
+    }
+    for (const ancestor of ledger.scopes.filter(scope => scope.id !== target.scope.id && within(scope.location.root.path, path))) {
+      if (ancestor.resource.kind !== 'worktree') continue;
+      const resource = ancestor.resource, association = resource.association;
+      if (association.kind !== 'git-worktree') throw new Error('Invalid ancestor worktree ownership');
+      await checkLocation(resource.common);
+      if (!await localBranchHead(association.repository.path, `refs/heads/${association.branch}`)
+        && (!await absentLocation(ancestor.location) || !await absentLocation(resource.gitDirectory)))
+        throw new Error('Task branch is missing while its ancestor worktree or Git registration remains');
+    }
     if (this.reservations.has(taskId)) throw new Error('Task admission is in flight');
-    await this.checkArtifacts(taskId, target, path);
+    await this.checkArtifacts(taskId, target, actualRoot);
   }
   private async checkArtifacts(taskId: string, target: Target, actualRoot: string) {
     const path = target.scope.location.root.path;
@@ -302,7 +332,7 @@ export class TaskCloseout {
         const use = await processUse(target.disposalPath); if (use) throw new Error(use);
         const actual = await identity(target.disposalPath);
         if (actual.dev !== target.scope.location.root.dev || actual.ino !== target.scope.location.root.ino) throw new Error('Disposal identity changed');
-        await this.checkArtifacts(taskId, target, target.disposalPath);
+        await this.guard(taskId, target, target.disposalPath);
         await rm(target.disposalPath, { recursive: true });
       }
       target.directoryRemoved = true;
@@ -316,8 +346,11 @@ export class TaskCloseout {
     const ref = `refs/heads/${association.branch}`;
     const branchHead = await localBranchHead(repository, ref);
     if (branchHead && branchHead !== target.branchHead) throw new Error('Task branch changed after closeout');
-    if (branchHead) await checkBranchIdentity(target.branchIdentity, resource.common.root.path, ref);
-    if (target.branchHead === null && (present || !await absentLocation(resource.gitDirectory))) throw new Error('Task branch is missing while its worktree or Git registration remains');
+    if (branchHead) {
+      await checkBranchGeneration(resource.branchGeneration, resource.common.root.path, ref);
+      await checkBranchIdentity(target.branchIdentity, resource.common.root.path, ref);
+    }
+    if (branchHead === null && (present || !await absentLocation(resource.gitDirectory))) throw new Error('Task branch is missing while its worktree or Git registration remains');
     if (present) {
       await checkLocation(resource.gitDirectory);
       if (await git(path, 'symbolic-ref', '--quiet', 'HEAD') !== ref || await realpath(await git(path, 'rev-parse', '--absolute-git-dir')) !== resource.gitDirectory.root.path) throw new Error('Worktree identity changed');

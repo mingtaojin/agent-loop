@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { access, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { test, type TestContext } from 'node:test';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
@@ -540,4 +541,143 @@ for (const entry of ['native', 'capability'] as const) test(`${entry} project ac
   assert.equal((await f.state(worker.id)).lifecycle.kind, 'completed');
   assert.equal(await exists(scope.location.root.path), false);
   assert.ok((await f.state(worker.id)).operations[0]?.targets.every(target => target.state === 'removed'));
+});
+
+for (const mode of ['disposal-file', 'root', 'removed-recreated'] as const) test(`nested ownership protects ${mode} from recursive parent cleanup`, async t => {
+  const f = await fixture(t), worker = await f.worker(), tree = await f.loop.ensureWorkspace(worker.id, 'example/app');
+  if (tree.kind !== 'git-worktree') throw new Error('Expected worktree');
+  const allocated = z.object({ id: z.string() }).parse(await f.action({ action: 'allocate_artifacts', requestId: 'nested', parent: tree.workspace, label: 'Nested output' }, worker.id));
+  const scope = (await f.state(worker.id)).scopes.find(scope => scope.id === allocated.id); assert.ok(scope);
+  const file = join(scope.location.root.path, 'result.txt'); await writeFile(file, 'original output');
+  if (mode === 'disposal-file') await f.action({ action: 'register_artifact', requestId: 'delivery', scopeId: scope.id, path: file, disposition: 'delivered', reference: 'fixture://delivered' }, worker.id);
+  await f.complete(worker.id);
+  const child = (await f.state(worker.id)).operations[0]?.targets.find(target => target.scope.id === scope.id); assert.ok(child);
+  let retained = file;
+  if (mode === 'disposal-file') {
+    t.diagnostic('Constructed interrupted cleanup by moving the owned child directory to its persisted disposal path.');
+    await rename(scope.location.root.path, child.disposalPath);
+    retained = join(child.disposalPath, 'result.txt'); await rename(retained, `${retained}.old`); await writeFile(retained, 'replacement');
+  } else if (mode === 'root') {
+    await rename(scope.location.root.path, `${scope.location.root.path}.old`); await mkdir(scope.location.root.path); await writeFile(retained, 'replacement');
+  } else {
+    const setMeta = f.loop.store.setMeta.bind(f.loop.store); let recreated = false;
+    f.loop.store.setMeta = (key, value) => {
+      setMeta(key, value);
+      if (key === `task-closeout:${worker.id}`) {
+        const saved = taskCloseoutSchema.parse(JSON.parse(value));
+        if (!recreated && saved.operations[0]?.targets.find(target => target.scope.id === scope.id)?.state === 'removed') {
+          recreated = true;
+          mkdirSync(scope.location.root.path); writeFileSync(retained, 'replacement');
+        }
+      }
+    };
+  }
+  await f.finish(worker.id); await f.restart();
+  assert.equal(await readFile(retained, 'utf8'), 'replacement');
+  const targets = (await f.state(worker.id)).operations[0]?.targets; assert.ok(targets);
+  assert.equal(targets.find(target => target.scope.resource.kind === 'worktree')?.state, 'pending');
+  assert.equal(await git(f.project, 'rev-parse', `refs/heads/${tree.branch}`), await git(f.project, 'rev-parse', 'main'));
+});
+
+test('allocation branch generation rejects same-name same-OID recreation before completion', async t => {
+  const f = await fixture(t), worker = await f.worker(), tree = await f.loop.ensureWorkspace(worker.id, 'example/app');
+  if (tree.kind !== 'git-worktree') throw new Error('Expected worktree');
+  const head = await git(f.project, 'rev-parse', `refs/heads/${tree.branch}`);
+  await f.finish(worker.id);
+  await git(f.project, 'worktree', 'remove', '--force', tree.workspace); await git(f.project, 'branch', '-D', tree.branch);
+  await git(f.project, 'branch', tree.branch, head);
+  await f.complete(worker.id); await f.restart();
+  assert.equal(await git(f.project, 'rev-parse', `refs/heads/${tree.branch}`), head);
+  const target = (await f.state(worker.id)).operations[0]?.targets.find(target => target.scope.resource.kind === 'worktree');
+  assert.equal(target?.state, 'pending'); assert.match(target?.reason ?? '', /branch.*(generation|identity)/);
+});
+
+test('allocation branch generation permits normal Worker commits and packed refs before completion', async t => {
+  const f = await fixture(t), worker = await f.worker(), tree = await f.loop.ensureWorkspace(worker.id, 'example/app');
+  if (tree.kind !== 'git-worktree') throw new Error('Expected worktree');
+  for (let i = 0; i < 2; i++) {
+    await writeFile(join(tree.workspace, 'source.txt'), `Worker commit ${i}`); await git(tree.workspace, 'add', '.'); await git(tree.workspace, 'commit', '-m', `Worker ${i}`);
+  }
+  await git(f.project, 'pack-refs', '--all');
+  await f.finish(worker.id); await f.complete(worker.id); await f.restart();
+  assert.equal(await exists(tree.workspace), false);
+  assert.equal(await git(f.project, 'for-each-ref', '--format=%(refname)', `refs/heads/${tree.branch}`), '');
+  assert.ok((await f.state(worker.id)).operations[0]?.targets.every(target => target.state === 'removed'));
+});
+
+for (const mode of ['absent', 'replacement', 'symlink', 'missing-ref'] as const) test(`nested absence reconciles ${mode} with verified ancestors`, async t => {
+  const f = await fixture(t), worker = await f.worker(), tree = await f.loop.ensureWorkspace(worker.id, 'example/app');
+  if (tree.kind !== 'git-worktree') throw new Error('Expected worktree');
+  const parent = join(tree.workspace, 'build', 'outputs'); await mkdir(parent, { recursive: true });
+  const allocated = z.object({ id: z.string() }).parse(await f.action({ action: 'allocate_artifacts', requestId: 'nested', parent, label: 'Nested output' }, worker.id));
+  const scope = (await f.state(worker.id)).scopes.find(scope => scope.id === allocated.id); assert.ok(scope);
+  await writeFile(join(scope.location.root.path, 'retained.txt'), 'nested');
+  await f.finish(worker.id);
+  if (mode !== 'missing-ref') await git(f.project, 'worktree', 'remove', '--force', tree.workspace);
+  await git(f.project, 'update-ref', '-d', `refs/heads/${tree.branch}`);
+  if (mode === 'replacement') { await mkdir(tree.workspace); await writeFile(join(tree.workspace, 'retained.txt'), 'replacement'); }
+  if (mode === 'symlink') await symlink(f.project, tree.workspace);
+  await f.complete(worker.id); await f.restart();
+  const state = await f.state(worker.id);
+  if (mode === 'absent') {
+    assert.ok(state.operations[0]?.targets.every(target => target.state === 'removed'));
+    assert.equal(await exists(tree.workspace), false); assert.equal(await exists(scope.location.root.path), false);
+    assert.equal(f.loop.store.task(worker.id).resources.some(resource => resource.id === tree.id), false);
+  } else {
+    assert.equal(state.operations[0]?.targets.find(target => target.scope.id === scope.id)?.state, 'pending');
+    assert.equal(await exists(tree.workspace), true);
+    if (mode === 'replacement') assert.equal(await readFile(join(tree.workspace, 'retained.txt'), 'utf8'), 'replacement');
+    if (mode === 'missing-ref') assert.equal(await readFile(join(scope.location.root.path, 'retained.txt'), 'utf8'), 'nested');
+  }
+  assert.equal(await readFile(join(f.project, 'source.txt'), 'utf8'), 'original source');
+});
+
+for (const childLocation of ['original', 'disposal'] as const) test(`constructed interrupted parent disposal protects recreated nested ${childLocation} path`, async t => {
+  const f = await fixture(t), worker = await f.worker(), tree = await f.loop.ensureWorkspace(worker.id, 'example/app');
+  if (tree.kind !== 'git-worktree') throw new Error('Expected worktree');
+  const outer = z.object({ id: z.string(), location: z.object({ root: z.object({ path: z.string() }) }) }).parse(await f.action({ action: 'allocate_artifacts', requestId: 'outer', parent: tree.workspace, label: 'Outer build' }, worker.id));
+  const innerParent = join(outer.location.root.path, 'deep', 'output'); await mkdir(innerParent, { recursive: true });
+  const inner = z.object({ id: z.string(), location: z.object({ root: z.object({ path: z.string() }) }) }).parse(await f.action({ action: 'allocate_artifacts', requestId: 'inner', parent: innerParent, label: 'Inner output' }, worker.id));
+  await f.complete(worker.id);
+  const state = await f.state(worker.id), child = state.operations[0]?.targets.find(target => target.scope.id === inner.id), parent = state.operations[0]?.targets.find(target => target.scope.id === outer.id);
+  assert.ok(child); assert.ok(parent);
+  await rm(inner.location.root.path, { recursive: true });
+  child.state = 'removed'; child.directoryRemoved = true;
+  f.loop.store.setMeta(`task-closeout:${worker.id}`, JSON.stringify(state));
+  await rename(outer.location.root.path, parent.disposalPath);
+  const oldPath = childLocation === 'original' ? child.scope.location.root.path : child.disposalPath;
+  const replacement = join(parent.disposalPath, relative(outer.location.root.path, oldPath));
+  await mkdir(replacement); await writeFile(join(replacement, 'replacement.txt'), 'not owned by completed child');
+  await f.finish(worker.id); await f.restart();
+  assert.equal(await readFile(join(replacement, 'replacement.txt'), 'utf8'), 'not owned by completed child');
+  const targets = (await f.state(worker.id)).operations[0]?.targets; assert.ok(targets);
+  assert.equal(targets.find(target => target.scope.id === outer.id)?.state, 'pending');
+  assert.equal(targets.find(target => target.scope.resource.kind === 'worktree')?.state, 'pending');
+});
+
+test('unproven allocation branch generation retains worktree when reflogs were disabled', async t => {
+  const f = await fixture(t), worker = await f.worker();
+  await git(f.project, 'config', 'core.logAllRefUpdates', 'false');
+  const tree = await f.loop.ensureWorkspace(worker.id, 'example/app');
+  if (tree.kind !== 'git-worktree') throw new Error('Expected worktree');
+  await writeFile(join(tree.workspace, 'retained.txt'), 'unproven ownership');
+  await f.finish(worker.id); await f.complete(worker.id); await f.restart();
+  assert.equal(await readFile(join(tree.workspace, 'retained.txt'), 'utf8'), 'unproven ownership');
+  const target = (await f.state(worker.id)).operations[0]?.targets.find(target => target.scope.resource.kind === 'worktree');
+  assert.equal(target?.state, 'pending'); assert.match(target?.reason ?? '', /branch.*generation/);
+});
+
+test('constructed interrupted disposal preserves a new coordinator scope allocated at its actual location', async t => {
+  const f = await fixture(t), tree = await f.loop.ensureWorkspace(f.coordinatorId, 'example/app');
+  if (tree.kind !== 'git-worktree') throw new Error('Expected worktree');
+  const outer = z.object({ id: z.string(), location: z.object({ root: z.object({ path: z.string() }) }) }).parse(await f.action({ action: 'allocate_artifacts', requestId: 'outer-batch', parent: tree.workspace, label: 'Completed batch' }));
+  await f.action({ action: 'cleanup_artifacts', requestId: 'close-batch', scopeIds: [outer.id] });
+  const target = (await f.state(f.coordinatorId)).operations[0]?.targets.find(target => target.scope.id === outer.id); assert.ok(target);
+  await rename(outer.location.root.path, target.disposalPath);
+  const next = z.object({ location: z.object({ root: z.object({ path: z.string() }) }) }).parse(await f.action({ action: 'allocate_artifacts', requestId: 'next-batch', parent: target.disposalPath, label: 'New work' }));
+  const file = join(next.location.root.path, 'retained.txt'); await writeFile(file, 'next coordinator work');
+  await f.finish(f.coordinatorId); await f.restart();
+  assert.equal(await readFile(file, 'utf8'), 'next coordinator work');
+  const state = await f.state(f.coordinatorId);
+  assert.equal(state.lifecycle.kind, 'open'); assert.equal(state.operations[0]?.targets[0]?.state, 'pending');
 });

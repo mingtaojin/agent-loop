@@ -11,10 +11,10 @@
 
 ## Throughput checkpoint
 
-- Blocking first steps. Fetch latest main, isolate worktree, preserve original changes, ground lifecycle/resources, compare two design sketches, run baseline checks.
-- Independent workstreams. Two grounding readers and independent design candidates write separate artifacts. One implementation owner writes coupled lifecycle/model/tests. Lead owns audit and PR delivery.
-- Shared mutable state. Original checkout is protected. SQLite and Task transitions stay under the existing single Runtime owner and task lanes. No concurrent code writers.
-- Smallest safe decomposition. One feature PR because lifecycle, safe cleanup and caller guidance must agree atomically. A single code owner keeps resource identities and completion guards consistent.
+- Blocking first steps. The repaired candidate is based on baa3055. Typecheck, build, full658 and closeout46 pass. The f131edd source-review FAIL is accepted and its three ownership findings have executable regressions. Merge waits for fresh independent source and behavioral verdicts, then exact-head/base checks.
+- Independent workstreams. Enforced read-only source review and disposable Runtime verification read frozen code and write separate external reports. Lead owns documentation and forge operations.
+- Shared mutable state. No code writers run during review. Code and build manifests detect drift. Original dirty checkout stays protected.
+- Smallest safe decomposition. One coherent feature PR31. Documentation-only evidence updates may follow if code/build identity stays equal to the verified candidate.
 
 ## Workflow
 
