@@ -75,14 +75,15 @@ Issue 评论先交协调者判断影响，再按需转给原 Worker。Worker 最
 | `confirm_group_cleanup` | 核对实际用户对清单的确认消息 | 协调者 |
 | `apply_group_cleanup` | 执行或继续已确认清单，逐群记录结果 | 协调者 |
 | `control` | 暂停或恢复本项目的指定 Worker | 协调者 |
+| `supervision` | 持久暂停或恢复项目定时监督提醒 | 协调者 |
 | `report` | 上报结果、问题或更新 | Worker、verifier |
-| `record` | 追加带版本的项目记录 | 项目成员 |
+| `record` | 按 scope 追加带项目版本的记录，返回有界确认 | 项目成员 |
 | `rotate` | 保存恢复说明并在安全结束后更换协调会话 | 协调者 |
 | `release_workspace` | 释放调用方拥有的 Runtime 工作树 | 项目成员 |
 
-修改动作携带稳定的 `requestId`。同一调用方使用相同 ID 和内容重试，返回原结果；更换内容会报冲突。`record` 同时携带 `expectedVersion`，版本不符时先重新读取，再决定如何更新。
+修改动作携带稳定的 `requestId`。同一调用方使用相同 ID 和内容重试，返回原操作确认；更换内容会报冲突。历史 record 回执也只返回记录确认，不重新暴露过去保存的整份项目状态。`record` 同时携带 `expectedVersion`，版本不符时先重新读取，再决定如何更新。
 
-默认 `status` 返回有界概览。完整历史按 `section` 分页，支持 `issues`、`comments`、`records`、`tasks` 和 `intakes`。协调者还可查询 `unassigned_intakes`，只发现脱敏标识，不提供其他项目的正文和附件路径。`offset` 从零开始，`limit` 默认 20、最大 100。继续读取 `nextOffset`，不要把概览当作全部历史。
+默认 `status` 返回有界概览。Worker 和 verifier 只能读取自己的任务详情、关联 Issue 和评论，以及对自己可见的记录。其他任务的输出、资源和原生请求正文不进入其结果。协调者可显式查询本项目任务详情。过滤先于分页，counts 表示调用方可见的数量。完整历史按 `section` 分页，支持 `issues`、`comments`、`records`、`tasks` 和 `intakes`。协调者还可查询 `unassigned_intakes`，只发现脱敏标识，不提供其他项目的正文和附件路径。`offset` 从零开始，`limit` 默认 20、最大 100。继续读取 `nextOffset`，不要把概览当作全部历史。
 
 ```json
 {"action":"status","section":"records","offset":0,"limit":20}
@@ -92,15 +93,36 @@ Issue 评论先交协调者判断影响，再按需转给原 Worker。Worker 最
 
 未归属的历史请求先在项目群确认实际归属，再调用 `claim_intake`。动作携带 `taskId`、`messageId` 和稳定 `requestId`，其中 `messageId` 必须指向本项目协调群保存的实际所有者消息。认领仅保存路由，不创建 Worker、启动 Thread 或回答原生请求。已有项目归属、正式 Thread、暂停以及其他项目的 GitHub catalog 绑定都会阻止认领。同一请求安全重试，随后仍需显式 `dispatch(intakeTaskId)`。不要自动认领积压请求。
 
+### 选择记录范围
+
+record 的 scope 与作者分别保存。
+
+| scope | 可见范围 | 可写入角色 |
+| --- | --- | --- |
+| `{"kind":"project"}` | 本项目所有成员 | 协调者 |
+| `{"kind":"task","taskId":"<目标 Task>"}` | 目标 Task，以及可显式查询的协调者 | 目标 Worker 或 verifier，或本项目协调者 |
+| `{"kind":"coordinator"}` | 协调者 | 协调者 |
+
+省略 scope 时，Worker 和 verifier 写入自己的任务范围，协调者写入协调者范围。目标必须已经属于同一项目。协调者将选定资料写到 verifier 的任务范围，或通过 send 交接。verifier 不因此获得作者的其他记录。
+
+当前记录按 scope 和 key 的组合取最新值。两个任务可以各自使用同一个 key。`expectedVersion` 仍使用项目级 version，其他任务写入可能引起版本冲突。重新读取并修改请求内容时使用新的 requestId。
+
+旧记录保留原文。没有 scope 的旧记录只供协调者显式查询。它们不进入任何成员的自动上下文。record 返回 accepted、requestId、key、version 和已保存的 scope，不返回其他项目资料。
+
+角色指导和配置规则保持稳定。可见记录在实际 start 或 steer 输入中单独提供，最多八条，每条正文最多 2000 字符。记录写入不会创建 Turn，也不会因全局版本改变而更新无关任务的上下文或加载状态。协调者的自动上下文只包含共享记录及自身范围的记录，其他任务详情按需查询。
+
+过滤作用于 Runtime 提供的项目资料，不清除原 Thread 已经收到的历史，也不构成共享工程目录的文件访问隔离。每个 Task 继续使用原有持续 Thread。
+
 ### 保存需求决定与开发交接
 
-项目自己的文档版本、决定、来源、授权和下一步通过现有 `record` 保存。文档负责描述需求，记录引用文档和具体变化，不再复制整份规格。下面是示意记录，路径、消息身份和版本须替换为当前项目的真实证据。`expectedVersion` 使用刚读取的项目版本。
+项目自己的文档版本、决定、来源、授权和下一步通过现有 `record` 保存。文档负责描述需求，记录引用文档和具体变化，不再复制整份规格。下面的示意记录把选定交接资料提供给已存在的 Worker。目标 Task、路径、消息身份和版本须替换为当前项目的真实证据。`expectedVersion` 使用刚读取的项目版本。
 
 ```json
 {
   "action": "record",
   "requestId": "d279fb3e-4d62-4192-91da-1968e189ed20",
   "expectedVersion": 8,
+  "scope": {"kind": "task", "taskId": "<worker-task-id>"},
   "key": "export-v3-development-handoff",
   "text": "需求 .scratch/export/spec.md v3，提交 <commit>；确认范围：导出当前筛选结果；不做：定时导出；验收：列顺序和数量与筛选一致；未决：无。用户文档确认来源 <message-id-1/group-id/sender-id>，开发授权来源 <message-id-2/group-id/sender-id>，原文及范围见这两条输入。协调者判断：可交接实现；下一步：原 Worker 在独立分支开发并提交独立验证。"
 }
@@ -124,7 +146,19 @@ Issue 评论先交协调者判断影响，再按需转给原 Worker。Worker 最
 
 升级时，已经存在的正式任务依据保存的工程资源原地纳入协调，保留群、Thread、待处理输入、审批、资源和暂停或失败状态。尚未执行的旧任务作为接单请求交给协调者决定。无法确定项目的历史任务保留现场并等待澄清，不继续无项目归属的执行。`status` 的 `intakes` 分页保存未派发请求入口，协调者更换上下文后仍能找回。
 
-存在 Worker 时，Runtime 按 `supervisionIntervalMs` 发送通用监督提醒。提醒要求核查真实进展，不因静默判定失败。协调者处于暂停、故障、运行中或已有待投递输入时，不叠加监督提醒。具体重规划与恢复方法由 Orchestrate 决定。
+存在可推进的 Worker 时，Runtime 按 `supervisionIntervalMs` 发送监督提醒。全部 Worker 暂停、失败、等待阻塞的原生请求，或本轮已结束且无待执行输入时，不生成周期提醒。协调者处于暂停、故障、运行中或已有待投递输入时，不叠加提醒。一轮结束不自动等同于任务完成，任务完成仍由协调者按验收证据判断。
+
+协调者根据实际用户要求显式操作项目监督状态。Runtime 不从普通文本猜暂停。下面的操作在重启后仍然生效，恢复时使用新的 requestId 和 `"operation":"resume"`。
+
+```json
+{"action":"supervision","requestId":"pause-project-reminders-1","operation":"pause"}
+```
+
+supervision 只控制定时提醒。Worker 继续执行，用户输入继续接收。暂停指定 Worker 仍使用 control。状态与操作回执原子保存，重试旧的 pause 不会覆盖后来已完成的 resume。尚未尝试投递的 pending 提醒可标记为 superseded，并记录原因。delivering 和 uncertain 提醒保留原始投递状态，不能被当作已送达。
+
+正常活动检查和动态工具校验使用当前连接的 Turn 身份与轻量状态，不读取完整历史。启动恢复、终态、结果未知的输入和审批仍需完整核对。轻量活动证据不包含历史输入 ID，不能据此宣称未知输入已投递。
+
+单个请求超时只使该请求结果不确定，保留其他 Thread 和原生审批的连接身份。超时的 thread/resume 在原结果未知时不重发，后到的原响应可以解除该 Task 的等待。真实进程退出、协议损坏或写通道故障才使共享连接失效。重建连接后，按实际任务需要恢复原 Thread，缺失的旧 Thread 不阻止其他任务恢复。未知输入和审批不自动重放。
 
 ## 交付与清理
 
@@ -137,3 +171,14 @@ Issue 评论先交协调者判断影响，再按需转给原 Worker。Worker 最
 ## 验证
 
 需求及验收场景见[项目协调者规格](../.scratch/project-coordinator/spec.md)。隔离 Runtime 测试使用真实 SQLite 和受控平台接口，协议测试运行实际适配器及子进程。真实模型探针使用独立临时项目，不对业务仓库或任务群操作。结果分别记录在功能目录的 `execution` 中。
+
+任务记录、活动检查、监督暂停和超时隔离可在本地复查，无需真实模型或飞书实例。
+
+```sh
+node --import tsx --test test/project.test.ts test/project-runtime.test.ts test/project-codex.test.ts test/codex.test.ts test/codex-isolation.test.ts test/runtime.test.ts
+npm run check
+npm run build
+npm test
+```
+
+上述检查使用临时 SQLite 目录和本地协议子进程。它们不代表真实飞书验收，也不证明现场首次 Codex 请求阻塞的内部原因。
