@@ -5,13 +5,13 @@
 - [x] Read the Principles section of poteto-mode.
 - [x] Phase A: Frame.
 - [x] Phase B: Design the workflow.
-- [ ] Phase C: Run the loop.
-- [ ] Phase D: Keep the audit trail.
+- [x] Phase C: Run the loop.
+- [x] Phase D: Keep the audit trail.
 - [ ] Phase E: Verify and hand back.
 
 ## Throughput checkpoint
 
-- Blocking first steps. The repaired candidate is based on baa3055. Typecheck, build, full658 and closeout46 pass. The f131edd source-review FAIL is accepted and its three ownership findings have executable regressions. Merge waits for fresh independent source and behavioral verdicts, then exact-head/base checks.
+- Blocking first steps. The shared-daemon integration is based on 884fd307. Typecheck, build, full681 and closeout46 pass. The f131edd source-review FAIL is accepted and its three ownership findings have executable regressions. Merge waits for fresh independent source and behavioral verdicts, then exact-head/base checks. Final verification and merge state are recorded on PR31.
 - Independent workstreams. Enforced read-only source review and disposable Runtime verification read frozen code and write separate external reports. Lead owns documentation and forge operations.
 - Shared mutable state. No code writers run during review. Code and build manifests detect drift. Original dirty checkout stays protected.
 - Smallest safe decomposition. One coherent feature PR31. Documentation-only evidence updates may follow if code/build identity stays equal to the verified candidate.
