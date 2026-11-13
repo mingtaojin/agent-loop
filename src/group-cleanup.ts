@@ -59,8 +59,9 @@ export class GroupCleanup {
     for (const item of plan.items) {
       if (['dissolved', 'already_gone', 'skipped'].includes(item.status)) continue;
       const task = this.store.task(item.taskId);
-      if (this.protected(task.id) || task.chatId !== item.chatId || plan.excluded.some(entry => entry.chatId === item.chatId)) {
-        item.status = 'skipped'; item.error = '任务群绑定已改变或属于协调群'; this.save(plan); continue;
+      if (this.protected(task.id) || plan.excluded.some(entry => entry.chatId === item.chatId)
+        || this.store.tasks().some(candidate => candidate.chatId === item.chatId && this.protected(candidate.id))) {
+        item.status = 'skipped'; item.error = '项目协调群不参与解散'; this.save(plan); continue;
       }
       try {
         await this.transport.verifyGroup(item.chatId);

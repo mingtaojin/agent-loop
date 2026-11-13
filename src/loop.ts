@@ -464,8 +464,9 @@ export class AgentLoop {
     await this.ports.workspace.release({ taskId, resourceId, workspace: resource.workspace, repository: resource.repository, branch: resource.branch });
     this.store.transaction(() => {
       this.store.setMeta(key, 'released');
-      task.resources = task.resources.filter(item => item.id !== resourceId);
-      this.store.saveTask(task);
+      const latest = this.store.task(taskId);
+      latest.resources = latest.resources.filter(item => item.id !== resourceId);
+      this.store.saveTask(latest);
     });
     return { released: true, resourceId };
   }

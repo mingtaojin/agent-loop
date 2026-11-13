@@ -56,6 +56,7 @@ export class TaskGroups {
     const startedAt = Number(this.store.meta(startKey) ?? Date.now());
     if (this.store.meta(startKey) === null) this.store.setMeta(startKey, String(startedAt));
     if (!previous) this.store.beginOperation(operationId, taskId, kind);
+    else if (previous.error === 'rejected') this.store.retryRejectedOperation(operationId);
     const { title, url } = presentTaskSource(task.source, 100);
     let chatId: string;
     try {

@@ -11,7 +11,7 @@ import { sourceCommentSchema, taskSchema, type IncomingMessage, type PendingRequ
 import { AgentLoop } from '../src/loop.js';
 import { FeishuApiError, GroupCreationRejected, type CodexPort, type WorkspacePort } from '../src/ports.js';
 import { GroupCleanup } from '../src/group-cleanup.js';
-import { groupGeneration, TaskGroups } from '../src/task-groups.js';
+import { groupGeneration, retireTaskGroup, TaskGroups } from '../src/task-groups.js';
 import { ProjectLedger, projectStateSchema, type ProjectAction } from '../src/project.js';
 import type { ReasoningEffort } from '../src/project.js';
 import { Store } from '../src/store.js';
@@ -146,6 +146,100 @@ test('definitive create rejection permits retry but a reconciliation read failur
   f.feishu.ensureGroup = async input => { assert.equal(input.reconcileOnly, true); return ensure(input); };
   await groups.open(another.id);
   assert.equal(f.feishu.groups.size, 3);
+});
+
+test('an interrupted retry after a rejected group create must reconcile before another create', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('rejected-create-crash', 'Create safely.');
+  f.feishu.ensureGroup = async () => { throw new GroupCreationRejected(232017, 'known no-create'); };
+  await assert.rejects(new TaskGroups(f.loop.store, f.feishu).open(worker.id), /known no-create/);
+  await f.loop.close();
+  const child = join(f.root, 'group-crash-child.mjs');
+  await writeFile(child, `
+    import { writeSync } from 'node:fs';
+    import { Store } from ${JSON.stringify(new URL('../src/store.ts', import.meta.url).href)};
+    import { TaskGroups } from ${JSON.stringify(new URL('../src/task-groups.ts', import.meta.url).href)};
+    import { FeishuFake } from ${JSON.stringify(new URL('./fakes.ts', import.meta.url).href)};
+    const store = new Store(process.argv[2]), transport = new FeishuFake();
+    transport.ensureGroup = async input => {
+      writeSync(1, JSON.stringify({ reconcileOnly: input.reconcileOnly, operation: store.operation(process.argv[3] + ':group') }));
+      process.exit(42);
+    };
+    await new TaskGroups(store, transport).open(process.argv[3]);
+  `);
+  await assert.rejects(promisify(execFile)(process.execPath, ['--import', 'tsx', child, f.root, worker.id]), error => {
+    const failure = z.object({ code: z.literal(42), stdout: z.string() }).parse(error);
+    const trace = z.object({ reconcileOnly: z.literal(false), operation: z.object({ status: z.literal('attempting'), error: z.null() }) });
+    trace.parse(JSON.parse(failure.stdout));
+    return true;
+  });
+  const recovered = new Store(f.root);
+  try {
+    assert.equal(recovered.operation(`${worker.id}:group`)?.status, 'attempting');
+    assert.equal(recovered.operation(`${worker.id}:group`)?.error, null);
+    f.feishu.ensureGroup = async input => { assert.equal(input.reconcileOnly, true); throw new Error('unknown result remains unresolved'); };
+    await assert.rejects(new TaskGroups(recovered, f.feishu).open(worker.id), /unknown result/);
+  } finally { recovered.close(); }
+});
+
+test('cleanup reconciles a frozen uncertain deletion after another publisher retires its binding', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('cleanup-retired', 'Keep the task.');
+  const opened = await f.openGroup(worker.id); assert.ok(opened.chatId);
+  const cleanup = new GroupCleanup(f.loop.store, f.feishu, 'owner');
+  const plan = cleanup.plan(f.coordinator().id, 'cleanup-retired-plan');
+  await f.loop.receive(f.message('cleanup-retired-confirm', plan.confirmationText, f.coordinator().chatId!));
+  cleanup.confirm(f.coordinator().id, plan.id, 'cleanup-retired-confirm');
+  const dissolve = f.feishu.dissolveGroup.bind(f.feishu);
+  let deletes = 0, verifies = 0;
+  f.feishu.dissolveGroup = async chatId => { deletes++; await dissolve(chatId); throw new Error('delete ack lost'); };
+  assert.equal((await cleanup.apply(f.coordinator().id, plan.id)).items[0]?.status, 'uncertain');
+  retireTaskGroup(f.loop.store, worker.id, opened.chatId);
+  const verify = f.feishu.verifyGroup.bind(f.feishu);
+  f.feishu.verifyGroup = async chatId => { verifies++; return verify(chatId); };
+  assert.equal((await cleanup.apply(f.coordinator().id, plan.id)).items[0]?.status, 'already_gone');
+  assert.equal(verifies, 1); assert.equal(deletes, 1);
+  assert.equal(f.loop.store.task(worker.id).chatId, null);
+});
+
+test('cleanup finishes its frozen old group without retiring a newly opened replacement', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('cleanup-replacement', 'Keep new groups.');
+  const opened = await f.openGroup(worker.id); assert.ok(opened.chatId);
+  const cleanup = new GroupCleanup(f.loop.store, f.feishu, 'owner');
+  const plan = cleanup.plan(f.coordinator().id, 'replacement-plan');
+  await f.loop.receive(f.message('replacement-confirm', plan.confirmationText, f.coordinator().chatId!));
+  cleanup.confirm(f.coordinator().id, plan.id, 'replacement-confirm');
+  const dissolve = f.feishu.dissolveGroup.bind(f.feishu);
+  f.feishu.dissolveGroup = async () => { throw new Error('delete outcome unknown'); };
+  await cleanup.apply(f.coordinator().id, plan.id);
+  retireTaskGroup(f.loop.store, worker.id, opened.chatId);
+  const replacement = await f.openGroup(worker.id, 'open-replacement'); assert.ok(replacement.chatId);
+  f.feishu.dissolveGroup = dissolve;
+  assert.equal((await cleanup.apply(f.coordinator().id, plan.id)).items[0]?.status, 'dissolved');
+  assert.equal(f.loop.store.task(worker.id).chatId, replacement.chatId);
+  assert.ok([...f.feishu.groups.values()].includes(replacement.chatId));
+  assert.ok(![...f.feishu.groups.values()].includes(opened.chatId));
+});
+
+test('an asynchronous workspace release preserves concurrently retired group state and task updates', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('release-retired-binding', 'Use the project.');
+  const opened = await f.openGroup(worker.id); assert.ok(opened.chatId);
+  const resource = await f.loop.ensureWorkspace(worker.id, 'example/frontend');
+  let signalEntered = () => {}, unblock = () => {};
+  const entered = new Promise<void>(resolve => { signalEntered = resolve; });
+  const held = new Promise<void>(resolve => { unblock = resolve; });
+  f.loop.ports.workspace.release = async () => { signalEntered(); await held; };
+  const releasing = f.loop.projectAction(worker.id, { action: 'release_workspace', requestId: 'release-retired', resourceId: resource.id });
+  await entered;
+  retireTaskGroup(f.loop.store, worker.id, opened.chatId);
+  const current = f.loop.store.task(worker.id); current.reason = 'Newer task update'; f.loop.store.saveTask(current);
+  unblock(); await releasing;
+  const after = f.loop.store.task(worker.id);
+  assert.equal(after.chatId, null); assert.equal(groupGeneration(f.loop.store, worker.id), 1);
+  assert.equal(after.reason, 'Newer task update');
+  assert.ok(!after.resources.some(item => item.id === resource.id));
 });
 
 test('approval cards rejected before delivery remain pending and native requests survive no-group recovery', async t => {
