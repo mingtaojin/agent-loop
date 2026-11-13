@@ -84,3 +84,22 @@ The first local probe regression rejected an existing valid transition. `routeSe
 - Manual diff review checked the seven conflict resolutions, retained scope and adapter changes, probe assertions, and documentation. No new source comments, dependencies, compatibility scheduler or generated logs are staged. Production source under `src` has 48 added and 89 removed lines relative to 85040d8, a net reduction of 41 lines.
 
 The source checks above cover the integrated implementation, not real model acceptance or deployed behavior. The branch remains local for root to freeze and verify before PR delivery. The original conflicted checkout, frozen review checkout and root decisions.tsv were not changed. The local design file was updated in place and remains ignored, as before.
+
+## Native first-turn history materialization correction
+
+The goal is reliable coordinator execution in the isolated task-scoped implementation. The independent native run at a0c3cce failed before dispatch because an accepted Turn was not yet visible through history. Its log is preserved in `.scratch/native-history-fix/original-native-failure.log`.
+
+A narrow local protocol probe against codex-cli 0.167.0 confirmed that a retained new Thread advertises paginated history while both `thread/read includeTurns:true` and `thread/turns/list` temporarily return `-32601` with `list_turns is not supported yet`. The accepted start response has `itemsView:notLoaded`, and metadata can still be idle before `turn/started`. Full pagination succeeds after the notification. The selected protocol fields and exact errors are preserved in `native-protocol-before.json`. The probe used one local fixture, requested no tools, and stopped its child server. This was protocol diagnosis, not coordinator acceptance.
+
+`awaitingHistory` already represents an accepted Turn awaiting complete history independently of Activity. The repair uses that existing evidence after Activity clears the active Turn on an idle observation. The exact materialization error bypasses the unsupported-summary cache. Bounded expiry remains `UncertainOperationError`, with the accepted Turn retained for later reconciliation. No history fallback, delivery inference, restart, resend or Activity history read was added. Genuine unsupported methods and summary parameters retain their existing sticky behavior.
+
+Before the source fix, all three new child-protocol regressions failed. They cover idle metadata after the start response, completion before that response, and persistent unavailable history. `regression-red.log` retains those failures. The first fixed focused run exposed an incorrect cache assertion in the new test. A completion notification correctly invalidates the observation, so one further full read is required before caching. The assertion was corrected; `regression-green.log` preserves that intermediate failed run. A fourth regression covers transient `-32601` after settled history without disabling future summaries.
+
+The single owner changed only `src/adapters/codex.ts` and `test/codex.test.ts`. This implements Fix Root Causes by separating history readiness from active execution, Model the Domain by reusing accepted-turn evidence, and Prove It Works by retaining native protocol and executable regression evidence. Throughput checkpoint was one writer, then focused tests and type checking, followed by build and the complete suite.
+
+- `node --import tsx --test test/codex.test.ts test/codex-isolation.test.ts test/project-codex.test.ts` passed all 119 tests.
+- `npm run check` and `npm run build` passed.
+- `npm test` passed all 606 tests, with zero failures, cancellations or skips.
+- `git diff --check` passed. Manual diff review removed no required behavior and introduced no source comments, dependencies or generated tracked files.
+
+Check logs remain under `.scratch/native-history-fix`. No original or frozen checkout, services, remote targets, configuration, credentials, images or root decision log was changed. No push or merge was performed. Root owns the independent fixed-head review and fresh compiled and native acceptance.

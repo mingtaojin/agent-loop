@@ -114,6 +114,10 @@ class RpcError extends Error {
   constructor(readonly code: number, message: string) { super(message); }
 }
 
+function isTurnHistoryMaterializing(error: unknown): error is RpcError {
+  return error instanceof RpcError && error.message === 'thread/turns/list: list_turns is not supported yet';
+}
+
 function historyDigest(value: object): string {
   return createHash('sha256').update(JSON.stringify(value, (_key, entry: unknown) => {
     if (entry && typeof entry === 'object' && !Array.isArray(entry)) return Object.fromEntries(Object.entries(entry).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
@@ -499,8 +503,10 @@ export class CodexAppServer implements CodexPort {
       try { return await this.inspectSnapshot(threadId, true); }
       catch (error) {
         this.historyObservations.delete(threadId);
-        const materializing = error instanceof TurnHistoryPendingError || (error instanceof RpcError && /list_turns is not supported yet/.test(error.message) && this.activeTurns.has(threadId));
-        if (!materializing || Date.now() >= deadline) throw error;
+        if (isTurnHistoryMaterializing(error) && (this.activeTurns.has(threadId) || this.awaitingHistory.has(threadId))) {
+          error = new TurnHistoryPendingError(error.message);
+        }
+        if (!(error instanceof TurnHistoryPendingError) || Date.now() >= deadline) throw error;
         await delay(50);
       }
     } while (true);
@@ -534,6 +540,7 @@ export class CodexAppServer implements CodexPort {
           };
         }
       } catch (error) {
+        if (isTurnHistoryMaterializing(error)) throw error;
         if (!(error instanceof RpcError) || ![-32601, -32602].includes(error.code)) throw error;
         if (this.epoch === epoch) this.summaryUnsupported = true;
       }
