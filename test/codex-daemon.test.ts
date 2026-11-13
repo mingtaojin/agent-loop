@@ -380,3 +380,80 @@ test('configuration normalizes legacy Thread overrides and rejects unmigratable 
   assert.equal(config.codex.model, 'legacy-model'); assert.equal(config.codex.modelProvider, 'legacy-provider'); assert.equal(config.codex.reasoningEffort, 'high');
   assert.throws(() => configSchema.parse({ feishu: { userOpenId: 'owner' }, codex: { command: ['codex', 'app-server', '-c', 'network_access=true'] } }), /Cannot migrate/);
 });
+
+test('completion seals only the owning client Thread and late native requests do not affect another client', async t => {
+  const f = await fixture(t);
+  const owner = f.client(), other = f.client();
+  const owned = await create(owner, f.root), foreign = await create(other, f.root);
+  const ownedTurn = await start(owner, owned), foreignTurn = await start(other, foreign);
+  const ownedActivity = await owner.activity(owned);
+  assert.equal(ownedActivity.kind, 'running');
+  if (ownedActivity.kind !== 'running') throw new Error('Expected active owned Thread');
+  const completed = new Set<string>();
+  owner.setThreadCompletionPolicy({ isCompleted: threadId => completed.has(threadId) });
+  f.terminal(f.threads.get(owned)!, 'completed');
+  await f.wait(() => !owner.isActiveTurn(ownedActivity));
+  owner.assertThreadCompletionAllowed(owned);
+  completed.add(owned);
+  const before = f.records.length;
+  const approval = (id: string, threadId: string, turnId: string) => ({ id, method: 'item/commandExecution/requestApproval', params: { threadId, turnId, itemId: id, startedAtMs: 1, command: 'effect', cwd: f.root } });
+  f.broadcast(approval('sealed-request', owned, ownedTurn));
+  f.broadcast(approval('foreign-request', foreign, foreignTurn));
+  await f.wait(() => f.records.some(row => row.message.id === 'sealed-request'));
+  assert.deepEqual(f.records.filter(row => row.message.id === 'sealed-request').map(row => row.message.result), [{ decision: 'decline' }]);
+  assert.equal(f.records.filter(row => row.message.id === 'foreign-request').length, 0);
+  const foreignSnapshot = await other.inspect(foreign);
+  assert.equal(foreignSnapshot.status, 'running');
+  assert.equal(foreignSnapshot.requests.length, 1);
+  assert.equal(await owner.executionUse(owned), 'busy');
+  f.broadcast({ method: 'serverRequest/resolved', params: { threadId: owned, requestId: 'sealed-request' } });
+  await f.wait(() => { try { owner.assertThreadCompletionAllowed(owned); return true; } catch { return false; } });
+  assert.equal(await owner.executionUse(owned), 'idle');
+  await assert.rejects(start(owner, owned, 'sealed-input'), /sealed/);
+  f.broadcast({ method: 'turn/started', params: { threadId: owned, turn: { id: 'late-start' } } });
+  await f.wait(() => owner.isActiveTurn({ ...ownedActivity, turnId: 'late-start' }));
+  await owner.close();
+  assert.ok(f.records.slice(before).some(row => row.message.method === 'thread/unsubscribe' && row.message.params?.threadId === owned));
+  assert.equal(f.records.slice(before).filter(row => ['thread/resume', 'turn/start', 'turn/interrupt'].includes(row.message.method ?? '') && row.message.params?.threadId === owned).length, 0);
+  assert.equal((await other.inspect(foreign)).turnId, foreignTurn);
+  assert.equal((await other.inspect(foreign)).requests.length, 1);
+  await other.interrupt({ threadId: foreign, turnId: foreignTurn });
+  await start(other, foreign, 'still-usable');
+  assert.equal((await f.controls()).filter(args => args.at(-1) !== 'version').length, 0);
+});
+
+test('a failed sealed denial send stays unresolved while the shared daemon and another client remain usable', async t => {
+  const f = await fixture(t);
+  let rejectedDenials = 0;
+  const connect = sharedDaemonConnector(normalizeDaemonSettings({ socketPath: f.socketPath }), 1000);
+  const owner = f.client({}, async handlers => {
+    const connection = await connect(handlers);
+    return {
+      send: async message => {
+        if (messageSchema.parse(JSON.parse(message)).id === 'failed-denial') { rejectedDenials++; throw new Error('Injected denial write failure'); }
+        await connection.send(message);
+      },
+      close: () => connection.close(),
+    };
+  });
+  const other = f.client();
+  const owned = await create(owner, f.root), foreign = await create(other, f.root);
+  const turnId = await start(owner, owned);
+  const foreignTurn = await start(other, foreign);
+  owner.setThreadCompletionPolicy({ isCompleted: threadId => threadId === owned });
+  const request = { id: 'failed-denial', method: 'item/commandExecution/requestApproval', params: { threadId: owned, turnId, itemId: 'late', startedAtMs: 1, command: 'effect', cwd: f.root } };
+  f.broadcast(request);
+  await f.wait(() => rejectedDenials === 1);
+  assert.equal(await owner.executionUse(owned), 'busy');
+  assert.throws(() => owner.assertThreadCompletionAllowed(owned), /native requests/);
+  f.broadcast(request);
+  await delay(20);
+  assert.equal(rejectedDenials, 1);
+  assert.equal((await other.inspect(foreign)).turnId, foreignTurn);
+  assert.equal((await other.inspect(foreign)).requests.length, 0);
+  await owner.close();
+  await other.interrupt({ threadId: foreign, turnId: foreignTurn });
+  await start(other, foreign, 'after-denial-failure');
+  assert.equal(f.records.filter(row => row.message.id === 'failed-denial').length, 0);
+  assert.equal((await f.controls()).filter(args => args.at(-1) !== 'version').length, 0);
+});
