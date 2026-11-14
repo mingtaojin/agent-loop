@@ -2,6 +2,7 @@ import { intakeRouteSchema, presentTaskSource, type InputProvenance, type Task, 
 import { ProjectLedger, type ProjectState } from './project.js';
 import { Store, type Inbox } from './store.js';
 import type { StoredExecutionEvent } from './execution-events.js';
+import { z } from 'zod';
 
 export const visibleTextLimit = 32_768;
 
@@ -134,6 +135,16 @@ function coalesce(events: StoredExecutionEvent[]): DashboardExecutionEvent[] {
   return result;
 }
 
+type DashboardOwnership = { projectId: string; role: ProjectTaskCard['role'] };
+interface DashboardContext {
+  tasks: Task[];
+  states: Map<string, ProjectState>;
+  ownership: Map<string, DashboardOwnership>;
+  reportsByTask: Map<string, DashboardReport[]>;
+  latestActivity: Map<string, StoredExecutionEvent>;
+}
+const membershipMetadataSchema = z.strictObject({ projectId: z.string(), role: z.enum(['coordinator', 'worker']) });
+
 export class ProjectDashboardReader {
   readonly ledger: ProjectLedger;
   constructor(private readonly store: Store) { this.ledger = new ProjectLedger(store); }
@@ -143,25 +154,60 @@ export class ProjectDashboardReader {
     return raw === null ? null : intakeRouteSchema.parse(JSON.parse(raw));
   }
 
-  private projectForTask(taskId: string): { projectId: string; role: ProjectTaskCard['role'] } | null {
-    const member = this.ledger.membership(taskId);
-    if (member) return { projectId: member.projectId, role: member.role };
-    const route = this.route(taskId);
-    return route ? { projectId: route.projectId, role: 'intake' } : null;
+  private membershipMetadata(taskId: string): z.infer<typeof membershipMetadataSchema> | null {
+    const raw = this.store.meta(`project:${JSON.stringify(['member', taskId])}`);
+    return raw === null ? null : membershipMetadataSchema.parse(JSON.parse(raw));
   }
 
-  private reportsForTask(taskId: string): DashboardReport[] {
-    const membership = this.ledger.membership(taskId);
-    const coordinatorTaskId = membership ? this.ledger.project(membership.projectId)?.coordinatorTaskId : this.route(taskId)?.coordinatorTaskId;
-    if (!coordinatorTaskId) return [];
-    return this.store.inputs(coordinatorTaskId).flatMap(input => input.provenance.kind === 'agent' && input.provenance.taskId === taskId
-      ? [reportFromInput(input)].filter((report): report is DashboardReport => report !== null) : []);
+  private context(tasks: Task[]): DashboardContext {
+    const states = new Map<string, ProjectState>();
+    const ownership = new Map<string, DashboardOwnership>();
+    const coordinatorInputs = new Map<string, Inbox[]>();
+    for (const task of tasks) {
+      const member = this.membershipMetadata(task.id);
+      const route = member ? null : this.route(task.id);
+      const owned = member ? { projectId: member.projectId, role: member.role } as DashboardOwnership
+        : route ? { projectId: route.projectId, role: 'intake' as const } : null;
+      if (!owned) continue;
+      ownership.set(task.id, owned);
+      if (!states.has(owned.projectId)) {
+        const state = this.ledger.project(owned.projectId);
+        if (state) states.set(owned.projectId, state);
+      }
+    }
+    for (const [taskId, owned] of ownership) {
+      if (owned.role === 'intake') continue;
+      const state = states.get(owned.projectId);
+      const member = state?.members.find(candidate => candidate.taskId === taskId);
+      if (!member || member.role !== owned.role) throw new Error('Inconsistent project membership');
+    }
+    for (const state of states.values()) coordinatorInputs.set(state.coordinatorTaskId, this.store.inputs(state.coordinatorTaskId));
+    for (const route of tasks.filter(task => ownership.get(task.id)?.role === 'intake')) {
+      const routeState = this.route(route.id);
+      if (routeState && !coordinatorInputs.has(routeState.coordinatorTaskId)) coordinatorInputs.set(routeState.coordinatorTaskId, this.store.inputs(routeState.coordinatorTaskId));
+    }
+    const reportsByTask = new Map<string, DashboardReport[]>();
+    for (const inputs of coordinatorInputs.values()) for (const input of inputs) {
+      if (input.provenance.kind !== 'agent') continue;
+      const report = reportFromInput(input);
+      if (!report) continue;
+      const list = reportsByTask.get(input.provenance.taskId) ?? [];
+      list.push(report); reportsByTask.set(input.provenance.taskId, list);
+    }
+    return { tasks, states, ownership, reportsByTask, latestActivity: this.store.latestVisibleExecutionEvents(tasks.map(task => task.id)) };
   }
 
-  private card(task: Task, projectId: string, role: ProjectTaskCard['role'], issueId: string | null = null): ProjectTaskCard {
-    const latestActivity = this.store.latestVisibleExecutionEvent(task.id);
+  private reportsForTask(taskId: string, context: DashboardContext): DashboardReport[] {
+    const ownership = context.ownership.get(taskId);
+    const state = ownership ? context.states.get(ownership.projectId) : null;
+    if (!state && ownership?.role !== 'intake') return [];
+    return context.reportsByTask.get(taskId) ?? [];
+  }
+
+  private card(task: Task, projectId: string, role: ProjectTaskCard['role'], context: DashboardContext, issueId: string | null = null): ProjectTaskCard {
+    const latestActivity = context.latestActivity.get(task.id) ?? null;
     const visibleActivity = latestActivity ? dashboardEvent(latestActivity) : null;
-    const reports = this.reportsForTask(task.id);
+    const reports = this.reportsForTask(task.id, context);
     const waiting = task.requests.map(request => `${request.kind}: ${boundedDashboardText(request.prompt)}`);
     const source = presentTaskSource(task.source, 200);
     const repository = task.source.kind === 'github' ? task.source.issue.repository : task.resources.find(resource => resource.kind !== 'project')?.repository.name ?? null;
@@ -175,21 +221,19 @@ export class ProjectDashboardReader {
     };
   }
 
-  projects(): ProjectDashboard[] {
-    const tasks = this.store.tasks();
+  projects(tasks = this.store.tasks()): ProjectDashboard[] {
+    const context = this.context(tasks);
     const cards = new Map<string, ProjectTaskCard[]>();
-    const states = new Map<string, ProjectState>();
     for (const task of tasks) {
-      const ownership = this.projectForTask(task.id);
+      const ownership = context.ownership.get(task.id);
       if (!ownership) continue;
-      const state = this.ledger.project(ownership.projectId);
+      const state = context.states.get(ownership.projectId);
       if (!state) continue;
-      states.set(state.id, state);
       const issueId = state.members.find(member => member.taskId === task.id)?.issueId ?? null;
       const list = cards.get(state.id) ?? [];
-      list.push(this.card(task, state.id, ownership.role, issueId)); cards.set(state.id, list);
+      list.push(this.card(task, state.id, ownership.role, context, issueId)); cards.set(state.id, list);
     }
-    return [...states.values()].sort((a, b) => a.name.localeCompare(b.name)).map(state => ({
+    return [...context.states.values()].sort((a, b) => a.name.localeCompare(b.name)).map(state => ({
       id: state.id, name: state.name, directory: state.directory, coordinatorTaskId: state.coordinatorTaskId,
       members: state.members, tasks: (cards.get(state.id) ?? []).sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id)),
     }));
@@ -219,14 +263,15 @@ export class ProjectDashboardReader {
     return { cursor, events };
   }
 
-  taskDetail(taskId: string): DashboardTaskDetail | null {
-    const task = this.store.tasks().find(candidate => candidate.id === taskId);
+  taskDetail(taskId: string, tasks = this.store.tasks()): DashboardTaskDetail | null {
+    const task = tasks.find(candidate => candidate.id === taskId);
     if (!task) return null;
-    const ownership = this.projectForTask(taskId);
-    const project = ownership ? this.ledger.project(ownership.projectId) : null;
-    const reports = this.reportsForTask(taskId);
+    const context = this.context(tasks);
+    const ownership = context.ownership.get(taskId);
+    const project = ownership ? context.states.get(ownership.projectId) : null;
+    const reports = this.reportsForTask(taskId, context);
     return {
-      task: ownership && project ? this.card(task, project.id, ownership.role, project.members.find(member => member.taskId === taskId)?.issueId ?? null) : null,
+      task: ownership && project ? this.card(task, project.id, ownership.role, context, project.members.find(member => member.taskId === taskId)?.issueId ?? null) : null,
       projectId: ownership?.projectId ?? null,
       inputs: this.store.inputs(taskId), outputs: this.store.outputs(taskId), events: coalesce(this.allEvents(taskId)), reports,
       diagnostics: this.store.diagnostics().filter(row => row.scope === taskId || row.scope.endsWith(':' + taskId)),

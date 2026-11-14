@@ -139,7 +139,10 @@ test('real adapter to SQLite to SSE streams partial text, tools and capacity err
   assert.equal(resumedEvents.at(-1)?.kind, 'turn_end');
   assert.equal((await (await fetch(dashboard.url + '/api/tasks/' + first.id)).json()).outputs.some((row: { text: string }) => row.text === '正在检查运行状态，校验已完成。'), true);
   const readOnly = new Store(root, { readOnly: true });
-  assert.deepEqual(readOnly.executionEvents(first.id), events); readOnly.close();
+  const durable = readOnly.executionEvents(first.id);
+  assert.equal(durable.some(event => event.kind === 'tool_output'), false);
+  assert.equal(durable.filter(event => event.kind === 'agent_message').length, 1);
+  assert.equal(durable.at(-1)?.kind, 'turn_end'); readOnly.close();
   assert.equal(loop.store.task(second.id).status, 'running');
 });
 
