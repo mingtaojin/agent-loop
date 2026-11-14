@@ -6,6 +6,7 @@ export const localArtifactRequestSchema = z.strictObject({
   kind: z.enum(['image', 'file']),
   chatId: nonEmpty,
   id: nonEmpty,
+  root: z.string().min(1).refine(isAbsolute, 'Artifact root must be absolute'),
   path: z.string().min(1).refine(isAbsolute, 'Artifact path must be absolute'),
 });
 export type LocalArtifactRequest = z.infer<typeof localArtifactRequestSchema>;
@@ -26,11 +27,12 @@ export interface FeishuArtifactPort {
 }
 
 export type ArtifactDeliveryRecord = Omit<FeishuArtifactReceipt, 'messageId'> & {
+  root: string;
   status: 'uploaded' | 'sent';
   messageId?: string;
 };
 export const artifactDeliveryRecordSchema = z.strictObject({
-  id: z.string().min(1), chatId: z.string().min(1), kind: z.enum(['image', 'file']), name: z.string().min(1),
+  id: z.string().min(1), chatId: z.string().min(1), kind: z.enum(['image', 'file']), root: z.string().min(1), name: z.string().min(1),
   bytes: z.number().int().positive(), sha256: z.string().regex(/^[0-9a-f]{64}$/), key: z.string().min(1),
   status: z.enum(['uploaded', 'sent']), messageId: z.string().min(1).optional(),
 });

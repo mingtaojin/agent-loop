@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
-import { lstat, readFile } from 'node:fs/promises';
-import { basename, extname } from 'node:path';
+import { lstat, readFile, realpath, stat } from 'node:fs/promises';
+import { basename, extname, relative, sep } from 'node:path';
 import { Client } from '@larksuiteoapi/node-sdk';
 import { z } from 'zod';
 import { UncertainOperationError } from '../domain.js';
@@ -40,7 +40,7 @@ function stableUuid(value: string): string {
 }
 
 function sameArtifact(record: ArtifactDeliveryRecord, artifact: ValidatedArtifact): boolean {
-  return record.chatId === artifact.chatId && record.kind === artifact.kind && record.name === artifact.name
+  return record.chatId === artifact.chatId && record.kind === artifact.kind && record.root === artifact.root && record.name === artifact.name
     && record.bytes === artifact.bytes && record.sha256 === artifact.sha256;
 }
 
@@ -63,6 +63,14 @@ export class FeishuArtifactAdapter implements FeishuArtifactPort {
     const parsed = localArtifactRequestSchema.safeParse(input);
     if (!parsed.success) throw new FeishuArtifactValidationError(parsed.error.issues.map(issue => issue.message).join('; '));
     const path = parsed.data.path;
+    const root = await realpath(parsed.data.root).catch(error => { throw new FeishuArtifactValidationError(`Artifact root is unavailable: ${error instanceof Error ? error.message : String(error)}`); });
+    const rootMetadata = await stat(root).catch(error => { throw new FeishuArtifactValidationError(`Artifact root is unavailable: ${error instanceof Error ? error.message : String(error)}`); });
+    if (!rootMetadata.isDirectory()) throw new FeishuArtifactValidationError('Artifact root must be a directory');
+    const canonicalPath = await realpath(path).catch(error => { throw new FeishuArtifactValidationError(`Artifact path is unavailable: ${error instanceof Error ? error.message : String(error)}`); });
+    const pathFromRoot = relative(root, canonicalPath);
+    if (!pathFromRoot || pathFromRoot === '..' || pathFromRoot.startsWith(`..${sep}`) || pathFromRoot.startsWith(sep)) {
+      throw new FeishuArtifactValidationError('Artifact path must be inside its task root');
+    }
     const metadata = await lstat(path).catch(error => { throw new FeishuArtifactValidationError(`Artifact path is unavailable: ${error instanceof Error ? error.message : String(error)}`); });
     if (!metadata.isFile()) throw new FeishuArtifactValidationError('Artifact path must be a regular file');
     const name = basename(path);
@@ -75,7 +83,7 @@ export class FeishuArtifactAdapter implements FeishuArtifactPort {
     if (data.length > maxBytes) throw new FeishuArtifactValidationError(`Artifact exceeds ${maxBytes} bytes`);
     const extension = extname(name).toLowerCase();
     if (parsed.data.kind === 'image' && (!imageExtensions.has(extension) || !imageSignature(extension, data))) throw new FeishuArtifactValidationError(`Artifact is not a supported ${extension || 'image'} file`);
-    return { ...parsed.data, name, bytes: data.length, sha256: createHash('sha256').update(data).digest('hex'), data };
+    return { ...parsed.data, root, path: canonicalPath, name, bytes: data.length, sha256: createHash('sha256').update(data).digest('hex'), data };
   }
   private receipt(record: ArtifactDeliveryRecord): FeishuArtifactReceipt {
     const messageId = id.safeParse(record.messageId);
@@ -117,7 +125,7 @@ export class FeishuArtifactAdapter implements FeishuArtifactPort {
   }
   async sendLocalArtifact(input: LocalArtifactRequest): Promise<FeishuArtifactReceipt> {
     const artifact = await this.validate(input);
-    const fingerprint = JSON.stringify([artifact.chatId, artifact.kind, artifact.name, artifact.bytes, artifact.sha256]);
+    const fingerprint = JSON.stringify([artifact.chatId, artifact.kind, artifact.root, artifact.name, artifact.bytes, artifact.sha256]);
     const active = this.inFlight.get(artifact.id);
     if (active) {
       if (active.fingerprint !== fingerprint) throw new FeishuArtifactConflictError(`Artifact delivery ID ${artifact.id} is already active for different content`);
@@ -133,9 +141,9 @@ export class FeishuArtifactAdapter implements FeishuArtifactPort {
     if (previous && !sameArtifact(previous, artifact)) throw new FeishuArtifactConflictError(`Artifact delivery ID ${artifact.id} does not match its recorded content`);
     if (previous?.status === 'sent') return this.receipt(previous);
     const key = previous?.key ?? await this.upload(artifact);
-    if (!previous) await this.ledger.write({ id: artifact.id, chatId: artifact.chatId, kind: artifact.kind, name: artifact.name, bytes: artifact.bytes, sha256: artifact.sha256, key, status: 'uploaded' });
+    if (!previous) await this.ledger.write({ id: artifact.id, chatId: artifact.chatId, kind: artifact.kind, root: artifact.root, name: artifact.name, bytes: artifact.bytes, sha256: artifact.sha256, key, status: 'uploaded' });
     const messageId = await this.send(artifact, key);
-    const record: ArtifactDeliveryRecord = { id: artifact.id, chatId: artifact.chatId, kind: artifact.kind, name: artifact.name, bytes: artifact.bytes, sha256: artifact.sha256, key, status: 'sent', messageId };
+    const record: ArtifactDeliveryRecord = { id: artifact.id, chatId: artifact.chatId, kind: artifact.kind, root: artifact.root, name: artifact.name, bytes: artifact.bytes, sha256: artifact.sha256, key, status: 'sent', messageId };
     try { await this.ledger.write(record); }
     catch (error) { throw new UncertainOperationError(`Feishu artifact ledger write outcome is unknown: ${error instanceof Error ? error.message : String(error)}`); }
     return this.receipt(record);
