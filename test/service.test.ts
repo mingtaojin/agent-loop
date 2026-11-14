@@ -596,13 +596,37 @@ test('ordinary control text never changes runtime state', async t => {
   assert.equal(workerCalls(f.loop, f.codex).steers.length, 6); assert.equal(workerCalls(f.loop, f.codex).interrupts.length, 0); assert.equal(f.task().status, 'running');
 });
 
+test('uploaded files of any format reach Codex with original names and readable task-local paths', async t => {
+  const f = await fixture(t);
+  await f.launch();
+  const files = [
+    { key: 'rar-key', name: '新建文件夹 (3) (8).rar', bytes: Buffer.from([82, 97, 114, 33, 26, 7, 1, 0, 0, 255]) },
+    { key: 'binary-log', name: 'record.log', bytes: Buffer.from([255, 254, 128, 0]) },
+    { key: 'bare-key', name: 'README', bytes: Buffer.from('no extension') },
+  ];
+  for (const file of files) f.feishu.resources.set(file.key, file.bytes);
+  const message = f.message(1, 'archive-evidence', '证据都在压缩包里', { attachments: [
+    { key: 'image-key', name: 'image', kind: 'image' },
+    ...files.map(file => ({ key: file.key, name: file.name, kind: 'file' as const })),
+  ] });
+  f.feishu.resources.set('image-key', Buffer.from([137, 80, 78, 71]));
+  await f.loop.receive(message);
+  const input = f.codex.steers.find(item => item.deliveryId === message.id)?.input;
+  assert.ok(input, 'message with archive is delivered');
+  const references = input.flatMap(item => {
+    const match = item.kind === 'text' ? /附件 ("(?:[^"\\]|\\.)*") 的完整原文件位于 ("(?:[^"\\]|\\.)*")/.exec(item.text) : null;
+    return match?.[1] && match[2] ? [{ name: z.string().parse(JSON.parse(match[1])), path: z.string().parse(JSON.parse(match[2])) }] : [];
+  });
+  assert.deepEqual(references.map(reference => reference.name), files.map(file => file.name));
+  for (const [index, reference] of references.entries()) assert.deepEqual(await readFile(reference.path), files[index]?.bytes);
+  assert.ok(!f.feishu.sent.some(output => output.text.includes('附件准备失败')));
+});
+
 for (const resource of [
-  { name: 'record.zip', bytes: Buffer.from('archive'), maximum: 1024 },
-  { name: 'record.log', bytes: Buffer.from([255, 254, 128]), maximum: 1024 },
   { name: 'record.log', bytes: Buffer.from('too large'), maximum: 2 },
   { name: 'record.log', bytes: Buffer.from(''), maximum: 1024 },
 ]) {
-  test(`unsupported or invalid evidence is reported without forwarding its accompanying text (${resource.name}, ${resource.bytes.length} bytes, limit ${resource.maximum})`, async t => {
+  test(`invalid evidence is reported without forwarding its accompanying text (${resource.name}, ${resource.bytes.length} bytes, limit ${resource.maximum})`, async t => {
     const f = await fixture(t);
     f.config.maxAttachmentBytes = resource.maximum;
     await f.launch();
