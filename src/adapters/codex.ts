@@ -33,7 +33,7 @@ const turnSchema = z.object({
   items: z.array(itemSchema), itemsView: z.enum(['full', 'summary', 'notLoaded']).default('full'),
 });
 const completedTurnSchema = z.object({
-  id: z.string(), status: z.enum(['inProgress', 'completed', 'interrupted', 'failed']),
+  id: z.string(), status: z.enum(['inProgress', 'completed', 'interrupted', 'failed']).optional(),
   error: z.object({ message: z.string() }).nullish(),
 }).passthrough();
 const turnPageSchema = z.object({ data: z.array(turnSchema), nextCursor: z.string().nullish() });
@@ -173,6 +173,7 @@ export class CodexAppServer implements CodexPort {
   private initialized: Promise<void> | undefined;
   private failure: Error | undefined;
   private recovery: Promise<void> | undefined;
+  private connectionClosed: Promise<void> | undefined;
   private closed = false;
   private workspaceHandler: Parameters<CodexPort['setWorkspaceHandler']>[0] | undefined;
   private projectHandler: Parameters<NonNullable<CodexPort['setProjectHandler']>>[0] | undefined;
@@ -243,7 +244,7 @@ export class CodexAppServer implements CodexPort {
     this.epoch = randomUUID();
     const connection = this.connection;
     this.connection = undefined;
-    void connection?.close().catch(() => undefined);
+    this.connectionClosed = connection?.close().then(() => undefined, () => undefined) ?? Promise.resolve();
   }
 
   private async write(message: unknown, failurePolicy: 'fail-connection' | 'retain-request' = 'fail-connection'): Promise<void> {
@@ -757,6 +758,7 @@ export class CodexAppServer implements CodexPort {
     } finally {
       input.signal?.removeEventListener('abort', abort);
       if (!summarizer.closed) await summarizer.close();
+      else await summarizer.connectionClosed;
     }
   }
 

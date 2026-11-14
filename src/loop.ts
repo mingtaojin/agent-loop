@@ -214,10 +214,11 @@ export class AgentLoop {
     const titleTimeoutMs = this.config.execution.backends.codex.titleTimeoutMs;
     if (!text || fitsTaskTitle(text) || !this.ports.codex.summarizeTitle) return fallback;
     try {
+      await mkdir(task.contextDirectory, { recursive: true, mode: 0o700 });
       const signal = AbortSignal.any([this.titleAbort.signal, AbortSignal.timeout(titleTimeoutMs)]);
       return parseTaskTitle(await this.ports.codex.summarizeTitle({ taskId: task.id, cwd: task.contextDirectory, text, signal })) ?? fallback;
     } catch (error) {
-      this.titleAbort.signal.throwIfAborted();
+      if (this.stopping || this.titleAbort.signal.aborted) return fallback;
       this.problem(`title:${task.id}`, `Group title summary failed; using the task text: ${errorMessage(error)}`);
       return fallback;
     }

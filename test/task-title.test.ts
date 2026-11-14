@@ -11,7 +11,8 @@ import { type IncomingMessage } from '../src/domain.js';
 import type { CodexPort, WorkspacePort } from '../src/ports.js';
 import { parseTaskTitle, taskTitleMaxWidth } from '../src/task-title.js';
 import { testExecution } from './test-config.js';
-import { restoreSurface, testProject, workerCalls, SurfaceCodex } from './coordinated-surfaces.js';
+import { restoreSurface, testProject, SurfaceCodex } from './coordinated-surfaces.js';
+import { workerCalls } from './coordinated-runtime.js';
 import { CodexAppServer } from './helpers/codex.js';
 import { FeishuFake, GitHubFake } from './fakes.js';
 
@@ -42,7 +43,7 @@ test('group name summarizes a long request while the worker keeps its original t
   await restoreSurface(f.loop, f.message('issue-12', issueExample));
   assert.equal(f.workerTitle(), '2.4.1 后处理根因定位');
   assert.equal(f.requests.length, 1);
-  assert.equal(workerCalls(f.loop, f.codex).starts.at(-1)?.input[0]?.text, issueExample);
+  assert.deepEqual(workerCalls(f.loop, f.codex).starts.at(-1)?.input[0], { kind: 'text', text: issueExample });
 });
 
 for (const [name, summarize] of [
@@ -53,7 +54,7 @@ for (const [name, summarize] of [
   const f = await fixture(t, summarize);
   await restoreSurface(f.loop, f.message(`fallback-${name}`, issueExample));
   assert.equal(f.workerTitle(), issueExample);
-  assert.equal(workerCalls(f.loop, f.codex).starts.at(-1)?.input[0]?.text, issueExample);
+  assert.deepEqual(workerCalls(f.loop, f.codex).starts.at(-1)?.input[0], { kind: 'text', text: issueExample });
 });
 
 test('a short single-line request names its group directly without a model call', async t => {
@@ -70,17 +71,16 @@ test('long colloquial requests are summarized and over-long model titles are cap
   const title = f.workerTitle(); assert.ok(title);
   assert.ok(title.startsWith('Agent Loop 飞书任务群'));
   assert.ok([...title].reduce((width, char) => width + (/[⺀-￿]/.test(char) ? 2 : 1), 0) <= taskTitleMaxWidth);
-  assert.equal(workerCalls(f.loop, f.codex).starts.at(-1)?.input[0]?.text, colloquial);
+  assert.deepEqual(workerCalls(f.loop, f.codex).starts.at(-1)?.input[0], { kind: 'text', text: colloquial });
 });
 
 test('closing the loop cancels an in-flight title summary', async t => {
   let aborted = false;
   const f = await fixture(t, input => new Promise<string>((_, reject) => input.signal?.addEventListener('abort', () => { aborted = true; reject(new Error('aborted')); }, { once: true })));
-  const received = f.loop.receive(f.message('shutdown', issueExample));
-  const ticking = f.loop.tick();
-  await delay(10);
+  const running = restoreSurface(f.loop, f.message('shutdown', issueExample));
+  while (!f.requests.length) await delay(5);
   await f.loop.close();
-  await Promise.allSettled([received, ticking]);
+  await Promise.allSettled([running]);
   assert.equal(aborted, true);
 });
 
@@ -90,6 +90,11 @@ test('model titles lose wrapping quotes, trailing punctuation and extra lines', 
   assert.equal(parseTaskTitle(' 「」 '), null);
   assert.equal(parseTaskTitle('grill with doc技能触发不佳'), 'grill with doc技能触发不佳');
   assert.equal(parseTaskTitle('一二三四五六七八九十甲乙丙丁戊己庚辛'), '一二三四五六七八九十甲乙丙丁戊己');
+  const displayWidth = (text: string) => [...text].reduce((width, char) => width + (char === '😀' || char === '𠀀' ? 2 : 1), 0);
+  const astralCjk = parseTaskTitle('𠀀'.repeat(32)), emoji = parseTaskTitle('😀'.repeat(20)), mixed = parseTaskTitle('A😀𠀀B'.repeat(10));
+  assert.ok(astralCjk && displayWidth(astralCjk) <= taskTitleMaxWidth);
+  assert.ok(emoji && displayWidth(emoji) <= taskTitleMaxWidth);
+  assert.ok(mixed && displayWidth(mixed) <= taskTitleMaxWidth);
 });
 
 async function titleServer(t: TestContext, mode: string) {
