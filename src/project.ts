@@ -42,16 +42,24 @@ export const recordScopeSchema = z.discriminatedUnion('kind', [
 export type RecordScope = z.infer<typeof recordScopeSchema>;
 const recordRequestSchema = z.strictObject({ requestId: idSchema, key: idSchema, text: textSchema, expectedVersion: versionSchema,
   scope: recordScopeSchema.optional() });
+const featureAuthorizationSchema = z.strictObject({
+  messageId: idSchema.optional(),
+  scope: textSchema,
+  acceptance: textSchema,
+  sourceRevision: idSchema,
+});
 export const projectActionSchema = z.discriminatedUnion('action', [
   z.strictObject({ action: z.literal('status'), section: z.enum(['overview', 'issues', 'comments', 'records', 'tasks', 'intakes', 'unassigned_intakes', 'closeout']).optional(),
     offset: versionSchema.optional(), limit: z.number().int().min(1).max(100).optional() }),
   z.strictObject({ action: z.literal('dispatch'), requestId: idSchema, prompt: textSchema,
-    predecessorTaskId: idSchema.optional(), issueId: idSchema.optional(), intakeTaskId: idSchema.optional(), role: z.enum(['worker', 'verifier']).default('worker') }),
+    predecessorTaskId: idSchema.optional(), issueId: idSchema.optional(), intakeTaskId: idSchema.optional(), role: z.enum(['worker', 'verifier']).default('worker'),
+    mode: z.enum(['investigation', 'implementation']).optional(), authorization: featureAuthorizationSchema.optional() }),
   z.strictObject({ action: z.literal('allocate_artifacts'), requestId: idSchema, label: textSchema, parent: z.string().min(1).optional() }),
   z.strictObject({ action: z.literal('register_artifact'), requestId: idSchema, taskId: idSchema.optional(), scopeId: idSchema, path: z.string().min(1), disposition: artifactDispositionSchema, reference: textSchema.optional() }),
   z.strictObject({ action: z.literal('complete_task'), requestId: idSchema, taskId: idSchema, outcome: z.enum(['delivered', 'terminated']), summary: textSchema, deliveryReferences: z.array(textSchema) }),
   z.strictObject({ action: z.literal('cleanup_artifacts'), requestId: idSchema, scopeIds: z.array(idSchema).min(1) }),
   z.strictObject({ action: z.literal('send'), requestId: idSchema, taskId: idSchema, text: textSchema }),
+  z.strictObject({ action: z.literal('announce'), requestId: idSchema, kind: z.enum(['decision', 'blocker', 'approval', 'delivery']), text: textSchema }),
   z.strictObject({ action: z.literal('claim_intake'), requestId: idSchema, taskId: idSchema, messageId: idSchema }),
   z.strictObject({ action: z.literal('open_group'), requestId: idSchema, taskId: idSchema }),
   z.strictObject({ action: z.literal('plan_group_cleanup'), requestId: idSchema }),
