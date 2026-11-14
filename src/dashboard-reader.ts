@@ -1,9 +1,23 @@
-import { intakeRouteSchema, presentTaskSource, type InputProvenance, type Task } from './domain.js';
+import { intakeRouteSchema, presentTaskSource, type InputProvenance, type Task, type TaskResource } from './domain.js';
 import { ProjectLedger, type ProjectState } from './project.js';
 import { Store, type Inbox } from './store.js';
 import type { StoredExecutionEvent } from './execution-events.js';
 
 export const visibleTextLimit = 32_768;
+
+export type DashboardResource =
+  | { kind: 'project'; project: Extract<TaskResource, { kind: 'project' }>['project']; workspace: string }
+  | { repository: string; workspace: string };
+
+export function dashboardResource(resource: TaskResource): DashboardResource {
+  return resource.kind === 'project'
+    ? { kind: resource.kind, project: resource.project, workspace: resource.workspace }
+    : { repository: resource.repository.name, workspace: resource.workspace };
+}
+
+export function dashboardResources(resources: TaskResource[]): DashboardResource[] {
+  return resources.map(dashboardResource);
+}
 
 export function boundedDashboardText(value: string): string {
   return value.length <= visibleTextLimit ? value : value.slice(0, visibleTextLimit) + '\n…';
@@ -46,7 +60,7 @@ export interface ProjectTaskCard {
   threadId: string | null;
   turnId: string | null;
   chatId: string | null;
-  resources: Task['resources'];
+  resources: DashboardResource[];
   currentTurn: string | null;
   latestActivity: DashboardExecutionEvent | null;
   waitingReason: string | null;
@@ -155,7 +169,7 @@ export class ProjectDashboardReader {
       id: task.id, projectId, role, title: source.title, sourceLabel: source.label, sourceKind: task.source.kind, sourceUrl: source.url, repository,
       issueId: issueId ?? (task.source.kind === 'github' ? task.source.issue.id : null),
       status: task.status, executionStatus: task.executionStatus, currentTurn: task.turnId ?? visibleActivity?.turnId ?? null,
-      threadId: task.threadId, turnId: task.turnId, chatId: task.chatId, resources: task.resources,
+      threadId: task.threadId, turnId: task.turnId, chatId: task.chatId, resources: dashboardResources(task.resources),
       latestActivity: visibleActivity, waitingReason: waiting[0] ?? (task.reason ? boundedDashboardText(task.reason) : null) ?? (task.recovery.lastError ? boundedDashboardText(task.recovery.lastError) : null), requests: task.requests.map(request => ({ kind: request.kind, prompt: boundedDashboardText(request.prompt) })),
       recovery: task.recovery, createdAt: task.createdAt, updatedAt: task.updatedAt, latestReport: reports.at(-1) ?? null,
     };
