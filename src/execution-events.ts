@@ -28,11 +28,12 @@ const itemNotificationSchema = scopeSchema.extend({
 
 export function executionEvent(method: string, params: unknown): ExecutionEvent | null {
   const base = { createdAt: Date.now() };
-  if (method === 'item/agentMessage/delta' || method === 'item/commandExecution/outputDelta') {
+  if (method === 'item/commandExecution/outputDelta') return null;
+  if (method === 'item/agentMessage/delta') {
     const parsed = deltaSchema.safeParse(params);
     if (!parsed.success) return null;
     const { delta, ...scope } = parsed.data;
-    return { ...base, ...scope, kind: method === 'item/agentMessage/delta' ? 'agent_delta' : 'tool_output', label: method === 'item/agentMessage/delta' ? 'Agent' : '工具输出', text: delta };
+    return { ...base, ...scope, kind: 'agent_delta', label: 'Agent', text: delta };
   }
   if (method === 'error') {
     const parsed = errorSchema.safeParse(params);
@@ -57,10 +58,10 @@ export function executionEvent(method: string, params: unknown): ExecutionEvent 
   }
   const kind = method === 'item/started' ? 'tool_start' : 'tool_end';
   switch (item.type) {
-    case 'commandExecution': return { ...scope, kind, label: '命令 · ' + item.status + (item.exitCode == null ? '' : ' · exit ' + item.exitCode), text: '$ ' + item.command + '\n' + (item.aggregatedOutput ?? '') };
-    case 'fileChange': return { ...scope, kind, label: '文件变更 · ' + item.status, text: item.changes.map(change => change.path + '\n' + change.diff).join('\n\n') };
-    case 'mcpToolCall': return { ...scope, kind, label: item.server + '/' + item.tool + ' · ' + item.status, text: JSON.stringify(item.error ?? item.result ?? '') };
-    case 'dynamicToolCall': return { ...scope, kind, label: item.tool + ' · ' + item.status, text: JSON.stringify(item.contentItems ?? []) };
+    case 'commandExecution': return { ...scope, kind, label: '命令 · ' + item.status + (item.exitCode == null ? '' : ' · exit ' + item.exitCode), text: '$ ' + item.command };
+    case 'fileChange': return { ...scope, kind, label: '文件变更 · ' + item.status, text: item.changes.map(change => change.path).join('\n') };
+    case 'mcpToolCall': return { ...scope, kind, label: item.server + '/' + item.tool + ' · ' + item.status, text: '' };
+    case 'dynamicToolCall': return { ...scope, kind, label: item.tool + ' · ' + item.status, text: '' };
     case 'webSearch': return { ...scope, kind, label: '搜索', text: item.query };
   }
 }

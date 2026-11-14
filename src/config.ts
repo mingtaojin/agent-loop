@@ -17,7 +17,7 @@ export const documentBaseUrlSchema = z.url().max(2048).refine(value => {
 
 export const configSchema = z.strictObject({
   dataDir: z.string().min(1).default('./data'),
-  dashboard: z.strictObject({ host: z.enum(['127.0.0.1', '0.0.0.0']).default('127.0.0.1'), port: z.number().int().min(1).max(65535).default(8787) }).default({ host: '127.0.0.1', port: 8787 }),
+  dashboard: z.strictObject({ host: z.enum(['127.0.0.1', '0.0.0.0']).default('0.0.0.0'), port: z.number().int().min(1).max(65535).default(8787) }).default({ host: '0.0.0.0', port: 8787 }),
   repositories: z.array(collectionRepositorySchema).default([]).refine(
     repositories => new Set(repositories.map(repository => repository.name.toLowerCase())).size === repositories.length,
     'Repository names must be unique',

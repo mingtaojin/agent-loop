@@ -179,6 +179,15 @@ export class Store {
       return storedExecutionEventSchema.parse({ ...executionEventSchema.parse(JSON.parse(row.payload)), seq: row.seq, taskId: row.task_id });
     });
   }
+  visibleExecutionEvents(taskId: string, after = 0, limit = 500): StoredExecutionEvent[] {
+    if (!this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='execution_events'").get()) return [];
+    return this.db.prepare(`SELECT seq,task_id,payload FROM execution_events
+      WHERE task_id=? AND seq>? AND COALESCE(json_extract(payload,'$.kind'),'') <> 'tool_output'
+      ORDER BY seq LIMIT ?`).all(taskId, after, limit).map(raw => {
+      const row = z.object({ seq: z.number(), task_id: z.string(), payload: z.string() }).parse(raw);
+      return storedExecutionEventSchema.parse({ ...executionEventSchema.parse(JSON.parse(row.payload)), seq: row.seq, taskId: row.task_id });
+    });
+  }
   documentConversationPosition(taskId: string): DocumentSourcePosition {
     return documentSourcePositionSchema.parse(this.db.prepare(`SELECT
       COALESCE((SELECT seq FROM execution_events WHERE task_id=? ORDER BY seq DESC LIMIT 1),0) AS eventSeq,

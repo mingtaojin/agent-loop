@@ -103,9 +103,9 @@ for (const scenario of [
   })), diagnostics: [] });
 });
 
-async function listen(port = 0) {
+async function listen(port = 0, host = '127.0.0.1') {
   const server = createServer();
-  await new Promise<void>((done, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', done); });
+  await new Promise<void>((done, reject) => { server.once('error', reject); server.listen(port, host, done); });
   const address = server.address(); assert.ok(address && typeof address !== 'string');
   return { port: address.port, close: () => new Promise<void>((done, reject) => server.close(error => error ? reject(error) : done())) };
 }
@@ -190,8 +190,10 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) test(`actual CLI run serves
     assert.equal(fixture.child.exitCode, null, fixture.stderr());
     return fixture.stdout().trimEnd().endsWith('}');
   });
-  assert.deepEqual(JSON.parse(fixture.stdout()), { event: 'started', dataDir: join(await realpath(fixture.root), 'data'), tasks: 0,
-    dashboard: { url: fixture.url, listenAddress: `127.0.0.1:${fixture.port}`, networkUrls: [] } });
+  const started = JSON.parse(fixture.stdout());
+  assert.equal(started.event, 'started'); assert.equal(started.dataDir, join(await realpath(fixture.root), 'data')); assert.equal(started.tasks, 0);
+  assert.equal(started.dashboard.url, fixture.url); assert.equal(started.dashboard.listenAddress, `0.0.0.0:${fixture.port}`);
+  assert.ok(Array.isArray(started.dashboard.networkUrls));
   const page = await fetch(fixture.url);
   assert.equal(page.status, 200); assert.match(await page.text(), /实时输出/);
   const snapshot = await (await fetch(fixture.url + '/api/snapshot')).json();
@@ -212,7 +214,7 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) test(`actual CLI run serves
 });
 
 test('CLI run rejects an occupied dashboard port before starting Feishu and releases the writer lock', async t => {
-  const occupied = await listen(); t.after(() => occupied.close());
+  const occupied = await listen(0, '0.0.0.0'); t.after(() => occupied.close());
   const fixture = await runFixture(t, { port: occupied.port });
   assert.deepEqual(await fixture.exited, { code: 1, signal: null });
   assert.match(fixture.stderr(), /EADDRINUSE/); assert.equal(fixture.stdout(), '');

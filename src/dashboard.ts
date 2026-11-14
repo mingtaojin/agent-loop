@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { hostname, networkInterfaces } from 'node:os';
 import { z } from 'zod';
 import { Store } from './store.js';
+import { boundedDashboardText, ProjectDashboardReader } from './dashboard-reader.js';
 import { errorMessage, presentTaskSource } from './domain.js';
 import { dashboardHtml, dashboardCss, dashboardScript } from './dashboard-page.js';
 
@@ -11,7 +12,7 @@ const cursorSchema = z.coerce.number().int().nonnegative().max(Number.MAX_SAFE_I
 const heartbeatSchema = z.object({ pid: z.number(), lastSeenAt: z.number(), intervalMs: z.number(), status: z.enum(['running', 'stopped']) });
 
 export async function startDashboard(options: { dataDir: string; port: number; host?: '127.0.0.1' | '0.0.0.0' }) {
-  const listenHost = options.host ?? '127.0.0.1';
+  const listenHost = options.host ?? '0.0.0.0';
   const networkAddresses = () => Object.values(networkInterfaces()).flatMap(addresses => (addresses ?? []).filter(address => address.family === 'IPv4' && !address.internal).map(address => address.address));
   let store: Store | null = null;
   const clients = new Set<ServerResponse>();
@@ -27,6 +28,7 @@ export async function startDashboard(options: { dataDir: string; port: number; h
     const db = readStore();
     const rawHeartbeat = db?.meta('runtime-heartbeat');
     const heartbeat = rawHeartbeat ? heartbeatSchema.safeParse(JSON.parse(rawHeartbeat)) : null;
+    const projects = db ? new ProjectDashboardReader(db).projects() : [];
     return {
       dataDir: options.dataDir, now: Date.now(), runtime: heartbeat?.success ? heartbeat.data : null,
       tasks: (db?.tasks() ?? []).map(task => ({
@@ -37,11 +39,11 @@ export async function startDashboard(options: { dataDir: string; port: number; h
         workspaceSelection: task.workspaceSelection,
         threadId: task.threadId, turnId: task.turnId, chatId: task.chatId,
         createdAt: task.createdAt, updatedAt: task.updatedAt, recovery: task.recovery,
-        requests: task.requests.map(request => ({ kind: request.kind, prompt: request.prompt })),
+        requests: task.requests.map(request => ({ kind: request.kind, prompt: boundedDashboardText(request.prompt) })),
         resources: task.resources.map(resource => resource.kind === 'project'
           ? { kind: resource.kind, project: resource.project, workspace: resource.workspace }
           : { repository: resource.repository.name, workspace: resource.workspace }),
-      })), diagnostics: db?.diagnostics() ?? [],
+      })), projects, diagnostics: db?.diagnostics() ?? [],
     };
   };
   const server = createServer((request, response) => {
@@ -67,14 +69,25 @@ export async function startDashboard(options: { dataDir: string; port: number; h
     if (asset) { response.writeHead(200, { 'content-type': asset.type }); response.end(asset.body); return; }
     try {
       if (url.pathname === '/api/snapshot') { json(response, 200, snapshot()); return; }
+      if (url.pathname === '/api/projects') {
+        json(response, 200, readStore() ? new ProjectDashboardReader(readStore()!).projects() : []); return;
+      }
+      const projectMatch = /^\/api\/projects\/([^/]+)$/.exec(url.pathname);
+      if (projectMatch?.[1]) {
+        const project = readStore() ? new ProjectDashboardReader(readStore()!).project(decodeURIComponent(projectMatch[1])) : null;
+        if (!project) { json(response, 404, { error: '项目不存在' }); return; }
+        json(response, 200, project); return;
+      }
       const taskMatch = /^\/api\/tasks\/([^/]+)$/.exec(url.pathname);
       if (taskMatch?.[1]) {
         const taskId = decodeURIComponent(taskMatch[1]);
         const db = readStore();
         if (!db?.tasks().some(task => task.id === taskId)) { json(response, 404, { error: '任务不存在' }); return; }
+        const detail = new ProjectDashboardReader(db).taskDetail(taskId);
         json(response, 200, {
-          inputs: db.inputs(taskId).map(input => ({ id: input.id, text: input.message.text, createdAt: input.message.createdAt, origin: input.origin, route: input.route, selectionHandled: input.selectionHandled, status: input.status, error: input.error, attachments: input.message.attachments.map(attachment => ({ name: attachment.name, kind: attachment.kind })) })),
-          outputs: db.outputs(taskId),
+          inputs: db.inputs(taskId).map(input => ({ id: input.id, text: boundedDashboardText(input.message.text), createdAt: input.message.createdAt, origin: input.origin, route: input.route, selectionHandled: input.selectionHandled, status: input.status, error: input.error ? boundedDashboardText(input.error) : null, attachments: input.message.attachments.map(attachment => ({ name: attachment.name, kind: attachment.kind })) })),
+          outputs: db.outputs(taskId).map(output => ({ ...output, text: boundedDashboardText(output.text), error: output.error ? boundedDashboardText(output.error) : null })), projectId: detail?.projectId ?? null, task: detail?.task ?? null,
+          events: detail?.events ?? [], executionEvents: detail?.events ?? [], reports: detail?.reports ?? [], diagnostics: detail?.diagnostics ?? [],
         }); return;
       }
       if (url.pathname !== '/api/events') { json(response, 404, { error: '未找到' }); return; }
@@ -93,10 +106,12 @@ export async function startDashboard(options: { dataDir: string; port: number; h
       const send = () => {
         if (blocked || response.destroyed) return;
         try {
-          for (const event of db.executionEvents(taskId, cursor)) {
+          const page = new ProjectDashboardReader(db).events(taskId, cursor);
+          for (const event of page.events) {
             cursor = event.seq;
             if (!response.write('id: ' + event.seq + '\nevent: execution\ndata: ' + JSON.stringify(event) + '\n\n')) { blocked = true; break; }
           }
+          if (!blocked) cursor = page.cursor;
           if (Date.now() - lastKeepAlive > 10_000 && !blocked) {
             lastKeepAlive = Date.now();
             blocked = !response.write(': heartbeat\n\n');
