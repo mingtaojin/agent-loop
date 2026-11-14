@@ -12,7 +12,7 @@ const cursorSchema = z.coerce.number().int().nonnegative().max(Number.MAX_SAFE_I
 const heartbeatSchema = z.object({ pid: z.number(), lastSeenAt: z.number(), intervalMs: z.number(), status: z.enum(['running', 'stopped']) });
 
 export async function startDashboard(options: { dataDir: string; port: number; host?: '127.0.0.1' | '0.0.0.0' }) {
-  const listenHost = options.host ?? '127.0.0.1';
+  const listenHost = options.host ?? '0.0.0.0';
   const networkAddresses = () => Object.values(networkInterfaces()).flatMap(addresses => (addresses ?? []).filter(address => address.family === 'IPv4' && !address.internal).map(address => address.address));
   let store: Store | null = null;
   const clients = new Set<ServerResponse>();
@@ -106,9 +106,8 @@ export async function startDashboard(options: { dataDir: string; port: number; h
       const send = () => {
         if (blocked || response.destroyed) return;
         try {
-          for (const event of db.executionEvents(taskId, cursor)) {
+          for (const event of new ProjectDashboardReader(db).events(taskId, cursor)) {
             cursor = event.seq;
-            if (event.kind === 'tool_output') continue;
             if (!response.write('id: ' + event.seq + '\nevent: execution\ndata: ' + JSON.stringify(event) + '\n\n')) { blocked = true; break; }
           }
           if (Date.now() - lastKeepAlive > 10_000 && !blocked) {

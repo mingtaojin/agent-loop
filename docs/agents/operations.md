@@ -42,7 +42,7 @@ launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.local.agent-l
 
 ## 查看日志
 
-标准输出和错误输出都追加到项目中的 `data/logs/runtime.log`。启动事件 `started` 包含 `dashboard.url`、`dashboard.listenAddress` 和 `dashboard.networkUrls`。默认网页地址为 `http://127.0.0.1:8787`。
+标准输出和错误输出都追加到项目中的 `data/logs/runtime.log`。启动事件 `started` 包含 `dashboard.url`、`dashboard.listenAddress` 和 `dashboard.networkUrls`。看板默认监听全部 IPv4 接口，端口为 `8787`；使用启动事件中的 `dashboard.networkUrls` 访问网络地址。看板不提供登录或 token 鉴权。
 
 ```sh
 tail -n 80 -f /Users/developer/IdeaProjects/agent-loop/data/logs/runtime.log

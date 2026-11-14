@@ -33,9 +33,10 @@ test('project dashboard uses ledger membership, reports, and redacted task event
     ledger.addMember('project-a', verifier.id, 'verifier');
     store.setMeta('project-intake-route:' + intake.id, JSON.stringify({ projectId: 'project-a', coordinatorTaskId: coordinator.id }));
     const report = { id: 'report', chatId: 'chat:' + coordinator.id, senderId: 'runtime:project', text: 'Worker worker update. Added the reader.', attachments: [], createdAt: Date.now(), chatType: 'group' as const };
-    store.receive(coordinator.id, report, 'source', { kind: 'agent', projectId: 'project-a', taskId: worker.id, eventId: 'report', category: 'update', currentStep: 'Reader', nextStep: 'Run tests', blockers: [], evidence: ['test/dashboard-coordinator.test.ts'] });
+    store.receive(coordinator.id, report, 'source', { kind: 'agent', projectId: 'project-a', taskId: worker.id, eventId: 'report:worker:update', category: 'update', currentStep: 'Reader', nextStep: 'Run tests', blockers: [], evidence: ['test/dashboard-coordinator.test.ts'] });
     store.recordExecutionEvent(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'agent', kind: 'agent_message', label: 'Agent', text: 'Visible progress', createdAt: Date.now() });
     store.recordExecutionEvent(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'tool', kind: 'tool_end', label: '命令 · completed · exit 0', text: '$ npm test', createdAt: Date.now() });
+    store.recordExecutionEvent(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'legacy-tool', kind: 'tool_end', label: '命令 · completed · exit 0', text: '$ npm test\nSECRET_OUTPUT', createdAt: Date.now() });
     store.recordExecutionEvent(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'tool', kind: 'tool_output', label: '工具输出', text: 'SECRET_OUTPUT', createdAt: Date.now() });
   });
   const dashboard = await startDashboard({ dataDir: root, port: 0 });

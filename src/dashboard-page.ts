@@ -2,14 +2,14 @@ export const dashboardHtml = String.raw`<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent Loop · 调试台</title><link rel="stylesheet" href="/app.css"><script src="/app.js" defer></script></head>
 <body><div class="shell">
   <aside class="sidebar">
-    <a class="brand" href="/"><span class="brand-mark">a<span>↗</span></span><span>agent loop<small>LOCAL OBSERVATORY</small></span></a>
+    <a class="brand" href="/"><span class="brand-mark">a<span>↗</span></span><span>agent loop<small>PROJECT OBSERVATORY</small></span></a>
     <div class="sidebar-heading"><span>任务</span><span id="task-count" class="count">0</span></div>
     <label class="search"><span>⌕</span><input id="search" aria-label="搜索任务" placeholder="搜索名称、任务 ID…"></label>
     <select id="status-filter" aria-label="筛选任务状态"><option value="">全部状态</option><option value="running">执行中</option><option value="idle">等待输入</option><option value="failed">执行失败</option><option value="paused">已暂停</option><option value="pending">待启动</option></select><select id="role-filter" aria-label="筛选任务角色"><option value="">全部角色</option><option value="coordinator">协调者</option><option value="worker">Worker</option><option value="verifier">verifier</option><option value="intake">intake</option></select>
     <nav id="task-list" aria-label="任务列表"></nav>
     <div class="sidebar-footer"><div><span id="runtime-dot" class="dot"></span><strong id="runtime-status">读取服务状态…</strong></div><p id="runtime-detail">等待心跳</p><span class="footer-label">数据目录</span><code id="data-dir"></code></div>
   </aside>
-  <main><header class="topbar"><div><span class="eyebrow">DEVELOPMENT</span><span class="topbar-title">运行观测</span></div><div class="connection"><span id="connection-dot" class="dot"></span><span id="connection-text" role="status">正在连接</span><span class="local-tag">调试 · 只读</span></div></header>
+  <main><header class="topbar"><div><span class="eyebrow">DEVELOPMENT</span><span class="topbar-title">运行观测</span></div><div class="connection"><span id="connection-dot" class="dot"></span><span id="connection-text" role="status">正在连接</span><span class="local-tag">网络调试 · 只读</span></div></header>
     <section class="overview"><div><h1>看见每一步执行<span>。</span></h1><p>模型输出、工具调用与执行异常，在同一个地方追踪。</p></div><div class="metrics"><div><strong id="metric-running">0</strong><span><i class="dot green"></i>执行中</span></div><div><strong id="metric-idle">0</strong><span><i class="dot"></i>等待输入</span></div><div><strong id="metric-failed">0</strong><span><i class="dot red"></i>执行失败</span></div></div></section>
     <div id="page-error" class="banner error" role="alert" hidden></div>
     <section id="empty" class="empty-state"><div class="empty-icon">↳</div><h2>等待第一个项目</h2><p>项目协调者、Worker、verifier、已路由 intake 和历史任务会按 ProjectLedger 归入项目。<br>看板只读显示可见执行说明和结构化汇报，不保存工具输出正文或隐藏推理。</p><div class="empty-note">调试台已就绪 · 读取同一配置的数据目录</div></section>
@@ -41,7 +41,11 @@ const normalDisclosures = new Map(), filteredDisclosures = new Map();
 let taskListCriteria = '';
 const time = value => new Date(value).toLocaleTimeString('zh-CN', { hour12: false });
 const node = (tag, className, text) => { const el = document.createElement(tag); if (className) el.className = className; if (text !== undefined) el.textContent = text; return el; };
-const allDashboardTasks = () => snapshot?.projects ? snapshot.projects.flatMap(project => project.tasks) : snapshot?.tasks || [];
+const allDashboardTasks = () => {
+  if (!snapshot) return [];
+  const projectTasks = snapshot.projects?.flatMap(project => project.tasks) || [];
+  return [...new Map([...snapshot.tasks, ...projectTasks].map(task => [task.id, task])).values()];
+};
 const projectName = id => snapshot?.projects?.find(project => project.id === id)?.name || '未关联项目';
 const roleLabels = { coordinator: '协调者', worker: 'Worker', verifier: 'verifier', intake: 'intake' };
 function statusDot(status) { return 'dot' + (status === 'running' ? ' green' : status === 'failed' ? ' red' : status === 'paused' ? ' amber' : ''); }
@@ -186,7 +190,7 @@ function renderRuntime() {
 }
 function renderTask() {
   const task = allDashboardTasks().find(item => item.id === selectedId);
-  $('empty').hidden = !!task || !!snapshot?.projects; $('task-panel').hidden = !task;
+  $('empty').hidden = !!task || !!snapshot?.projects?.length; $('task-panel').hidden = !task;
   $('project-overview').hidden = !!task || !snapshot?.projects?.length;
   if (!task) return;
   $('source-kind').textContent = task.sourceKind === 'cli' ? 'CLI SUBMISSION' : task.sourceKind === 'github' ? 'GITHUB ISSUE' : 'FEISHU CONVERSATION';
@@ -305,7 +309,7 @@ async function refresh() {
     const response = await fetch('/api/snapshot'); if (!response.ok) throw new Error('读取任务失败 · HTTP ' + response.status);
     snapshot = await response.json(); showError(''); renderRuntime();
     if (selectedId && !allDashboardTasks().some(task => task.id === selectedId)) { if (stream) stream.close(); stream = null; selectedId = null; }
-    if (!selectedId && !snapshot.projects && allDashboardTasks().length) selectTask(allDashboardTasks().slice().sort((a, b) => b.updatedAt - a.updatedAt)[0].id);
+    if (!selectedId && allDashboardTasks().length) selectTask(allDashboardTasks().slice().sort((a, b) => b.updatedAt - a.updatedAt)[0].id);
     else { taskList(); renderTask(); }
     renderProjectOverview();
     if (!selectedId) connection(true, '调试台已连接');

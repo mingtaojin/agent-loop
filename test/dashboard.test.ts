@@ -120,7 +120,7 @@ test('real adapter to SQLite to SSE streams partial text, tools and capacity err
   const reader = response.body.getReader();
   const chunk = await reader.read();
   const raw = new TextDecoder().decode(chunk.value);
-  assert.match(raw, /agent_delta/); assert.match(raw, /tool_output/); assert.match(raw, /Selected model is at capacity/);
+  assert.match(raw, /agent_delta/); assert.match(raw, /tool_start/); assert.doesNotMatch(raw, /tool_output/); assert.match(raw, /Selected model is at capacity/);
   assert.doesNotMatch(raw, /private reasoning/);
   assert.ok(!raw.includes(second.threadId));
   const before = loop.store.executionEvents(first.id);
@@ -156,7 +156,7 @@ test('debug event projection excludes untrusted protocol configuration and priva
   assert.ok(value); assert.equal(value.kind, 'error');
   assert.doesNotMatch(JSON.stringify(value), /secret/);
   assert.equal(configSchema.parse({ feishu: { userOpenId: 'owner' } }).dashboard.port, 8787);
-  assert.equal(configSchema.parse({ feishu: { userOpenId: 'owner' } }).dashboard.host, '127.0.0.1');
+  assert.equal(configSchema.parse({ feishu: { userOpenId: 'owner' } }).dashboard.host, '0.0.0.0');
   assert.equal(z.number().parse(value.createdAt) > 0, true);
 });
 

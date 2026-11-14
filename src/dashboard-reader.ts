@@ -79,7 +79,7 @@ export interface DashboardTaskDetail {
 
 function reportFromInput(input: Inbox): DashboardReport | null {
   const provenance = input.provenance;
-  if (provenance.kind !== 'agent' || !['result', 'question', 'update'].includes(provenance.category)) return null;
+  if (provenance.kind !== 'agent' || !provenance.eventId.startsWith('report:') || !['result', 'question', 'update'].includes(provenance.category)) return null;
   const report = {
     kind: provenance.category as DashboardReport['kind'],
     text: boundedText(input.message.text),
@@ -94,7 +94,13 @@ function reportFromInput(input: Inbox): DashboardReport | null {
 
 function dashboardEvent(event: StoredExecutionEvent): DashboardExecutionEvent | null {
   if (event.kind === 'tool_output') return null;
-  return { ...event, text: boundedText(event.text) } as DashboardExecutionEvent;
+  let text = event.text;
+  if (event.kind === 'tool_start' || event.kind === 'tool_end') {
+    if (event.label.startsWith('命令 · ')) text = text.split('\n', 1)[0] ?? '';
+    else if (event.label.startsWith('文件变更 · ')) text = text.split('\n', 1)[0] ?? '';
+    else text = '';
+  }
+  return { ...event, text: boundedText(text) } as DashboardExecutionEvent;
 }
 
 function coalesce(events: StoredExecutionEvent[]): DashboardExecutionEvent[] {
@@ -179,6 +185,13 @@ export class ProjectDashboardReader {
   }
 
   project(projectId: string): ProjectDashboard | null { return this.projects().find(project => project.id === projectId) ?? null; }
+
+  events(taskId: string, after = 0, limit = 500): DashboardExecutionEvent[] {
+    return this.store.executionEvents(taskId, after, limit).flatMap(event => {
+      const visible = dashboardEvent(event);
+      return visible ? [visible] : [];
+    });
+  }
 
   taskDetail(taskId: string): DashboardTaskDetail | null {
     const task = this.store.tasks().find(candidate => candidate.id === taskId);
