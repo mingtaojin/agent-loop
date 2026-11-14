@@ -76,6 +76,7 @@ export class AgentLoop {
       releaseWorkspace: (taskId, resourceId) => this.releaseWorkspace(taskId, resourceId),
       control: (taskId, action) => this.control(taskId, action),
       openGroup: taskId => this.openGroup(taskId),
+      announce: async (taskId, action) => this.announce(taskId, action),
       groupCleanup: async (callerId, action) => {
         const cleanup = new GroupCleanup(this.store, ports.feishu, config.feishu.userOpenId);
         switch (action.action) {
@@ -162,6 +163,13 @@ export class AgentLoop {
     if (!task.chatId
       && this.store.outputs(task.id).find(output => output.id === id)?.status === 'pending')
       this.store.markOutput(id, 'dropped', '任务当前无群，不补发历史');
+  }
+  private announce(taskId: string, action: Extract<ProjectAction, { action: 'announce' }>): { accepted: true; requestId: string } {
+    const task = this.store.task(taskId);
+    if (!task.chatId) throw new Error('Project coordinator group is unavailable');
+    const headings = { decision: '【需要决定】', blocker: '【任务阻塞】', approval: '【需要处理审批】', delivery: '【交付结论】' } as const;
+    this.store.enqueue(task.id, `${headings[action.kind]}\n${action.text}`, `project-announcement:${action.requestId}`);
+    return { accepted: true, requestId: action.requestId };
   }
   private async openGroup(taskId: string): Promise<string> {
     let chatId = '';
@@ -734,7 +742,7 @@ export class AgentLoop {
       if (output.phase !== 'final' || 'kind' in snapshot) continue;
       if (task.legacy && this.store.hasOutput(task.id, `turn:${output.turnId}`)) continue;
       if (output.text.trim()) this.store.setMeta(`task-summary:${task.id}`, output.text);
-      if (output.text.trim()) this.notify(task, output.text, `agent-output:${output.id}`);
+      if (output.text.trim() && this.projects.publishCoordinatorFinal(task, output.turnId)) this.notify(task, output.text, `agent-output:${output.id}`);
     }
     for (const request of snapshot.requests) {
       const identity = `${request.connectionEpoch}:${request.id}`;
@@ -885,6 +893,7 @@ export class AgentLoop {
         this.store.transaction(() => { for (const input of initial) this.store.markInput(input.id, 'delivering'); });
         try {
           task.turnId = await this.ports.codex.startTurn({ threadId: threadId, input: prepared, deliveryId: first.id, additionalContext: this.projects.context(task.id), additionalDeliveryIds: initial.slice(1).map(input => input.id) });
+          for (const input of initial) this.projects.markCoordinatorInput(task, task.turnId, input);
           this.store.transaction(() => {
             for (const input of initial) this.store.markInput(input.id, 'delivered');
             task.status = 'running'; task.executionStatus = 'running'; task.reason = null; this.persist(task);
@@ -946,6 +955,7 @@ export class AgentLoop {
             }
           } else task.turnId = await this.ports.codex.startTurn({ threadId: threadId, input: prepared, deliveryId: input.id, additionalContext: this.projects.context(task.id) });
         }
+        if (task.turnId) this.projects.markCoordinatorInput(task, task.turnId, input);
         this.store.transaction(() => { this.store.markInput(input.id, 'delivered'); task.status = 'running'; task.executionStatus = 'running'; task.reason = null; this.persist(task); });
       } catch (error) {
         if (error instanceof RejectedInputError) { this.store.markInput(input.id, 'failed', errorMessage(error)); this.notify(task, `原生问题回复未被接受，消息已保留。\n${errorMessage(error)}`, `reply-error:${input.id}`); break; }

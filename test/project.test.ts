@@ -120,6 +120,7 @@ test('project actions are discriminated strict shapes with a default worker role
     { action: 'status' }, { action: 'dispatch', requestId: 'd', prompt: 'Investigate.', role: 'worker' },
     { action: 'dispatch', requestId: 'v', prompt: 'Verify.', role: 'verifier', issueId: 'issue-1' },
     { action: 'send', requestId: 's', taskId: 'worker', text: 'Preserve order.' },
+    { action: 'announce', requestId: 'a', kind: 'delivery', text: 'Delivered.' },
     { action: 'report', requestId: 'r', kind: 'question', text: 'Which format?' },
     { action: 'report', requestId: 'r', kind: 'result', text: 'Evidence is ready.' },
     { action: 'report', requestId: 'r', kind: 'update', text: 'Still investigating.' },

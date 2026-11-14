@@ -68,6 +68,12 @@ export function matchSource(source: Source, criteria: Criteria): { matches: bool
   if (criteria.labelsNone.some(label => labels.has(label))) return { matches: false, reason: 'labels_none' };
   return { matches: true, reason };
 }
+export function sourceType(source: Source, criteria: Criteria): string | null {
+  const labelTypes = new Set(source.labels.flatMap(label => criteria.typeLabels[label] ? [criteria.typeLabels[label]] : []));
+  const native = source.nativeType === null ? undefined : criteria.nativeTypes[source.nativeType];
+  if (labelTypes.size > 1 || (native && [...labelTypes].some(type => type !== native))) return null;
+  return native ?? [...labelTypes][0] ?? null;
+}
 
 export const requestSchema = z.object({
   id: z.string(), threadId: z.string(), turnId: z.string(),

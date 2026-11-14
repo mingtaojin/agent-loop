@@ -1,5 +1,6 @@
 import { seedSavedIntake } from './saved-intake.js';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { mkdtemp, mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -449,9 +450,11 @@ async function fixture(t: TestContext, options: { secondProject?: boolean } = {}
     },
     async initialize() { await loop.collect(); await loop.tick(); return coordinator(); },
     async status(callerId = coordinator().id) { return overviewSchema.parse(await loop.projectAction(callerId, { action: 'status' })); },
-    async dispatch(requestId: string, prompt: string, extra: { issueId?: string; role?: 'worker' | 'verifier'; callerId?: string } = {}) {
+    async dispatch(requestId: string, prompt: string, extra: { issueId?: string; role?: 'worker' | 'verifier'; callerId?: string; mode?: 'investigation' | 'implementation'; authorization?: Extract<ProjectAction, { action: 'dispatch' }>['authorization'] } = {}) {
       const result = dispatchReceipt.parse(await loop.projectAction(extra.callerId ?? coordinator().id, {
         action: 'dispatch', requestId, prompt, role: extra.role ?? 'worker', ...(extra.issueId ? { issueId: extra.issueId } : {}),
+        ...(extra.mode ? { mode: extra.mode } : extra.issueId ? { mode: 'investigation' as const } : {}),
+        ...(extra.authorization ? { authorization: extra.authorization } : {}),
       }));
       await loop.tick();
       const task = loop.store.task(result.taskId);
@@ -571,14 +574,15 @@ test('dispatch is idempotent under concurrent requests and restart, rejects conf
   const f = await fixture(t); f.github.sources = [projectIssue(12)];
   const coordinator = await f.initialize();
   const action: ProjectAction = { action: 'dispatch', requestId: 'investigate-12', issueId: f.github.sources[0]!.id,
-    role: 'worker', prompt: 'Investigate batch export. Deliver findings and acceptance criteria only. Do not edit business code or deploy.' };
+    role: 'worker', mode: 'investigation', prompt: 'Investigate batch export. Deliver findings and acceptance criteria only. Do not edit business code or deploy.' };
   const [first, duplicate] = await Promise.all([f.loop.projectAction(coordinator.id, action), f.loop.projectAction(coordinator.id, action)]);
   assert.deepEqual(first, duplicate);
   const { taskId } = dispatchReceipt.parse(first);
   await f.loop.tick();
   const worker = f.loop.store.task(taskId); assert.ok(worker.threadId);
   assert.deepEqual(f.state().members.find(member => member.taskId === taskId), { taskId, role: 'worker', issueId: f.github.sources[0]!.id });
-  assert.equal(f.loop.store.meta(`project-delegation:${taskId}`), action.prompt);
+  const delegation = f.loop.store.meta(`project-delegation:${taskId}`) ?? '';
+  assert.ok(delegation.startsWith(action.prompt)); assert.match(delegation, /Investigation-only contract:/);
   const creation = f.codex.created.find(input => input.cwd === f.directory); assert.ok(creation);
   assert.match(creation.instructions, /poteto-mode/);
   assert.ok(creation.instructions.includes(action.prompt));
@@ -641,6 +645,54 @@ test('new Issue comments reach only the coordinator until explicitly sent to the
   assert.equal(f.codex.steers.filter(input => input.threadId === worker.threadId && JSON.stringify(input.input).includes(comment.url)).length, 1);
   assert.equal(f.codex.approvals.length, 0);
   assert.equal(f.loop.tasks().length, 2);
+});
+
+test('background coordinator events stay local until an idempotent typed announcement is sent', async t => {
+  const f = await fixture(t); const coordinator = await f.initialize(); await f.idleCoordinator();
+  const before = f.feishu.sent.filter(output => output.chatId === coordinator.chatId).length;
+  f.loop.projects.event('app', 'github-background', 'GitHub Issue facts', coordinator.id, 'github_issue');
+  await f.loop.tick();
+  const running = f.loop.store.task(coordinator.id); assert.equal(running.status, 'running'); assert.ok(running.threadId);
+  const announcement: ProjectAction = { action: 'announce', requestId: 'announce-background', kind: 'blocker', text: '需要补充测试环境证据。' };
+  await f.loop.projectAction(coordinator.id, announcement);
+  f.codex.complete(running.threadId, 'Internal background assessment.');
+  await f.loop.tick();
+  const sent = f.feishu.sent.filter(output => output.chatId === coordinator.chatId);
+  assert.equal(sent.length, before + 1);
+  assert.equal(sent.at(-1)?.text, '【任务阻塞】\n需要补充测试环境证据。');
+  await f.loop.projectAction(coordinator.id, announcement); await f.loop.tick();
+  assert.equal(f.feishu.sent.filter(output => output.chatId === coordinator.chatId).length, before + 1);
+});
+
+test('a direct project-group message keeps the coordinator final reply visible', async t => {
+  const f = await fixture(t); const coordinator = await f.initialize(); await f.idleCoordinator();
+  const message = f.message('direct-coordinator', '请说明当前任务状态。', coordinator.chatId!);
+  await f.loop.receive(message);
+  const running = f.loop.store.task(coordinator.id); assert.ok(running.threadId);
+  f.codex.complete(running.threadId, '当前任务仍在调查。'); await f.loop.tick();
+  assert.ok(f.feishu.sent.some(output => output.chatId === coordinator.chatId && output.text === '当前任务仍在调查。'));
+});
+
+test('Feature implementation needs owner authorization while investigation remains allowed', async t => {
+  const f = await fixture(t); const source = projectIssue(14); f.github.sources = [source]; const coordinator = await f.initialize(); await f.idleCoordinator();
+  const intake = f.loop.store.taskForSource(source.id); assert.ok(intake);
+  const missing: ProjectAction = { action: 'dispatch', requestId: 'feature-implementation-missing', issueId: source.id, intakeTaskId: intake.id,
+    role: 'worker', mode: 'implementation', prompt: 'Implement the requested feature.' };
+  await assert.rejects(f.loop.projectAction(coordinator.id, missing), /authorization/);
+  assert.equal(f.loop.projects.ledger.membership(intake.id), null);
+  const owner = f.message('feature-owner-decision', '确认开发这个 Feature，范围是导出筛选结果。', coordinator.chatId!);
+  await f.loop.receive(owner);
+  const sourceRevision = createHash('sha256').update(JSON.stringify({ ...source, assignees: [...source.assignees].sort(), labels: [...source.labels].sort(), updatedAt: undefined })).digest('hex');
+  const action: ProjectAction = { ...missing, requestId: 'feature-implementation-authorized', authorization: {
+    messageId: owner.id, scope: '导出当前筛选结果', acceptance: '结果与当前筛选条件一致', sourceRevision,
+  } };
+  const first = dispatchReceipt.parse(await f.loop.projectAction(coordinator.id, action));
+  const second = dispatchReceipt.parse(await f.loop.projectAction(coordinator.id, action));
+  assert.deepEqual(second, first);
+  await f.loop.tick();
+  const worker = f.loop.store.task(first.taskId);
+  assert.equal(f.loop.projects.ledger.membership(worker.id)?.role, 'worker');
+  assert.match(f.loop.store.meta(`project-delegation:${worker.id}`) ?? '', /Implement the requested feature/);
 });
 
 for (const kind of ['result', 'question', 'update'] as const) test(`worker ${kind} report wakes the coordinator once and survives redelivery after restart`, async t => {
