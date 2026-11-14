@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { hostname, networkInterfaces } from 'node:os';
 import { z } from 'zod';
 import { Store } from './store.js';
-import { boundedDashboardText, ProjectDashboardReader } from './dashboard-reader.js';
+import { boundedDashboardText, dashboardResources, ProjectDashboardReader } from './dashboard-reader.js';
 import { errorMessage, presentTaskSource } from './domain.js';
 import { dashboardHtml, dashboardCss, dashboardScript } from './dashboard-page.js';
 
@@ -39,9 +39,7 @@ export async function startDashboard(options: { dataDir: string; port: number; h
         threadId: task.threadId, turnId: task.turnId, chatId: task.chatId,
         createdAt: task.createdAt, updatedAt: task.updatedAt, recovery: task.recovery,
         requests: task.requests.map(request => ({ kind: request.kind, prompt: boundedDashboardText(request.prompt) })),
-        resources: task.resources.map(resource => resource.kind === 'project'
-          ? { kind: resource.kind, project: resource.project, workspace: resource.workspace }
-          : { repository: resource.repository.name, workspace: resource.workspace }),
+        resources: dashboardResources(task.resources),
       })), projects, diagnostics: db?.diagnostics() ?? [],
     };
   };
