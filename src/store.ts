@@ -205,6 +205,7 @@ export class Store {
     }
   }
   setMeta(key: string, value: string): void { this.db.prepare('INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, value); }
+  deleteMeta(key: string): void { this.db.prepare('DELETE FROM meta WHERE key=?').run(key); }
   latestExecutionSequence(): number {
     return z.object({ seq: z.number() }).parse(this.db.prepare('SELECT COALESCE(MAX(seq),0) AS seq FROM execution_events').get()).seq;
   }
