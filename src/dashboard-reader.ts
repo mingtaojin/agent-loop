@@ -145,8 +145,8 @@ export class ProjectDashboardReader {
   }
 
   private card(task: Task, projectId: string, role: ProjectTaskCard['role'], issueId: string | null = null): ProjectTaskCard {
-    const events = coalesce(this.allEvents(task.id));
-    const latestActivity = events.at(-1) ?? null;
+    const latestActivity = this.store.latestVisibleExecutionEvent(task.id);
+    const visibleActivity = latestActivity ? dashboardEvent(latestActivity) : null;
     const reports = this.reportsForTask(task.id);
     const waiting = task.requests.map(request => `${request.kind}: ${boundedDashboardText(request.prompt)}`);
     const source = presentTaskSource(task.source, 200);
@@ -154,9 +154,9 @@ export class ProjectDashboardReader {
     return {
       id: task.id, projectId, role, title: source.title, sourceLabel: source.label, sourceKind: task.source.kind, sourceUrl: source.url, repository,
       issueId: issueId ?? (task.source.kind === 'github' ? task.source.issue.id : null),
-      status: task.status, executionStatus: task.executionStatus, currentTurn: task.turnId ?? latestActivity?.turnId ?? null,
+      status: task.status, executionStatus: task.executionStatus, currentTurn: task.turnId ?? visibleActivity?.turnId ?? null,
       threadId: task.threadId, turnId: task.turnId, chatId: task.chatId, resources: task.resources,
-      latestActivity, waitingReason: waiting[0] ?? (task.reason ? boundedDashboardText(task.reason) : null) ?? (task.recovery.lastError ? boundedDashboardText(task.recovery.lastError) : null), requests: task.requests.map(request => ({ kind: request.kind, prompt: boundedDashboardText(request.prompt) })),
+      latestActivity: visibleActivity, waitingReason: waiting[0] ?? (task.reason ? boundedDashboardText(task.reason) : null) ?? (task.recovery.lastError ? boundedDashboardText(task.recovery.lastError) : null), requests: task.requests.map(request => ({ kind: request.kind, prompt: boundedDashboardText(request.prompt) })),
       recovery: task.recovery, createdAt: task.createdAt, updatedAt: task.updatedAt, latestReport: reports.at(-1) ?? null,
     };
   }
