@@ -2,9 +2,9 @@
 
 Status: ready-for-agent
 
-Implementation: complete. Initial compiled suite 380/380, TypeScript check and build pass. Delivery is being verified on current main.
+Implementation: complete locally. Full serial suite 380/380, TypeScript check and build pass.
 
-Acceptance: owner-driven real Feishu approve/reject, expired-card and injected-handler-failure cases passed on 2026-11-12. Independent read-only database and marker checks passed. Temporary test instrumentation was removed. The historical click's unique root cause remains unproven.
+Acceptance: local SDK/Runtime verified; real Feishu client acceptance blocked and historical click root cause unproven. No deployment.
 
 An authenticated Feishu approval click must receive an explicit interaction response after its durable receipt. Native resolution continues through the existing task lane and cannot be replayed by a duplicate callback.
 
@@ -35,6 +35,6 @@ The original screenshot was downloaded without modification. Its SHA-256 matches
 
 The historical click has no correlated callback duration or wire-response capture. The reproduced exception path is not proof of the screenshot's exact cause. A source observation that SQLite has a five-second busy timeout is also not evidence that database contention occurred in that incident. Global persistence policy is outside this patch.
 
-The owner authorized deployment and completed fresh acceptance cards. Original incident cards were not replayed. The duplicate callback check was a separately identified controlled replay of a new acceptance callback. The injected failure was a handler exception, not physical database contention. See the [acceptance record](../../docs/verification/feishu-approval-callback.md).
+No production restart, deployment, original-card replay, external message, Git commit or PR is part of this repair. Actual Feishu client rendering and disappearance of the reported timeout require separate authorized client acceptance with the fixed artifact.
 
 References: [official callback receiving guide](https://open.feishu.cn/document/event-subscription-guide/callback-subscription/receive-and-handle-callbacks), [card callback response structure](https://open.feishu.cn/document/feishu-cards/card-callback-communication).

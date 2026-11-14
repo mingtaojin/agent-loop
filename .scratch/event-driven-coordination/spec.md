@@ -81,3 +81,69 @@ The user confirmed the reporting boundary and the default discussion summary in 
 The existing on-demand task-group decision sends ordinary questions and final outputs through the coordinator. This change keeps explicit work reports and native events, and replaces automatic final-reply forwarding. Update the corresponding role guidance and architecture record with the implementation.
 
 The absence of a new event means the coordinator continues waiting. Worker silence alone no longer triggers a check or proves failure. Source tests, independent behavioral evidence, Git merge and deployment must be reported separately.
+
+## 拉取前本地讨论记录
+
+以下保留拉取前的本地讨论稿原文，用于追溯用户确认来源。其中“尚未实施”等状态描述属于当时的记录，不覆盖上方已经合入 main 的规格。
+
+```markdown
+Status: ready-for-agent
+
+# Worker 群内讨论按需同步与协调者事件触发
+
+本文件记录 2026-11-14 当前会话确认的需求。grill-with-docs 的两项产品问题均已确认，尚未修改业务代码或部署。
+
+## 用户诉求
+
+用户要求 Worker 群内聊天不逐条同步给协调者，可以在讨论结束后明确要求同步。同时去除定时监督，让协调者通过事件触发。
+
+## 已确认决定
+
+- D1：停止将用户在 Worker 任务群中的普通发言逐条自动转发给协调者。用户仍直接与原 Worker 交流。
+- D2：用户可以在任务群以自然语言明确发起讨论同步，例如说“同步给协调者”，也可以指定只同步某个话题。
+- D3：移除 Runtime 主动生成定时监督提醒的行为。项目存在 Worker、长时间没有活动或 Worker 全部空闲，都不再单独构成唤醒理由。
+- D4：取消 Worker 和 verifier 普通最终答复的自动回传。无论是否有任务群，正式问题、进展和成果都由执行者通过 report 明确上报；用户要求的讨论同步也通过该通道传达。独立执行结束时，执行者须主动汇报结果，不能仅凭结束一轮回复替代汇报。
+- D5：执行失败、非暂停路径的中断、原生问题以及审批和权限请求仍按既有事件路径通知协调者。普通消息不能代替原生审批。
+- D6：收到讨论同步要求后，Worker 直接发送本次讨论摘要，包含已定结论、范围变化、待决问题和证据来源，并保留实际用户消息来源。默认不增加预览确认步骤，也不转发整段聊天记录。用户指定同步范围时按该范围整理。
+
+## 当前契约与变更依据
+
+| 路径 | 当前行为 | 本次变更 |
+| --- | --- | --- |
+| [receiveOwner](../../src/loop.ts#L724) | 用户消息进入 Worker，同时生成协调者的 owner_input。 | 按 D1 停止自动转发。 |
+| [observe](../../src/loop.ts#L661) | Worker 每轮非空最终答复也生成 final_answer，与用户消息转发相互独立。 | 按 D4 取消自动回传，保留 D5 中的运行事件。 |
+| [report](../../src/project-runtime.ts#L453) | Worker 主动提交 result、question、update，均生成协调者事件。 | 按 D4 承接正式汇报和讨论同步。 |
+| [supervise](../../src/project-runtime.ts#L498) | 达到间隔且满足状态条件时写入监督事件，不检查 Worker 是否全部空闲。 | 按 D3 删除定时监督事件来源。 |
+| [tick](../../src/loop.ts#L322) | 推进持久输入和观察执行状态，当前还调用 supervise。 | 移除监督调用；传输和状态观察本身不等于生成模型工作。 |
+| [现有用户消息测试](../../test/project-runtime.test.ts#L660) | 断言 Worker 群内用户决定自动唤醒协调者并去重。 | 旧行为断言需随实现改写。 |
+| [现有最终答复测试](../../test/project-runtime.test.ts#L909) | 断言最终调查答复自动唤醒协调者。 | 改为验证普通答复不唤醒，明确汇报才唤醒。 |
+
+[ADR 0012](../../docs/adr/0012-on-demand-task-groups.md) 规定普通问题和最终输出交给协调者。D4 将其中最终输出的自动转发改为执行者明确汇报，实现时须同步更新相关指导。原规格中的[核查真实产物要求](../project-coordinator/spec.md#r09-监督依据真实产物)继续适用；本次移除的是定时触发来源。
+
+## 确认状态
+
+Q1 的汇报边界和 Q2 的同步内容均已确认，无剩余产品问题。Status 表示规格充分，不表示业务代码已经实现、测试通过或完成部署。
+
+## 验收场景
+
+- 用户在 Worker 群中普通聊天时，消息送达原 Worker，不生成协调者的 owner_input。
+- Worker 完成本轮普通回复时，回复保留在原任务，不因 final_answer 自动唤醒协调者。有群和无群任务都遵循此规则。
+- Worker 明确提交 report 的 question、update 或 result 时，协调者收到对应事件。独立执行结束须主动 report 结果。
+- 用户要求“同步给协调者”时，Worker 直接发送一次符合 D6 的摘要。只同步某个话题的要求限制摘要范围。
+- 相同 report 请求安全重试时，沿用现有 requestId 去重，不重复投递同一同步事件。
+- Worker 的运行异常和原生请求仍按 D5 通知。同步摘要保留用户来源，不替代工具审批或增加授权。
+- 只有时间流逝、项目存在 Worker 或所有 Worker 空闲时，不生成监督提醒，也不据此启动协调者。已有用户、GitHub、明确汇报、运行异常以及必要生命周期事件继续使用既有投递路径。
+
+## 沿用的约束
+
+- 沿用原 Task、Thread 和项目归属。讨论同步不创建另一个 Worker。
+- 保留用户决定与代理判断的区别。同步内容不增加开发、部署或原生工具审批权限。
+- 删除定时监督后，没有新的有效事件时，协调者继续等待，不凭静默推断 Worker 失败。
+- 消息投递、状态观察和已发生故障的恢复与主动定时监督分别处理，本次不将其全部改成推送架构。
+- 业务代码、测试调整、提交和部署尚未执行。当前工作区已有的其他修改及合并冲突不在本轮处理范围内。
+
+## Comments
+
+- 2026-11-14：解释“最终答复”只是 Worker 本轮回复结束，并非整个任务完成后，用户明确回复“你前面的第一条确认按照你的建议来”。Q1 已关闭，决定记入 D4 和 D5，不再重复确认。
+- 2026-11-14：用户对 Q2 的默认讨论摘要、直接发送和可指定话题范围回复“确认”。Q2 已关闭，决定记入 D2 和 D6。
+```
