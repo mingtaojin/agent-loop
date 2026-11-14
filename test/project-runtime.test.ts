@@ -12,7 +12,7 @@ import { z } from 'zod';
 import { configSchema } from '../src/config.js';
 import { sourceCommentSchema, taskSchema, type IncomingMessage, type PendingRequest, type Source } from '../src/domain.js';
 import { AgentLoop } from '../src/loop.js';
-import { FeishuApiError, GroupCreationRejected, type CodexPort, type WorkspacePort } from '../src/ports.js';
+import { CodexProviderMismatchError, FeishuApiError, GroupCreationRejected, type CodexPort, type WorkspacePort } from '../src/ports.js';
 import { GroupCleanup } from '../src/group-cleanup.js';
 import { groupGeneration, retireTaskGroup, TaskGroups } from '../src/task-groups.js';
 import { ProjectLedger, projectStateSchema, type ProjectAction } from '../src/project.js';
@@ -982,6 +982,83 @@ test('only the coordinator can pause and resume its project Worker while other t
     assert.equal(f.codex.starts.filter(input => input.threadId === task.threadId).length, 1);
   }
   assert.equal(f.loop.tasks().length, 5); assert.equal(f.feishu.groups.size, 2);
+});
+
+test('paused provider-mismatched tasks migrate once and create a current-provider Thread only on explicit resume', async t => {
+  const f = await fixture(t); await f.initialize();
+  const app = f.coordinator();
+  const worker = await f.dispatch('provider-migration', 'Inspect the saved project state.');
+  const oldThreadId = worker.threadId; assert.ok(oldThreadId);
+  await f.loop.projectAction(app.id, { action: 'control', requestId: 'pause-provider', taskId: worker.id, operation: 'pause' });
+  const before = f.loop.store.task(worker.id);
+  f.loop.store.setMeta(`provider-migration-probed:${worker.id}`, '');
+  f.codex.inspectErrors.set(oldThreadId, new CodexProviderMismatchError('magpie', 'openai'));
+  let probes = 0;
+  const inspect = f.codex.inspect.bind(f.codex);
+  f.codex.inspect = async (...args) => { if (args[0] === oldThreadId) probes++; return inspect(...args); };
+  await f.loop.tick(); await f.loop.tick();
+  const migrated = f.loop.store.task(worker.id);
+  assert.equal(migrated.status, 'paused');
+  assert.equal(migrated.reason, 'Operator paused');
+  assert.equal(migrated.threadId, null);
+  assert.equal(migrated.turnId, null);
+  assert.equal(migrated.executionStatus, 'unbound');
+  assert.equal(probes, 1);
+  assert.equal(f.loop.store.meta(`project-archived-thread:${oldThreadId}`), worker.id);
+  const migration = f.loop.store.inputs(worker.id).find(input => input.id === `provider-migration:${worker.id}`);
+  assert.ok(migration);
+  assert.equal(migration?.status, 'held');
+  assert.match(migration?.message.text ?? '', /Original task prompt/);
+  f.codex.inspectErrors.delete(oldThreadId);
+  await f.loop.projectAction(app.id, { action: 'control', requestId: 'resume-provider', taskId: worker.id, operation: 'resume' });
+  const resumed = f.loop.store.task(worker.id);
+  assert.equal(resumed.status, 'running');
+  assert.ok(resumed.threadId);
+  assert.notEqual(resumed.threadId, oldThreadId);
+  assert.equal(f.codex.created.length, 3);
+  assert.ok(f.codex.starts.some(input => input.threadId === resumed.threadId && input.deliveryId === migration?.id));
+  assert.equal(f.loop.store.task(worker.id).reason, null);
+  assert.equal(f.loop.store.task(worker.id).chatId, before.chatId);
+});
+
+test('provider migration defers resume while paused input or native requests are unresolved', async t => {
+  const f = await fixture(t); await f.initialize();
+  const app = f.coordinator();
+  const worker = await f.dispatch('provider-migration-blocked', 'Preserve unresolved work.');
+  const oldThreadId = worker.threadId; assert.ok(oldThreadId);
+  await f.loop.projectAction(app.id, { action: 'control', requestId: 'pause-provider-blocked', taskId: worker.id, operation: 'pause' });
+  f.loop.store.setMeta(`provider-migration-probed:${worker.id}`, '');
+  const paused = f.loop.store.task(worker.id);
+  paused.requests = [{ id: 'request', threadId: oldThreadId, turnId: paused.turnId ?? 'turn', kind: 'question', prompt: 'Need input', method: 'item/tool/requestUserInput', payload: {}, isBlocking: true, connectionEpoch: 'epoch' }];
+  f.loop.store.saveTask(paused);
+  f.codex.inspectErrors.set(oldThreadId, new CodexProviderMismatchError('magpie', 'openai'));
+  await f.loop.projectAction(app.id, { action: 'control', requestId: 'resume-provider-blocked', taskId: worker.id, operation: 'resume' });
+  const deferred = f.loop.store.task(worker.id);
+  assert.equal(deferred.status, 'paused');
+  assert.equal(deferred.reason, 'Operator paused');
+  assert.equal(deferred.threadId, oldThreadId);
+  assert.equal(f.loop.store.meta(`provider-migration:${worker.id}`), null);
+});
+
+test('paused provider probes stop after one transient failure until explicit resume', async t => {
+  const f = await fixture(t); await f.initialize();
+  const app = f.coordinator();
+  const worker = await f.dispatch('provider-migration-probe', 'Keep the paused task stable.');
+  const oldThreadId = worker.threadId; assert.ok(oldThreadId);
+  await f.loop.projectAction(app.id, { action: 'control', requestId: 'pause-provider-probe', taskId: worker.id, operation: 'pause' });
+  f.loop.store.setMeta(`provider-migration-probed:${worker.id}`, '');
+  f.codex.inspectErrors.set(oldThreadId, new Error('temporary transport failure'));
+  let probes = 0;
+  const inspect = f.codex.inspect.bind(f.codex);
+  f.codex.inspect = async (...args) => { if (args[0] === oldThreadId) probes++; return inspect(...args); };
+  await f.loop.tick(); await f.loop.tick();
+  assert.equal(probes, 1);
+  assert.equal(f.loop.store.task(worker.id).status, 'paused');
+  f.codex.inspectErrors.delete(oldThreadId);
+  await f.loop.projectAction(app.id, { action: 'control', requestId: 'resume-provider-probe', taskId: worker.id, operation: 'resume' });
+  assert.equal(f.loop.store.task(worker.id).status, 'idle');
+  assert.equal(f.loop.store.task(worker.id).threadId, oldThreadId);
+  assert.ok(probes > 1);
 });
 
 test('a final investigation reply stays local and an explicit report wakes the coordinator', async t => {

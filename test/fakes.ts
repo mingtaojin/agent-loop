@@ -1,7 +1,7 @@
 import { writeFile } from 'node:fs/promises';
-import { TurnChangedError, UncertainOperationError, type ExecutionSnapshot, type IncomingMessage, type PendingRequest, type Source, type SourceComment, type TaskResource, type WorkspaceRequest } from '../src/domain.js';
+import { TurnChangedError, UncertainOperationError, type ApprovalAction, type ExecutionSnapshot, type IncomingMessage, type PendingRequest, type Source, type SourceComment, type TaskResource, type WorkspaceRequest } from '../src/domain.js';
 export interface LegacyReport { status: 'waiting_user' | 'awaiting_review' | 'failed'; summary: string; question: string | null; prUrl: string | null; validation: string[]; limitations: string[] }
-import { TaskGroupUnavailable, type Activity, type TurnIdentity, type CodexPort, type FeishuPort, type GitHubPort } from '../src/ports.js';
+import { TaskGroupUnavailable, type Activity, type TurnIdentity, type CodexPort, type FeishuPort, type GitHubPort, type FeishuReconnectEvent } from '../src/ports.js';
 
 export function issue(number: number, changes: Partial<Source> = {}): Source {
   return {
@@ -54,9 +54,11 @@ export class FeishuFake implements FeishuPort {
   downloadHook: ((destination: string) => Promise<void> | void) | null = null;
   offline: IncomingMessage[] = [];
   historyError: Error | null = null;
+  historyCalls = 0;
   loseGroupAck = false;
   loseSendAck = false;
   receiver: ((message: IncomingMessage) => Promise<void>) | null = null;
+  reconnect: ((event: FeishuReconnectEvent) => void) | null = null;
   async ensureGroup(input: Parameters<FeishuPort['ensureGroup']>[0]): Promise<string> {
     const key = input.generation ? `${input.taskId}:${input.generation}` : input.taskId;
     const group = this.groups.get(key) ?? `chat-${input.taskId}-${input.generation ?? 0}`;
@@ -83,10 +85,11 @@ export class FeishuFake implements FeishuPort {
     await this.downloadHook?.(input.destination);
   }
   async history(input: Parameters<FeishuPort['history']>[0]): Promise<IncomingMessage[]> {
+    this.historyCalls++;
     if (this.historyError) throw this.historyError;
     return this.offline.filter(message => message.chatId === input.chatId && message.createdAt >= input.since);
   }
-  async start(onMessage: (message: IncomingMessage) => Promise<void>): Promise<void> { this.receiver = onMessage; }
+  async start(onMessage: (message: IncomingMessage) => Promise<void>, _onError?: (error: unknown) => void, _onAction?: (action: ApprovalAction) => Promise<void>, onReconnect?: (event: FeishuReconnectEvent) => void): Promise<void> { this.receiver = onMessage; this.reconnect = onReconnect ?? null; }
   async close(): Promise<void> { this.receiver = null; }
 }
 
@@ -111,6 +114,7 @@ export class CodexFake implements CodexPort {
   recoveries = 0;
   recoveryError: Error | null = null;
   inspectError: Error | null = null;
+  readonly inspectErrors = new Map<string, Error>();
   async recover(): Promise<void> { this.recoveries++; if (this.recoveryError) throw this.recoveryError; }
   async respondApproval(input: Parameters<CodexPort['respondApproval']>[0]): Promise<'confirmed' | 'uncertain'> {
     this.approvals.push(structuredClone(input));
@@ -150,7 +154,11 @@ export class CodexFake implements CodexPort {
     if (snapshot.requests.length || snapshot.status === 'running') return 'busy';
     return ['idle', 'completed', 'interrupted', 'failed'].includes(snapshot.status) ? 'idle' : 'unknown';
   }
-  async inspect(...[threadId]: Parameters<CodexPort['inspect']>): Promise<ExecutionSnapshot> { if (this.inspectError) throw this.inspectError; return structuredClone(this.snapshot(threadId)); }
+  async inspect(...[threadId]: Parameters<CodexPort['inspect']>): Promise<ExecutionSnapshot> {
+    const error = this.inspectErrors.get(threadId) ?? this.inspectError;
+    if (error) throw error;
+    return structuredClone(this.snapshot(threadId));
+  }
   async activity(...args: Parameters<CodexPort['activity']>): Promise<Activity> {
     const [threadId] = args;
     const snapshot = await this.inspect(...args);

@@ -7,7 +7,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { Client, WSClient, EventDispatcher, Domain, LoggerLevel, defaultHttpInstance, type HttpInstance, type HttpRequestOptions } from '@larksuiteoapi/node-sdk';
 import { z } from 'zod';
 import { UncertainOperationError, errorMessage, type ApprovalAction, type Attachment, type IncomingMessage, type PendingRequest } from '../domain.js';
-import { FeishuApiError, GroupCreationRejected, TaskGroupUnavailable, type FeishuPort, type FeishuProgressPort, type ProgressWriteGuard } from '../ports.js';
+import { FeishuApiError, GroupCreationRejected, TaskGroupUnavailable, type FeishuPort, type FeishuProgressPort, type FeishuReconnectEvent, type ProgressWriteGuard } from '../ports.js';
 import { FeishuDocumentAdapter, type FeishuDocumentApi } from './feishu-document.js';
 
 export interface FeishuOptions {
@@ -417,7 +417,7 @@ export class FeishuAdapter implements FeishuPort, FeishuProgressPort {
     } while (token);
     return [...messages.values()].sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
   }
-  async start(onMessage: (message: IncomingMessage) => Promise<void>, onError: (error: unknown) => void, onAction?: (action: ApprovalAction) => Promise<void>): Promise<void> {
+  async start(onMessage: (message: IncomingMessage) => Promise<void>, onError: (error: unknown) => void, onAction?: (action: ApprovalAction) => Promise<void>, onReconnect?: (event: FeishuReconnectEvent) => void): Promise<void> {
     const eventDispatcher = new EventDispatcher({ loggerLevel: LoggerLevel.error }).register({
       'card.action.trigger': async (raw: unknown) => {
         const receivedAt = Date.now();
@@ -459,6 +459,8 @@ export class FeishuAdapter implements FeishuPort, FeishuProgressPort {
     });
     if (this.socket) { await this.socket.start({ eventDispatcher }); return; }
     await new Promise<void>((resolve, reject) => {
+      let reconnectAttempt = 0;
+      let reconnectStartedAt: number | undefined;
       const timer = setTimeout(() => {
         this.socket?.close({ force: true });
         reject(new Error('Feishu long connection did not become ready before its timeout'));
@@ -468,7 +470,20 @@ export class FeishuAdapter implements FeishuPort, FeishuProgressPort {
         handshakeTimeoutMs: this.options.requestTimeoutMs ?? 30_000,
         onReady: () => { clearTimeout(timer); resolve(); },
         onError: error => { clearTimeout(timer); onError(error); reject(error); },
-        onReconnecting: () => onError(new Error('Feishu long connection disconnected; history backfill is required')) });
+        onReconnecting: () => {
+          reconnectAttempt++;
+          reconnectStartedAt ??= Date.now();
+          const event: FeishuReconnectEvent = { state: 'reconnecting', attempt: reconnectAttempt };
+          onReconnect?.(event);
+          onError(new Error(`Feishu long connection reconnecting: ${JSON.stringify(event)}`));
+        },
+        onReconnected: () => {
+          const event: FeishuReconnectEvent = { state: 'reconnected', attempt: reconnectAttempt, ...(reconnectStartedAt === undefined ? {} : { durationMs: Math.max(0, Date.now() - reconnectStartedAt) }) };
+          onReconnect?.(event);
+          reconnectAttempt = 0;
+          reconnectStartedAt = undefined;
+        },
+      });
       void this.socket.start({ eventDispatcher }).catch(error => { clearTimeout(timer); reject(error); });
     });
   }

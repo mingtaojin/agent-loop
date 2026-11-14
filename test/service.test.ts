@@ -557,9 +557,10 @@ test('history gaps and uncertain outgoing messages are visible without replaying
   const originalCount = f.feishu.sent.length;
   f.feishu.historyError = new Error('History permission unavailable');
   await f.restart();
+  await f.loop.recover();
   assert.equal(f.feishu.sent.filter(message => message.text.includes('任务对话已建立')).length, 1);
   assert.ok(f.feishu.sent.length > originalCount);
-  assert.ok(f.feishu.sent.some(message => message.text.includes('离线消息补偿未完成')));
+  assert.ok(f.feishu.sent.some(message => message.text.includes('离线消息补偿暂时失败')));
   assert.equal(workerCalls(f.loop, f.codex).starts.length, 1);
 });
 

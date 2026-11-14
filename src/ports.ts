@@ -37,9 +37,14 @@ export interface FeishuPort {
   send(input: { chatId: string; text: string; id: string }): Promise<void>;
   download(input: { messageId: string; attachment: Attachment; destination: string; maxBytes: number }): Promise<void>;
   history(input: { chatId: string; since: number }): Promise<IncomingMessage[]>;
-  start(onMessage: (message: IncomingMessage) => Promise<void>, onError: (error: unknown) => void, onAction?: (action: ApprovalAction) => Promise<void>): Promise<void>;
+  start(onMessage: (message: IncomingMessage) => Promise<void>, onError: (error: unknown) => void, onAction?: (action: ApprovalAction) => Promise<void>, onReconnect?: (event: FeishuReconnectEvent) => void): Promise<void>;
   sendApproval(input: { chatId: string; id: string; taskId: string; request: PendingRequest }): Promise<void>;
   close(): Promise<void>;
+}
+export interface FeishuReconnectEvent {
+  state: 'reconnecting' | 'reconnected';
+  attempt: number;
+  durationMs?: number;
 }
 export class FeishuApiError extends Error {
   constructor(readonly code: number, message: string) { super(`Feishu API error ${code}: ${message}`); }
@@ -87,6 +92,11 @@ export interface CodexPort {
   recover(): Promise<void>;
   interrupt(input: { threadId: string; turnId: string }): Promise<void>;
   close(): Promise<void>;
+}
+export class CodexProviderMismatchError extends Error {
+  constructor(readonly threadProvider: string, readonly currentProvider: string) {
+    super(`Codex Thread provider ${threadProvider} does not match current provider ${currentProvider}`);
+  }
 }
 export interface WorkspacePort {
   readonly supportsCloseout?: boolean;
