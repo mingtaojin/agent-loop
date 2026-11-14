@@ -9,7 +9,7 @@ import { criteriaSchema, requestSchema, workspaceTargetSchema } from './domain.j
 import { discoverProjects } from './project-discovery.js';
 import type { Config } from './config.js';
 import { errorMessage, presentTaskSource, matchSource, RejectedInputError, TurnChangedError, type AgentInput, type ApprovalAction, type DiscoveredProject, type ExecutionSnapshot, type IncomingMessage, type Repository, type Source, type SourceComment, type Task, type TaskResource, type TaskSource, type WorkspaceTarget } from './domain.js';
-import { FeishuApiError, TaskGroupUnavailable, type RunningActivity, type TurnIdentity, type CodexPort, type FeishuPort, type GitHubPort, type WorkspacePort } from './ports.js';
+import { CodexProviderMismatchError, FeishuApiError, TaskGroupUnavailable, type FeishuReconnectEvent, type RunningActivity, type TurnIdentity, type CodexPort, type FeishuPort, type GitHubPort, type WorkspacePort } from './ports.js';
 import { TaskGroups, assertGroupBinding, groupGeneration, retireTaskGroup } from './task-groups.js';
 import { CleanupAdmissionBusy, TaskCloseout } from './task-closeout.js';
 import { GroupCleanup } from './group-cleanup.js';
@@ -23,6 +23,8 @@ import { matchesProjectIssue } from './project.js';
 
 const digest = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex');
 const approvalOutputSchema = z.object({ taskId: z.string(), request: requestSchema, chatId: z.string().optional(), lastAttemptAt: z.number().optional() });
+const historyFailureSchema = z.object({ attempts: z.number().int().nonnegative(), noticeSent: z.boolean() });
+type ProviderMigrationResult = 'not-needed' | 'migrated' | 'deferred';
 const recoveryState = () => ({ attempts: 0, nextAttemptAt: null, lastError: null, interruptedTurnId: null, lastUserInputSeq: null });
 function sourceRevision(source: Source): string {
   return digest(JSON.stringify({ ...source, assignees: [...source.assignees].sort(), labels: [...source.labels].sort(), updatedAt: undefined }));
@@ -40,6 +42,8 @@ export class AgentLoop {
   private starting: Promise<void> | null = null;
   private closing: Promise<void> | null = null;
   private collecting: Promise<void> | null = null;
+  private backfilling: Promise<void> | null = null;
+  private backfillRequested = false;
   readonly projects: ProjectRuntime;
   readonly closeout: TaskCloseout;
   private readonly groups: TaskGroups;
@@ -588,6 +592,65 @@ export class AgentLoop {
     } else task.recovery.nextAttemptAt = Date.now() + this.config.recovery.retryDelayMs;
     this.persist(task); this.problem(task.id, error);
   }
+  private async migratePausedProvider(task: Task, forceProbe = false): Promise<ProviderMigrationResult> {
+    if (task.status !== 'paused' || !task.threadId) return 'not-needed';
+    const probeKey = `provider-migration-probed:${task.id}`;
+    if (!forceProbe && this.store.meta(probeKey)) return 'not-needed';
+    this.store.setMeta(probeKey, String(Date.now()));
+    const oldThreadId = task.threadId;
+    try {
+      await this.inspect(oldThreadId);
+      this.store.setMeta(`provider-migration-deferred:${task.id}`, '');
+      return 'not-needed';
+    } catch (error) {
+      if (!(error instanceof CodexProviderMismatchError)) {
+        this.problem(`provider-migration:${task.id}`, new Error(`provider probe failed: ${error instanceof Error ? error.name : 'unknown'}`));
+        return 'not-needed';
+      }
+      const blocked = task.requests.length > 0
+        || this.store.approvals(task.id).some(item => ['pending', 'processing', 'uncertain'].includes(item.status))
+        || this.hasUnknownInput(task);
+      if (blocked) {
+        this.store.setMeta(`provider-migration-deferred:${task.id}`, '1');
+        this.problem(`provider-migration:${task.id}`, new Error('provider mismatch migration deferred because task input or requests are unresolved'));
+        return 'deferred';
+      }
+      const inputId = `provider-migration:${task.id}`;
+      const migration = {
+        oldThreadId,
+        threadProvider: error.threadProvider,
+        currentProvider: error.currentProvider,
+        migratedAt: Date.now(),
+      };
+      const context: IncomingMessage = {
+        id: inputId,
+        chatId: task.chatId ?? '',
+        senderId: 'runtime:provider-migration',
+        chatType: 'group',
+        text: `Provider migration context. The saved Codex conversation used provider ${JSON.stringify(error.threadProvider)}, while the current runtime uses provider ${JSON.stringify(error.currentProvider)}. Start from durable project and workspace state; inspect it before acting. Preserve prior decisions and authorization. Do not replay effects whose outcomes are unknown.\nOriginal task prompt:\n${task.prompt}`,
+        attachments: [],
+        createdAt: Date.now(),
+      };
+      this.store.transaction(() => {
+        this.store.setMeta(`project-archived-thread:${oldThreadId}`, task.id);
+        this.store.setMeta(`provider-migration:${task.id}`, JSON.stringify(migration));
+        const generation = Number(this.store.meta(`project-generation:${task.id}`) ?? 0) + 1;
+        this.store.setMeta(`project-generation:${task.id}`, String(generation));
+        task.threadId = null;
+        task.turnId = null;
+        task.lastHandledTurnId = null;
+        task.executionStatus = 'unbound';
+        task.updatedAt = Date.now();
+        this.store.saveTask(task);
+        if (!this.store.inputs(task.id).some(input => input.id === inputId)) {
+          this.store.receive(task.id, context, 'resume', { kind: 'recovery', previousTurnId: oldThreadId });
+        }
+      });
+      this.store.setMeta(`provider-migration-probed:${task.id}`, 'migrated');
+      this.store.setMeta(`provider-migration-deferred:${task.id}`, '');
+      return 'migrated';
+    }
+  }
   private async advance(id: string, reconcile = false): Promise<void> {
     if (this.closeout.completed(id)) { this.forwardCompletedInputs(this.store.task(id)); await this.closeout.progress(id); await this.flush(this.store.task(id)); return; }
     let task = this.store.task(id);
@@ -619,6 +682,14 @@ export class AgentLoop {
       if (task.status === 'paused' && task.legacy?.status === 'paused' && task.reason !== 'Operator paused' && this.store.inputs(task.id).some(input => input.origin === 'user' && input.status === 'pending')) {
         task.status = task.threadId ? 'idle' : 'pending'; task.reason = null; task.recovery = recoveryState(); this.persist(task);
         for (const input of this.store.inputs(task.id)) if (input.status === 'held') this.store.markInput(input.id, 'pending');
+      }
+      if (task.status === 'paused') {
+        await this.migratePausedProvider(task);
+        task = this.store.task(id);
+        if (task.status === 'paused') {
+          for (const input of this.store.inputs(task.id)) if (input.status === 'pending') this.store.markInput(input.id, 'held');
+          await this.flush(task); return;
+        }
       }
       if (task.status === 'failed') { await this.flush(task); return; }
       if (task.recovery.nextAttemptAt !== null) {
@@ -934,9 +1005,14 @@ export class AgentLoop {
       if (action === 'pause') await this.pause(task, 'Operator paused');
       else if (action === 'status') this.notify(task, `Task ${task.id}\n${task.status}\n${task.reason ?? ''}`, `status:${randomUUID()}`);
       else if (['paused', 'failed'].includes(task.status)) {
-        for (const resource of task.resources) await this.restoreWorkspace(task.id, resource);
-        task.status = task.threadId ? 'idle' : 'pending'; task.reason = null; task.recovery = recoveryState(); this.persist(task);
-        for (const input of this.store.inputs(task.id)) if (input.status === 'held') this.store.markInput(input.id, 'pending');
+        if (task.status === 'paused') {
+          const migration = await this.migratePausedProvider(task, true);
+          if (migration === 'deferred') { await this.flush(this.store.task(taskId)); return; }
+        }
+        const current = this.store.task(taskId);
+        for (const resource of current.resources) await this.restoreWorkspace(current.id, resource);
+        current.status = current.threadId ? 'idle' : 'pending'; current.reason = null; current.recovery = recoveryState(); this.persist(current);
+        for (const input of this.store.inputs(current.id)) if (input.status === 'held') this.store.markInput(input.id, 'pending');
       }
       await this.advance(taskId);
     });
@@ -998,7 +1074,7 @@ export class AgentLoop {
     const tasks = this.store.tasks().sort((a, b) => priority(a) - priority(b));
     await Promise.all(tasks.map(task => this.serial(task.id, async () => {
       try {
-        if (this.closeout.completed(task.id)) { this.forwardCompletedInputs(task); await this.backfillTask(task); await this.flush(task); return; }
+        if (this.closeout.completed(task.id)) { this.forwardCompletedInputs(task); await this.flush(task); return; }
         for (const resource of task.resources) await this.restoreWorkspace(task.id, resource);
         if (!this.projects.ledger.membership(task.id)) {
           const project = await this.projects.resolveTask(task);
@@ -1017,7 +1093,6 @@ export class AgentLoop {
         if (task.chatId) {
           try { await this.ports.feishu.verifyGroup(task.chatId); }
           catch (error) { if (error instanceof TaskGroupUnavailable) this.retireGroup(task); else throw error; }
-          await this.backfillTask(task);
         }
         await this.advance(task.id, true);
       } catch (error) {
@@ -1029,29 +1104,56 @@ export class AgentLoop {
         await this.flush(failed);
       }
     })));
+    await this.backfill();
   }
   private async backfillTask(task: Task): Promise<void> {
     if (!task.chatId) return;
     const previous = Number(this.store.meta(`history:${task.id}`) ?? task.createdAt);
+    const cursor = Date.now();
+    const since = Math.max(task.createdAt, previous - this.config.pollIntervalMs * 2);
+    let messages: IncomingMessage[];
     try {
-      const cursor = Date.now();
-      const since = Math.max(task.createdAt, previous - this.config.pollIntervalMs * 2);
-      for (const message of await this.ports.feishu.history({ chatId: task.chatId, since })) {
-        if (message.senderId === this.config.feishu.userOpenId) {
-          this.receiveOwner(task, message);
-        }
-      }
-      this.store.setMeta(`history:${task.id}`, String(cursor));
+      messages = await this.ports.feishu.history({ chatId: task.chatId, since });
     } catch (error) {
       if (await this.groupUnavailable(task, error)) { this.retireGroup(task); return; }
-      this.problem(task.id, error);
-      this.notify(task, `离线消息补偿未完成，可能存在缺口：${errorMessage(error)}`, `history-error:${digest(errorMessage(error))}`);
+      const failureKey = `history-failure:${task.id}`;
+      const previousFailure = this.store.meta(failureKey);
+      const state = previousFailure ? historyFailureSchema.parse(JSON.parse(previousFailure)) : { attempts: 0, noticeSent: false };
+      state.attempts++;
+      if (state.attempts >= 2 && !state.noticeSent) {
+        state.noticeSent = true;
+        this.notify(this.store.task(task.id), '离线消息补偿暂时失败，系统将继续重试。', `history-error:${task.id}`);
+      }
+      this.store.setMeta(failureKey, JSON.stringify(state));
+      this.problem(`history:${task.id}`, new Error(`history fetch failed (${error instanceof Error ? error.name : 'unknown'})`));
+      await this.serial(task.id, () => this.advance(task.id));
+      return;
     }
+    for (const message of messages) if (message.senderId === this.config.feishu.userOpenId) this.receiveOwner(task, message);
+    this.store.setMeta(`history:${task.id}`, String(cursor));
+    const failureKey = `history-failure:${task.id}`;
+    const rawFailure = this.store.meta(failureKey);
+    if (rawFailure) {
+      const failure = historyFailureSchema.parse(JSON.parse(rawFailure));
+      this.store.setMeta(failureKey, JSON.stringify({ attempts: 0, noticeSent: false }));
+      if (failure.noticeSent) this.notify(this.store.task(task.id), '离线消息补偿已恢复。', `history-recovered:${task.id}`);
+    }
+    await this.serial(task.id, () => this.advance(task.id));
   }
   private async backfill(): Promise<void> {
-    await Promise.all(this.store.tasks().filter(task => task.chatId).map(task => this.serial(task.id, async () => {
-      await this.backfillTask(task); await this.advance(task.id);
-    })));
+    if (this.backfilling) return this.backfilling;
+    const work = Promise.all(this.store.tasks().filter(task => task.chatId).map(task => this.backfillTask(task))).then(() => undefined);
+    this.backfilling = work;
+    try { await work; } finally { if (this.backfilling === work) this.backfilling = null; }
+  }
+  private requestBackfill(event: FeishuReconnectEvent): void {
+    this.problem('feishu-reconnect', new Error(`Feishu reconnect ${event.state}: attempt=${event.attempt}${event.durationMs === undefined ? '' : ` durationMs=${event.durationMs}`}`));
+    if (event.state !== 'reconnected' || !this.running || this.stopping || this.backfillRequested) return;
+    this.backfillRequested = true;
+    queueMicrotask(() => {
+      this.backfillRequested = false;
+      void this.backfill().catch(error => this.problem('backfill', error));
+    });
   }
   start(): Promise<void> {
     if (this.stopping) return Promise.reject(new Error('Agent Loop is closing'));
@@ -1061,7 +1163,7 @@ export class AgentLoop {
   private async startService(): Promise<void> {
     if (this.running) return;
     this.started = true;
-    await this.ports.feishu.start(message => this.receive(message), error => this.problem('feishu', error), action => this.approve(action));
+    await this.ports.feishu.start(message => this.receive(message), error => this.problem('feishu', error), action => this.approve(action), event => this.requestBackfill(event));
     if (this.stopping) return;
     await this.projects.ensure();
     await this.recover();

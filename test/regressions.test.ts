@@ -159,6 +159,54 @@ test('periodic collection recovers history-only messages after a connection gap 
   assert.equal(f.task().status, 'running');
 });
 
+test('Feishu reconnect requests one coalesced backfill while the runtime is ready', async t => {
+  const f = await fixture(t);
+  await f.launch();
+  await f.loop.start();
+  const before = f.feishu.historyCalls;
+  const message = f.message('reconnect-history', 'Recovered after reconnect.');
+  f.feishu.offline = [message];
+  assert.ok(f.feishu.reconnect);
+  f.feishu.reconnect?.({ state: 'reconnected', attempt: 1 });
+  f.feishu.reconnect?.({ state: 'reconnected', attempt: 2 });
+  await setTimeout(10);
+  assert.equal(f.feishu.historyCalls, before + f.loop.tasks().filter(task => task.chatId).length);
+  assert.equal(f.loop.store.inputs(f.task().id).some(input => input.id === message.id), true);
+});
+
+test('slow Feishu history fetch does not block a live owner message', async t => {
+  const f = await fixture(t);
+  await f.launch();
+  await f.loop.start();
+  const entered = gate();
+  const release = gate();
+  const history = f.feishu.history.bind(f.feishu);
+  f.feishu.history = async input => { entered.resolve(); await release.promise; return history(input); };
+  const collecting = f.loop.collect();
+  await entered.promise;
+  const message = f.message('live-during-history', 'Live owner input.');
+  await f.loop.receive(message);
+  assert.equal(workerCalls(f.loop, f.codex).steers.at(-1)?.deliveryId, message.id);
+  release.resolve();
+  await collecting;
+});
+
+test('history failure notices are delayed, coalesced, and clear with one recovery notice', async t => {
+  const f = await fixture(t);
+  await f.launch();
+  await f.loop.start();
+  f.feishu.historyError = new Error('first private failure');
+  await f.loop.collect();
+  assert.equal(f.feishu.sent.filter(message => message.text.includes('离线消息补偿暂时失败')).length, 0);
+  await f.loop.collect();
+  assert.equal(f.feishu.sent.filter(message => message.text.includes('离线消息补偿暂时失败')).length, f.loop.tasks().filter(task => task.chatId).length);
+  f.feishu.historyError = null;
+  await f.loop.collect();
+  await f.loop.collect();
+  assert.equal(f.feishu.sent.filter(message => message.text.includes('离线消息补偿已恢复')).length, f.loop.tasks().filter(task => task.chatId).length);
+  assert.equal(f.loop.store.meta(`history-failure:${f.task().id}`), JSON.stringify({ attempts: 0, noticeSent: false }));
+});
+
 test('messages received during startup persist until recovery verifies the task', async t => {
   const f = await fixture(t);
   await f.launch();

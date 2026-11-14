@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
 import { RejectedInputError, TurnChangedError, UncertainOperationError, workspaceTargetSchema, type AgentInput, type AgentOutput, type ExecutionSnapshot, type PendingRequest, type WorkspaceRequest } from '../domain.js';
-import type { Activity, CodexPort, TurnIdentity } from '../ports.js';
+import { CodexProviderMismatchError, type Activity, type CodexPort, type TurnIdentity } from '../ports.js';
 import { executionEvent, type ExecutionEvent } from '../execution-events.js';
 import { projectActionSchema } from '../project.js';
 import type { ReasoningEffort } from '../execution.js';
@@ -114,6 +114,12 @@ type HistoryObservation = { completed?: CompletedHistory };
 class TurnHistoryPendingError extends UncertainOperationError {}
 class RpcError extends Error {
   constructor(readonly code: number, message: string) { super(message); }
+}
+
+function providerMismatch(error: unknown): CodexProviderMismatchError | null {
+  const message = error instanceof Error ? error.message : String(error);
+  const match = /This chat uses ([^,\r\n]+), but your current provider is ([^.\r\n]+)\.?/i.exec(message);
+  return match ? new CodexProviderMismatchError(match[1]!.trim(), match[2]!.trim()) : null;
 }
 
 function isTurnHistoryMaterializing(error: unknown): error is RpcError {
@@ -438,7 +444,7 @@ export class CodexAppServer implements CodexPort {
       ...(current.reasoningEffort ? { config: { model_reasoning_effort: current.reasoningEffort } } : {}), threadId, developerInstructions: current.instructions }, outcome => {
       if (!matches()) return;
       this.historyObservations.delete(threadId);
-      if (outcome.kind === 'failure') { current.load = { kind: 'failed', error: outcome.error }; return; }
+      if (outcome.kind === 'failure') { current.load = { kind: 'failed', error: providerMismatch(outcome.error) ?? outcome.error }; return; }
       try {
         const { thread } = threadResponseSchema.parse(outcome.value);
         if (thread.id !== threadId) throw new Error('Codex resumed a different thread');
@@ -450,7 +456,7 @@ export class CodexAppServer implements CodexPort {
       if (!matches()) throw new UncertainOperationError('Codex connection changed during thread resume');
       if (current.load.kind === 'failed') throw current.load.error;
     }).catch(error => {
-      const failure = error instanceof Error ? error : new Error(String(error));
+      const failure = providerMismatch(error) ?? (error instanceof Error ? error : new Error(String(error)));
       if (matches() && current.load.kind === 'pending') {
         current.load = { kind: failure instanceof RpcTimeoutError ? 'uncertain' : 'failed', error: failure };
       }
