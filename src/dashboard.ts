@@ -16,22 +16,39 @@ export async function startDashboard(options: { dataDir: string; port: number; h
   const networkAddresses = () => Object.values(networkInterfaces()).flatMap(addresses => (addresses ?? []).filter(address => address.family === 'IPv4' && !address.internal).map(address => address.address));
   let store: Store | null = null;
   const clients = new Set<ServerResponse>();
+  const readerFor = (db: Store) => new ProjectDashboardReader(db);
+  let readModelCache: { version: number; expiresAt: number; tasks: ReturnType<Store['tasks']>; projects: ReturnType<ProjectDashboardReader['projects']>; diagnostics: ReturnType<Store['diagnostics']> } | null = null;
   const readStore = () => {
     if (!store && existsSync(join(options.dataDir, 'tasks.sqlite'))) store = new Store(options.dataDir, { readOnly: true });
     return store;
   };
+  // Open the read-only connection before listening so the first API request measures the
+  // dashboard query rather than SQLite connection and schema setup.
+  readStore();
   const json = (response: ServerResponse, status: number, value: unknown) => {
     response.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
     response.end(JSON.stringify(value));
   };
-  const snapshot = () => {
+  const readModel = () => {
+    const now = Date.now();
     const db = readStore();
+    const version = db?.dataVersion() ?? 0;
+    if (readModelCache && readModelCache.version === version && readModelCache.expiresAt > now) return readModelCache;
+    const tasks = db?.tasks() ?? [];
+    const projects = db ? readerFor(db).projects(tasks) : [];
+    const diagnostics = db?.diagnostics() ?? [];
+    readModelCache = { version, expiresAt: now + 250, tasks, projects, diagnostics };
+    return readModelCache;
+  };
+  const snapshot = () => {
+    const now = Date.now();
+    const db = readStore();
+    const model = readModel();
     const rawHeartbeat = db?.meta('runtime-heartbeat');
     const heartbeat = rawHeartbeat ? heartbeatSchema.safeParse(JSON.parse(rawHeartbeat)) : null;
-    const projects = db ? new ProjectDashboardReader(db).projects() : [];
-    return {
-      dataDir: options.dataDir, now: Date.now(), runtime: heartbeat?.success ? heartbeat.data : null,
-      tasks: (db?.tasks() ?? []).map(task => ({
+    const value = {
+      dataDir: options.dataDir, now, runtime: heartbeat?.success ? heartbeat.data : null,
+      tasks: model.tasks.map(task => ({
         id: task.id, title: presentTaskSource(task.source, 200).title,
         sourceLabel: presentTaskSource(task.source, 200).label,
         sourceKind: task.source.kind, sourceUrl: task.source.kind === 'github' ? task.source.issue.url : null,
@@ -40,8 +57,9 @@ export async function startDashboard(options: { dataDir: string; port: number; h
         createdAt: task.createdAt, updatedAt: task.updatedAt, recovery: task.recovery,
         requests: task.requests.map(request => ({ kind: request.kind, prompt: boundedDashboardText(request.prompt) })),
         resources: dashboardResources(task.resources),
-      })), projects, diagnostics: db?.diagnostics() ?? [],
+      })), projects: model.projects, diagnostics: model.diagnostics,
     };
+    return value;
   };
   const server = createServer((request, response) => {
     response.setHeader('cache-control', 'no-store');
@@ -67,11 +85,12 @@ export async function startDashboard(options: { dataDir: string; port: number; h
     try {
       if (url.pathname === '/api/snapshot') { json(response, 200, snapshot()); return; }
       if (url.pathname === '/api/projects') {
-        json(response, 200, readStore() ? new ProjectDashboardReader(readStore()!).projects() : []); return;
+        json(response, 200, readModel().projects); return;
       }
       const projectMatch = /^\/api\/projects\/([^/]+)$/.exec(url.pathname);
       if (projectMatch?.[1]) {
-        const project = readStore() ? new ProjectDashboardReader(readStore()!).project(decodeURIComponent(projectMatch[1])) : null;
+        const projectId = decodeURIComponent(projectMatch[1]);
+        const project = readModel().projects.find(candidate => candidate.id === projectId) ?? null;
         if (!project) { json(response, 404, { error: '项目不存在' }); return; }
         json(response, 200, project); return;
       }
@@ -79,8 +98,9 @@ export async function startDashboard(options: { dataDir: string; port: number; h
       if (taskMatch?.[1]) {
         const taskId = decodeURIComponent(taskMatch[1]);
         const db = readStore();
-        if (!db?.tasks().some(task => task.id === taskId)) { json(response, 404, { error: '任务不存在' }); return; }
-        const detail = new ProjectDashboardReader(db).taskDetail(taskId);
+        const tasks = db?.tasks() ?? [];
+        if (!db || !tasks.some(task => task.id === taskId)) { json(response, 404, { error: '任务不存在' }); return; }
+        const detail = readerFor(db).taskDetail(taskId, tasks);
         json(response, 200, {
           inputs: db.inputs(taskId).map(input => ({ id: input.id, text: boundedDashboardText(input.message.text), createdAt: input.message.createdAt, origin: input.origin, status: input.status, error: input.error ? boundedDashboardText(input.error) : null, attachments: input.message.attachments.map(attachment => ({ name: attachment.name, kind: attachment.kind })) })),
           outputs: db.outputs(taskId).map(output => ({ ...output, text: boundedDashboardText(output.text), error: output.error ? boundedDashboardText(output.error) : null })), projectId: detail?.projectId ?? null, task: detail?.task ?? null,
@@ -103,7 +123,7 @@ export async function startDashboard(options: { dataDir: string; port: number; h
       const send = () => {
         if (blocked || response.destroyed) return;
         try {
-          const page = new ProjectDashboardReader(db).events(taskId, cursor);
+          const page = reader.events(taskId, cursor);
           for (const event of page.events) {
             cursor = event.seq;
             if (!response.write('id: ' + event.seq + '\nevent: execution\ndata: ' + JSON.stringify(event) + '\n\n')) { blocked = true; break; }
@@ -118,7 +138,8 @@ export async function startDashboard(options: { dataDir: string; port: number; h
           response.end();
         }
       };
-      const timer = setInterval(send, 250);
+      const reader = new ProjectDashboardReader(db);
+      const timer = setInterval(send, 1_000);
       response.on('close', () => { clearInterval(timer); clients.delete(response); });
       send();
     } catch (error) { json(response, 500, { error: errorMessage(error) }); }

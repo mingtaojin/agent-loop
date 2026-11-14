@@ -18,9 +18,23 @@ export type Inbox = Omit<z.infer<typeof inboxRow>, 'payload'> & { message: Incom
 const outboxSchema = z.object({ id: z.string(), task_id: z.string(), text: z.string(), status: z.enum(['pending', 'sending', 'sent', 'uncertain', 'dropped']), error: z.string().nullable() });
 export type Outbox = z.infer<typeof outboxSchema>;
 
+/** Runtime execution traces are a bounded projection; user/audit facts live in their own tables. */
+export const executionEventRetentionLimit = 2_000;
+export const executionDeltaSampleMs = 250;
+export const diagnosticRetentionLimit = 1_000;
+const diagnosticReadLimit = 100;
+const diagnosticMessageLimit = 8_192;
+type LiveExecutionListener = (event: StoredExecutionEvent) => void;
+const liveExecutionListeners = new Map<string, Set<LiveExecutionListener>>();
+
 export class Store {
   private readonly db: DatabaseSync;
   private readonly lock: DatabaseSync | null;
+  private readonly lastDeltaAt = new Map<string, number>();
+  private readonly ephemeralEvents: StoredExecutionEvent[] = [];
+  private logicalSequence = 0;
+  private logicalSequenceLoaded = false;
+  private unsubscribeLive: (() => void) | null = null;
   constructor(private readonly dataDir: string, options: { readOnly?: boolean } = {}) {
     mkdirSync(dataDir, { recursive: true, mode: 0o700 });
     this.lock = options.readOnly ? null : new DatabaseSync(join(dataDir, 'owner.sqlite'));
@@ -28,7 +42,17 @@ export class Store {
     catch { this.lock?.close(); throw new Error('已有 Agent Loop 进程使用此数据目录'); }
     try {
       this.db = new DatabaseSync(join(dataDir, 'tasks.sqlite'), { readOnly: options.readOnly ?? false });
-      if (options.readOnly) return;
+      if (options.readOnly) {
+        const listeners = liveExecutionListeners.get(dataDir) ?? new Set<LiveExecutionListener>();
+        liveExecutionListeners.set(dataDir, listeners);
+        const listener: LiveExecutionListener = event => {
+          this.ephemeralEvents.push(event);
+          if (this.ephemeralEvents.length > 4_096) this.ephemeralEvents.splice(0, this.ephemeralEvents.length - 4_096);
+        };
+        listeners.add(listener);
+        this.unsubscribeLive = () => { listeners.delete(listener); if (!listeners.size) liveExecutionListeners.delete(dataDir); };
+        return;
+      }
       this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
         CREATE TABLE IF NOT EXISTS sources(id TEXT PRIMARY KEY,payload TEXT NOT NULL,reason TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS source_revisions(source_id TEXT NOT NULL,hash TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(source_id,hash));
@@ -39,9 +63,12 @@ export class Store {
         CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id),kind TEXT NOT NULL,status TEXT NOT NULL,result TEXT,error TEXT);
         CREATE TABLE IF NOT EXISTS approval_actions(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id),payload TEXT NOT NULL,status TEXT NOT NULL,error TEXT);
         CREATE TABLE IF NOT EXISTS diagnostics(id INTEGER PRIMARY KEY,created_at INTEGER NOT NULL,scope TEXT NOT NULL,message TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS diagnostic_rollups(scope TEXT NOT NULL,fingerprint TEXT NOT NULL,first_created_at INTEGER NOT NULL,last_created_at INTEGER NOT NULL,count INTEGER NOT NULL,message TEXT NOT NULL,PRIMARY KEY(scope,fingerprint));
+        CREATE INDEX IF NOT EXISTS diagnostic_rollups_recent ON diagnostic_rollups(last_created_at DESC);
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS execution_events(seq INTEGER PRIMARY KEY AUTOINCREMENT,task_id TEXT NOT NULL REFERENCES tasks(id),created_at INTEGER NOT NULL,payload TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS execution_events_task ON execution_events(task_id,seq);
+        CREATE INDEX IF NOT EXISTS execution_events_task_kind_seq ON execution_events(task_id,json_extract(payload,'$.kind'),seq);
         CREATE TABLE IF NOT EXISTS feishu_progress(task_id TEXT NOT NULL REFERENCES tasks(id),turn_id TEXT NOT NULL,payload TEXT NOT NULL,active INTEGER NOT NULL,PRIMARY KEY(task_id,turn_id));
         CREATE INDEX IF NOT EXISTS feishu_progress_active ON feishu_progress(active);
         CREATE TABLE IF NOT EXISTS feishu_document_progress(task_id TEXT PRIMARY KEY REFERENCES tasks(id),payload TEXT NOT NULL);
@@ -158,30 +185,81 @@ export class Store {
   markApproval(id: string, status: 'processing' | 'confirmed' | 'uncertain' | 'rejected', error: string | null = null): void {
     this.db.prepare('UPDATE approval_actions SET status=?,error=? WHERE id=?').run(status, error, id);
   }
-  diagnostic(scope: string, message: string): void { this.db.prepare('INSERT INTO diagnostics(created_at,scope,message) VALUES(?,?,?)').run(Date.now(), scope, message); }
+  diagnostic(scope: string, message: string): void {
+    const createdAt = Date.now();
+    const bounded = message.length <= diagnosticMessageLimit ? message : message.slice(0, diagnosticMessageLimit) + '\n…';
+    const fingerprint = createHash('sha256').update(`${scope}\u0000${bounded}`).digest('hex');
+    this.db.prepare(`INSERT INTO diagnostic_rollups(scope,fingerprint,first_created_at,last_created_at,count,message)
+      VALUES(?,?,?,?,1,?) ON CONFLICT(scope,fingerprint) DO UPDATE SET last_created_at=excluded.last_created_at,count=diagnostic_rollups.count+1,message=excluded.message`)
+      .run(scope, fingerprint, createdAt, createdAt, bounded);
+    this.db.prepare(`DELETE FROM diagnostic_rollups WHERE rowid NOT IN (SELECT rowid FROM diagnostic_rollups ORDER BY last_created_at DESC LIMIT ?)`)
+      .run(diagnosticRetentionLimit);
+  }
   diagnostics(): { created_at: number; scope: string; message: string }[] {
     const schema = z.object({ created_at: z.number(), scope: z.string(), message: z.string() });
-    return this.db.prepare('SELECT created_at,scope,message FROM diagnostics ORDER BY id DESC LIMIT 100').all().map(row => schema.parse(row));
+    const legacy = this.db.prepare('SELECT created_at,scope,message FROM diagnostics ORDER BY id DESC LIMIT ?').all(diagnosticReadLimit).map(row => schema.parse(row));
+    const hasRollups = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='diagnostic_rollups'").get();
+    const rollups = hasRollups ? this.db.prepare('SELECT last_created_at AS created_at,scope,message FROM diagnostic_rollups ORDER BY last_created_at DESC LIMIT ?').all(diagnosticReadLimit).map(row => schema.parse(row)) : [];
+    const seen = new Set<string>();
+    return [...legacy, ...rollups].sort((a, b) => b.created_at - a.created_at).filter(row => {
+      const identity = `${row.scope}\u0000${row.message}`;
+      if (seen.has(identity)) return false;
+      seen.add(identity); return true;
+    }).slice(0, diagnosticReadLimit);
   }
   meta(key: string): string | null { const row = this.db.prepare('SELECT value FROM meta WHERE key=?').get(key); return row ? z.object({ value: z.string() }).parse(row).value : null; }
   recordExecutionEvent(taskId: string, event: ExecutionEvent): void {
-    this.db.prepare('INSERT INTO execution_events(task_id,created_at,payload) VALUES(?,?,?)').run(taskId, event.createdAt, JSON.stringify(event));
+    const sequence = this.nextExecutionSequence();
+    let persist = event.kind !== 'tool_output' && event.kind !== 'agent_delta';
+    // Keep enough live narrative for the dashboard/progress surfaces without turning every token
+    // delta into a durable row. Completed messages and lifecycle events remain lossless.
+    if (event.kind === 'agent_delta') {
+      const key = `${taskId}\u0000${event.threadId}\u0000${event.turnId ?? ''}\u0000${event.itemId ?? ''}`;
+      const previous = this.lastDeltaAt.get(key);
+      persist = previous === undefined || event.createdAt - previous >= executionDeltaSampleMs;
+      if (persist) this.lastDeltaAt.set(key, event.createdAt);
+    }
+    const compact = event.kind === 'tool_start' || event.kind === 'tool_end'
+      ? { ...event, text: event.text.split('\n', 1)[0]!.slice(0, 4_096) }
+      : event;
+    const stored = storedExecutionEventSchema.parse({ ...compact, seq: sequence, taskId });
+    if (!persist) {
+      const live = { ...stored, text: stored.text.length <= 16_384 ? stored.text : stored.text.slice(-16_384) };
+      this.ephemeralEvents.push(live);
+      if (this.ephemeralEvents.length > 4_096) this.ephemeralEvents.splice(0, this.ephemeralEvents.length - 4_096);
+      for (const listener of liveExecutionListeners.get(this.dataDir) ?? []) listener(live);
+      return;
+    }
+    this.db.prepare('INSERT INTO execution_events(seq,task_id,created_at,payload) VALUES(?,?,?,?)').run(sequence, taskId, event.createdAt, JSON.stringify(compact));
+    if (sequence % 128 === 0) this.pruneExecutionEvents(taskId);
+  }
+  private nextExecutionSequence(): number {
+    if (!this.logicalSequenceLoaded) {
+      const row = z.object({ seq: z.number() }).parse(this.db.prepare('SELECT COALESCE(MAX(seq),0) AS seq FROM execution_events').get());
+      this.logicalSequence = row.seq; this.logicalSequenceLoaded = true;
+    }
+    return ++this.logicalSequence;
+  }
+  private eventRows(taskId: string, after = 0, limit = 500, includeToolOutput = true): StoredExecutionEvent[] {
+    const durable = this.db.prepare('SELECT seq,task_id,payload FROM execution_events WHERE task_id=? AND seq>? ORDER BY seq LIMIT ?').all(taskId, after, limit).map(raw => {
+      const row = z.object({ seq: z.number(), task_id: z.string(), payload: z.string() }).parse(raw);
+      return storedExecutionEventSchema.parse({ ...executionEventSchema.parse(JSON.parse(row.payload)), seq: row.seq, taskId: row.task_id });
+    });
+    const transient = this.ephemeralEvents.filter(event => event.taskId === taskId && event.seq > after && (includeToolOutput || event.kind !== 'tool_output'));
+    return [...durable, ...transient].sort((a, b) => a.seq - b.seq).slice(0, limit);
+  }
+  private pruneExecutionEvents(taskId: string): void {
+    this.db.prepare(`DELETE FROM execution_events
+      WHERE task_id=? AND seq NOT IN (SELECT seq FROM execution_events WHERE task_id=? ORDER BY seq DESC LIMIT ?)`)
+      .run(taskId, taskId, executionEventRetentionLimit);
   }
   executionEvents(taskId: string, after = 0, limit = 500): StoredExecutionEvent[] {
     if (!this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='execution_events'").get()) return [];
-    return this.db.prepare('SELECT seq,task_id,payload FROM execution_events WHERE task_id=? AND seq>? ORDER BY seq LIMIT ?').all(taskId, after, limit).map(raw => {
-      const row = z.object({ seq: z.number(), task_id: z.string(), payload: z.string() }).parse(raw);
-      return storedExecutionEventSchema.parse({ ...executionEventSchema.parse(JSON.parse(row.payload)), seq: row.seq, taskId: row.task_id });
-    });
+    return this.eventRows(taskId, after, limit);
   }
   visibleExecutionEvents(taskId: string, after = 0, limit = 500): StoredExecutionEvent[] {
     if (!this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='execution_events'").get()) return [];
-    return this.db.prepare(`SELECT seq,task_id,payload FROM execution_events
-      WHERE task_id=? AND seq>? AND COALESCE(json_extract(payload,'$.kind'),'') <> 'tool_output'
-      ORDER BY seq LIMIT ?`).all(taskId, after, limit).map(raw => {
-      const row = z.object({ seq: z.number(), task_id: z.string(), payload: z.string() }).parse(raw);
-      return storedExecutionEventSchema.parse({ ...executionEventSchema.parse(JSON.parse(row.payload)), seq: row.seq, taskId: row.task_id });
-    });
+    return this.eventRows(taskId, after, limit, false);
   }
   latestVisibleExecutionEvent(taskId: string): StoredExecutionEvent | null {
     if (!this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='execution_events'").get()) return null;
@@ -192,34 +270,62 @@ export class Store {
     const row = z.object({ seq: z.number(), task_id: z.string(), payload: z.string() }).parse(raw);
     return storedExecutionEventSchema.parse({ ...executionEventSchema.parse(JSON.parse(row.payload)), seq: row.seq, taskId: row.task_id });
   }
+  latestVisibleExecutionEvents(taskIds: readonly string[]): Map<string, StoredExecutionEvent> {
+    const result = new Map<string, StoredExecutionEvent>();
+    if (!taskIds.length || !this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='execution_events'").get()) return result;
+    const placeholders = taskIds.map(() => '?').join(',');
+    const rows = this.db.prepare(`SELECT event.seq,event.task_id,event.payload FROM execution_events event
+      JOIN (SELECT task_id,MAX(seq) AS seq FROM execution_events
+        WHERE task_id IN (${placeholders}) AND COALESCE(json_extract(payload,'$.kind'),'') <> 'tool_output'
+        GROUP BY task_id) latest ON latest.task_id=event.task_id AND latest.seq=event.seq`).all(...taskIds);
+    for (const raw of rows) {
+      const row = z.object({ seq: z.number(), task_id: z.string(), payload: z.string() }).parse(raw);
+      result.set(row.task_id, storedExecutionEventSchema.parse({ ...executionEventSchema.parse(JSON.parse(row.payload)), seq: row.seq, taskId: row.task_id }));
+    }
+    for (const event of this.ephemeralEvents) {
+      if (event.kind === 'tool_output' || !taskIds.includes(event.taskId)) continue;
+      const previous = result.get(event.taskId);
+      if (!previous || event.seq > previous.seq) result.set(event.taskId, event);
+    }
+    return result;
+  }
   documentConversationPosition(taskId: string): DocumentSourcePosition {
-    return documentSourcePositionSchema.parse(this.db.prepare(`SELECT
+    const position = documentSourcePositionSchema.parse(this.db.prepare(`SELECT
       COALESCE((SELECT seq FROM execution_events WHERE task_id=? ORDER BY seq DESC LIMIT 1),0) AS eventSeq,
       COALESCE((SELECT seq FROM inbox WHERE task_id=? ORDER BY seq DESC LIMIT 1),0) AS inputSeq`).get(taskId, taskId));
+    const transient = this.ephemeralEvents.filter(event => event.taskId === taskId).at(-1)?.seq ?? 0;
+    return { ...position, eventSeq: Math.max(position.eventSeq, transient) };
   }
   *documentConversationEvents(taskId: string): IterableIterator<StoredExecutionEvent> {
-    const rowSchema = z.object({ seq: z.number(), payload: z.string() });
-    for (const raw of this.db.prepare("SELECT seq,payload FROM execution_events WHERE task_id=? AND json_extract(payload,'$.kind') IN ('agent_delta','agent_message','turn_start','turn_end','turn_status') ORDER BY seq").iterate(taskId)) {
-      const row = rowSchema.parse(raw);
-      yield storedExecutionEventSchema.parse({ ...JSON.parse(row.payload), seq: row.seq, taskId });
+    const rows = this.db.prepare("SELECT seq,payload FROM execution_events WHERE task_id=? AND json_extract(payload,'$.kind') IN ('agent_delta','agent_message','turn_start','turn_end','turn_status') ORDER BY seq").all(taskId)
+      .map(raw => ({ seq: z.object({ seq: z.number() }).parse(raw).seq, payload: z.object({ payload: z.string() }).parse(raw).payload }));
+    const transient = this.ephemeralEvents.filter(event => event.taskId === taskId && event.kind !== 'tool_output');
+    for (const item of [...rows.map(row => ({ seq: row.seq, payload: row.payload })), ...transient.map(event => ({ seq: event.seq, event }))].sort((a, b) => a.seq - b.seq)) {
+      const event = 'event' in item ? item.event : storedExecutionEventSchema.parse({ ...JSON.parse(item.payload), seq: item.seq, taskId });
+      if (['agent_delta', 'agent_message', 'turn_start', 'turn_end', 'turn_status'].includes(event.kind)) yield event;
     }
   }
-  setMeta(key: string, value: string): void { this.db.prepare('INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, value); }
+  setMeta(key: string, value: string): void {
+    this.db.prepare('INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE meta.value IS NOT excluded.value').run(key, value);
+  }
   deleteMeta(key: string): void { this.db.prepare('DELETE FROM meta WHERE key=?').run(key); }
+  dataVersion(): number {
+    const row = this.db.prepare('PRAGMA data_version').get();
+    return z.object({ data_version: z.number() }).parse(row).data_version;
+  }
   latestExecutionSequence(): number {
-    return z.object({ seq: z.number() }).parse(this.db.prepare('SELECT COALESCE(MAX(seq),0) AS seq FROM execution_events').get()).seq;
+    const persisted = z.object({ seq: z.number() }).parse(this.db.prepare('SELECT COALESCE(MAX(seq),0) AS seq FROM execution_events').get()).seq;
+    return Math.max(persisted, this.logicalSequence, this.ephemeralEvents.at(-1)?.seq ?? 0);
   }
   progressEvents(after: number, limit = 500): StoredExecutionEvent[] {
-    return this.db.prepare('SELECT seq,task_id,payload FROM execution_events WHERE seq>? ORDER BY seq LIMIT ?').all(after, limit).map(raw => {
+    const durable = this.db.prepare("SELECT seq,task_id,payload FROM execution_events WHERE seq>? AND COALESCE(json_extract(payload,'$.kind'),'') <> 'tool_output' ORDER BY seq LIMIT ?").all(after, limit).map(raw => {
       const row = z.object({ seq: z.number(), task_id: z.string(), payload: z.string() }).parse(raw);
       return storedExecutionEventSchema.parse({ ...JSON.parse(row.payload), seq: row.seq, taskId: row.task_id });
     });
+    return [...durable, ...this.ephemeralEvents.filter(event => event.seq > after)].sort((a, b) => a.seq - b.seq).slice(0, limit);
   }
   recentTurnEvents(taskId: string, turnId: string): StoredExecutionEvent[] {
-    return this.db.prepare("SELECT seq,payload FROM execution_events WHERE task_id=? AND json_extract(payload,'$.turnId')=? ORDER BY seq DESC LIMIT 200").all(taskId, turnId).reverse().map(raw => {
-      const row = z.object({ seq: z.number(), payload: z.string() }).parse(raw);
-      return storedExecutionEventSchema.parse({ ...JSON.parse(row.payload), seq: row.seq, taskId });
-    });
+    return this.eventRows(taskId, 0, executionEventRetentionLimit, false).filter(event => event.turnId === turnId).slice(-200);
   }
   progressRecord(taskId: string, turnId: string): unknown | null {
     const row = this.db.prepare('SELECT payload FROM feishu_progress WHERE task_id=? AND turn_id=?').get(taskId, turnId);
@@ -231,7 +337,7 @@ export class Store {
   saveProgressRecord(taskId: string, turnId: string, record: unknown, active: boolean): void {
     this.db.prepare('INSERT INTO feishu_progress VALUES(?,?,?,?) ON CONFLICT(task_id,turn_id) DO UPDATE SET payload=excluded.payload,active=excluded.active').run(taskId, turnId, JSON.stringify(record), Number(active));
   }
-  close(): void { this.db.close(); this.lock?.close(); }
+  close(): void { this.unsubscribeLive?.(); this.unsubscribeLive = null; this.db.close(); this.lock?.close(); }
   documentProgressRecord(taskId: string): unknown | null {
     const row = this.db.prepare('SELECT payload FROM feishu_document_progress WHERE task_id=?').get(taskId);
     return row ? JSON.parse(payloadRow.parse(row).payload) : null;
