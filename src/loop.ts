@@ -20,6 +20,7 @@ import { taskProgressStatus } from './feishu-progress-view.js';
 import { IntakeOwnershipChanged, intakeMaterialVersion, ProjectRuntime } from './project-runtime.js';
 import type { ProjectAction, ProjectConfig } from './project.js';
 import { matchesProjectIssue } from './project.js';
+import type { FeishuArtifactPort } from './feishu-artifact.js';
 
 const digest = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex');
 const approvalOutputSchema = z.object({ taskId: z.string(), request: requestSchema, chatId: z.string().optional(), lastAttemptAt: z.number().optional() });
@@ -54,6 +55,7 @@ function sourceRevision(source: Source): string {
 }
 export class AgentLoop {
   readonly store: Store;
+  readonly feishuArtifacts: FeishuArtifactPort | undefined;
   private readonly workspaceBridge: WorkspaceBridge;
   private readonly progress: FeishuProgressPublisher | FeishuDocumentProgressPublisher | null;
   private readonly lanes = new Map<string, Promise<void>>();
@@ -70,8 +72,9 @@ export class AgentLoop {
   readonly projects: ProjectRuntime;
   readonly closeout: TaskCloseout;
   private readonly groups: TaskGroups;
-  constructor(readonly config: Config, readonly ports: { github: GitHubPort; feishu: FeishuPort; codex: CodexPort; workspace: WorkspacePort }, store?: Store) {
+  constructor(readonly config: Config, readonly ports: { github: GitHubPort; feishu: FeishuPort; feishuArtifacts?: FeishuArtifactPort; codex: CodexPort; workspace: WorkspacePort }, store?: Store) {
     this.store = store ?? new Store(config.dataDir);
+    this.feishuArtifacts = ports.feishuArtifacts;
     this.closeout = new TaskCloseout(this.store, {
       assertCompletionAllowed: task => {
         if (!task.threadId) return;
