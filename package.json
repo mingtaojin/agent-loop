@@ -10,6 +10,7 @@
     "build": "tsc",
     "check": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts",
+    "benchmark:dashboard": "tsx scripts/benchmark-dashboard.ts",
     "start": "tsx src/cli.ts",
     "verify:shared-codex": "npm run build && tsx scripts/verify-shared-codex.ts",
     "verify:closeout": "tsx --test test/task-closeout.test.ts",

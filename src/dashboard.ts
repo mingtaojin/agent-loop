@@ -104,7 +104,7 @@ export async function startDashboard(options: { dataDir: string; port: number; h
         json(response, 200, {
           inputs: db.inputs(taskId).map(input => ({ id: input.id, text: boundedDashboardText(input.message.text), createdAt: input.message.createdAt, origin: input.origin, status: input.status, error: input.error ? boundedDashboardText(input.error) : null, attachments: input.message.attachments.map(attachment => ({ name: attachment.name, kind: attachment.kind })) })),
           outputs: db.outputs(taskId).map(output => ({ ...output, text: boundedDashboardText(output.text), error: output.error ? boundedDashboardText(output.error) : null })), projectId: detail?.projectId ?? null, task: detail?.task ?? null,
-          events: detail?.events ?? [], executionEvents: detail?.events ?? [], reports: detail?.reports ?? [], diagnostics: detail?.diagnostics ?? [],
+          events: detail?.events ?? [], executionEvents: detail?.events ?? [], timeline: detail?.timeline ?? [], reports: detail?.reports ?? [], diagnostics: detail?.diagnostics ?? [],
         }); return;
       }
       if (url.pathname !== '/api/events') { json(response, 404, { error: '未找到' }); return; }
