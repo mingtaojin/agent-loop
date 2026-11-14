@@ -23,7 +23,30 @@ import { matchesProjectIssue } from './project.js';
 
 const digest = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex');
 const approvalOutputSchema = z.object({ taskId: z.string(), request: requestSchema, chatId: z.string().optional(), lastAttemptAt: z.number().optional() });
-const historyFailureSchema = z.object({ attempts: z.number().int().nonnegative(), noticeSent: z.boolean() });
+const historyFailureSchema = z.object({ episodeId: z.string().min(1), startedAt: z.number(), failures: z.number().int().positive(), recoveredCount: z.number().int().nonnegative() });
+const legacyHistoryFailureSchema = z.union([
+  z.object({ startedAt: z.number(), failures: z.number().int().positive() }),
+  z.object({ attempts: z.number().int().nonnegative(), noticeSent: z.boolean() }),
+]);
+const historyNoticeAfterFailures = 2;
+const historyDelayedNotice = [
+  '飞书历史消息暂时拉取失败，正在自动重试。',
+  '这一步只用于补收可能漏掉的群消息，与代码提交、push 等操作无关，不影响已回复的结果。',
+  '目前没有确认丢失消息。如果你最近发的消息没有回应，可能是还没收到，恢复后会自动补上处理，不用重发。恢复后会在本群告知。',
+].join('\n');
+const historyRecoveredNotice = (recovered: number) => recovered
+  ? `飞书历史消息已恢复拉取，补收到 ${recovered} 条之前没收到的消息，会按顺序处理。`
+  : '飞书历史消息已恢复拉取，核对后没有漏收的消息。';
+function parseHistoryFailure(taskId: string, raw: string | null): z.infer<typeof historyFailureSchema> | null {
+  if (!raw) return null;
+  const value: unknown = JSON.parse(raw);
+  const current = historyFailureSchema.safeParse(value);
+  if (current.success) return current.data;
+  const legacy = legacyHistoryFailureSchema.parse(value);
+  const startedAt = 'startedAt' in legacy ? legacy.startedAt : Date.now();
+  const failures = 'failures' in legacy ? legacy.failures : Math.max(legacy.attempts, legacy.noticeSent ? historyNoticeAfterFailures : 0);
+  return { episodeId: `legacy:${taskId}:${startedAt}`, startedAt, failures: Math.max(failures, 1), recoveredCount: 0 };
+}
 type ProviderMigrationResult = 'not-needed' | 'migrated' | 'deferred';
 const recoveryState = () => ({ attempts: 0, nextAttemptAt: null, lastError: null, interruptedTurnId: null, lastUserInputSeq: null });
 function sourceRevision(source: Source): string {
@@ -1109,34 +1132,31 @@ export class AgentLoop {
   private async backfillTask(task: Task): Promise<void> {
     if (!task.chatId) return;
     const previous = Number(this.store.meta(`history:${task.id}`) ?? task.createdAt);
-    const cursor = Date.now();
-    const since = Math.max(task.createdAt, previous - this.config.pollIntervalMs * 2);
-    let messages: IncomingMessage[];
+    const failureKey = `history-failure:${task.id}`;
+    const failure = parseHistoryFailure(task.id, this.store.meta(failureKey));
+    let recovered = 0;
     try {
-      messages = await this.ports.feishu.history({ chatId: task.chatId, since });
+      const cursor = Date.now();
+      const since = Math.max(task.createdAt, previous - this.config.pollIntervalMs * 2);
+      for (const message of await this.ports.feishu.history({ chatId: task.chatId, since })) {
+        if (message.senderId === this.config.feishu.userOpenId && this.receiveOwner(task, message)) recovered++;
+      }
+      this.store.transaction(() => {
+        this.store.setMeta(`history:${task.id}`, String(cursor));
+        if (!failure) return;
+        this.store.deleteMeta(failureKey);
+        if (failure.failures >= historyNoticeAfterFailures) this.notify(this.store.task(task.id), historyRecoveredNotice(failure.recoveredCount + recovered), `history-recovered:${task.id}:${failure.episodeId}`);
+      });
     } catch (error) {
       if (await this.groupUnavailable(task, error)) { this.retireGroup(task); return; }
-      const failureKey = `history-failure:${task.id}`;
-      const previousFailure = this.store.meta(failureKey);
-      const state = previousFailure ? historyFailureSchema.parse(JSON.parse(previousFailure)) : { attempts: 0, noticeSent: false };
-      state.attempts++;
-      if (state.attempts >= 2 && !state.noticeSent) {
-        state.noticeSent = true;
-        this.notify(this.store.task(task.id), '离线消息补偿暂时失败，系统将继续重试。', `history-error:${task.id}`);
-      }
-      this.store.setMeta(failureKey, JSON.stringify(state));
-      this.problem(`history:${task.id}`, new Error(`history fetch failed (${error instanceof Error ? error.name : 'unknown'})`));
+      this.problem(`history:${task.id}`, error);
+      const next = { episodeId: failure?.episodeId ?? randomUUID(), startedAt: failure?.startedAt ?? Date.now(), failures: (failure?.failures ?? 0) + 1, recoveredCount: (failure?.recoveredCount ?? 0) + recovered };
+      this.store.transaction(() => {
+        this.store.setMeta(failureKey, JSON.stringify(next));
+        if (next.failures === historyNoticeAfterFailures) this.notify(this.store.task(task.id), historyDelayedNotice, `history-delayed:${task.id}:${next.episodeId}`);
+      });
       await this.serial(task.id, () => this.advance(task.id));
       return;
-    }
-    for (const message of messages) if (message.senderId === this.config.feishu.userOpenId) this.receiveOwner(task, message);
-    this.store.setMeta(`history:${task.id}`, String(cursor));
-    const failureKey = `history-failure:${task.id}`;
-    const rawFailure = this.store.meta(failureKey);
-    if (rawFailure) {
-      const failure = historyFailureSchema.parse(JSON.parse(rawFailure));
-      this.store.setMeta(failureKey, JSON.stringify({ attempts: 0, noticeSent: false }));
-      if (failure.noticeSent) this.notify(this.store.task(task.id), '离线消息补偿已恢复。', `history-recovered:${task.id}`);
     }
     await this.serial(task.id, () => this.advance(task.id));
   }

@@ -560,7 +560,9 @@ test('history gaps and uncertain outgoing messages are visible without replaying
   await f.loop.recover();
   assert.equal(f.feishu.sent.filter(message => message.text.includes('任务对话已建立')).length, 1);
   assert.ok(f.feishu.sent.length > originalCount);
-  assert.ok(f.feishu.sent.some(message => message.text.includes('离线消息补偿暂时失败')));
+  const notice = f.feishu.sent.find(message => message.text.includes('飞书历史消息暂时拉取失败'));
+  assert.ok(notice);
+  assert.match(notice.text, /与代码提交、push 等操作无关/);
   assert.equal(workerCalls(f.loop, f.codex).starts.length, 1);
 });
 
