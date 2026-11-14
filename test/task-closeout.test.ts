@@ -1,3 +1,4 @@
+import { testExecution } from './test-config.js';
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { once } from 'node:events';
@@ -33,7 +34,7 @@ async function fixture(t: TestContext) {
   await mkdir(project);
   await git(project, 'init', '-b', 'main'); await git(project, 'config', 'user.email', 'fixture@example.test'); await git(project, 'config', 'user.name', 'Fixture');
   await writeFile(join(project, 'source.txt'), 'original source'); await git(project, 'add', '.'); await git(project, 'commit', '-m', 'initial');
-  const config = configSchema.parse({ dataDir: data, feishu: { userOpenId: 'owner' },
+  const config = configSchema.parse({ execution: testExecution, dataDir: data, feishu: { userOpenId: 'owner' },
     repositories: [{ name: 'example/app', path: project, baseBranch: 'main', criteria: { labelsAny: ['work'] } }],
     projects: [{ id: 'app', name: 'App', directory: project, repositories: [{ name: 'example/app', labelsAny: ['work'] }] }],
   });
@@ -471,19 +472,6 @@ test('cleanup admission racing attachment preparation leaves input pending until
   releaseUsage(); await tick; await f.loop.tick();
   assert.equal(f.loop.store.inputs(f.coordinatorId).find(input => input.id === message.id)?.status, 'delivered');
   assert.equal(await exists(scope.location.root.path), false);
-});
-
-test('selected conversation worktree is removed only after durable completion and never restored', async t => {
-  const f = await fixture(t);
-  const result = z.object({ taskId: z.string() }).parse(await f.action({ action: 'dispatch', requestId: 'selected', prompt: 'Selected workspace fixture', role: 'worker' }));
-  const task = f.loop.store.task(result.taskId), repository = repositorySchema.parse({ name: 'example/app', path: f.project, baseBranch: 'main', criteria: { labelsAny: ['work'] } });
-  task.workspaceSelection = { kind: 'selected', temporaryThreadId: 'fixture-selection', inputIds: [], choice: { kind: 'repository', repositoryName: repository.name, repository, reason: 'Constructed selected-cwd fixture' } };
-  f.loop.store.saveTask(task); await f.loop.tick();
-  const selected = f.loop.store.task(task.id), tree = selected.resources.find(resource => resource.kind === 'git-worktree'); assert.ok(tree);
-  assert.equal(f.codex.created.at(-1)?.cwd, tree.workspace);
-  await assert.rejects(f.action({ action: 'release_workspace', requestId: 'selected-release', resourceId: tree.id }, task.id), /active conversation directory/);
-  await f.finish(task.id); await f.complete(task.id); assert.equal(await exists(tree.workspace), false);
-  const creates = f.codex.created.length; await f.restart(); assert.equal(f.codex.created.length, creates); assert.equal(await exists(tree.workspace), false);
 });
 
 test('lost generic receipts do not allocate a second scope or lose the atomic completion intent', async t => {

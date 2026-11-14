@@ -1,3 +1,4 @@
+import { testExecution } from './test-config.js';
 import { SurfaceCodex, testProject, restoreSurface, tickSurface } from './coordinated-surfaces.js';
 import assert from 'node:assert/strict';
 import { realpath, mkdtemp, rm } from 'node:fs/promises';
@@ -105,9 +106,9 @@ async function fixture(t: TestContext, initialize = true) {
 }
 
 test('progress is opt-in and validates its interval and explicit dashboard URL', () => {
-  assert.deepEqual(configSchema.parse({ feishu: { userOpenId: 'owner' } }).feishu.progress, { enabled: false, surface: 'card', intervalMs: 1000, maxLines: 3000 });
-  assert.throws(() => configSchema.parse({ feishu: { userOpenId: 'owner', progress: { intervalMs: 1 } } }));
-  assert.throws(() => configSchema.parse({ feishu: { userOpenId: 'owner', progress: { dashboardUrl: 'file:///etc/passwd' } } }));
+  assert.deepEqual(configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner' } }).feishu.progress, { enabled: false, surface: 'card', intervalMs: 1000, maxLines: 3000 });
+  assert.throws(() => configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner', progress: { intervalMs: 1 } } }));
+  assert.throws(() => configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner', progress: { dashboardUrl: 'file:///etc/passwd' } } }));
 });
 
 test('saved cards stop publishing after group removal and recreated groups get a fresh card and UUID', async t => {
@@ -345,7 +346,7 @@ test('whole runtime delivers final answer unchanged while progress API fails', a
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'feishu-runtime-')));
   const progress = new Transport(); progress.rejectCreate = true;
   const feishu = Object.assign(new FeishuFake(), { progress }); const codex = new SurfaceCodex();
-  const loop = new AgentLoop(configSchema.parse({ dataDir: directory, projects: [testProject(directory)], feishu: { userOpenId: 'owner', progress: { enabled: true } } }), {
+  const loop = new AgentLoop(configSchema.parse({ execution: testExecution, dataDir: directory, projects: [testProject(directory)], feishu: { userOpenId: 'owner', progress: { enabled: true } } }), {
     feishu, codex, github: new GitHubFake(), workspace: { ensure: async () => directory, head: async () => 'head' },
   });
   t.after(async () => { await loop.close(); await rm(directory, { recursive: true, force: true }); });
@@ -364,7 +365,7 @@ test('enabling progress after completed runtime history ignores recovery observa
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'feishu-enable-')));
   const progress = new Transport();
   const feishu = Object.assign(new FeishuFake(), { progress }); const codex = new SurfaceCodex();
-  const config = configSchema.parse({ dataDir: directory, projects: [testProject(directory)], feishu: { userOpenId: 'owner' } });
+  const config = configSchema.parse({ execution: testExecution, dataDir: directory, projects: [testProject(directory)], feishu: { userOpenId: 'owner' } });
   const ports = { feishu, codex, github: new GitHubFake(), workspace: { ensure: async () => directory, head: async () => 'head' } };
   let loop = new AgentLoop(config, ports);
   t.after(async () => { await loop.close(); await rm(directory, { recursive: true, force: true }); });

@@ -14,7 +14,7 @@ export type DocumentSourcePosition = z.infer<typeof documentSourcePositionSchema
 const operationSchema = z.object({ id: z.string(), task_id: z.string(), kind: z.string(), status: z.enum(['attempting', 'confirmed', 'uncertain']), result: z.string().nullable(), error: z.string().nullable() });
 export type Operation = z.infer<typeof operationSchema>;
 const inboxRow = z.object({ seq: z.number(), id: z.string(), task_id: z.string(), payload: z.string(), status: z.enum(['pending', 'delivering', 'delivered', 'failed', 'uncertain', 'held', 'dropped']), origin: z.enum(['user', 'source', 'initial', 'resume']), error: z.string().nullable() });
-export type Inbox = Omit<z.infer<typeof inboxRow>, 'payload'> & { message: IncomingMessage; provenance: InputProvenance; requestId: string | null; route: 'task' | 'workspace-selection'; selectionHandled: boolean };
+export type Inbox = Omit<z.infer<typeof inboxRow>, 'payload'> & { message: IncomingMessage; provenance: InputProvenance; requestId: string | null };
 const outboxSchema = z.object({ id: z.string(), task_id: z.string(), text: z.string(), status: z.enum(['pending', 'sending', 'sent', 'uncertain', 'dropped']), error: z.string().nullable() });
 export type Outbox = z.infer<typeof outboxSchema>;
 
@@ -97,36 +97,31 @@ export class Store {
       legacy: { status: legacy.status, prUrl: legacy.prUrl },
     });
   }
-  receive(taskId: string, message: IncomingMessage, origin: Inbox['origin'] = 'user', provenance?: InputProvenance, route: Inbox['route'] = 'task'): boolean {
+  receive(taskId: string, message: IncomingMessage, origin: Inbox['origin'] = 'user', provenance?: InputProvenance): boolean {
     const task = this.task(taskId);
     const facts = provenance ?? (origin === 'user' ? { kind: 'user', message } : origin === 'source'
       ? { kind: 'github_issue', sourceId: task.sourceId, revision: message.id, url: task.source.kind === 'github' ? task.source.issue.url : '' }
       : origin === 'initial' ? { kind: 'initial', sourceId: task.sourceId } : { kind: 'recovery', previousTurnId: task.turnId ?? 'legacy' });
-    return this.db.prepare("INSERT OR IGNORE INTO inbox(id,task_id,payload,status,origin) VALUES(?,?,?,'pending',?)").run(message.id, taskId, JSON.stringify({ message, provenance: facts, requestId: null, route, selectionHandled: false }), origin).changes > 0;
+    return this.db.prepare("INSERT OR IGNORE INTO inbox(id,task_id,payload,status,origin) VALUES(?,?,?,'pending',?)").run(message.id, taskId, JSON.stringify({ message, provenance: facts, requestId: null }), origin).changes > 0;
   }
   inputs(taskId: string): Inbox[] {
     return this.db.prepare('SELECT * FROM inbox WHERE task_id=? ORDER BY seq').all(taskId).map(raw => {
       const { payload, ...row } = inboxRow.parse(raw);
       const json: unknown = JSON.parse(payload);
-      const wrapped = z.object({ message: incomingSchema, provenance: inputProvenanceSchema, requestId: z.string().nullable().default(null), route: z.enum(['task', 'workspace-selection']).default('task'), selectionHandled: z.boolean().default(false) }).safeParse(json);
+      const wrapped = z.object({ message: incomingSchema, provenance: inputProvenanceSchema, requestId: z.string().nullable().default(null) }).safeParse(json);
       if (wrapped.success) return { ...row, ...wrapped.data };
       const message = incomingSchema.parse(json);
       const task = this.task(taskId);
       const provenance: InputProvenance = row.origin === 'user' ? { kind: 'user', message }
         : row.origin === 'source' ? { kind: 'github_issue', sourceId: task.sourceId, revision: message.id, url: task.source.kind === 'github' ? task.source.issue.url : '' }
         : row.origin === 'initial' ? { kind: 'initial', sourceId: task.sourceId } : { kind: 'recovery', previousTurnId: task.turnId ?? 'legacy' };
-      return { ...row, message, provenance, requestId: null, route: 'task', selectionHandled: false };
+      return { ...row, message, provenance, requestId: null };
     });
   }
   associateRequest(id: string, taskId: string, requestId: string): void {
     const input = this.inputs(taskId).find(item => item.id === id);
     if (!input) throw new Error('Unknown inbox input');
-    this.db.prepare('UPDATE inbox SET payload=? WHERE id=?').run(JSON.stringify({ message: input.message, provenance: input.provenance, requestId, route: input.route, selectionHandled: input.selectionHandled }), id);
-  }
-  markSelectionHandled(id: string, taskId: string): void {
-    const input = this.inputs(taskId).find(item => item.id === id);
-    if (!input || input.route !== 'workspace-selection') throw new Error('Unknown workspace selection answer');
-    this.db.prepare('UPDATE inbox SET payload=? WHERE id=?').run(JSON.stringify({ message: input.message, provenance: input.provenance, requestId: input.requestId, route: input.route, selectionHandled: true }), id);
+    this.db.prepare('UPDATE inbox SET payload=? WHERE id=?').run(JSON.stringify({ message: input.message, provenance: input.provenance, requestId }), id);
   }
   markInput(id: string, status: Inbox['status'], error: string | null = null): void { this.db.prepare('UPDATE inbox SET status=?,error=? WHERE id=?').run(status, error, id); }
   enqueue(taskId: string, text: string, key: string): string {

@@ -6,6 +6,7 @@ import { projectConfigSchema } from '../src/project.js';
 import type { CodexFake } from './fakes.js';
 import type { FeishuFake } from './fakes.js';
 import type { IncomingMessage } from '../src/domain.js';
+import { intakeMaterialVersion } from '../src/project-runtime.js';
 import { setTimeout as delay } from 'node:timers/promises';
 
 export function testProject(directory: string) {
@@ -37,9 +38,14 @@ export async function dispatchIntake(loop: AgentLoop, taskId: string, prompt = '
 export async function tickWithCoordinator(loop: AgentLoop) {
   for (let attempt = 0; attempt < 500; attempt++) {
     await loop.tick();
-    const pending = loop.tasks().some(task => task.purpose === 'intake' && task.status === 'pending'
-      && !task.reason && !loop.projects.intakeRoute(task.id));
-    if (!pending) break;
+    const pending = loop.tasks().filter(task => task.purpose === 'intake' && !loop.projects.intakeRoute(task.id)
+      && !loop.projects.ledger.membership(task.id) && task.status !== 'paused' && task.status !== 'failed');
+    const project = loop.config.projects[0];
+    if (project) for (const task of pending) {
+      const inputs = loop.store.inputs(task.id);
+      await loop.projects.acceptIntake(task.id, project.id, { text: inputs.map(input => input.message.text).join('\n\n'), version: intakeMaterialVersion(task, inputs) });
+    }
+    if (!pending.length) break;
     await delay(2);
   }
   for (const task of loop.tasks()) {
@@ -78,11 +84,10 @@ export async function instructWorker(loop: AgentLoop, taskId: string, requestId:
 export function workerCalls(loop: AgentLoop, codex: CodexFake) {
   const tasks = loop.tasks();
   const threads = new Set(tasks.filter(task => loop.projects.ledger.membership(task.id)?.role === 'worker').map(task => task.threadId));
-  const coordinatorDirectories = new Set(tasks.filter(task => loop.projects.ledger.membership(task.id)?.role === 'coordinator').map(task => task.contextDirectory));
   return {
     starts: codex.starts.filter(call => threads.has(call.threadId)),
     steers: codex.steers.filter(call => threads.has(call.threadId)),
-    created: codex.created.filter(call => !coordinatorDirectories.has(call.cwd)),
+    created: codex.created.filter(call => call.instructions.includes('\nProject role: worker.')),
     interrupts: codex.interrupts.filter(call => threads.has(call.threadId)),
     replies: codex.replies.filter(call => threads.has(call.request.threadId)),
   };

@@ -13,7 +13,7 @@ function task(id: string, title: string, purpose: 'execution' | 'intake' = 'exec
   const now = Date.now();
   return taskSchema.parse({ id, sourceId: id + ':source', source: { kind: 'manual', message: {
     id: id + ':message', chatId: 'chat:' + id, senderId: 'owner', text: title, attachments: [], createdAt: now, chatType: 'group',
-  } }, purpose, contextDirectory: '/tmp/' + id, resources: [], workspaceSelection: { kind: 'pending' }, status: 'running', reason: null,
+  } }, purpose, contextDirectory: '/tmp/' + id, resources: [], status: 'running', reason: null,
   prompt: title, promptHash: id, skillPath: null, chatId: 'chat:' + id, threadId: 'thread:' + id, turnId: 'turn:' + id,
   executionStatus: 'running', lastHandledTurnId: null, requests: [], recovery: { attempts: 0, nextAttemptAt: null, lastError: null, interruptedTurnId: null, lastUserInputSeq: null }, createdAt: now, updatedAt: now });
 }
@@ -23,15 +23,15 @@ test('project dashboard uses ledger membership, reports, and redacted task event
   const store = new Store(root);
   const coordinator = task('coordinator', 'Coordinate release');
   const worker = task('worker', 'Implement dashboard');
-  const verifier = task('verifier', 'Verify dashboard');
+  const secondWorker = task('second-worker', 'Verify dashboard');
   const intake = task('intake', 'Routed request', 'intake');
   const foreign = task('foreign', 'Other project');
   store.transaction(() => {
-    for (const value of [coordinator, worker, verifier, intake, foreign]) store.saveTask(value);
+    for (const value of [coordinator, worker, secondWorker, intake, foreign]) store.saveTask(value);
     const ledger = new ProjectLedger(store);
-    ledger.create({ id: 'project-a', name: 'Project A', directory: root, repositories: [], instructions: '', models: { coordinator: 'gpt-6-astra', worker: 'gpt-6.1-sol' }, reasoningEfforts: { coordinator: 'high', worker: 'xhigh' } }, coordinator.id);
+    ledger.create({ id: 'project-a', name: 'Project A', directory: root, repositories: [], instructions: '' }, coordinator.id);
     ledger.addMember('project-a', worker.id, 'worker');
-    ledger.addMember('project-a', verifier.id, 'verifier');
+    ledger.addMember('project-a', secondWorker.id, 'worker');
     store.setMeta('project-intake-route:' + intake.id, JSON.stringify({ projectId: 'project-a', coordinatorTaskId: coordinator.id }));
     const report = { id: 'report', chatId: 'chat:' + coordinator.id, senderId: 'runtime:project', text: 'Worker worker update. Added the reader.', attachments: [], createdAt: Date.now(), chatType: 'group' as const };
     store.receive(coordinator.id, report, 'source', { kind: 'agent', projectId: 'project-a', taskId: worker.id, eventId: 'report:worker:update', category: 'update', currentStep: 'Reader', nextStep: 'Run tests', blockers: [], evidence: ['test/dashboard-coordinator.test.ts'] });
@@ -49,7 +49,7 @@ test('project dashboard uses ledger membership, reports, and redacted task event
   const projects = await (await fetch(dashboard.url + '/api/projects')).json();
   assert.equal(projects.length, 1);
   assert.deepEqual(projects[0].tasks.map((item: { id: string; role: string }) => [item.id, item.role]).sort(), [
-    ['coordinator', 'coordinator'], ['worker', 'worker'], ['verifier', 'verifier'], ['intake', 'intake'],
+    ['coordinator', 'coordinator'], ['worker', 'worker'], ['second-worker', 'worker'], ['intake', 'intake'],
   ].sort());
   assert.equal(projects[0].tasks.some((item: { id: string }) => item.id === 'foreign'), false);
   const workerCard = projects[0].tasks.find((item: { id: string }) => item.id === worker.id);

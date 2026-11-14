@@ -1,3 +1,4 @@
+import { testExecution } from './test-config.js';
 import { recoverSavedIntake, openDirectGroup } from './saved-intake.js';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
@@ -12,6 +13,7 @@ import { test, type TestContext } from 'node:test';
 import { z } from 'zod';
 import { configSchema } from '../src/config.js';
 import { AgentLoop } from '../src/loop.js';
+import { intakeMaterialVersion } from '../src/project-runtime.js';
 import { Store } from '../src/store.js';
 import { FeishuAdapter, parseFeishuEvent, type FeishuDependencies } from '../src/adapters/feishu.js';
 import type { EventDispatcher } from '@larksuiteoapi/node-sdk';
@@ -27,7 +29,7 @@ function gate() {
 }
 async function fixture(t: TestContext) {
   const root = await mkdtemp(join(tmpdir(), 'agent-runtime-'));
-  const config = configSchema.parse({ dataDir: root, feishu: { userOpenId: 'owner' }, recovery: { maxAttempts: 2, retryDelayMs: 1 },
+  const config = configSchema.parse({ execution: testExecution, dataDir: root, feishu: { userOpenId: 'owner' }, recovery: { maxAttempts: 2, retryDelayMs: 1 },
     projects: [{ id: 'runtime', name: 'Runtime fixture', directory: root, repositories: [{ name: 'example/project', labelsAny: ['bug'] }] }],
     repositories: [{ name: 'example/project', path: root, baseBranch: 'main' }],
   });
@@ -45,14 +47,13 @@ async function fixture(t: TestContext) {
   const intakes = () => loop.tasks().filter(task => task.source.kind === 'manual');
   const task = () => { const value = workers()[0]; assert.ok(value); return value; };
   const starts = () => codex.starts.filter(start => workers().some(task => task.threadId === start.threadId));
-  const created = () => codex.created.filter(input => input.cwd !== loop.store.task(loop.projects.ledger.project('runtime')!.coordinatorTaskId).contextDirectory);
+  const created = () => codex.created.filter(input => input.instructions.includes('\nProject role: worker.'));
   const workerSteers = () => codex.steers.filter(start => workers().some(task => task.threadId === start.threadId));
-  codex.selectionResults = Array.from({ length: 30 }, () => ({ kind: 'project', projectId: 'coordinated:runtime', reason: 'Fixture request belongs to this project' }));
   const snapshot = () => { const id = task().threadId; assert.ok(id); return codex.snapshot(id); };
   return { root, config, ports, github, feishu, codex, workspaces, task, workers, intakes, starts, created, workerSteers, snapshot, message,
     async delegate(taskId: string) { await delegateIntake(loop, taskId); return openDirectGroup(loop, taskId); },
     get loop() { return loop; },
-    async manual() { await recoverSavedIntake(loop, message('new', 'Explore this idea')); const intake = loop.store.taskForSource('feishu:new:new'); assert.ok(intake); if (intake.purpose === 'intake') await delegateIntake(loop, intake.id); await openDirectGroup(loop, intake.id); return task(); },
+    async manual() { await recoverSavedIntake(loop, message('new', 'Explore this idea')); const intake = loop.store.taskForSource('feishu:new:new'); assert.ok(intake); await loop.tick(); if (intake.purpose === 'intake' && !loop.projects.intakeRoute(intake.id)) { const inputs = loop.store.inputs(intake.id); await loop.projects.acceptIntake(intake.id, 'runtime', { text: inputs.map(input => input.message.text).join('\n\n'), version: intakeMaterialVersion(intake, inputs) }); } if (loop.store.task(intake.id).purpose === 'intake') await delegateIntake(loop, intake.id); await openDirectGroup(loop, intake.id); return task(); },
     async restart() { await loop.close(); loop = new AgentLoop(config, ports); await loop.recover(); },
     async githubTask() { github.sources = [issue(1)]; await loop.collect(); await loop.tick();
       const coordinator = loop.projects.ledger.project('runtime')!.coordinatorTaskId;
@@ -77,7 +78,7 @@ test('private text, commands and attachments never admit or modify tasks', async
     await f.loop.receive(message); await f.loop.receive(message);
   }
   assert.deepEqual(f.loop.tasks(), before);
-  assert.equal(f.codex.selections.length, 0); assert.equal(f.feishu.downloads.length, 0);
+  assert.equal(f.feishu.downloads.length, 0);
   assert.equal(f.intakes().length, 0); assert.equal(f.feishu.groups.size, 1);
 });
 
@@ -105,10 +106,11 @@ for (const prefix of ['', ' \t\r\n/new ']) test(`saved attachment-only intake re
   const intake = f.intakes()[0]; assert.ok(intake);
   assert.deepEqual(intake.source, { kind: 'manual', message: original });
   assert.equal(f.loop.store.inputs(intake.id)[0]?.message.text, '');
+  await f.delegate(intake.id);
   const download = f.feishu.downloads[0]; assert.ok(download);
   assert.equal(download.messageId, original.id);
   assert.deepEqual(await readFile(download.destination.replace(/\.partial$/, '')), bytes);
-  await f.delegate(intake.id); await f.restart(); await f.loop.receive(original);
+  await f.restart(); await f.loop.receive(original);
   assert.equal(f.intakes().length, 1); assert.equal(f.feishu.downloads.length, 1);
   assert.match(JSON.stringify(f.starts()[0]?.input), /evidence.log/);
 });
@@ -423,7 +425,7 @@ test('resource identity failure remains a barrier after recovery retries', async
 
 test('dynamic workspace request completes while startTurn holds the task lane and retains its project plus two worktrees', async t => {
   const f = await fixture(t);
-  const repository = { name: 'example/one', path: f.root, baseBranch: 'main', criteria: configSchema.parse({ feishu: { userOpenId: 'owner' }, repositories: [{ name: 'example/one', path: f.root, baseBranch: 'main' }] }).repositories[0]!.criteria };
+  const repository = { name: 'example/one', path: f.root, baseBranch: 'main', criteria: configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner' }, repositories: [{ name: 'example/one', path: f.root, baseBranch: 'main' }] }).repositories[0]!.criteria };
   f.config.repositories = [repository, { ...repository, name: 'example/two' }];
   const start = f.codex.startTurn.bind(f.codex);
   f.codex.startTurn = async input => {
@@ -432,14 +434,14 @@ test('dynamic workspace request completes while startTurn holds the task lane an
     return turnId;
   };
   await f.manual();
-  assert.equal(f.task().resources.length, 3); assert.equal(f.workspaces.length, 3);
-  assert.equal(f.created().length, 1); await f.restart(); assert.equal(f.task().resources.length, 3);
+  assert.equal(f.task().resources.length, 2); assert.equal(f.workspaces.length, 2);
+  assert.equal(f.created().length, 1); await f.restart(); assert.equal(f.task().resources.length, 2);
   await assert.rejects(f.loop.ensureWorkspace(f.task().id, 'unconfigured/repo'), /configured/);
 });
 
 test('legacy SQLite migration preserves conversation, workspace, pending input and uncertain effects', async t => {
   const root = await mkdtemp(join(tmpdir(), 'agent-runtime-migration-')); t.after(() => rm(root, { recursive: true, force: true }));
-  const repository = configSchema.parse({ feishu: { userOpenId: 'owner' }, repositories: [{ name: 'example/project', path: root, baseBranch: 'main' }] }).repositories[0]!;
+  const repository = configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner' }, repositories: [{ name: 'example/project', path: root, baseBranch: 'main' }] }).repositories[0]!;
   const oldTask = { id: 'old', sourceId: 'issue-1', source: issue(1), repository, workspace: join(root, 'workspaces/old'), branch: 'agent-loop/old', status: 'awaiting_review', reason: null, prompt: 'old prompt', promptHash: 'hash', skillPath: '/old/skill', chatId: 'chat-old', threadId: 'thread-old', turnId: 'turn-old', lastHandledTurnId: 'turn-old', requests: [], createdAt: 1, updatedAt: 2, prUrl: 'https://example.invalid/pr' };
   const db = new DatabaseSync(join(root, 'tasks.sqlite'));
   db.exec('CREATE TABLE tasks(id TEXT PRIMARY KEY,source_id TEXT NOT NULL UNIQUE,chat_id TEXT UNIQUE,thread_id TEXT UNIQUE,payload TEXT NOT NULL); CREATE TABLE inbox(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,task_id TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL,error TEXT)');
@@ -463,7 +465,7 @@ test('legacy SQLite migration preserves conversation, workspace, pending input a
 
 test('legacy shell bridge acquires task-bound resources through the live Runtime owner', async t => {
   const f = await fixture(t); await f.githubTask();
-  const retained = f.task(); retained.workspaceSelection = { kind: 'pending' }; f.loop.store.saveTask(retained); await f.loop.tick();
+  const retained = f.task(); f.loop.store.saveTask(retained); await f.loop.tick();
   const execute = promisify(execFile);
   const capability = join(f.root, 'workspace-capabilities', `${f.task().id}.json`);
   const client = resolve('src/workspace-client.ts');
@@ -477,7 +479,7 @@ test('legacy shell bridge acquires task-bound resources through the live Runtime
   await f.restart();
   await assert.rejects(execute(process.execPath, [client, copied, 'example/project']));
   await execute(process.execPath, [client, capability, 'example/project']);
-  assert.equal(f.task().resources.length, 2);
+  assert.equal(f.task().resources.length, 1);
   await f.loop.control(f.task().id, 'pause');
   await assert.rejects(execute(process.execPath, [client, capability, 'example/project']), /active/);
 });

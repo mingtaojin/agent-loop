@@ -1,3 +1,4 @@
+import { testExecution } from './test-config.js';
 import { recoverSavedIntake } from './saved-intake.js';
 import { tickWithCoordinator, tickWithDirectGroups, workerCalls, workerGroupCount, instructWorker } from './coordinated-runtime.js';
 import assert from 'node:assert/strict';
@@ -37,7 +38,7 @@ async function fixture(t: TestContext) {
   await git(repository, 'commit', '-m', 'Fixture');
   await writeFile(join(root, 'prompt.md'), prompt);
   await writeFile(join(root, 'SKILL.md'), '# poteto-mode\nFollow the user confirmation requirement.\n');
-  const config = configSchema.parse({
+  const config = configSchema.parse({ execution: testExecution,
     dataDir: join(root, 'data'),
     repositories: [{ name: 'example/project', path: repository, baseBranch: 'main', criteria: { assigneesAny: ['developer'] } }],
     engineering: { promptPath: join(root, 'prompt.md'), skillPath: join(root, 'SKILL.md') },
@@ -217,27 +218,25 @@ test('manual and GitHub requests execute only with the Worker role and coordinat
   f.config.repositories[0]!.criteria.taskTypes = ['bug', 'feature'];
   f.github.sources = [issue(1), issue(2, { nativeType: 'Feature', labels: ['enhancement'] })];
   await f.loop.collect();
-  f.codex.selectionResults.push({ kind: 'repository', repositoryName: 'example/project', reason: 'Requested project' });
   await recoverSavedIntake(f.loop, { id: 'manual-topic', chatId: 'private', senderId: 'ou_owner', chatType: 'p2p', text: 'Discuss this topic', attachments: [], createdAt: Date.now() });
   await tickWithDirectGroups(f.loop);
   const role = await readFile(new URL('../prompts/worker.md', import.meta.url), 'utf8');
   const calls = workerCalls(f.loop, f.codex);
-  assert.equal(calls.created.length, 3);
+  assert.equal(calls.created.length, 2);
   for (const thread of calls.created) {
     assert.ok(thread.instructions.startsWith(role));
     assert.ok(thread.instructions.includes('Delegation from your project coordinator:'));
-    assert.equal(thread.model, 'gpt-6.1-sol');
+    assert.equal(thread.model, 'test-worker');
     assert.equal(thread.reasoningEffort, 'xhigh');
   }
   for (const turn of calls.starts) assert.equal(JSON.stringify(turn.input).includes(prompt), false);
-  assert.ok(calls.starts.some(turn => turn.input.some(input => input.kind === 'text' && input.text === 'Discuss this topic')));
   assert.ok(calls.starts.some(turn => JSON.stringify(turn.input).includes('Reproduction 1')));
   assert.ok(calls.starts.some(turn => JSON.stringify(turn.input).includes('Reproduction 2')));
 });
 
 test('retained Worker roles preserve project tools, workspace bridge and configured skill paths', async t => {
   const f = await fixture(t); await f.launch();
-  const task = f.task(); task.workspaceSelection = { kind: 'pending' }; f.loop.store.saveTask(task);
+  const task = f.task(); f.loop.store.saveTask(task);
   const resumedInstructions: string[] = [];
   const inspect = f.codex.inspect.bind(f.codex);
   f.codex.inspect = async (threadId, instructions?: string) => {
@@ -292,7 +291,7 @@ test('new criteria scope collection without stopping existing sources after repo
 test('workspaces are acquired on demand and remain isolated while another task waits', async t => {
   const f = await fixture(t); await writeFile(join(f.repository, 'tracked.txt'), 'user dirty change\n');
   await f.launch([1, 2]);
-  assert.ok(f.requests().every(task => task.resources.length === 1 && task.resources[0]?.kind === 'project'));
+  assert.ok(f.requests().every(task => task.resources.length === 0));
   await Promise.all([1, 2].map(number => f.loop.ensureWorkspace(f.task(number).id, 'example/project')));
   const first = f.task(1), second = f.task(2);
   assert.notEqual(workspace(first), workspace(second)); assert.notEqual(first.threadId, second.threadId);
@@ -327,7 +326,7 @@ test('project directory policy returns the whole engineering root and preserves 
   assert.equal(await readFile(join(directory.workspace, 'repository', 'tracked.txt'), 'utf8'), 'original commit\n');
   assert.equal(await git(f.repository, 'branch', '--show-current'), 'main');
   const client = fileURLToPath(new URL(import.meta.url.endsWith('.ts') ? '../src/workspace-client.ts' : '../src/workspace-client.js', import.meta.url));
-  secondTask.workspaceSelection = { kind: 'pending' }; f.loop.store.saveTask(secondTask); await tickWithDirectGroups(f.loop);
+  f.loop.store.saveTask(secondTask); await tickWithDirectGroups(f.loop);
   const bridged = await execute(process.execPath, [client, join(f.config.dataDir, 'workspace-capabilities', `${secondTask.id}.json`), 'example/project']);
   assert.equal(JSON.parse(bridged.stdout).workspace, root);
   assert.equal((await f.loop.ensureWorkspace(f.task(1).id, 'example/project')).workspace, previous.workspace);
@@ -336,7 +335,7 @@ test('project directory policy returns the whole engineering root and preserves 
   assert.equal((await f.loop.ensureWorkspace(f.task(1).id, 'example/project')).workspace, previous.workspace);
   assert.equal(f.task(1).threadId, firstThread);
   assert.equal(f.task(2).threadId, secondThread);
-  assert.equal(f.task(2).resources.length, 2);
+  assert.equal(f.task(2).resources.length, 1);
   const changed = f.config.repositories[0]; assert.ok(changed);
   f.config.repositories = [{ ...changed, workspace: { kind: 'project-directory', path: f.repository } }];
   assert.equal((await f.loop.ensureWorkspace(f.task(2).id, 'example/project')).workspace, root);

@@ -14,7 +14,7 @@ const transport: typeof import('../src/adapters/codex-daemon.js') = await import
 const root = await mkdtemp('/tmp/verify-shared-codex-');
 const output = resolve(process.env.CODEX_VERIFY_OUTPUT ?? `.scratch/verification/shared-codex-${Date.now()}.json`);
 const executable = process.env.CODEX_VERIFY_EXECUTABLE ?? 'codex';
-const settings = transport.normalizeDaemonSettings({ executable, model: process.env.CODEX_VERIFY_MODEL, modelProvider: process.env.CODEX_VERIFY_PROVIDER });
+const settings = transport.normalizeDaemonSettings({ executable });
 const daemon = () => z.object({ status: z.literal('running'), socketPath: z.string() }).passthrough().parse(JSON.parse(execFileSync(executable, ['app-server', 'daemon', 'version'], { encoding: 'utf8' })));
 const identity = async () => {
   const version = daemon();
@@ -26,10 +26,8 @@ const messageSchema = z.object({ id: z.union([z.number(), z.string()]).optional(
 const records: { method: string; threadId?: string; turnId?: string; status?: unknown; params?: unknown; error?: unknown; turns?: unknown }[] = [];
 const owned = new Set<string>();
 const connector = transport.sharedDaemonConnector(settings, 30_000);
-let cancelOnTurnStart: AbortController | undefined;
 const observed: CodexConnector = async handlers => {
   const calls = new Map<string | number, { method: string; params: Record<string, unknown> }>();
-  let ephemeralThread: string | undefined;
   const connection = await connector({
     ...handlers,
     message: data => {
@@ -41,7 +39,6 @@ const observed: CodexConnector = async handlers => {
         if (call.method === 'thread/start' && message.result !== undefined && !message.error) {
           const response = z.object({ thread: z.object({ id: z.string() }) }).parse(message.result);
           owned.add(response.thread.id);
-          if (call.params.ephemeral === true) ephemeralThread = response.thread.id;
           records.push({ method: 'thread/created', threadId: response.thread.id, params: call.params });
         }
         if (call.method === 'thread/read' && message.result !== undefined && !message.error) {
@@ -54,11 +51,6 @@ const observed: CodexConnector = async handlers => {
         records.push({ method: message.method, threadId, turnId: turn.id, status: turn.status, error: turn.error });
       }
       handlers.message(data);
-      if (!message.method && message.result !== undefined && !('error' in message) && call?.method === 'turn/start' && call.params.threadId === ephemeralThread && cancelOnTurnStart) {
-        const controller = cancelOnTurnStart;
-        cancelOnTurnStart = undefined;
-        queueMicrotask(() => controller.abort());
-      }
     },
   });
   return {
@@ -111,17 +103,6 @@ try {
   const first = await terminal(formal, threadId);
   assert.match(final(first), new RegExp(token)); assert.equal(toolCalls, 1);
   evidence.formal = { threadId, snapshot: first, dynamicToolCalls: toolCalls };
-  const choice = await formal.selectWorkspace({ taskId: 'choice', cwd: root, candidates: [{ name: 'fixture/project', path: project }], input: [{ kind: 'text', text: 'Work in fixture/project. Choose that exact configured repository. Do not execute the work.' }], answers: [] });
-  assert.deepEqual(choice.choice.kind, 'repository');
-  evidence.choice = choice;
-  const controller = new AbortController(); cancelOnTurnStart = controller;
-  await assert.rejects(formal.selectWorkspace({ taskId: 'cancel', cwd: root, candidates: [{ name: 'fixture/project', path: project }], input: [{ kind: 'text', text: 'Before choosing, carefully compare all the evidence for this engineering request. It refers to QUARTZ_ENGINE_482.' }], answers: [], signal: controller.signal }), /abort/i);
-  const cancelled = records.filter(row => row.method === 'thread/created' && z.object({ ephemeral: z.boolean() }).parse(row.params).ephemeral).at(-1)?.threadId;
-  assert.ok(cancelled);
-  assert.ok(records.some(row => row.method === 'turn/interrupt' && row.threadId === cancelled && row.turnId));
-  assert.ok(records.some(row => row.method === 'thread/observed' && row.threadId === cancelled && z.object({ type: z.string() }).parse(row.status).type === 'idle'));
-  assert.ok(records.some(row => row.method === 'thread/unsubscribe' && row.threadId === cancelled));
-  evidence.cancellation = { threadId: cancelled, records: records.filter(row => row.threadId === cancelled) };
   await formal.startTurn({ threadId, deliveryId: 'formal-after', input: [{ kind: 'text', text: 'Reply only with the token you were asked to remember. No tools.' }] });
   const continued = await terminal(formal, threadId); assert.match(final(continued), new RegExp(token));
   assert.ok(continued.seenInputIds.includes('formal-before')); assert.ok(continued.seenInputIds.includes('formal-after'));

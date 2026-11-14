@@ -1,3 +1,4 @@
+import { testExecution } from '../test/test-config.js';
 import { recoverSavedIntake, openDirectGroup } from '../test/saved-intake.js';
 import { tickWithCoordinator } from '../test/coordinated-runtime.js';
 import assert from 'node:assert/strict';
@@ -20,12 +21,12 @@ const outputDirectory = resolve('.scratch/image-path-inputs');
 const protocolPath = join(root, 'protocol.jsonl');
 const project = join(root, 'selected-project');
 await mkdir(project);
-const config = configSchema.parse({ dataDir: join(root, 'data'), feishu: { userOpenId: 'fixture-owner' },
+const config = configSchema.parse({ execution: { ...testExecution, backends: { codex: {
+  executable: 'codex', sandbox: 'read-only', approvalPolicy: 'never', requestTimeoutMs: 60_000,
+} } }, dataDir: join(root, 'data'), feishu: { userOpenId: 'fixture-owner' },
   repositories: [{ name: 'fixture/images', path: project, baseBranch: 'main', workspace: { kind: 'project-directory', path: project } }],
-  codex: { executable: 'codex',
-    sandbox: 'read-only', approvalPolicy: 'never', requestTimeoutMs: 60_000 },
 });
-const server = new CodexAppServer(config.codex, observedCodexConnection({ recordPath: protocolPath }).connector);
+const server = new CodexAppServer({ ...config.execution.backends.codex, env: process.env }, observedCodexConnection({ recordPath: protocolPath }).connector);
 const feishu = new FeishuFake();
 const loop = new AgentLoop(config, { codex: server, feishu, github: new GitHubFake(), workspace: new WorkspaceProvider(config.dataDir) });
 const evidence: Record<string, unknown> = {

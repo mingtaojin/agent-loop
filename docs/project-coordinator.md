@@ -4,7 +4,7 @@
 
 每个项目通过自己的协调者接单，使用 pstack Orchestrate 委派和监督任务。Worker 使用 poteto-mode，自行选择调查、需求澄清、开发和验证方法。用户只在项目协调群交办，包括没有 Issue 的 Bug 和新需求。GitHub 收集作为协调者证据，Runtime 不自动创建普通执行任务。CLI 和私聊不再接单。
 
-Worker 和 verifier 默认不建群；用户需要直接交流时，由协调者打开指定任务群。
+Worker 默认不建群；用户需要直接交流时，由协调者打开指定任务群。
 
 ## 配置项目
 
@@ -14,6 +14,11 @@ Worker 和 verifier 默认不建群；用户需要直接交流时，由协调者
 
 ```json
 {
+  "execution": {
+    "coordinator": {"backend": "codex", "model": "gpt-6-astra", "reasoningEffort": "high"},
+    "worker": {"backend": "codex", "model": "gpt-6.1-sol", "reasoningEffort": "xhigh"},
+    "backends": {"codex": {"executable": "codex", "approvalPolicy": "on-request", "sandbox": "workspace-write", "requestTimeoutMs": 120000}}
+  },
   "projects": [
     {
       "id": "product",
@@ -24,8 +29,6 @@ Worker 和 verifier 默认不建群；用户需要直接交流时，由协调者
         {"name": "example/backend", "labelsAny": ["agent"], "assigneesAny": []}
       ],
       "instructions": "优先处理 priority:urgent。用户保留亲自审核的 PR 等待确认。",
-      "models": {"coordinator": "gpt-6-astra", "worker": "gpt-6.1-sol"},
-      "reasoningEfforts": {"coordinator": "high", "worker": "xhigh"}
     }
   ]
 }
@@ -39,9 +42,9 @@ Worker 和 verifier 默认不建群；用户需要直接交流时，由协调者
 
 配置在启动时加载。启用实际配置前，按[本机服务操作](agents/operations.md)执行切换并核对。源码测试不代表正式实例已经启用。
 
-协调者默认使用 `gpt-6-astra` 和 `high`，Worker 默认使用 `gpt-6.1-sol` 和 `xhigh`。项目可通过 `models` 和 `reasoningEfforts` 分别覆盖角色模型和推理强度。verifier 未指定时沿用 Codex 默认配置，按 pstack 为独立验证选择不同模型家族。
+协调者和 Worker 使用实例级 `execution` 配置。配置为每个角色指定执行后端、模型和推理强度，所有协调项目共用同一套值。Agent Loop 不提供 验证角色，独立验证由 pstack 负责。执行配置变化由 watcher 读取，已有任务在下一次调用使用新配置。
 
-模型名必须能由本机 Codex 解析。Runtime 不按名称猜测模型家族，也不默默更换不可用模型。任务创建时保存所选模型与推理强度，恢复与协调会话切换继续使用保存值。既有任务按保存的项目身份恢复。
+模型名必须能由本机 Codex 解析。Runtime 不按名称猜测模型家族，也不默默更换不可用模型。任务只保存 coordinator 或 worker 角色；恢复和下一次调用按当前配置解析模型与推理强度。既有任务按保存的项目身份恢复。
 
 ## 对话与角色指导
 
@@ -59,7 +62,7 @@ GitHub Feature 是外部需求提案。即使 Issue 描述完整，也不能直�
 
 用户要求“只讨论、不实现”时，结论齐备也不自动进入开发，直到用户改变该限制。“少发消息、只在需要决策时发消息”减少日常进度噪声，必要问题与文档确认仍需完成。需求变化先记录与当前约定的差异，只澄清受影响的事项。普通业务回答不是原生工具批准。原生审批仍绑定具体请求与实际任务群，不能通过项目消息代为批准。
 
-Issue 评论先交协调者判断影响，再按需转给原 Worker。Worker 和 verifier 的普通最终答复、任务群内用户消息留在原任务，保留完整来源、附件、原 Thread 和任务记录。GitHub 事件和 Worker 汇报触发的协调者普通最终答复保留在协调者 Thread、执行记录和进度文档中；需要用户处理时，协调者使用 `announce` 发送带类型标题的普通文本。用户直接在项目协调群发消息后的协调者答复继续发送到项目群。
+Issue 评论先交协调者判断影响，再按需转给原 Worker。Worker 的普通最终答复、任务群内用户消息留在原任务，保留完整来源、附件、原 Thread 和任务记录。GitHub 事件和 Worker 汇报触发的协调者普通最终答复保留在协调者 Thread、执行记录和进度文档中；需要用户处理时，协调者使用 `announce` 发送带类型标题的普通文本。用户直接在项目协调群发消息后的协调者答复继续发送到项目群。
 
 正式问题、阻塞、进展和成果通过显式 `report` 通知协调者，独立任务完成也须 `report result`。用户直接在任务群讨论或澄清时，普通问答在群内继续，不因需求尚未确定而自动汇报。原生问题、审批、权限请求、执行失败和非暂停中断保留原有通知与处理通道。一轮结束只代表本轮结束。
 
@@ -74,15 +77,15 @@ Issue 评论先交协调者判断影响，再按需转给原 Worker。Worker 和
 | --- | --- | --- |
 | `status` | 查询项目、任务和持久记录 | 项目成员 |
 | `claim_intake` | 引用本项目群实际用户消息，原地认领明确的未归属旧请求，不启动执行 | 协调者 |
-| `dispatch` | 接管指定 intakeTaskId，或按请求身份创建 Worker、独立 verifier | 协调者 |
+| `dispatch` | 接管指定 intakeTaskId，或按请求身份创建 Worker、外部验证流程 | 协调者 |
 | `send` | 向本项目 Worker 追加指导或回答 | 协调者 |
 | `announce` | 向项目协调群发送带类型标题的用户可见公告 | 协调者 |
-| `open_group` | 打开本项目指定 Worker 或 verifier 的任务群，已有有效群则复用 | 协调者 |
+| `open_group` | 打开本项目指定 Worker 的任务群，已有有效群则复用 | 协调者 |
 | `plan_group_cleanup` | 冻结既有任务群清单，排除所有项目协调群 | 协调者 |
 | `confirm_group_cleanup` | 核对实际用户对清单的确认消息 | 协调者 |
 | `apply_group_cleanup` | 执行或继续已确认清单，逐群记录结果 | 协调者 |
 | `control` | 暂停或恢复本项目的指定 Worker | 协调者 |
-| `report` | 上报结果、问题或更新 | Worker、verifier |
+| `report` | 上报结果、问题或更新 | Worker |
 | `record` | 按 scope 追加带项目版本的记录，返回有界确认 | 项目成员 |
 | `rotate` | 保存恢复说明并在安全结束后更换协调会话 | 协调者 |
 | `allocate_artifacts` | 分配新任务专属产物目录 | 项目成员 |
@@ -93,7 +96,7 @@ Issue 评论先交协调者判断影响，再按需转给原 Worker。Worker 和
 
 修改动作携带稳定的 `requestId`。同一调用方使用相同 ID 和内容重试，返回原操作确认；更换内容会报冲突。历史 record 回执也只返回记录确认，不重新暴露过去保存的整份项目状态。`record` 同时携带 `expectedVersion`，版本不符时先重新读取，再决定如何更新。
 
-默认 `status` 返回有界概览。Worker 和 verifier 只能读取自己的任务详情、关联 Issue 和评论，以及对自己可见的记录。其他任务的输出、资源和原生请求正文不进入其结果。协调者可显式查询本项目任务详情。过滤先于分页，counts 表示调用方可见的数量。完整历史按 `section` 分页，支持 `issues`、`comments`、`records`、`tasks` 和 `intakes`。协调者还可查询 `unassigned_intakes`，只发现脱敏标识，不提供其他项目的正文和附件路径。`offset` 从零开始，`limit` 默认 20、最大 100。继续读取 `nextOffset`，不要把概览当作全部历史。
+默认 `status` 返回有界概览。Worker 只能读取自己的任务详情、关联 Issue 和评论，以及对自己可见的记录。其他任务的输出、资源和原生请求正文不进入其结果。协调者可显式查询本项目任务详情。过滤先于分页，counts 表示调用方可见的数量。完整历史按 `section` 分页，支持 `issues`、`comments`、`records`、`tasks` 和 `intakes`。协调者还可查询 `unassigned_intakes`，只发现脱敏标识，不提供其他项目的正文和附件路径。`offset` 从零开始，`limit` 默认 20、最大 100。继续读取 `nextOffset`，不要把概览当作全部历史。
 
 ```json
 {"action":"status","section":"records","offset":0,"limit":20}
@@ -110,10 +113,10 @@ record 的 scope 与作者分别保存。
 | scope | 可见范围 | 可写入角色 |
 | --- | --- | --- |
 | `{"kind":"project"}` | 本项目所有成员 | 协调者 |
-| `{"kind":"task","taskId":"<目标 Task>"}` | 目标 Task，以及可显式查询的协调者 | 目标 Worker 或 verifier，或本项目协调者 |
+| `{"kind":"task","taskId":"<目标 Task>"}` | 目标 Task，以及可显式查询的协调者 | 目标 Worker，或本项目协调者 |
 | `{"kind":"coordinator"}` | 协调者 | 协调者 |
 
-省略 scope 时，Worker 和 verifier 写入自己的任务范围，协调者写入协调者范围。目标必须已经属于同一项目。协调者将选定资料写到 verifier 的任务范围，或通过 send 交接。verifier 不因此获得作者的其他记录。
+省略 scope 时，Worker 写入自己的任务范围，协调者写入协调者范围。目标必须已经属于同一项目。协调者将选定资料写到目标 Worker 的任务范围，或通过 send 交接。Worker 不因此获得作者的其他记录。
 
 当前记录按 scope 和 key 的组合取最新值。两个任务可以各自使用同一个 key。`expectedVersion` 仍使用项目级 version，其他任务写入可能引起版本冲突。重新读取并修改请求内容时使用新的 requestId。
 
@@ -142,7 +145,7 @@ record 的 scope 与作者分别保存。
 
 ### 公共提示词如何生效
 
-同一实例的项目角色共用该实例代码目录中的 `prompts/coordinator.md` 和 `prompts/worker.md`，verifier 也读取 Worker 模板。项目自己的规则与授权由项目配置和持久记录提供，公共模板不授予跨项目的合并或部署权限。其他安装实例需要各自发布对应文件；只更新一个工作树不会更新其他实例。
+同一实例的项目角色共用该实例代码目录中的 `prompts/coordinator.md` 和 `prompts/worker.md`，Worker 也读取 Worker 模板。项目自己的规则与授权由项目配置和持久记录提供，公共模板不授予跨项目的合并或部署权限。其他安装实例需要各自发布对应文件；只更新一个工作树不会更新其他实例。
 
 `src/loop.ts` 在建立正式 Thread 和检查已有 Thread 时读取当前角色文件，再拼接项目指导和执行环境。源码入口从源码目录定位 `prompts/`，编译入口从 `dist/src/` 回到安装根目录的 `prompts/`，部署时也需保留这两个 Markdown 文件。项目成员不使用普通任务的 `engineering.promptPath`；Task 中保存的旧 prompt 不是角色指导的读取依据。
 

@@ -2,7 +2,7 @@
 
 每个项目都通过自己的协调者接单，委派使用 poteto-mode 的 Worker，并接收问题和成果。配置、项目工具和会话恢复见[项目协调者](docs/project-coordinator.md)。
 
-Agent Loop 保存项目和任务的持续上下文。用户在项目协调群交办新需求，GitHub Issue 作为协调者证据。CLI 和机器人私聊不再接单。协调者决定是否派发 Worker，正式执行复用持续 Thread。Worker 和 verifier 默认无群，需要直接交流或点击审批时按需建群。Agent 选择技能、实现和交付流程，Runtime 保存关系、材料、原生请求与恢复记录。
+Agent Loop 保存项目和任务的持续上下文。用户在项目协调群交办新需求，GitHub Issue 作为协调者证据。CLI 和机器人私聊不再接单。协调者决定是否派发 Worker，正式执行复用持续 Thread。Worker 默认无群，需要直接交流或点击审批时按需建群。Agent 选择技能、实现和交付流程，Runtime 保存关系、材料、原生请求与恢复记录。
 
 ## 准备配置
 
@@ -15,11 +15,11 @@ cp config/example.json config.json
 
 编辑 `config.json`，将 `feishu.userOpenId` 改为应用下的所有者 Open ID。相对路径均以配置文件所在目录为基准。
 
-正式任务与目录选择共用本机 Codex daemon。Agent Loop 通过官方 `daemon version` 发现服务，只在服务未运行时调用 `daemon start`。连接失败会报告错误，断线后重新连接并核对原 Thread。Agent Loop 不停止、重启或更新 daemon，也不回退私有 App Server。
+正式任务共用本机 Codex daemon。Agent Loop 通过官方 `daemon version` 发现服务，只在服务未运行时调用 `daemon start`。连接失败会报告错误，断线后重新连接并核对原 Thread。Agent Loop 不停止、重启或更新 daemon，也不回退私有 App Server。
 
-在 `codex.executable` 配置 CLI 入口，默认使用 PATH 中的 `codex`。可选的 `socketPath` 直接指定本机 daemon socket，此时不执行发现或自动启动。`model`、`modelProvider` 和 `reasoningEffort` 在 Thread 范围生效，不修改 Codex 全局配置。旧 `command` 中的 `-c model=...`、`-c model_provider=...` 和 `-c model_reasoning_effort=...` 自动迁移为 Thread 设置。其他参数会报告迁移错误。
+在 `execution.backends` 配置执行后端连接参数，在角色配置中填写 `backend`、`model` 和 `reasoningEffort`。当前提供 Codex 后端，未来可以增加其他执行后端。模型配置属于 Agent Loop 运行时，不修改后端的全局配置；配置文件变化由运行时 watcher 读取，下一次模型调用生效。
 
-如需让目录选择与正式任务使用不同模型，在 `codex` 中增加 `selectionModel`。它只覆盖临时选择 Thread，正式 Thread 继续使用 `model` 或角色模型。省略时两者相同。模型名必须是 Codex 当前配置能解析的名称。临时选择使用独立连接和空白 Thread，保持只读、无审批和无动态工具。
+Agent Loop 不再使用模型选择目录。任务必须先归属到已配置项目；未归属 intake 和历史任务保持等待，不创建执行 Thread。项目协调者和 Worker 直接使用项目目录及统一的角色执行配置。
 
 本地项目可使用 `repositories: []`，不需要 GitHub token。正式会话按角色读取 `prompts/coordinator.md` 或 `prompts/worker.md`，`engineering.promptPath` 不覆盖角色规则。角色指导、委派范围和环境信息通过 `developerInstructions` 与 `additionalContext` 传入正式 Thread；用户消息和 Issue 内容作为请求材料。`engineering.skillPath` 指向已安装的 poteto-mode，其他技能通过现有机制发现。加载与更新方式见[正式会话提示词](docs/prompts/task.md)。
 
@@ -32,7 +32,7 @@ cp config/example.json config.json
 }
 ```
 
-父目录的一级子目录各自作为工程入口，例如 `opentest` 和 `agent-loop`。工程可以没有 Git 元数据，也可以包含多个仓库与资料。内部仓库、模块和版本目录不作为独立入口，由正式 Agent 按任务继续定位。每次新的目录选择读取当前候选，新增工程无需逐个登记。根目录没有绑定某台机器的默认值，更换父目录只需修改配置。
+父目录的一级子目录各自作为可发现工程，例如 `opentest` 和 `agent-loop`。工程可以没有 Git 元数据，也可以包含多个仓库与资料。内部仓库、模块和版本目录不作为独立项目，由正式 Agent 按任务继续定位。新增工程无需逐个登记。根目录没有绑定某台机器的默认值，更换父目录只需修改配置。
 
 `repositories` 继续定义 GitHub 采集来源。使用工程发现根目录时，条目只需仓库名与 `criteria`，无需填写本地 `path`、`baseBranch` 或 `workspace`。本地工程发现不依赖 Git remote，也不会自动采集这些工程的 GitHub Issue。飞书任务可使用 `repositories: []`，仍能发现本地工程。
 
@@ -49,15 +49,9 @@ cp config/example.json config.json
 
 使用根目录发现工程或旧条目的共享目录策略时，Runtime 校验已有项目目录。目录可以由多个任务共享，Agent 按目录中的项目说明使用子仓库和 worktree。服务不自动拉取、复制或重置原始工程。旧显式条目省略 `workspace` 或设置 `{"kind":"git-worktree"}` 时使用独立 Git 工作区。配置在服务启动时加载，修改配置后需重启服务。更换根目录不自动重绑已有任务的会话与工程资源。
 
-## 目录选择与正式任务
+## 项目归属与正式任务
 
-新 Task 先保存原始任务与附件。独立的临时 Thread 根据这些材料和发现的一级工程入口，只读选择一个工程、选择无需工程目录，或提出目录问题。未配置根目录时沿用显式配置的入口。选择模型不执行正式任务，也不进入 poteto-mode 或 grill-with-docs 工程流程。Runtime 不根据 Issue 类型或关键词代替模型选择目录。
-
-选择需要补充信息时，所有者在任务群中的答复用于目录选择，也作为用户补充保留给正式任务。下一次选择使用新的临时 Thread，携带原始材料和已保存的目录答复。正式任务的首轮输入包含原始任务与这些答复的完整文字、来源和附件，避免遗漏“只排查、不改代码”等限制。临时模型的问题、推理和选择输出不进入正式任务；关联的 Issue 更新和评论不能冒充所有者答复。
-
-Runtime 校验选择结果并保存绑定，再准备选定的项目目录。显式配置的旧独立 worktree 策略继续适用。正式 Thread 使用准备好的工程目录作为实际工作目录；无需工程目录时使用任务资料目录。临时选择完成、失败或取消后，适配器确认己方执行停止，再解除订阅并关闭连接。正式 Thread 不继承选择对话历史，共享 daemon 和其他客户端继续运行。若断线使活跃临时 Turn 的标识不可知，适配器报告结果未知，不猜测标识或重复执行。正式任务收到统一工作指导、简短环境说明和完整任务材料。
-
-后续讨论、澄清、工程工作和恢复沿用正式 Thread。已有正式 Thread 的任务保留原会话和资源，不重新选目录。历史上已收集但尚未建立正式 Thread 的任务在启动时进入目录选择。职责边界见 [ADR 0008](docs/adr/0008-temporary-workspace-selection.md)。
+新 Task 先保存原始任务与附件。项目协调者负责确认工程归属并通过 `claim_intake` 或 `dispatch` 派发 Worker；未归属 intake 和历史任务保持等待，不创建执行 Thread。确认归属后，协调者和 Worker 直接使用项目配置的目录，所有项目共用实例级角色执行配置。后续讨论、澄清、工程工作和恢复沿用正式 Thread。
 
 凭证通过环境变量提供。默认名称为 `GITHUB_TOKEN`、`FEISHU_APP_ID`、`FEISHU_APP_SECRET`。配置仅保存变量名。程序加载当前目录的 `.env`，已有进程变量优先。可用 `--env-file` 指定其他文件。不要将真实凭证写入 JSON、prompt 或全局说明。
 
@@ -91,7 +85,7 @@ npm start -- run --config config.json
 ## 在项目群交办
 
 在项目协调群发送需求及材料。协调者先核对已有工作，再决定是否委派 Worker。
-Worker 和 verifier 默认无群，用户需要直接交流时向协调者提出。
+Worker 默认无群，用户需要直接交流时向协调者提出。
 原生审批自动打开任务群并在项目群通知，普通问题和最终成果交给协调者。
 
 CLI submit、answer 及机器人私聊接单已移除。运维命令和内部协调工具继续保留。
@@ -119,7 +113,7 @@ npm start -- run --config config.json
 
 飞书默认只转发 Agent 的最终答复。执行进度可通过固定文档标签页或消息卡片展示，同一时间只使用一种方式。原生问题与审批请求仍通过独立消息处理。
 
-项目 Worker 和 verifier 默认没有任务群，正式问题、进展和成果通过显式 `report` 交给项目协调者，独立任务完成也须汇报。普通最终答复和任务群讨论留在原任务；用户要求同步时，Worker 直接提交有实际用户来源的讨论摘要。用户需要直接对话时，在项目群自然语言提出，由协调者打开指定任务群。原生审批会按需建群并在项目群通知。Runtime 不发送定时监督提醒，没有新事件时协调者持续等待。新群不补发历史消息。群被手动解散后任务继续运行；现有进度发布只面向有效群，不提供新的项目进度总览。批量清理见[任务群管理](docs/task-groups.md)。
+项目 Worker 默认没有任务群，正式问题、进展和成果通过显式 `report` 交给项目协调者，独立任务完成也须汇报。普通最终答复和任务群讨论留在原任务；用户要求同步时，Worker 直接提交有实际用户来源的讨论摘要。用户需要直接对话时，在项目群自然语言提出，由协调者打开指定任务群。原生审批会按需建群并在项目群通知。Runtime 不发送定时监督提醒，没有新事件时协调者持续等待。新群不补发历史消息。群被手动解散后任务继续运行；现有进度发布只面向有效群，不提供新的项目进度总览。批量清理见[任务群管理](docs/task-groups.md)。
 
 调试台会保存可见模型文字、工具调用状态元数据和错误；不记录工具输出正文、原始协议配置、系统指导或私有推理内容。它是网络可访问的全局只读视图，不提供登录或 token 鉴权。
 
@@ -191,13 +185,13 @@ CLI `submit`、`answer` 及机器人私聊接单已经移除。运维 `doctor`�
 
 正式任务可通过 `ensure_workspace` 的 `projectId` 参数申请额外发现的项目，原有 `repository` 参数继续支持显式仓库与保存的旧资源。同一 Task 可关联多个工程资源。已有资源优先按保存的身份与路径恢复，配置更新不迁移旧工作区。目录或分支不符时停止并保留现场。
 
-当前原生 Codex 不能为旧 Thread 补加动态工具。Runtime 继续为旧 Thread 提供任务限定的本地 shell 客户端，仍调用相同的工作区管理器；新正式 Thread 使用动态工具，指导中不再携带目录选择流程和备用 shell 命令。旧 Thread 的能力文件位于 `<dataDir>/workspace-capabilities`，进程重启后替换。不要复制或手工调用其他任务的能力文件。目录准备不代表额外授权，实际读取与修改继续受 Codex sandbox 和原生审批限制。
+当前原生 Codex 不能为旧 Thread 补加动态工具。Runtime 继续为旧 Thread 提供任务限定的本地 shell 客户端，仍调用相同的工作区管理器；新正式 Thread 使用动态工具和项目目录。旧 Thread 的能力文件位于 `<dataDir>/workspace-capabilities`，进程重启后替换。不要复制或手工调用其他任务的能力文件。目录准备不代表额外授权，实际读取与修改继续受 Codex sandbox 和原生审批限制。
 
 ## 重启和故障
 
-本机常驻服务按[本机服务操作](docs/agents/operations.md)中的 launchd 命令重启。前台调试进程按 Ctrl+C 退出。保留数据目录、任务分支和 worktree。服务核对群、目录选择结果、资源、正式 Thread 和未确认输入，不建立第二个同任务执行者。已保存的目录选择结果继续复用；等待目录答复和正式任务的正常等待均在重启后保留。服务关闭会中止己方活跃执行、解除己方 Thread 订阅并关闭连接，共享 Codex daemon 继续运行。
+本机常驻服务按[本机服务操作](docs/agents/operations.md)中的 launchd 命令重启。前台调试进程按 Ctrl+C 退出。保留数据目录、任务分支和 worktree。服务核对群、项目归属、资源、正式 Thread 和未确认输入，不建立第二个同任务执行者。等待项目归属和正式任务的正常等待均在重启后保留。服务关闭会中止己方活跃执行、解除己方 Thread 订阅并关闭连接，共享 Codex daemon 继续运行。
 
-目录选择失败和已确认的执行故障按 `recovery.maxAttempts` 和 `recovery.retryDelayMs` 有限恢复。临时选择中断后可依据已保存材料重新选择，正式任务的未知副作用仍须核对。没有正式执行总时长限制，静默本身不触发故障判定。达到恢复上限、目录不匹配或未知副作用会保留诊断。未知输入、审批和通知不盲目重放。
+已确认的执行故障按 `recovery.maxAttempts` 和 `recovery.retryDelayMs` 有限恢复。项目归属不明确时保留 pending，不创建 Thread。没有正式执行总时长限制，静默本身不触发故障判定。达到恢复上限、目录不匹配或未知副作用会保留诊断。未知输入、审批和通知不盲目重放。
 
 自动恢复停止后，所有者在原任务群发送的新消息会重新校验资源并沿原 Thread 继续，离线期间已保存的后续消息也会处理。新消息开启一轮有限恢复；同一条未投递消息不会反复重置恢复次数，来源更新也不会唤醒失败任务。
 
@@ -222,6 +216,6 @@ npm run build
 
 ## 验证共享 Codex 服务
 
-运行 `npm run verify:shared-codex`，通过构建产物验证正式对话、动态工具、目录选择、选择取消和独立客户端继续执行。脚本仅使用临时目录和只读模型请求，记录 daemon socket 与进程身份，不停止、重启或更新真实 daemon。可用 `CODEX_VERIFY_EXECUTABLE`、`CODEX_VERIFY_MODEL`、`CODEX_VERIFY_PROVIDER` 和 `CODEX_VERIFY_OUTPUT` 指定入口、Thread 设置与证据路径。
+运行 `npm run verify:shared-codex`，通过构建产物验证正式对话、动态工具和独立客户端继续执行。脚本仅使用临时目录和只读模型请求，记录 daemon socket 与进程身份，不停止、重启或更新真实 daemon。可用 `CODEX_VERIFY_EXECUTABLE` 和 `CODEX_VERIFY_OUTPUT` 指定入口与证据路径。
 
 `npm test` 的本机多客户端协议 fixture 覆盖未运行时启动、启动失败、响应丢失和断线恢复。真实服务验证不通过停止正在使用的 daemon 注入故障。测试、真实服务验证、Git 合并和部署分别报告。

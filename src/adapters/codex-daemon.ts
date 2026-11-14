@@ -3,7 +3,6 @@ import { connect } from 'node:net';
 import { promisify } from 'node:util';
 import WebSocket from 'ws';
 import { z } from 'zod';
-import { reasoningEffortSchema } from '../project.js';
 
 export interface CodexConnection {
   send(message: string): Promise<void>;
@@ -14,33 +13,15 @@ export const daemonSettingsSchema = z.object({
   command: z.array(z.string().min(1)).min(1).optional(),
   executable: z.string().min(1).optional(),
   socketPath: z.string().min(1).optional(),
-  model: z.string().min(1).optional(),
-  modelProvider: z.string().min(1).optional(),
-  reasoningEffort: reasoningEffortSchema.optional(),
 });
 export function normalizeDaemonSettings(input: z.infer<typeof daemonSettingsSchema>) {
   const { command, ...settings } = daemonSettingsSchema.parse(input);
   const executable = settings.executable ?? command?.[0] ?? 'codex';
-  if (command && settings.executable && command[0] !== settings.executable) throw new Error('codex.command and codex.executable disagree. Use codex.executable for the shared daemon.');
-  const overrides: { model?: string; modelProvider?: string; reasoningEffort?: z.infer<typeof reasoningEffortSchema> } = {};
-  if (command && command.length > 1) {
-    if (command[1] !== 'app-server') throw new Error('codex.command must use the official app-server entry. Use codex.executable and Thread model/modelProvider/reasoningEffort settings.');
-    for (let index = 2; index < command.length; index += 2) {
-      const flag = command[index], assignment = command[index + 1];
-      if ((flag !== '-c' && flag !== '--config') || !assignment) throw new Error(`Unsupported codex.command argument ${JSON.stringify(flag)}. Shared daemon mode accepts only model, model_provider and model_reasoning_effort overrides. Move them to codex.model, codex.modelProvider and codex.reasoningEffort.`);
-      const match = /^(model|model_provider|model_reasoning_effort)\s*=\s*(.+)$/.exec(assignment);
-      if (!match) throw new Error(`Cannot migrate codex.command override ${JSON.stringify(assignment)}. Shared daemon mode never changes global configuration. Use Thread model, modelProvider and reasoningEffort settings.`);
-      const raw = match[2]!;
-      let value: unknown = raw;
-      if (raw.startsWith('"')) { try { value = JSON.parse(raw); } catch { throw new Error(`Invalid quoted Codex override ${assignment}`); } }
-      else if (raw.startsWith("'") && raw.endsWith("'")) value = raw.slice(1, -1);
-      const text = z.string().min(1).parse(value);
-      if (match[1] === 'model') overrides.model = text;
-      else if (match[1] === 'model_provider') overrides.modelProvider = text;
-      else overrides.reasoningEffort = reasoningEffortSchema.parse(text);
-    }
+  if (command && settings.executable && command[0] !== settings.executable) throw new Error('execution.backends.codex.command and executable disagree.');
+  if (command && command.length > 2) {
+    throw new Error('execution.backends.codex.command cannot contain model overrides; configure role execution profiles instead.');
   }
-  return { executable, socketPath: settings.socketPath, model: settings.model ?? overrides.model, modelProvider: settings.modelProvider ?? overrides.modelProvider, reasoningEffort: settings.reasoningEffort ?? overrides.reasoningEffort };
+  return { executable, socketPath: settings.socketPath };
 }
 export type DaemonSettings = ReturnType<typeof normalizeDaemonSettings>;
 const execute = promisify(execFile);

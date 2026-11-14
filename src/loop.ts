@@ -1,14 +1,14 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { access, mkdir, readFile, realpath, stat, rename, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, stat, rename, rm, writeFile } from 'node:fs/promises';
 import { join, extname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WorkspaceBridge } from './workspace-bridge.js';
 import { z } from 'zod';
-import { criteriaSchema, discoveredProjectSchema, requestSchema, workspaceTargetSchema } from './domain.js';
+import { criteriaSchema, requestSchema, workspaceTargetSchema } from './domain.js';
 import { discoverProjects } from './project-discovery.js';
 import type { Config } from './config.js';
-import { errorMessage, presentTaskSource, matchSource, RejectedInputError, TurnChangedError, workspaceSelectionResponseSchema, type AgentInput, type ApprovalAction, type DiscoveredProject, type ExecutionSnapshot, type IncomingMessage, type Repository, type Source, type SourceComment, type Task, type TaskResource, type TaskSource, type WorkspaceCandidate, type WorkspaceTarget, type WorkspaceSelectionResponse } from './domain.js';
+import { errorMessage, presentTaskSource, matchSource, RejectedInputError, TurnChangedError, type AgentInput, type ApprovalAction, type DiscoveredProject, type ExecutionSnapshot, type IncomingMessage, type Repository, type Source, type SourceComment, type Task, type TaskResource, type TaskSource, type WorkspaceTarget } from './domain.js';
 import { FeishuApiError, TaskGroupUnavailable, type RunningActivity, type TurnIdentity, type CodexPort, type FeishuPort, type GitHubPort, type WorkspacePort } from './ports.js';
 import { TaskGroups, assertGroupBinding, groupGeneration, retireTaskGroup } from './task-groups.js';
 import { CleanupAdmissionBusy, TaskCloseout } from './task-closeout.js';
@@ -23,14 +23,10 @@ import { matchesProjectIssue } from './project.js';
 
 const digest = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex');
 const approvalOutputSchema = z.object({ taskId: z.string(), request: requestSchema, chatId: z.string().optional(), lastAttemptAt: z.number().optional() });
-const intakeQuestionSchema = z.strictObject({ question: z.string(), inputIds: z.array(z.string()) });
-const intakeChoiceSchema = z.strictObject({ projectId: z.string(), revision: z.string() });
 const recoveryState = () => ({ attempts: 0, nextAttemptAt: null, lastError: null, interruptedTurnId: null, lastUserInputSeq: null });
 function sourceRevision(source: Source): string {
   return digest(JSON.stringify({ ...source, assignees: [...source.assignees].sort(), labels: [...source.labels].sort(), updatedAt: undefined }));
 }
-class WorkspaceSelectionError extends Error {}
-
 export class AgentLoop {
   readonly store: Store;
   private readonly workspaceBridge: WorkspaceBridge;
@@ -44,7 +40,6 @@ export class AgentLoop {
   private starting: Promise<void> | null = null;
   private closing: Promise<void> | null = null;
   private collecting: Promise<void> | null = null;
-  private readonly selectionAbort = new AbortController();
   readonly projects: ProjectRuntime;
   readonly closeout: TaskCloseout;
   private readonly groups: TaskGroups;
@@ -219,10 +214,6 @@ export class AgentLoop {
         this.problem(`discovery:${task.id}`, error);
       }
     }
-    const acquisition = ` To request an additional discovered project, call ensure_workspace with {"projectId":"<exact supplied project id>"}. For a configured repository or a saved legacy resource, use {"repository":"<repository name>"}. Available discovered projects: ${JSON.stringify(projects)}. Saved resources retain their identities and paths.${discoveryError}`;
-    if (task.workspaceSelection.kind === 'selected') {
-      return `${prompt}\nExecution environment: ${JSON.stringify({ cwd: this.executionDirectory(task), taskDataDirectory: task.contextDirectory, resources: task.resources.map(resource => resource.kind === 'project' ? { project: resource.project, kind: resource.kind, path: resource.workspace } : { repository: resource.repository.name, kind: resource.kind, path: resource.workspace }) })}. Follow the project instructions in the current working directory.${acquisition}${skill ? ` Engineering skill path: ${JSON.stringify(skill)}.` : ''}`;
-    }
     const capability = await this.workspaceBridge.grant(task.id);
     const client = fileURLToPath(new URL(import.meta.url.endsWith('.ts') ? './workspace-client.ts' : './workspace-client.js', import.meta.url));
     const quote = (text: string) => `'${text.replaceAll("'", "'\"'\"'")}'`;
@@ -231,7 +222,8 @@ export class AgentLoop {
       kind: repository.workspace?.kind ?? 'git-worktree',
       ...(repository.workspace?.kind === 'project-directory' ? { path: repository.workspace.path } : {}),
     }));
-    return `${prompt}\n${fallback}\nAvailable repositories: ${JSON.stringify(workspaces.map(repository => repository.repository))}.\nWorkspace policies: ${JSON.stringify(workspaces)}. Existing task resources retain their saved paths and policies. Project-directory resources return an existing shared engineering root. Follow its project instructions for working in its repositories; they are not task-owned worktrees.${acquisition}${skill ? ` Engineering skill path: ${JSON.stringify(skill)}.` : ''}`;
+    const acquisition = ` To request an additional discovered project, call ensure_workspace with {"projectId":"<exact supplied project id>"}. For a configured repository or a saved legacy resource, use {"repository":"<repository name>"}. Available discovered projects: ${JSON.stringify(projects)}. Saved resources retain their identities and paths.${discoveryError}`;
+    return `${prompt}\nExecution environment: ${JSON.stringify({ cwd: this.executionDirectory(task), taskDataDirectory: task.contextDirectory, resources: task.resources.map(resource => resource.kind === 'project' ? { project: resource.project, kind: resource.kind, path: resource.workspace } : { repository: resource.repository.name, kind: resource.kind, path: resource.workspace }) })}. Follow the project instructions in the current working directory.\n${fallback}\nAvailable repositories: ${JSON.stringify(workspaces.map(repository => repository.repository))}.\nWorkspace policies: ${JSON.stringify(workspaces)}. Existing task resources retain their saved paths and policies. Project-directory resources return an existing shared engineering root. Follow its project instructions for working in them; they are not task-owned worktrees.${acquisition}${skill ? ` Engineering skill path: ${JSON.stringify(skill)}.` : ''}`;
   }
   private async admitted<T>(taskId: string, run: () => Promise<T>): Promise<T> {
     const release = this.closeout.reserve(taskId);
@@ -242,7 +234,8 @@ export class AgentLoop {
     if (!task) throw new Error('Unbound Thread');
     const instructions = await this.instructions(task);
     this.closeout.assertOpen(task.id);
-    const snapshot = await this.admitted(task.id, () => this.ports.codex.inspect(threadId, instructions, this.store.meta(`project-task-model:${task.id}`) ?? undefined, this.projects.reasoningEffort(task.id)));
+    const profile = this.projects.executionProfile(task.id);
+    const snapshot = await this.admitted(task.id, () => this.ports.codex.inspect(threadId, instructions, profile?.model, profile?.reasoningEffort));
     this.recordProgressStatus({ ...task, turnId: snapshot.turnId, executionStatus: snapshot.status, requests: snapshot.requests });
     return snapshot;
   }
@@ -250,8 +243,8 @@ export class AgentLoop {
     if (!task.threadId) throw new Error('Unbound Thread');
     if (!reconcile && task.executionStatus === 'running' && !this.hasUnknownInput(task)
       && !this.store.approvals(task.id).some(approval => approval.status === 'processing' || approval.status === 'uncertain')) {
-      const activity = await this.ports.codex.activity(task.threadId, await this.instructions(task),
-        this.store.meta(`project-task-model:${task.id}`) ?? undefined, this.projects.reasoningEffort(task.id));
+      const profile = this.projects.executionProfile(task.id);
+      const activity = await this.ports.codex.activity(task.threadId, await this.instructions(task), profile?.model, profile?.reasoningEffort);
       if (activity.kind === 'running') {
         this.recordProgressStatus({ ...task, turnId: activity.turnId, executionStatus: 'running', requests: activity.requests });
         return activity;
@@ -274,7 +267,7 @@ export class AgentLoop {
     const id = randomUUID();
     const prompt = await this.currentPrompt();
     const task: Task = { id, sourceId, source, purpose, contextDirectory: join(this.config.dataDir, 'tasks', id), resources: [],
-      workspaceSelection: { kind: 'pending' }, status: 'pending', reason: null, prompt, promptHash: digest(prompt), skillPath: this.config.engineering?.skillPath ?? null,
+      status: 'pending', reason: null, prompt, promptHash: digest(prompt), skillPath: this.config.engineering?.skillPath ?? null,
       chatId: null, threadId: null, turnId: null, executionStatus: 'unbound', lastHandledTurnId: null, requests: [],
       recovery: recoveryState(), createdAt: Date.now(), updatedAt: Date.now() };
     await this.closeout.initialize(task);
@@ -387,33 +380,15 @@ export class AgentLoop {
     await Promise.all(this.store.tasks().filter(task => !this.lanes.has(task.id)).map(task => this.serial(task.id, () => this.advance(task.id))));
   }
   private executionDirectory(task: Task): string {
-    if (task.workspaceSelection.kind !== 'selected' || task.workspaceSelection.choice.kind === 'none') return task.contextDirectory;
-    const choice = task.workspaceSelection.choice;
-    const resource = task.resources.find(item => choice.kind === 'project'
-      ? item.kind === 'project' && item.project.id === choice.projectId
-      : item.kind !== 'project' && item.repository.name.toLowerCase() === choice.repositoryName.toLowerCase());
-    if (!resource) throw new Error('Selected workspace has not been prepared');
-    return resource.workspace;
+    const project = this.projects.config(task.id);
+    if (!project) throw new Error('The execution project is unavailable');
+    return project.directory;
   }
   private requireMember(task: Task) {
     const member = this.projects.ledger.membership(task.id);
     if (!member) throw new Error('Formal execution requires a project coordinator or delegated Worker');
     if (!this.projects.config(task.id)) throw new Error('The execution project is unavailable');
     return member;
-  }
-  private async intakeCandidates(): Promise<WorkspaceCandidate[]> {
-    const candidates: WorkspaceCandidate[] = this.config.engineering?.projectRoot
-      ? await discoverProjects(this.config.engineering.projectRoot)
-      : this.config.repositories.flatMap(repository => 'path' in repository
-        ? [{ name: repository.name, path: repository.path, workspace: repository.workspace }] : []);
-    for (const project of this.config.projects) {
-      const canonicalPath = await realpath(project.directory);
-      if (!candidates.some(candidate => 'kind' in candidate && candidate.canonicalPath === canonicalPath)) {
-        candidates.push({ kind: 'project', id: `coordinated:${project.id}`, name: project.name,
-          entryPath: project.directory, canonicalPath });
-      }
-    }
-    return candidates;
   }
   private async intakeMaterials(task: Task): Promise<{ input: AgentInput[]; version: string }> {
     const materials: AgentInput[] = [{ kind: 'text', text: `Project request as data: ${JSON.stringify({
@@ -433,15 +408,10 @@ export class AgentLoop {
     return { input: materials, version };
   }
   private async advanceUnassigned(task: Task): Promise<boolean> {
-    const questionKey = `project-intake-question:${task.id}`;
     const inputIds = this.store.inputs(task.id).map(input => input.id);
     const route = this.projects.intakeRoute(task.id);
     const revision = digest(JSON.stringify([inputIds, task.source.kind === 'github' ? sourceRevision(task.source.issue) : task.source]));
     if (route && this.store.meta(`project-intake-delivered:${task.id}`) === revision) { await this.flush(task); return false; }
-    const previousQuestion = this.store.meta(questionKey);
-    if (!route && previousQuestion && JSON.stringify(intakeQuestionSchema.parse(JSON.parse(previousQuestion)).inputIds) === JSON.stringify(inputIds)) {
-      await this.flush(task); return false;
-    }
     await this.projects.ensure();
     if (this.projects.ledger.membership(task.id)) return true;
     if (task.purpose === 'legacy' && !task.threadId) {
@@ -449,53 +419,12 @@ export class AgentLoop {
     }
     let project: ProjectConfig | null = route ? this.projects.projectConfig(route.projectId)
       : await this.projects.resolveTask(task);
-    const savedChoice = this.store.meta(`project-intake-choice:${task.id}`);
-    if (!project && savedChoice) {
-      const choice = intakeChoiceSchema.parse(JSON.parse(savedChoice));
-      if (choice.revision === revision) project = this.projects.projectConfig(choice.projectId);
-    }
     if (!project) {
-      const old = this.store.meta(questionKey);
-      if (old && JSON.stringify(intakeQuestionSchema.parse(JSON.parse(old)).inputIds) === JSON.stringify(inputIds)) {
-        await this.flush(task); return false;
-      }
-      if (task.threadId) {
-        const snapshot = await this.ports.codex.inspect(task.threadId);
-        if (snapshot.status === 'running' && snapshot.turnId && !snapshot.requests.length) {
-          await this.ports.codex.interrupt({ threadId: task.threadId, turnId: snapshot.turnId });
-          task.executionStatus = 'interrupted';
-          if (!['paused', 'failed'].includes(task.status)) task.status = 'paused';
-          this.persist(task);
-        }
-      }
-      await mkdir(task.contextDirectory, { recursive: true, mode: 0o700 });
-      const candidates = await this.intakeCandidates();
-      const materials = await this.intakeMaterials(task);
-      let selection: WorkspaceSelectionResponse;
-      try {
-        selection = workspaceSelectionResponseSchema.parse(await this.ports.codex.selectWorkspace({
-          taskId: task.id, cwd: task.contextDirectory, candidates, input: materials.input,
-          answers: this.store.inputs(task.id).filter(input => input.route === 'workspace-selection' && input.status !== 'dropped')
-            .map(input => ({ inputId: input.id, text: input.message.text })), signal: this.selectionAbort.signal,
-        }));
-      } catch (error) { throw new WorkspaceSelectionError(errorMessage(error)); }
-      this.selectionAbort.signal.throwIfAborted();
-      task = this.store.task(task.id);
-      if (JSON.stringify(this.store.inputs(task.id).map(input => input.id)) !== JSON.stringify(inputIds)) return false;
-      project = await this.projects.resolveSelection(selection.choice, candidates);
-      task = this.store.task(task.id);
-      if (this.projects.ledger.membership(task.id)) return true;
-      if (this.projects.intakeRoute(task.id) || (task.status === 'paused' && !task.threadId)
-        || JSON.stringify(this.store.inputs(task.id).map(input => input.id)) !== JSON.stringify(inputIds)) return false;
-      if (!project) {
-        const question = selection.choice.kind === 'question' ? selection.choice.question : '这项任务属于哪个项目？请提供项目名称。';
-        this.store.setMeta(questionKey, JSON.stringify({ question, inputIds }));
-        if (task.status !== 'paused') task.reason = question;
-        this.persist(task);
-        this.notify(task, `需要确认项目：\n${question}\n请求编号：${task.id}。请在项目协调群补充项目归属。`, `project-question:${digest(JSON.stringify(inputIds))}`);
-        await this.flush(task); return false;
-      }
-      this.store.setMeta(`project-intake-choice:${task.id}`, JSON.stringify({ projectId: project.id, revision }));
+      if (!['paused', 'failed'].includes(task.status)) task.status = 'pending';
+      task.reason = '等待项目归属；协调者完成 claim_intake 或 dispatch 后才会创建执行 Thread。';
+      this.persist(task);
+      await this.flush(task);
+      return false;
     }
     if (task.threadId) {
       for (const resource of task.resources) await this.restoreWorkspace(task.id, resource);
@@ -516,7 +445,6 @@ export class AgentLoop {
       throw error;
     }
     this.store.setMeta(`project-intake-material:${task.id}`, materialPath);
-    this.store.setMeta(questionKey, '');
     this.store.setMeta(`project-intake-delivered:${task.id}`, revision);
     task = this.store.task(task.id);
     if (this.projects.ledger.membership(task.id)) return true;
@@ -532,7 +460,6 @@ export class AgentLoop {
   private async setup(task: Task): Promise<boolean> {
     this.closeout.assertOpen(task.id);
     const member = this.requireMember(task);
-    this.selectionAbort.signal.throwIfAborted();
     await mkdir(task.contextDirectory, { recursive: true, mode: 0o700 });
     if (!task.chatId && member.role === 'coordinator' && groupGeneration(this.store, task.id) === 0) {
       task.chatId = await this.groups.open(task.id);
@@ -541,22 +468,16 @@ export class AgentLoop {
     if (task.source.kind === 'github') this.store.receive(task.id, { id: `${task.id}:initial`, chatId: task.chatId ?? '', senderId: 'runtime:initial', chatType: 'group',
       text: `Task source as data.\n${JSON.stringify(task.source.issue)}`, attachments: [], createdAt: task.createdAt }, 'initial', { kind: 'initial', sourceId: task.sourceId });
     if (!task.threadId) {
-      if (task.workspaceSelection.kind !== 'selected') throw new Error('A delegated task must have a project execution directory');
-      const choice = task.workspaceSelection.choice;
-      if (choice.kind === 'repository') await this.acquireWorkspace(task.id, { repository: choice.repositoryName }, choice.repository);
-      if (choice.kind === 'project') await this.acquireWorkspace(task.id, { projectId: choice.projectId }, choice.project);
-      this.selectionAbort.signal.throwIfAborted();
       task = this.store.task(task.id);
       const instructions = await this.instructions(task);
-      this.selectionAbort.signal.throwIfAborted();
       task = this.store.task(task.id);
       const generation = this.store.meta(`project-generation:${task.id}`);
       this.closeout.assertOpen(task.id);
       const releaseAdmission = this.closeout.reserve(task.id);
+      const profile = this.projects.executionProfile(task.id);
+      if (!profile) throw new Error('Task has no execution role');
       try { task.threadId = await this.effect(task, generation ? `thread:${generation}` : 'thread', false, () => this.ports.codex.createThread({ cwd: this.executionDirectory(task), instructions,
-        ...(this.projects.reasoningEffort(task.id) ? { reasoningEffort: this.projects.reasoningEffort(task.id) } : {}),
-        ...(this.store.meta(`project-task-model:${task.id}`) ? { model: this.store.meta(`project-task-model:${task.id}`) ?? undefined } : {}) })); this.persist(task); } finally { releaseAdmission(); }
-      this.selectionAbort.signal.throwIfAborted();
+        model: profile.model, reasoningEffort: profile.reasoningEffort })); this.persist(task); } finally { releaseAdmission(); }
     }
     return true;
   }
@@ -660,7 +581,7 @@ export class AgentLoop {
     const message = errorMessage(error);
     task.executionStatus = 'unknown'; task.reason = message;
     task.recovery.lastError = message; task.recovery.interruptedTurnId = turnId;
-    if (task.recovery.attempts >= this.config.recovery.maxAttempts || (!task.threadId && !(error instanceof WorkspaceSelectionError))) {
+    if (task.recovery.attempts >= this.config.recovery.maxAttempts || !task.threadId) {
       task.status = 'failed'; task.recovery.nextAttemptAt = null;
       task.recovery.lastUserInputSeq = this.store.inputs(task.id).filter(input => input.origin === 'user').at(-1)?.seq ?? 0;
       this.notify(task, `任务恢复已停止，保留现场。\n${message}`, `recovery-exhausted:${digest(message)}`);
@@ -791,8 +712,7 @@ export class AgentLoop {
     if (message.senderId !== this.config.feishu.userOpenId) return;
     if (message.chatType === 'p2p') return;
     const task = this.store.taskForChat(message.chatId);
-    if (!task || !this.receiveOwner(task, message, !this.projects.ledger.membership(task.id)
-      || (!task.threadId && task.workspaceSelection.kind === 'waiting') ? 'workspace-selection' : 'task')) return;
+    if (!task || !this.receiveOwner(task, message)) return;
     if (this.running || !this.started) await this.serial(task.id, () => this.advance(task.id));
   }
   private forwardCompletedInputs(task: Task): void {
@@ -810,8 +730,8 @@ export class AgentLoop {
       }
     });
   }
-  private receiveOwner(task: Task, message: IncomingMessage, route: Inbox['route']): boolean {
-    const received = this.store.receive(task.id, message, 'user', undefined, route);
+  private receiveOwner(task: Task, message: IncomingMessage): boolean {
+    const received = this.store.receive(task.id, message, 'user');
     this.forwardCompletedInputs(task);
     return received;
   }
@@ -870,12 +790,10 @@ export class AgentLoop {
     const threadId = task.threadId;
     const inputs = this.store.inputs(task.id).sort((a, b) => Number(b.origin === 'initial') - Number(a.origin === 'initial') || a.seq - b.seq);
     if (threadId && !this.stopping && task.status !== 'paused' && task.status !== 'failed'
-      && (this.store.meta(`project-intake-promotion:${task.id}`) !== null
-        || inputs.some(input => input.route === 'workspace-selection' && input.selectionHandled && input.status !== 'delivered' && input.status !== 'dropped'))
+      && this.store.meta(`project-intake-promotion:${task.id}`) !== null
       && !inputs.some(input => input.status === 'delivering' || input.status === 'uncertain')) {
       const snapshot = await this.inspect(threadId);
       if (snapshot.turnId === null && !snapshot.seenInputIds.length) {
-        if (inputs.some(input => input.route === 'workspace-selection' && input.selectionHandled && input.status === 'failed')) return;
         const initial = inputs.filter(input => input.status === 'pending' || input.status === 'held');
         const first = initial[0];
         if (!first) return;
@@ -1120,8 +1038,7 @@ export class AgentLoop {
       const since = Math.max(task.createdAt, previous - this.config.pollIntervalMs * 2);
       for (const message of await this.ports.feishu.history({ chatId: task.chatId, since })) {
         if (message.senderId === this.config.feishu.userOpenId) {
-          this.receiveOwner(task, message,
-            !task.threadId && task.workspaceSelection.kind === 'waiting' && message.createdAt >= task.workspaceSelection.askedAt ? 'workspace-selection' : 'task');
+          this.receiveOwner(task, message);
         }
       }
       this.store.setMeta(`history:${task.id}`, String(cursor));
@@ -1162,7 +1079,6 @@ export class AgentLoop {
   }
   private async closeService(): Promise<void> {
     this.stopping = true;
-    this.selectionAbort.abort(new Error('Agent Loop is closing'));
     this.running = false;
     for (const timer of this.timers) clearInterval(timer);
     await this.starting?.catch(() => undefined);

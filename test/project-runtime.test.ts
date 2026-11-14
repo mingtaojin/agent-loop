@@ -1,3 +1,4 @@
+import { testExecution } from './test-config.js';
 import { seedSavedIntake } from './saved-intake.js';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
@@ -40,7 +41,7 @@ const overviewSchema = z.object({
   members: projectStateSchema.shape.members,
   records: z.array(projectStateSchema.shape.records.element.extend({ truncated: z.boolean().optional() })),
   tasks: z.array(taskSchema.pick({ status: true, executionStatus: true, reason: true, chatId: true, threadId: true, resources: true })
-    .extend({ taskId: z.string(), role: z.enum(['coordinator', 'worker', 'verifier']) })),
+    .extend({ taskId: z.string(), role: z.enum(['coordinator', 'worker', 'worker']) })),
   nextOffset: z.number().nullable(),
 });
 
@@ -51,10 +52,10 @@ function projectIssue(number: number, repository = 'example/frontend', changes: 
   });
 }
 
-test('delegated workers and verifiers stay group-less until the coordinator opens one without replaying history', async t => {
+test('delegated workers and secondWorkers stay group-less until the coordinator opens one without replaying history', async t => {
   const f = await fixture(t, { secondProject: true }); await f.initialize();
   const worker = await f.dispatch('lazy-worker', 'Investigate the requested change.');
-  await f.dispatch('lazy-verifier', 'Verify independently.', { role: 'verifier' });
+  await f.dispatch('lazy-secondWorker', 'Verify independently.', { role: 'worker' });
   assert.equal(f.feishu.groups.size, 2);
   assert.ok(worker.threadId);
   const snapshot = f.codex.snapshot(worker.threadId);
@@ -389,15 +390,15 @@ test('bulk cleanup stops its batch on the first permission error and retries onl
 async function fixture(t: TestContext, options: { secondProject?: boolean } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'agent-project-runtime-'));
   const directory = await realpath(root);
-  const projectConfigs = configSchema.parse({ feishu: { userOpenId: 'owner' }, projects: [
-    { id: 'app', name: 'Application', directory, instructions: 'Keep author and verifier independent. Never deploy.', repositories: [
+  const projectConfigs = configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner' }, projects: [
+    { id: 'app', name: 'Application', directory, instructions: 'Keep author and secondWorker independent. Never deploy.', repositories: [
       { name: 'example/frontend', labelsAny: ['coordinate'], assigneesAny: ['coordinator-bot'] },
       { name: 'example/backend', labelsAny: ['backend-project'], assigneesAny: ['backend-bot'] },
     ] },
     ...(options.secondProject ? [{ id: 'docs', name: 'Documentation', directory,
       repositories: [{ name: 'example/docs', labelsAny: ['coordinate'] }] }] : []),
   ] }).projects;
-  const config = configSchema.parse({ dataDir: root, feishu: { userOpenId: 'owner' },
+  const config = configSchema.parse({ execution: testExecution, dataDir: root, feishu: { userOpenId: 'owner' },
     recovery: { maxAttempts: 2, retryDelayMs: 1 },
     repositories: ['example/frontend', 'example/backend'].map(name => ({ name, path: directory, baseBranch: 'main', criteria: { taskTypes: ['bug', 'feature'] } })),
     projects: projectConfigs,
@@ -431,14 +432,13 @@ async function fixture(t: TestContext, options: { secondProject?: boolean } = {}
   return { root, directory, config, projectConfigs, github, feishu, codex, workspaces, state, coordinator, events, message,
     get loop() { return loop; },
     async seedLegacy(source: Source) {
-      const repository = configSchema.parse({ feishu: { userOpenId: 'owner' }, repositories: [{ name: source.repository, path: directory, baseBranch: 'main', workspace: { kind: 'project-directory', path: directory } }] }).repositories[0];
+      const repository = configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner' }, repositories: [{ name: source.repository, path: directory, baseBranch: 'main', workspace: { kind: 'project-directory', path: directory } }] }).repositories[0];
       assert.ok(repository && 'path' in repository && repository.workspace?.kind === 'project-directory');
       const id = `legacy-${source.number}`, chatId = await feishu.ensureGroup({ taskId: id, title: source.title, sourceUrl: source.url });
       const threadId = await codex.createThread({ cwd: directory, instructions: 'Saved legacy instructions' });
       const turnId = await codex.startTurn({ threadId, deliveryId: `${id}:initial`, input: [{ kind: 'text', text: source.body }] });
       const task = taskSchema.parse({ id, sourceId: source.id, source: { kind: 'github', issue: source, repository, collectionReason: 'legacy' },
         contextDirectory: join(root, 'tasks', id), resources: [{ id: 'legacy-workspace', kind: 'project-directory', repository, workspace: directory }],
-        workspaceSelection: { kind: 'selected', temporaryThreadId: 'saved-legacy-selection', inputIds: [], choice: { kind: 'repository', repositoryName: repository.name, repository, reason: 'Saved selection' } },
         status: 'running', reason: null, prompt: 'Saved prompt', promptHash: 'saved-hash', skillPath: null,
         chatId, threadId, turnId, executionStatus: 'running', lastHandledTurnId: null, requests: [], createdAt: Date.now(), updatedAt: Date.now(),
       });
@@ -450,7 +450,7 @@ async function fixture(t: TestContext, options: { secondProject?: boolean } = {}
     },
     async initialize() { await loop.collect(); await loop.tick(); return coordinator(); },
     async status(callerId = coordinator().id) { return overviewSchema.parse(await loop.projectAction(callerId, { action: 'status' })); },
-    async dispatch(requestId: string, prompt: string, extra: { issueId?: string; role?: 'worker' | 'verifier'; callerId?: string; mode?: 'investigation' | 'implementation'; authorization?: Extract<ProjectAction, { action: 'dispatch' }>['authorization'] } = {}) {
+    async dispatch(requestId: string, prompt: string, extra: { issueId?: string; role?: 'worker'; callerId?: string; mode?: 'investigation' | 'implementation'; authorization?: Extract<ProjectAction, { action: 'dispatch' }>['authorization'] } = {}) {
       const result = dispatchReceipt.parse(await loop.projectAction(extra.callerId ?? coordinator().id, {
         action: 'dispatch', requestId, prompt, role: extra.role ?? 'worker', ...(extra.issueId ? { issueId: extra.issueId } : {}),
         ...(extra.mode ? { mode: extra.mode } : extra.issueId ? { mode: 'investigation' as const } : {}),
@@ -501,8 +501,7 @@ test('project collection uses label OR assignee across repositories without crea
   assert.equal(f.events(coordinator.id, 'github_issue').length, matched.length);
   assert.equal(f.feishu.groups.size, 1);
   assert.equal(f.workspaces.length, 0);
-  assert.equal(f.codex.selections.length, 0);
-  assert.equal(f.codex.created[0]?.cwd, coordinator.contextDirectory);
+  assert.equal(f.codex.created[0]?.cwd, f.directory);
   assert.match(f.codex.created[0]?.instructions ?? '', /Orchestrate/);
   for (const source of matched) {
     const intake = f.loop.store.taskForSource(source.id); assert.ok(intake);
@@ -583,15 +582,13 @@ test('dispatch is idempotent under concurrent requests and restart, rejects conf
   assert.deepEqual(f.state().members.find(member => member.taskId === taskId), { taskId, role: 'worker', issueId: f.github.sources[0]!.id });
   const delegation = f.loop.store.meta(`project-delegation:${taskId}`) ?? '';
   assert.ok(delegation.startsWith(action.prompt)); assert.match(delegation, /Investigation-only contract:/);
-  const creation = f.codex.created.find(input => input.cwd === f.directory); assert.ok(creation);
+  const creation = f.codex.created.find(input => input.instructions.includes(action.prompt)); assert.ok(creation);
   assert.match(creation.instructions, /poteto-mode/);
   assert.ok(creation.instructions.includes(action.prompt));
-  assert.equal(worker.resources[0]?.workspace, f.directory);
-  assert.equal(f.codex.selections.length, 0);
   await assert.rejects(f.loop.projectAction(coordinator.id, { ...action, prompt: 'Different scope under the same request' }), /different|conflict|already/i);
-  const verifier = await f.dispatch('verify-12', 'Independently verify the specified artifact. Do not change the author branch.', { role: 'verifier' });
-  assert.equal(f.state().members.find(member => member.taskId === verifier.id)?.role, 'verifier');
-  assert.notEqual(verifier.threadId, worker.threadId);
+  const secondWorker = await f.dispatch('verify-12', 'Independently verify the specified artifact. Do not change the author branch.', { role: 'worker' });
+  assert.equal(f.state().members.find(member => member.taskId === secondWorker.id)?.role, 'worker');
+  assert.notEqual(secondWorker.threadId, worker.threadId);
   const starts = f.codex.starts.length, groups = f.feishu.groups.size;
   await f.restart();
   assert.deepEqual(await f.loop.projectAction(coordinator.id, action), first);
@@ -863,54 +860,31 @@ test('rotation waits for coordinator idleness and retains its group, members, pe
   assert.equal(f.loop.tasks().length, 2);
 });
 
-test('configured role models reach thread creation and saved task models survive restart and coordinator rotation', async t => {
+test('role profiles reach Thread creation and hot reload applies to existing tasks', async t => {
   const f = await fixture(t);
-  const project = f.config.projects[0]; assert.ok(project);
-  const models = { coordinator: 'configured-coordinator', worker: 'configured-worker', verifier: 'configured-verifier' };
-  project.models = models;
   const coordinator = await f.initialize(); assert.ok(coordinator.threadId);
   const worker = await f.dispatch('model-worker', 'Investigate the export contract.');
-  const verifier = await f.dispatch('model-verifier', 'Independently verify the findings.', { role: 'verifier' });
-  assert.deepEqual(f.codex.created.map(input => input.model), [models.coordinator, models.worker, models.verifier]);
-  assert.deepEqual(f.codex.created.map(input => input.reasoningEffort), ['high', 'xhigh', undefined]);
-  const assignments = [
-    { task: coordinator, model: models.coordinator },
-    { task: worker, model: models.worker },
-    { task: verifier, model: models.verifier },
-  ];
+  assert.deepEqual(f.codex.created.map(input => input.model), ['test-coordinator', 'test-worker']);
   const inspected = f.codex.instructionUpdates.length;
-  project.models = { coordinator: 'new-coordinator-default', worker: 'new-worker-default', verifier: 'new-verifier-default' };
-  project.reasoningEfforts = { coordinator: 'low', worker: 'low' };
+  f.config.execution = {
+    coordinator: { backend: 'codex', model: 'reloaded-coordinator', reasoningEffort: 'low' },
+    worker: { backend: 'codex', model: 'reloaded-worker', reasoningEffort: 'medium' },
+    backends: f.config.execution.backends,
+  };
   await f.restart();
-  assert.equal(f.codex.created.length, 3);
-  for (const assignment of assignments) {
-    assert.equal(f.loop.store.task(assignment.task.id).threadId, assignment.task.threadId);
-    assert.ok(f.codex.instructionUpdates.slice(inspected).some(input => input.threadId === assignment.task.threadId && input.model === assignment.model));
-  }
-  const saved = z.object({ tasks: z.array(z.object({ taskId: z.string(), model: z.string() })) })
-    .parse(await f.loop.projectAction(coordinator.id, { action: 'status' }));
-  for (const assignment of assignments) assert.equal(saved.tasks.find(task => task.taskId === assignment.task.id)?.model, assignment.model);
-  await f.loop.projectAction(coordinator.id, { action: 'rotate', requestId: 'rotate-model', checkpoint: 'Retain task ownership and saved role models.' });
+  assert.ok(f.codex.instructionUpdates.slice(inspected).some(input => input.threadId === coordinator.threadId && input.model === 'reloaded-coordinator'));
+  assert.ok(f.codex.instructionUpdates.slice(inspected).some(input => input.threadId === worker.threadId && input.model === 'reloaded-worker'));
+  await f.loop.projectAction(coordinator.id, { action: 'rotate', requestId: 'rotate-model', checkpoint: 'Use the current role profiles.' });
   f.codex.complete(coordinator.threadId, null);
   await f.loop.tick(); await f.loop.tick();
-  const rotated = f.coordinator(); assert.ok(rotated.threadId);
-  assert.notEqual(rotated.threadId, coordinator.threadId); assert.equal(rotated.chatId, coordinator.chatId);
-  assert.equal(f.codex.created.length, 4); assert.equal(f.codex.created.at(-1)?.model, models.coordinator);
-  assert.equal(f.codex.created.at(-1)?.reasoningEffort, 'high');
-  assert.equal(f.loop.store.task(worker.id).threadId, worker.threadId);
-  assert.equal(f.loop.store.task(verifier.id).threadId, verifier.threadId);
-  await f.restart();
-  assert.equal(f.coordinator().threadId, rotated.threadId); assert.equal(f.codex.created.length, 4);
-  assert.ok(f.codex.instructionUpdates.some(input => input.threadId === rotated.threadId && input.model === models.coordinator));
-  assert.ok(f.codex.instructionUpdates.some(input => input.threadId === rotated.threadId && input.reasoningEffort === 'high'));
-  assert.ok(f.codex.instructionUpdates.some(input => input.threadId === worker.threadId && input.reasoningEffort === 'xhigh'));
+  assert.equal(f.codex.created.at(-1)?.model, 'reloaded-coordinator');
 });
 
-test('default coordinator and Worker use the requested model and reasoning combinations', async t => {
+test('configured coordinator and Worker use the shared role profiles', async t => {
   const f = await fixture(t); await f.initialize();
   await f.dispatch('default-role-models', 'Investigate within the project scope.');
   assert.deepEqual(f.codex.created.map(input => ({ model: input.model, effort: input.reasoningEffort })), [
-    { model: 'gpt-6-astra', effort: 'high' }, { model: 'gpt-6.1-sol', effort: 'xhigh' },
+    { model: 'test-coordinator', effort: 'high' }, { model: 'test-worker', effort: 'xhigh' },
   ]);
 });
 
@@ -962,7 +936,7 @@ test('only the coordinator can pause and resume its project Worker while other t
   const app = f.coordinator(), docs = f.coordinator('docs');
   const worker = await f.dispatch('controlled-worker', 'Investigate the export contract.');
   const sibling = await f.dispatch('independent-worker', 'Investigate an unrelated backend issue.');
-  const foreign = await f.dispatch('foreign-verifier', 'Independently verify documentation.', { callerId: docs.id, role: 'verifier' });
+  const foreign = await f.dispatch('foreign-secondWorker', 'Independently verify documentation.', { callerId: docs.id, role: 'worker' });
   const forbidden = [
     { caller: worker.id, target: sibling.id },
     { caller: foreign.id, target: foreign.id },
@@ -1203,7 +1177,7 @@ test('task record sentinels stay out of unrelated instructions and every status 
     url: 'https://example.test/comment', author: 'owner', body: 'A_PRIVATE_COMMENT_BODY', createdAt: '2026-11-14T01:00:00Z', updatedAt: '2026-11-14T01:00:00Z' }));
   const a = await f.dispatch('private-a', 'Task A.', { issueId: privateIssue.id });
   const b = await f.dispatch('private-b', 'Task B.');
-  const verifier = await f.dispatch('private-verifier', 'Verify selected evidence.', { role: 'verifier' });
+  const secondWorker = await f.dispatch('private-secondWorker', 'Verify selected evidence.', { role: 'worker' });
   const before = f.loop.projects.instructions(b.id);
   await f.loop.projectAction(a.id, { action: 'record', requestId: 'a-private', key: 'requirements', text: 'A_PRIVATE_RECORD_SENTINEL', expectedVersion: 0 });
   assert.equal(f.loop.projects.instructions(b.id), before);
@@ -1222,7 +1196,7 @@ test('task record sentinels stay out of unrelated instructions and every status 
     prompt: 'A_PRIVATE_PROMPT_SENTINEL', method: 'item/tool/requestUserInput', payload: {}, isBlocking: true, connectionEpoch: 'scope-test' }];
   f.loop.store.saveTask(saved);
   f.loop.store.enqueue(a.id, 'A_PRIVATE_OUTPUT_SENTINEL', 'private-output');
-  for (const caller of [b, verifier]) {
+  for (const caller of [b, secondWorker]) {
     for (const section of ['overview', 'records', 'tasks', 'issues', 'comments', 'intakes'] as const) {
       const response = await f.loop.projectAction(caller.id, { action: 'status', section, limit: 1 });
       assert.doesNotMatch(JSON.stringify(response), /A_PRIVATE_/, `${caller.id} ${section}`);
@@ -1255,15 +1229,15 @@ test('scoped records retain same-key identities, caller defaults and explicit co
   const f = await fixture(t, { secondProject: true }); await f.initialize();
   const a = await f.dispatch('scope-a', 'Task A.');
   const b = await f.dispatch('scope-b', 'Task B.');
-  const verifier = await f.dispatch('scope-v', 'Verify selected evidence.', { role: 'verifier' });
+  const secondWorker = await f.dispatch('scope-v', 'Verify selected evidence.', { role: 'worker' });
   const record = (callerId: string, requestId: string, text: string, scope?: Extract<ProjectAction, { action: 'record' }>['scope']) =>
     f.loop.projectAction(callerId, { action: 'record', requestId, key: 'same-key', text, expectedVersion: f.state().version, ...(scope ? { scope } : {}) });
   await record(a.id, 'a', 'A_ONLY');
   await record(b.id, 'b', 'B_ONLY');
-  await record(verifier.id, 'v', 'VERIFIER_ONLY');
+  await record(secondWorker.id, 'v', 'VERIFIER_ONLY');
   await record(f.coordinator().id, 'coord', 'COORDINATOR_ONLY');
   await record(f.coordinator().id, 'shared', 'PROJECT_SHARED', { kind: 'project' });
-  await record(f.coordinator().id, 'routed', 'SELECTED_A_EVIDENCE', { kind: 'task', taskId: verifier.id });
+  await record(f.coordinator().id, 'routed', 'SELECTED_A_EVIDENCE', { kind: 'task', taskId: secondWorker.id });
   for (const scope of [{ kind: 'project' }, { kind: 'coordinator' }, { kind: 'task', taskId: a.id }] as const)
     await assert.rejects(record(b.id, `forbidden-${scope.kind}`, 'FORBIDDEN', scope), /Only the coordinator/);
   await assert.rejects(record(f.coordinator().id, 'foreign', 'FORBIDDEN', { kind: 'task', taskId: f.coordinator('docs').id }), /does not belong/);
@@ -1275,7 +1249,7 @@ test('scoped records retain same-key identities, caller defaults and explicit co
   assert.doesNotMatch(f.loop.projects.context(a.id), /COORDINATOR_TASK_TARGET/);
   assert.ok(f.loop.projects.context(a.id).includes('A_ONLY'));
   assert.doesNotMatch(f.loop.projects.context(a.id), /B_ONLY|COORDINATOR_ONLY|SELECTED_A_EVIDENCE|VERIFIER_ONLY/);
-  assert.match(f.loop.projects.context(verifier.id), /SELECTED_A_EVIDENCE/);
+  assert.match(f.loop.projects.context(secondWorker.id), /SELECTED_A_EVIDENCE/);
   assert.doesNotMatch(f.loop.projects.context(f.coordinator().id), /A_ONLY|B_ONLY|SELECTED_A_EVIDENCE|VERIFIER_ONLY/);
   assert.doesNotMatch(f.loop.projects.context(f.coordinator('docs').id), /PROJECT_SHARED/);
   const page = z.object({ counts: z.object({ records: z.number() }), items: projectStateSchema.shape.records, nextOffset: z.number().nullable() });
@@ -1367,7 +1341,7 @@ test('running observation preserves approval identity and full inspection still 
   assert.equal(f.loop.store.task(worker.id).threadId, worker.threadId);
 });
 
-for (const role of ['worker', 'verifier'] as const) for (const grouped of [false, true]) for (const running of [false, true]) {
+for (const role of ['worker', 'worker'] as const) for (const grouped of [false, true]) for (const running of [false, true]) {
   test(`${role} final reply stays local with grouped=${grouped} and coordinator running=${running}`, async t => {
     const f = await fixture(t); await f.initialize();
     const delegated = await f.dispatch('local-final', 'Discuss the current findings.', { role });
@@ -1409,7 +1383,7 @@ for (const running of [false, true]) test(`Worker group messages stay local with
   assert.deepEqual(f.loop.store.inputs(worker.id).find(input => input.id === message.id)?.provenance, { kind: 'user', message });
 });
 
-for (const role of ['worker', 'verifier'] as const) for (const kind of ['result', 'question', 'update'] as const) for (const running of [false, true]) for (const grouped of [false, true]) {
+for (const role of ['worker', 'worker'] as const) for (const kind of ['result', 'question', 'update'] as const) for (const running of [false, true]) for (const grouped of [false, true]) {
   test(`${role} explicit ${kind} report arrives once with coordinator running=${running} and grouped=${grouped}`, async t => {
     const f = await fixture(t); await f.initialize();
     const worker = await f.dispatch('formal-report', 'Perform the assigned work.', { role });
@@ -1431,8 +1405,8 @@ for (const role of ['worker', 'verifier'] as const) for (const kind of ['result'
 test('elapsed time and restarts leave idle project members waiting until an explicit event arrives', async t => {
   const f = await fixture(t); await f.initialize();
   const worker = await f.dispatch('quiet-worker', 'Wait for discussion.');
-  const verifier = await f.dispatch('quiet-verifier', 'Wait for verification input.', { role: 'verifier' });
-  f.codex.complete(worker.threadId!, null); f.codex.complete(verifier.threadId!, null);
+  const secondWorker = await f.dispatch('quiet-secondWorker', 'Wait for verification input.', { role: 'worker' });
+  f.codex.complete(worker.threadId!, null); f.codex.complete(secondWorker.threadId!, null);
   await f.idleCoordinator();
   const starts = f.codex.starts.length, steers = f.codex.steers.length;
   const inputs = f.loop.store.inputs(f.coordinator().id);
@@ -1442,7 +1416,7 @@ test('elapsed time and restarts leave idle project members waiting until an expl
   assert.equal(f.codex.starts.length, starts); assert.equal(f.codex.steers.length, steers);
   assert.deepEqual(f.loop.store.inputs(f.coordinator().id), inputs);
   assert.equal(f.events(f.coordinator().id, 'supervision').length, 0);
-  await f.loop.projectAction(verifier.id, { action: 'report', requestId: 'new-evidence', kind: 'update', text: 'New evidence arrived.' });
+  await f.loop.projectAction(secondWorker.id, { action: 'report', requestId: 'new-evidence', kind: 'update', text: 'New evidence arrived.' });
   await f.loop.tick();
   assert.equal(f.codex.starts.length, starts + 1);
   assert.equal(f.events(f.coordinator().id, 'update')[0]?.status, 'delivered');
@@ -1594,21 +1568,21 @@ for (const status of ['failed', 'interrupted'] as const) test(`Worker ${status} 
   assert.equal(f.events(f.coordinator().id, 'execution_status').length, 1);
 });
 
-test('current reporting and event guidance reaches new and resumed Worker, verifier and coordinator Threads', async t => {
+test('current reporting and event guidance reaches new and resumed Worker, secondWorker and coordinator Threads', async t => {
   const f = await fixture(t); await f.initialize();
   const worker = await f.dispatch('guidance-worker', 'Discuss scope.');
-  const verifier = await f.dispatch('guidance-verifier', 'Verify the result.', { role: 'verifier' });
+  const secondWorker = await f.dispatch('guidance-secondWorker', 'Verify the result.', { role: 'worker' });
   const assertWorkerGuidance = (instructions: string) => {
     for (const requirement of ['普通对话不要自行调用 report', '不因需求尚未确定而机械 report', '普通讨论无需改用原生问题', '完成后必须主动 report result', '直接通过 report update', '无需先展示预览', '用户指定话题时只同步该话题', '真实消息 ID、群 ID、发送者', '不把同步要求当作实施、合并、部署或原生工具批准']) assert.ok(instructions.includes(requirement), requirement);
     assert.ok(!instructions.includes('最终答复也会回传协调者'));
   };
-  for (const role of ['worker', 'verifier']) {
+  for (const role of ['worker', 'worker']) {
     const created = f.codex.created.find(input => input.instructions.includes(`Project role: ${role}.`)); assert.ok(created);
     assertWorkerGuidance(created.instructions);
   }
   assert.ok(f.codex.created[0]?.instructions.includes('没有新事件时持续等待'));
   await f.restart();
-  for (const task of [worker, verifier]) {
+  for (const task of [worker, secondWorker]) {
     const update = f.codex.instructionUpdates.filter(input => input.threadId === task.threadId).at(-1); assert.ok(update);
     assertWorkerGuidance(update.instructions);
   }

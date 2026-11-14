@@ -1,5 +1,5 @@
 import { writeFile } from 'node:fs/promises';
-import { TurnChangedError, UncertainOperationError, type ExecutionSnapshot, type IncomingMessage, type PendingRequest, type Source, type SourceComment, type TaskResource, type WorkspaceRequest, type WorkspaceChoice } from '../src/domain.js';
+import { TurnChangedError, UncertainOperationError, type ExecutionSnapshot, type IncomingMessage, type PendingRequest, type Source, type SourceComment, type TaskResource, type WorkspaceRequest } from '../src/domain.js';
 export interface LegacyReport { status: 'waiting_user' | 'awaiting_review' | 'failed'; summary: string; question: string | null; prUrl: string | null; validation: string[]; limitations: string[] }
 import { TaskGroupUnavailable, type Activity, type TurnIdentity, type CodexPort, type FeishuPort, type GitHubPort } from '../src/ports.js';
 
@@ -51,6 +51,7 @@ export class FeishuFake implements FeishuPort {
   readonly downloads: Parameters<FeishuPort['download']>[0][] = [];
   readonly resources = new Map<string, Uint8Array>();
   readonly downloadFailures = new Set<string>();
+  downloadHook: ((destination: string) => Promise<void> | void) | null = null;
   offline: IncomingMessage[] = [];
   historyError: Error | null = null;
   loseGroupAck = false;
@@ -79,6 +80,7 @@ export class FeishuFake implements FeishuPort {
     const bytes = this.resources.get(input.attachment.key);
     if (!bytes) throw new Error('Resource missing');
     await writeFile(input.destination, bytes);
+    await this.downloadHook?.(input.destination);
   }
   async history(input: Parameters<FeishuPort['history']>[0]): Promise<IncomingMessage[]> {
     if (this.historyError) throw this.historyError;
@@ -96,16 +98,6 @@ export class CodexFake implements CodexPort {
   assertThreadCompletionAllowed(threadId: string): void {
     if (this.inspectError) throw new Error('Native request state is unavailable');
     if (this.snapshot(threadId).requests.length) throw new Error('Reconcile unresolved native requests before completion');
-  }
-  readonly selections: Omit<Parameters<CodexPort['selectWorkspace']>[0], 'signal'>[] = [];
-  selectionResults: WorkspaceChoice[] = [];
-  selectionError: Error | null = null;
-  async selectWorkspace(input: Parameters<CodexPort['selectWorkspace']>[0]): ReturnType<CodexPort['selectWorkspace']> {
-    const { signal, ...data } = input;
-    signal?.throwIfAborted();
-    this.selections.push(structuredClone(data));
-    if (this.selectionError) throw this.selectionError;
-    return { temporaryThreadId: `selection-${this.selections.length}`, choice: this.selectionResults.shift() ?? { kind: 'none', reason: 'Synthetic discussion selection' } };
   }
   readonly threads = new Map<string, ExecutionSnapshot>();
   readonly created: Parameters<CodexPort['createThread']>[0][] = [];
