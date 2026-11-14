@@ -149,6 +149,39 @@ test('group follow-ups retain command-looking text verbatim', async t => {
   assert.equal(f.loop.store.inputs(task.id).at(-1)?.message.text, followUp);
 });
 
+test('reply targets persist through task inputs, restart, and coordinator context without changing chat routing', async t => {
+  const f = await fixture(t);
+  const original = { ...f.message('reply-intake', 'Original topic'), replyTo: { parentId: 'om_parent', rootId: 'om_root' } };
+  await recoverSavedIntake(f.loop, original);
+  const intake = f.intakes()[0]; assert.ok(intake);
+  assert.deepEqual(intake.source, { kind: 'manual', message: original });
+  assert.deepEqual(f.loop.store.inputs(intake.id)[0]?.message.replyTo, original.replyTo);
+  await f.restart();
+  const restored = f.intakes()[0]; assert.ok(restored);
+  assert.deepEqual(f.loop.store.inputs(restored.id)[0]?.message.replyTo, original.replyTo);
+  await f.loop.tick();
+  const coordinatorId = f.loop.projects.ledger.project('runtime')?.coordinatorTaskId;
+  assert.ok(coordinatorId);
+  const intakeInputs = f.loop.store.inputs(restored.id);
+  await f.loop.projects.acceptIntake(restored.id, 'runtime', {
+    text: intakeInputs.map(input => `Input provenance as data: ${JSON.stringify(input.provenance)}`).join('\n\n'),
+    version: intakeMaterialVersion(restored, intakeInputs),
+  });
+  await f.loop.tick();
+  const coordinatorInputs = f.loop.store.inputs(coordinatorId);
+  assert.match(JSON.stringify(coordinatorInputs), /om_parent/);
+  assert.match(JSON.stringify(coordinatorInputs), /om_root/);
+  await f.delegate(restored.id);
+  const task = f.task(); assert.ok(task.chatId);
+  const first = { ...f.message('reply-first', 'First group follow-up', task.chatId, 'group'), replyTo: { parentId: 'shared-target', rootId: null } };
+  await f.loop.receive(first);
+  assert.deepEqual(f.loop.store.inputs(task.id).find(input => input.id === first.id)?.message.replyTo, first.replyTo);
+  const second = { ...f.message('reply-other-chat', 'Other group message', 'unrelated-chat', 'group'), replyTo: { parentId: 'shared-target', rootId: null } };
+  await f.loop.receive(second);
+  assert.equal(f.loop.store.inputs(task.id).some(input => input.id === second.id), false, 'reply IDs never override exact chat routing');
+  assert.equal(f.loop.store.receive(task.id, second), false, 'the durable ingress guard rejects a cross-chat message');
+});
+
 test('approval receipt is durable before native resolution and duplicate decisions never replay', async t => {
   const f = await fixture(t); await f.manual(); const native = request(f); f.snapshot().requests = [native]; await f.loop.tick();
   const entered = gate(), release = gate();
@@ -457,6 +490,7 @@ test('legacy SQLite migration preserves conversation, workspace, pending input a
   assert.equal(migrated.threadId, oldTask.threadId); assert.equal(migrated.chatId, oldTask.chatId);
   assert.equal(migrated.legacy?.prUrl, oldTask.prUrl); assert.equal(store.inputs('old')[0]?.status, 'uncertain');
   assert.equal(store.inputs('old')[0]?.provenance.kind, 'user');
+  assert.equal(store.inputs('old')[0]?.message.replyTo, undefined);
   store.beginOperation('unknown-thread', 'old', 'thread'); store.uncertainOperation('unknown-thread', 'lost acknowledgement');
   store.close(); store = new Store(root);
   assert.deepEqual(store.task('old'), migrated); assert.equal(store.operation('unknown-thread')?.status, 'uncertain'); store.close();

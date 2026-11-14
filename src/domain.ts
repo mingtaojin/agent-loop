@@ -85,10 +85,16 @@ export const attachmentSchema = z.object({
   key: z.string(), name: z.string(), kind: z.enum(['image', 'file']),
 });
 export type Attachment = z.infer<typeof attachmentSchema>;
+export const replyTargetSchema = z.strictObject({
+  parentId: z.string().min(1).nullable(),
+  rootId: z.string().min(1).nullable(),
+});
+export type ReplyTarget = z.infer<typeof replyTargetSchema>;
 export const incomingSchema = z.object({
   id: z.string(), chatId: z.string(), senderId: z.string(), text: z.string(),
   attachments: z.array(attachmentSchema), createdAt: z.number(),
   chatType: z.enum(['p2p', 'group']).default('group'),
+  replyTo: replyTargetSchema.optional(),
 });
 export type IncomingMessage = z.infer<typeof incomingSchema>;
 export function normalizeManualTaskText(text: IncomingMessage['text']): string {

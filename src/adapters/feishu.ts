@@ -6,7 +6,7 @@ import { pipeline } from 'node:stream/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Client, WSClient, EventDispatcher, Domain, LoggerLevel, defaultHttpInstance, type HttpInstance, type HttpRequestOptions } from '@larksuiteoapi/node-sdk';
 import { z } from 'zod';
-import { UncertainOperationError, errorMessage, type ApprovalAction, type Attachment, type IncomingMessage, type PendingRequest } from '../domain.js';
+import { UncertainOperationError, errorMessage, type ApprovalAction, type Attachment, type IncomingMessage, type PendingRequest, type ReplyTarget } from '../domain.js';
 import { FeishuApiError, GroupCreationRejected, TaskGroupUnavailable, type FeishuPort, type FeishuProgressPort, type FeishuReconnectEvent, type ProgressWriteGuard } from '../ports.js';
 import { FeishuDocumentAdapter, type FeishuDocumentApi } from './feishu-document.js';
 
@@ -39,14 +39,17 @@ const progressMessagesSchema = z.array(z.union([
 ])).max(50);
 const progressLookupRequestLimit = 12;
 const timestamp = z.string().regex(/^\d+$/).transform(Number).pipe(z.number().safe().nonnegative());
+const optionalMessageId = z.preprocess(value => value === null || value === '' ? undefined : value, id.optional());
 const eventSchema = z.object({
   sender: z.object({ sender_type: z.string(), sender_id: z.object({ open_id: id.optional() }).optional() }),
-  message: z.object({ message_id: id, chat_id: id, chat_type: z.enum(['p2p', 'group']).default('group'), create_time: timestamp, message_type: id, content: z.string() }),
+  message: z.object({ message_id: id, chat_id: id, chat_type: z.enum(['p2p', 'group']).default('group'), create_time: timestamp, message_type: id, content: z.string(),
+    parent_id: optionalMessageId, root_id: optionalMessageId, thread_id: optionalMessageId }),
 });
 const historySchema = z.object({
   message_id: id, chat_id: id, create_time: timestamp, msg_type: id, deleted: z.boolean().optional(),
   sender: z.object({ sender_type: z.string(), id_type: z.string(), id: id }),
-  body: z.object({ content: z.string() }),
+  body: z.object({ content: z.string() }), parent_id: optionalMessageId, root_id: optionalMessageId,
+  thread_id: optionalMessageId, upper_message_id: optionalMessageId,
 });
 const postNode = z.discriminatedUnion('tag', [
   z.object({ tag: z.literal('text'), text: z.string() }),
@@ -60,6 +63,10 @@ const postNode = z.discriminatedUnion('tag', [
   z.object({ tag: z.literal('md'), text: z.string() }),
 ]);
 const postSchema = z.object({ title: z.string().optional(), content: z.array(z.array(postNode)) });
+function replyTarget(parentId: string | undefined, rootId: string | undefined): ReplyTarget | undefined {
+  if (!parentId && !rootId) return undefined;
+  return { parentId: parentId ?? null, rootId: rootId ?? null };
+}
 function content(messageType: string, raw: string): Pick<IncomingMessage, 'text' | 'attachments'> {
   const value: unknown = JSON.parse(raw);
   switch (messageType) {
@@ -95,8 +102,10 @@ function content(messageType: string, raw: string): Pick<IncomingMessage, 'text'
 export function parseFeishuEvent(raw: unknown, userOpenId: string): IncomingMessage | null {
   const event = eventSchema.parse(raw);
   if (event.sender.sender_type !== 'user' || event.sender.sender_id?.open_id !== userOpenId) return null;
+  const replyTo = replyTarget(event.message.parent_id, event.message.root_id);
   return { id: event.message.message_id, chatId: event.message.chat_id, senderId: userOpenId,
-    createdAt: event.message.create_time, chatType: event.message.chat_type, ...content(event.message.message_type, event.message.content) };
+    createdAt: event.message.create_time, chatType: event.message.chat_type, ...content(event.message.message_type, event.message.content),
+    ...(replyTo ? { replyTo } : {}) };
 }
 export function parseFeishuHistory(raw: unknown, userOpenId: string): IncomingMessage | null {
   const envelope = z.object({ deleted: z.boolean().optional(), sender: z.object({
@@ -104,8 +113,10 @@ export function parseFeishuHistory(raw: unknown, userOpenId: string): IncomingMe
   }).optional() }).parse(raw);
   if (envelope.deleted || envelope.sender?.sender_type !== 'user' || envelope.sender.id_type !== 'open_id' || envelope.sender.id !== userOpenId) return null;
   const message = historySchema.parse(raw);
+  const replyTo = replyTarget(message.parent_id, message.root_id);
   return { id: message.message_id, chatId: message.chat_id, senderId: userOpenId,
-    createdAt: message.create_time, chatType: 'group', ...content(message.msg_type, message.body.content) };
+    createdAt: message.create_time, chatType: 'group', ...content(message.msg_type, message.body.content),
+    ...(replyTo ? { replyTo } : {}) };
 }
 const approvalSchema = z.object({
   id, taskId: id, threadId: id, turnId: id, requestId: id,

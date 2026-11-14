@@ -126,6 +126,7 @@ export class Store {
   }
   receive(taskId: string, message: IncomingMessage, origin: Inbox['origin'] = 'user', provenance?: InputProvenance): boolean {
     const task = this.task(taskId);
+    if (origin === 'user' && provenance === undefined && task.chatId !== null && message.chatId !== task.chatId) return false;
     const facts = provenance ?? (origin === 'user' ? { kind: 'user', message } : origin === 'source'
       ? { kind: 'github_issue', sourceId: task.sourceId, revision: message.id, url: task.source.kind === 'github' ? task.source.issue.url : '' }
       : origin === 'initial' ? { kind: 'initial', sourceId: task.sourceId } : { kind: 'recovery', previousTurnId: task.turnId ?? 'legacy' });

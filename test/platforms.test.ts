@@ -427,6 +427,28 @@ test('Feishu accepts only the configured user open_id and rejects malformed or u
   assert.throws(() => parseFeishuEvent({ ...event, message: { ...event.message, content: '{' } }, owner));
   assert.throws(() => parseFeishuEvent({ ...event, message: { ...event.message, message_type: 'interactive' } }, owner), /Unsupported/);
 });
+test('Feishu preserves reply parent and root IDs for every supported message type', () => {
+  const cases = [
+    ['text', { text: 'hello' }],
+    ['post', { content: [[{ tag: 'text', text: 'hello' }]] }],
+    ['image', { image_key: 'img_1' }],
+    ['file', { file_key: 'file_1', file_name: 'evidence.log' }],
+  ] as const;
+  for (const [messageType, value] of cases) {
+    const parsed = parseFeishuEvent({ ...event, message: { ...event.message, message_type: messageType,
+      parent_id: 'om_parent', root_id: 'om_root', thread_id: 'omt_1', content: JSON.stringify(value) } }, owner);
+    assert.deepEqual(parsed?.replyTo, { parentId: 'om_parent', rootId: 'om_root' });
+  }
+  const history = parseFeishuHistory({ ...historyItem, parent_id: 'om_parent', root_id: 'om_root', thread_id: 'omt_1', upper_message_id: 'om_upper' }, owner);
+  assert.deepEqual(history?.replyTo, { parentId: 'om_parent', rootId: 'om_root' });
+  assert.equal(parseFeishuEvent(event, owner)?.replyTo, undefined, 'legacy events remain without reply metadata');
+  assert.equal(parseFeishuHistory(historyItem, owner)?.replyTo, undefined, 'legacy history remains without reply metadata');
+});
+test('Feishu keeps a root-only target when parent_id is omitted', () => {
+  const parsed = parseFeishuEvent({ ...event, message: { ...event.message, root_id: 'om_root' } }, owner);
+  assert.deepEqual(parsed?.replyTo, { parentId: null, rootId: 'om_root' });
+  assert.equal(parseFeishuEvent({ ...event, message: { ...event.message, parent_id: '' } }, owner)?.replyTo, undefined);
+});
 test('Feishu rich posts preserve text and every original image/file resource', () => {
   const message = parseFeishuEvent({ ...event, message: { ...event.message, message_type: 'post', content: JSON.stringify({ zh_cn: {
     title: 'Evidence', content: [[{ tag: 'text', text: 'two captures' }, { tag: 'img', image_key: 'img_1' }, { tag: 'img', image_key: 'img_2' }],
@@ -515,6 +537,14 @@ test('Feishu write response loss is uncertain and never retried by the adapter',
   api.chat.create = async () => ({ code: 0 });
   await assert.rejects(adapter.ensureGroup({ taskId: 'task', title: 'task', sourceUrl: 'source' }), UncertainOperationError);
 });
+test('Feishu history backfill retains reply metadata from the message list', async () => {
+  const api = fakeApi();
+  api.message.list = async () => ({ code: 0, data: { items: [{ ...historyItem, parent_id: 'om_parent', root_id: 'om_root', thread_id: 'omt_1', upper_message_id: 'om_upper' }], has_more: false } });
+  const adapter = new FeishuAdapter(options, { api });
+  const messages = await adapter.history({ chatId: 'oc_1', since: 1770000000000 });
+  assert.deepEqual(messages[0]?.replyTo, { parentId: 'om_parent', rootId: 'om_root' });
+});
+
 test('Feishu history reads all pages, rejects mixed chats, and deduplicates overlap', async () => {
   const api = fakeApi();
   api.message.list = async payload => payload?.params.page_token
