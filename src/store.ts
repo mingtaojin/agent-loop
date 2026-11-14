@@ -231,7 +231,7 @@ export class Store {
       return;
     }
     this.db.prepare('INSERT INTO execution_events(seq,task_id,created_at,payload) VALUES(?,?,?,?)').run(sequence, taskId, event.createdAt, JSON.stringify(compact));
-    if (sequence % 128 === 0) this.pruneExecutionEvents(taskId);
+    this.pruneExecutionEvents(taskId);
   }
   private nextExecutionSequence(): number {
     if (!this.logicalSequenceLoaded) {
@@ -249,9 +249,24 @@ export class Store {
     return [...durable, ...transient].sort((a, b) => a.seq - b.seq).slice(0, limit);
   }
   private pruneExecutionEvents(taskId: string): void {
-    this.db.prepare(`DELETE FROM execution_events
-      WHERE task_id=? AND seq NOT IN (SELECT seq FROM execution_events WHERE task_id=? ORDER BY seq DESC LIMIT ?)`)
-      .run(taskId, taskId, executionEventRetentionLimit);
+    const count = z.object({ count: z.number() }).parse(this.db.prepare('SELECT COUNT(*) AS count FROM execution_events WHERE task_id=?').get(taskId)).count;
+    const overflow = count - executionEventRetentionLimit;
+    if (overflow <= 0) return;
+    // Keep final answers and lifecycle facts longest. Drop sampled/tool metadata first,
+    // then the oldest status rows if the durable budget still overflows.
+    this.db.prepare(`DELETE FROM execution_events WHERE seq IN (
+      SELECT seq FROM execution_events WHERE task_id=?
+      ORDER BY CASE json_extract(payload,'$.kind')
+        WHEN 'agent_delta' THEN 0
+        WHEN 'tool_start' THEN 0
+        WHEN 'tool_end' THEN 0
+        WHEN 'turn_status' THEN 1
+        WHEN 'error' THEN 2
+        WHEN 'turn_start' THEN 2
+        WHEN 'turn_end' THEN 2
+        WHEN 'agent_message' THEN 3
+        ELSE 1 END, seq LIMIT ?)`)
+      .run(taskId, overflow);
   }
   executionEvents(taskId: string, after = 0, limit = 500): StoredExecutionEvent[] {
     if (!this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='execution_events'").get()) return [];

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { DatabaseSync } from 'node:sqlite';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -59,4 +60,20 @@ test('durable execution history compacts per task without exceeding its event bu
   const readOnly = new Store(root, { readOnly: true });
   assert.ok(readOnly.executionEvents(saved.id).length <= executionEventRetentionLimit);
   readOnly.close();
+});
+
+test('retention trims the 2002-row final-plus-sampled-delta case to the exact durable budget', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-dashboard-retention-bound-'));
+  const store = new Store(root); const saved = task(root); store.saveTask(saved);
+  t.after(async () => { store.close(); await rm(root, { recursive: true, force: true }); });
+  store.recordExecutionEvent(saved.id, event('agent_delta', 'sampled delta', 10));
+  store.recordExecutionEvent(saved.id, event('agent_message', 'final answer', 11));
+  for (let index = 0; index < executionEventRetentionLimit; index++) store.recordExecutionEvent(saved.id, event('turn_status', 'running', index + 12));
+  const db = new DatabaseSync(join(root, 'tasks.sqlite'));
+  try {
+    const count = (db.prepare('SELECT COUNT(*) AS count FROM execution_events WHERE task_id=?').get(saved.id) as { count: number }).count;
+    assert.equal(count, executionEventRetentionLimit);
+    const final = db.prepare("SELECT payload FROM execution_events WHERE task_id=? AND json_extract(payload,'$.kind')='agent_message'").get(saved.id) as { payload: string } | undefined;
+    assert.equal(JSON.parse(final!.payload).text, 'final answer');
+  } finally { db.close(); }
 });
