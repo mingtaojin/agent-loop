@@ -7,16 +7,50 @@ import { startDashboard } from '../src/dashboard.js';
 import { ProjectDashboardReader } from '../src/dashboard-reader.js';
 import { Store } from '../src/store.js';
 import { ProjectLedger } from '../src/project.js';
-import { taskSchema } from '../src/domain.js';
+import { repositorySchema, taskSchema, type Task } from '../src/domain.js';
 
-function task(id: string, title: string, purpose: 'execution' | 'intake' = 'execution') {
+function task(id: string, title: string, purpose: 'execution' | 'intake' = 'execution', resources: Task['resources'] = []) {
   const now = Date.now();
   return taskSchema.parse({ id, sourceId: id + ':source', source: { kind: 'manual', message: {
     id: id + ':message', chatId: 'chat:' + id, senderId: 'owner', text: title, attachments: [], createdAt: now, chatType: 'group',
-  } }, purpose, contextDirectory: '/tmp/' + id, resources: [], status: 'running', reason: null,
+  } }, purpose, contextDirectory: '/tmp/' + id, resources, status: 'running', reason: null,
   prompt: title, promptHash: id, skillPath: null, chatId: 'chat:' + id, threadId: 'thread:' + id, turnId: 'turn:' + id,
   executionStatus: 'running', lastHandledTurnId: null, requests: [], recovery: { attempts: 0, nextAttemptAt: null, lastError: null, interruptedTurnId: null, lastUserInputSeq: null }, createdAt: now, updatedAt: now });
 }
+
+test('dashboard resource DTO keeps project card repositories usable by the client', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-dashboard-resource-dto-'));
+  const store = new Store(root);
+  const worker = task('worker', 'Implement dashboard', 'execution', [{
+    id: 'worker-repository', kind: 'git-worktree',
+    repository: repositorySchema.parse({ name: 'example/project', path: '/tmp/source', baseBranch: 'main' }),
+    branch: 'agent-loop/worker', workspace: '/tmp/worker-workspace',
+  }]);
+  const coordinator = task('coordinator', 'Coordinate release');
+  store.transaction(() => {
+    store.saveTask(coordinator); store.saveTask(worker);
+    const ledger = new ProjectLedger(store);
+    ledger.create({ id: 'project-a', name: 'Project A', directory: root, repositories: [], instructions: '' }, coordinator.id);
+    ledger.addMember('project-a', worker.id, 'worker');
+  });
+  const dashboard = await startDashboard({ dataDir: root, port: 0 });
+  t.after(async () => { await dashboard.close(); store.close(); await rm(root, { recursive: true, force: true }); });
+
+  const projects = await (await fetch(dashboard.url + '/api/projects')).json();
+  const projectTask = projects[0].tasks.find((item: { id: string }) => item.id === worker.id);
+  assert.ok(projectTask);
+  assert.deepEqual(projectTask.resources, [{ repository: 'example/project', workspace: '/tmp/worker-workspace' }]);
+  assert.equal(typeof projectTask.resources[0].repository, 'string');
+  assert.doesNotThrow(() => projectTask.resources[0].repository.toLowerCase());
+
+  const snapshot = await (await fetch(dashboard.url + '/api/snapshot')).json();
+  const projectSnapshotTask = snapshot.projects[0].tasks.find((item: { id: string }) => item.id === worker.id);
+  assert.ok(projectSnapshotTask);
+  assert.deepEqual(projectSnapshotTask.resources, [{ repository: 'example/project', workspace: '/tmp/worker-workspace' }]);
+  const snapshotTask = snapshot.tasks.find((item: { id: string }) => item.id === worker.id);
+  assert.ok(snapshotTask);
+  assert.deepEqual(snapshotTask.resources, [{ repository: 'example/project', workspace: '/tmp/worker-workspace' }]);
+});
 
 test('project dashboard uses ledger membership, reports, and redacted task events', async t => {
   const root = await mkdtemp(join(tmpdir(), 'agent-dashboard-coordinator-'));
