@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { errorMessage, presentTaskSource } from './domain.js';
+import { errorMessage, presentTaskSource, type Task } from './domain.js';
 import { GroupCreationRejected, TaskGroupBindingChanged, TaskGroupUnavailable, type FeishuPort } from './ports.js';
 import type { Store } from './store.js';
 import { ProjectLedger } from './project.js';
@@ -34,7 +34,8 @@ export function retireTaskGroup(store: Store, taskId: string, chatId: string): b
 
 export class TaskGroups {
   private readonly lanes = new Map<string, Promise<string>>();
-  constructor(private readonly store: Store, private readonly transport: FeishuPort) {}
+  constructor(private readonly store: Store, private readonly transport: FeishuPort,
+    private readonly titleForTask?: (task: Task) => Promise<string>) {}
   async open(taskId: string): Promise<string> {
     const running = this.lanes.get(taskId);
     if (running) return running;
@@ -69,7 +70,9 @@ export class TaskGroups {
     const { title: sourceTitle, url } = presentTaskSource(task.source, 100);
     const ledger = new ProjectLedger(this.store), member = ledger.membership(taskId);
     const name = member ? ledger.project(member.projectId)?.name ?? member.projectId : sourceTitle;
-    const title = member?.role === 'coordinator' ? (/协调者$/.test(name) ? name : `${name} 项目协调者`) : sourceTitle;
+    const title = member?.role === 'coordinator'
+      ? (/协调者$/.test(name) ? name : `${name} 项目协调者`)
+      : this.titleForTask ? await this.titleForTask(task) : sourceTitle;
     let chatId: string;
     try {
       chatId = previous?.status === 'confirmed' && previous.result !== null ? previous.result

@@ -75,6 +75,8 @@ export interface FeishuProgressPort {
   setProgressStreaming(input: { cardId: string; enabled: boolean; sequence: number; uuid: string }, guard?: ProgressWriteGuard): Promise<void>;
 }
 export interface CodexPort {
+  // Returns raw model output. Callers normalize it and fall back when it is unusable.
+  summarizeTitle?(input: { taskId: string; cwd: string; text: string; signal?: AbortSignal }): Promise<string>;
   setEventHandler?(handler: (event: ExecutionEvent) => void): void;
   createThread(input: { cwd: string; instructions: string; model?: string; reasoningEffort?: ReasoningEffort }): Promise<string>;
   inspect(threadId: string, instructions?: string, model?: string, reasoningEffort?: ReasoningEffort): Promise<ExecutionSnapshot>;

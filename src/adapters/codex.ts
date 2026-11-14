@@ -7,6 +7,7 @@ import { executionEvent, type ExecutionEvent } from '../execution-events.js';
 import { projectActionSchema } from '../project.js';
 import type { ReasoningEffort } from '../execution.js';
 import { normalizeDaemonSettings, sharedDaemonConnector, type CodexConnection, type CodexConnector, type DaemonSettings } from './codex-daemon.js';
+import { taskTitleInput, taskTitleInstructions, taskTitleOutputSchema } from '../task-title.js';
 
 export interface CodexOptions {
   command?: string[];
@@ -31,6 +32,10 @@ const turnSchema = z.object({
   error: z.object({ message: z.string() }).nullish(),
   items: z.array(itemSchema), itemsView: z.enum(['full', 'summary', 'notLoaded']).default('full'),
 });
+const completedTurnSchema = z.object({
+  id: z.string(), status: z.enum(['inProgress', 'completed', 'interrupted', 'failed']).optional(),
+  error: z.object({ message: z.string() }).nullish(),
+}).passthrough();
 const turnPageSchema = z.object({ data: z.array(turnSchema), nextCursor: z.string().nullish() });
 const userMessageSchema = z.object({ clientId: z.string().nullish(), content: z.array(z.object({ type: z.string(), text: z.string().optional() })) });
 const agentMessageSchema = z.object({ id: z.string(), text: z.string(), phase: z.enum(['commentary', 'partial_answer', 'final_answer']).nullish() });
@@ -111,6 +116,7 @@ class RpcTimeoutError extends UncertainOperationError {}
 type NativeResponse = { kind: 'result'; value: unknown } | { kind: 'error'; value: { code: number; message: string } };
 type CompletedHistory = { turnId: string; status: 'completed'; error: string | null; seenInputIds: string[]; digest: string };
 type HistoryObservation = { completed?: CompletedHistory };
+type EphemeralRun = { turnId: string; resolve: (turn: z.infer<typeof completedTurnSchema>) => void; reject: (error: Error) => void };
 class TurnHistoryPendingError extends UncertainOperationError {}
 class RpcError extends Error {
   constructor(readonly code: number, message: string) { super(message); }
@@ -159,6 +165,7 @@ export class CodexAppServer implements CodexPort {
   private readonly needsCleanup = new Set<string>();
   private readonly awaitingHistory = new Map<string, string>();
   private readonly historyObservations = new Map<string, HistoryObservation>();
+  private readonly ephemeralRuns = new Map<string, EphemeralRun>();
   private summaryUnsupported = false;
   private connection: CodexConnection | undefined;
   private readonly settings: DaemonSettings;
@@ -166,6 +173,7 @@ export class CodexAppServer implements CodexPort {
   private initialized: Promise<void> | undefined;
   private failure: Error | undefined;
   private recovery: Promise<void> | undefined;
+  private connectionClosed: Promise<void> | undefined;
   private closed = false;
   private workspaceHandler: Parameters<CodexPort['setWorkspaceHandler']>[0] | undefined;
   private projectHandler: Parameters<NonNullable<CodexPort['setProjectHandler']>>[0] | undefined;
@@ -228,13 +236,15 @@ export class CodexAppServer implements CodexPort {
     for (const call of this.calls.values()) if (call.kind === 'pending') { clearTimeout(call.timer); call.reject(this.failure); }
     for (const entry of this.threads.values()) entry.load = { kind: 'unloaded' };
     this.calls.clear();
+    for (const run of this.ephemeralRuns.values()) run.reject(error);
+    this.ephemeralRuns.clear();
     for (const live of this.requests.values()) for (const settle of live.waiters) settle(false);
     this.requests.clear();
     this.seenRequestIds.clear();
     this.epoch = randomUUID();
     const connection = this.connection;
     this.connection = undefined;
-    void connection?.close().catch(() => undefined);
+    this.connectionClosed = connection?.close().then(() => undefined, () => undefined) ?? Promise.resolve();
   }
 
   private async write(message: unknown, failurePolicy: 'fail-connection' | 'retain-request' = 'fail-connection'): Promise<void> {
@@ -294,10 +304,15 @@ export class CodexAppServer implements CodexPort {
         const completed = z.object({ threadId: z.string(), turnId: z.string(), item: itemSchema }).parse(message.params);
         this.captureOutput(completed.threadId, completed.turnId, completed.item, false);
       } else if (message.method === 'turn/completed') {
-        const completed = z.object({ threadId: z.string(), turn: z.object({ id: z.string() }) }).parse(message.params);
+        const completed = z.object({ threadId: z.string(), turn: completedTurnSchema }).parse(message.params);
         this.endedTurns.set(completed.threadId, completed.turn.id);
         this.needsCleanup.delete(completed.threadId);
         if (this.activeTurns.get(completed.threadId) === completed.turn.id) this.activeTurns.delete(completed.threadId);
+        const run = this.ephemeralRuns.get(completed.threadId);
+        if (run && (run.turnId === '' || run.turnId === completed.turn.id)) {
+          this.ephemeralRuns.delete(completed.threadId);
+          run.resolve(completed.turn);
+        }
         for (const [key, live] of this.requests) {
           if (live.request.threadId === completed.threadId && live.request.turnId === completed.turn.id) this.resolveRequest(key, false);
         }
@@ -730,6 +745,53 @@ export class CodexAppServer implements CodexPort {
     const phase = message.phase === 'final_answer' || !message.phase ? 'final' : 'progress';
     const id = `${threadId}:${turnId}:${message.id}`;
     this.outputs.set(id, { id, threadId, turnId, phase, text: message.text });
+  }
+
+  async summarizeTitle(input: { taskId: string; cwd: string; text: string; signal?: AbortSignal }): Promise<string> {
+    if (this.closed) throw new Error('Codex owner is closed for title summary');
+    input.signal?.throwIfAborted();
+    const summarizer = new CodexAppServer({ ...this.options, approvalPolicy: 'never', sandbox: 'read-only', reasoningEffort: 'low' }, this.connector);
+    const abort = () => summarizer.abandonEphemeral(new Error('Temporary title summary aborted'));
+    input.signal?.addEventListener('abort', abort, { once: true });
+    try {
+      return await summarizer.runEphemeralTitle(input);
+    } finally {
+      input.signal?.removeEventListener('abort', abort);
+      if (!summarizer.closed) await summarizer.close();
+      else await summarizer.connectionClosed;
+    }
+  }
+
+  private abandonEphemeral(error: Error): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.fail(error);
+  }
+
+  private async runEphemeralTitle(input: { taskId: string; cwd: string; text: string; signal?: AbortSignal }): Promise<string> {
+    await this.ready();
+    input.signal?.throwIfAborted();
+    const { thread } = threadResponseSchema.parse(await this.rpc('thread/start', {
+      ...this.config(), approvalPolicy: 'never', sandbox: 'read-only', cwd: input.cwd,
+      developerInstructions: taskTitleInstructions, dynamicTools: [], ephemeral: true,
+    }));
+    if (thread.status.type !== 'idle' || thread.turns.length) throw new Error('Title summary did not start in an empty idle thread');
+    this.threads.set(thread.id, { load: { kind: 'ready' }, untouched: true, instructions: taskTitleInstructions, model: this.options.model, reasoningEffort: 'low' });
+    const completed = new Promise<z.infer<typeof completedTurnSchema>>((resolve, reject) => {
+      this.ephemeralRuns.set(thread.id, { turnId: '', resolve, reject });
+    });
+    const started = z.object({ turn: turnSchema }).parse(await this.rpc('turn/start', {
+      threadId: thread.id, cwd: input.cwd, approvalPolicy: 'never', sandboxPolicy: { type: 'readOnly', networkAccess: false },
+      input: wireInput(taskTitleInput(input.text), `task-title:${input.taskId}`), outputSchema: z.toJSONSchema(taskTitleOutputSchema),
+    })).turn;
+    const run = this.ephemeralRuns.get(thread.id);
+    if (run) run.turnId = started.id;
+    const completedTurn = await completed;
+    if (completedTurn.status !== 'completed') throw new Error(completedTurn.error?.message ?? `Title summary ${completedTurn.status}`);
+    const answers = [...this.outputs.values()].filter(output => output.threadId === thread.id && output.turnId === completedTurn.id && output.phase === 'final');
+    const answer = answers[0];
+    if (!answer || answers.length !== 1) throw new Error('Title summary must return one complete answer');
+    return taskTitleOutputSchema.parse(JSON.parse(answer.text)).title;
   }
 
   setWorkspaceHandler(handler: Parameters<CodexPort['setWorkspaceHandler']>[0]): void { this.workspaceHandler = handler; }

@@ -63,6 +63,7 @@ export const configSchema = z.strictObject({
         approvalPolicy: z.enum(['untrusted', 'on-request', 'never']).default('on-request'),
         sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).default('workspace-write'),
         requestTimeoutMs: positiveMilliseconds.default(120_000),
+        titleTimeoutMs: positiveMilliseconds.default(60_000),
       }).transform((value, context) => {
         try { return { ...value, ...normalizeDaemonSettings(value), command: undefined }; }
         catch (error) { context.addIssue({ code: 'custom', message: error instanceof Error ? error.message : String(error) }); return z.NEVER; }
