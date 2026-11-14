@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { hostname, networkInterfaces } from 'node:os';
 import { z } from 'zod';
 import { Store } from './store.js';
-import { ProjectDashboardReader } from './dashboard-reader.js';
+import { boundedDashboardText, ProjectDashboardReader } from './dashboard-reader.js';
 import { errorMessage, presentTaskSource } from './domain.js';
 import { dashboardHtml, dashboardCss, dashboardScript } from './dashboard-page.js';
 
@@ -39,7 +39,7 @@ export async function startDashboard(options: { dataDir: string; port: number; h
         workspaceSelection: task.workspaceSelection,
         threadId: task.threadId, turnId: task.turnId, chatId: task.chatId,
         createdAt: task.createdAt, updatedAt: task.updatedAt, recovery: task.recovery,
-        requests: task.requests.map(request => ({ kind: request.kind, prompt: request.prompt })),
+        requests: task.requests.map(request => ({ kind: request.kind, prompt: boundedDashboardText(request.prompt) })),
         resources: task.resources.map(resource => resource.kind === 'project'
           ? { kind: resource.kind, project: resource.project, workspace: resource.workspace }
           : { repository: resource.repository.name, workspace: resource.workspace }),
@@ -85,8 +85,8 @@ export async function startDashboard(options: { dataDir: string; port: number; h
         if (!db?.tasks().some(task => task.id === taskId)) { json(response, 404, { error: '任务不存在' }); return; }
         const detail = new ProjectDashboardReader(db).taskDetail(taskId);
         json(response, 200, {
-          inputs: db.inputs(taskId).map(input => ({ id: input.id, text: input.message.text, createdAt: input.message.createdAt, origin: input.origin, route: input.route, selectionHandled: input.selectionHandled, status: input.status, error: input.error, attachments: input.message.attachments.map(attachment => ({ name: attachment.name, kind: attachment.kind })) })),
-          outputs: db.outputs(taskId), projectId: detail?.projectId ?? null, task: detail?.task ?? null,
+          inputs: db.inputs(taskId).map(input => ({ id: input.id, text: boundedDashboardText(input.message.text), createdAt: input.message.createdAt, origin: input.origin, route: input.route, selectionHandled: input.selectionHandled, status: input.status, error: input.error ? boundedDashboardText(input.error) : null, attachments: input.message.attachments.map(attachment => ({ name: attachment.name, kind: attachment.kind })) })),
+          outputs: db.outputs(taskId).map(output => ({ ...output, text: boundedDashboardText(output.text), error: output.error ? boundedDashboardText(output.error) : null })), projectId: detail?.projectId ?? null, task: detail?.task ?? null,
           events: detail?.events ?? [], executionEvents: detail?.events ?? [], reports: detail?.reports ?? [], diagnostics: detail?.diagnostics ?? [],
         }); return;
       }
@@ -106,10 +106,12 @@ export async function startDashboard(options: { dataDir: string; port: number; h
       const send = () => {
         if (blocked || response.destroyed) return;
         try {
-          for (const event of new ProjectDashboardReader(db).events(taskId, cursor)) {
+          const page = new ProjectDashboardReader(db).events(taskId, cursor);
+          for (const event of page.events) {
             cursor = event.seq;
             if (!response.write('id: ' + event.seq + '\nevent: execution\ndata: ' + JSON.stringify(event) + '\n\n')) { blocked = true; break; }
           }
+          if (!blocked) cursor = page.cursor;
           if (Date.now() - lastKeepAlive > 10_000 && !blocked) {
             lastKeepAlive = Date.now();
             blocked = !response.write(': heartbeat\n\n');

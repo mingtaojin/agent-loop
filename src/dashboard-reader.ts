@@ -3,9 +3,9 @@ import { ProjectLedger, type ProjectState } from './project.js';
 import { Store, type Inbox } from './store.js';
 import type { StoredExecutionEvent } from './execution-events.js';
 
-const visibleTextLimit = 32_768;
+export const visibleTextLimit = 32_768;
 
-function boundedText(value: string): string {
+export function boundedDashboardText(value: string): string {
   return value.length <= visibleTextLimit ? value : value.slice(0, visibleTextLimit) + '\n…';
 }
 
@@ -82,12 +82,12 @@ function reportFromInput(input: Inbox): DashboardReport | null {
   if (provenance.kind !== 'agent' || !provenance.eventId.startsWith('report:') || !['result', 'question', 'update'].includes(provenance.category)) return null;
   const report = {
     kind: provenance.category as DashboardReport['kind'],
-    text: boundedText(input.message.text),
+    text: boundedDashboardText(input.message.text),
     createdAt: input.message.createdAt,
-    ...(provenance.currentStep === undefined ? {} : { currentStep: boundedText(provenance.currentStep) }),
-    ...(provenance.nextStep === undefined ? {} : { nextStep: boundedText(provenance.nextStep) }),
-    ...(provenance.blockers === undefined ? {} : { blockers: typeof provenance.blockers === 'string' ? boundedText(provenance.blockers) : provenance.blockers.map(boundedText) }),
-    ...(provenance.evidence === undefined ? {} : { evidence: typeof provenance.evidence === 'string' ? boundedText(provenance.evidence) : provenance.evidence.map(boundedText) }),
+    ...(provenance.currentStep === undefined ? {} : { currentStep: boundedDashboardText(provenance.currentStep) }),
+    ...(provenance.nextStep === undefined ? {} : { nextStep: boundedDashboardText(provenance.nextStep) }),
+    ...(provenance.blockers === undefined ? {} : { blockers: typeof provenance.blockers === 'string' ? boundedDashboardText(provenance.blockers) : provenance.blockers.map(boundedDashboardText) }),
+    ...(provenance.evidence === undefined ? {} : { evidence: typeof provenance.evidence === 'string' ? boundedDashboardText(provenance.evidence) : provenance.evidence.map(boundedDashboardText) }),
   } satisfies DashboardReport;
   return report;
 }
@@ -100,7 +100,7 @@ function dashboardEvent(event: StoredExecutionEvent): DashboardExecutionEvent | 
     else if (event.label.startsWith('文件变更 · ')) text = text.split('\n', 1)[0] ?? '';
     else text = '';
   }
-  return { ...event, text: boundedText(text) } as DashboardExecutionEvent;
+  return { ...event, text: boundedDashboardText(text) } as DashboardExecutionEvent;
 }
 
 function coalesce(events: StoredExecutionEvent[]): DashboardExecutionEvent[] {
@@ -111,7 +111,7 @@ function coalesce(events: StoredExecutionEvent[]): DashboardExecutionEvent[] {
     const previous = result.at(-1);
     if (previous && previous.kind === 'agent_delta' && event.kind === 'agent_delta'
       && previous.threadId === event.threadId && previous.turnId === event.turnId && previous.itemId === event.itemId) {
-      previous.text = boundedText(previous.text.replace(/\n…$/, '') + event.text);
+      previous.text = boundedDashboardText(previous.text.replace(/\n…$/, '') + event.text);
       previous.seq = event.seq;
       previous.createdAt = event.createdAt;
       continue;
@@ -146,11 +146,11 @@ export class ProjectDashboardReader {
   }
 
   private card(task: Task, projectId: string, role: ProjectTaskCard['role'], issueId: string | null = null): ProjectTaskCard {
-    const events = coalesce(this.store.executionEvents(task.id));
+    const events = coalesce(this.allEvents(task.id));
     const latestActivity = events.at(-1) ?? null;
     const reports = this.reportsForTask(task.id);
-    const waiting = task.requests.map(request => `${request.kind}: ${request.prompt}`).concat(
-      task.workspaceSelection.kind === 'waiting' ? ['workspace-selection: ' + task.workspaceSelection.question] : [],
+    const waiting = task.requests.map(request => `${request.kind}: ${boundedDashboardText(request.prompt)}`).concat(
+      task.workspaceSelection.kind === 'waiting' ? ['workspace-selection: ' + boundedDashboardText(task.workspaceSelection.question)] : [],
     );
     const source = presentTaskSource(task.source, 200);
     const repository = task.source.kind === 'github' ? task.source.issue.repository : task.resources.find(resource => resource.kind !== 'project')?.repository.name ?? null;
@@ -159,7 +159,7 @@ export class ProjectDashboardReader {
       issueId: issueId ?? (task.source.kind === 'github' ? task.source.issue.id : null),
       status: task.status, executionStatus: task.executionStatus, currentTurn: task.turnId ?? latestActivity?.turnId ?? null,
       threadId: task.threadId, turnId: task.turnId, chatId: task.chatId, workspaceSelection: task.workspaceSelection, resources: task.resources,
-      latestActivity, waitingReason: waiting[0] ?? task.reason ?? (task.recovery.lastError ?? null), requests: task.requests.map(request => ({ kind: request.kind, prompt: request.prompt })),
+      latestActivity, waitingReason: waiting[0] ?? (task.reason ? boundedDashboardText(task.reason) : null) ?? (task.recovery.lastError ? boundedDashboardText(task.recovery.lastError) : null), requests: task.requests.map(request => ({ kind: request.kind, prompt: boundedDashboardText(request.prompt) })),
       recovery: task.recovery, createdAt: task.createdAt, updatedAt: task.updatedAt, latestReport: reports.at(-1) ?? null,
     };
   }
@@ -186,11 +186,26 @@ export class ProjectDashboardReader {
 
   project(projectId: string): ProjectDashboard | null { return this.projects().find(project => project.id === projectId) ?? null; }
 
-  events(taskId: string, after = 0, limit = 500): DashboardExecutionEvent[] {
-    return this.store.executionEvents(taskId, after, limit).flatMap(event => {
+  private allEvents(taskId: string): StoredExecutionEvent[] {
+    const events: StoredExecutionEvent[] = [];
+    let after = 0;
+    while (true) {
+      const batch = this.store.visibleExecutionEvents(taskId, after);
+      if (!batch.length) return events;
+      events.push(...batch);
+      after = batch.at(-1)!.seq;
+      if (batch.length < 500) return events;
+    }
+  }
+
+  events(taskId: string, after = 0, limit = 500): { cursor: number; events: DashboardExecutionEvent[] } {
+    const raw = this.store.visibleExecutionEvents(taskId, after, limit);
+    const cursor = raw.at(-1)?.seq ?? after;
+    const events = raw.flatMap(event => {
       const visible = dashboardEvent(event);
       return visible ? [visible] : [];
     });
+    return { cursor, events };
   }
 
   taskDetail(taskId: string): DashboardTaskDetail | null {
@@ -202,7 +217,7 @@ export class ProjectDashboardReader {
     return {
       task: ownership && project ? this.card(task, project.id, ownership.role, project.members.find(member => member.taskId === taskId)?.issueId ?? null) : null,
       projectId: ownership?.projectId ?? null,
-      inputs: this.store.inputs(taskId), outputs: this.store.outputs(taskId), events: coalesce(this.store.executionEvents(taskId)), reports,
+      inputs: this.store.inputs(taskId), outputs: this.store.outputs(taskId), events: coalesce(this.allEvents(taskId)), reports,
       diagnostics: this.store.diagnostics().filter(row => row.scope === taskId || row.scope.endsWith(':' + taskId)),
     };
   }

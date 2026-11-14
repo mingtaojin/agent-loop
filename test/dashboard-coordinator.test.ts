@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { startDashboard } from '../src/dashboard.js';
+import { ProjectDashboardReader } from '../src/dashboard-reader.js';
 import { Store } from '../src/store.js';
 import { ProjectLedger } from '../src/project.js';
 import { taskSchema } from '../src/domain.js';
@@ -38,6 +39,9 @@ test('project dashboard uses ledger membership, reports, and redacted task event
     store.recordExecutionEvent(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'tool', kind: 'tool_end', label: '命令 · completed · exit 0', text: '$ npm test', createdAt: Date.now() });
     store.recordExecutionEvent(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'legacy-tool', kind: 'tool_end', label: '命令 · completed · exit 0', text: '$ npm test\nSECRET_OUTPUT', createdAt: Date.now() });
     store.recordExecutionEvent(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'tool', kind: 'tool_output', label: '工具输出', text: 'SECRET_OUTPUT', createdAt: Date.now() });
+    for (let index = 0; index < 501; index++) store.recordExecutionEvent(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'legacy-tool-' + index, kind: 'tool_output', label: '工具输出', text: 'OLD_OUTPUT_' + index, createdAt: Date.now() });
+    store.recordExecutionEvent(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'after-gap', kind: 'agent_message', label: 'Agent', text: 'VISIBLE_AFTER_GAP', createdAt: Date.now() });
+    store.receive(worker.id, { id: 'long-input', chatId: worker.chatId!, senderId: 'owner', text: 'x'.repeat(40_000), attachments: [], createdAt: Date.now(), chatType: 'group' }, 'user');
   });
   const dashboard = await startDashboard({ dataDir: root, port: 0 });
   t.after(async () => { await dashboard.close(); store.close(); await rm(root, { recursive: true, force: true }); });
@@ -50,20 +54,29 @@ test('project dashboard uses ledger membership, reports, and redacted task event
   assert.equal(projects[0].tasks.some((item: { id: string }) => item.id === 'foreign'), false);
   const workerCard = projects[0].tasks.find((item: { id: string }) => item.id === worker.id);
   assert.equal(workerCard.latestReport.currentStep, 'Reader');
-  assert.match(workerCard.latestActivity.text, /npm test|Visible progress/);
+  assert.match(workerCard.latestActivity.text, /VISIBLE_AFTER_GAP/);
 
   const detail = await (await fetch(dashboard.url + '/api/tasks/' + worker.id)).json();
   assert.equal(detail.projectId, 'project-a');
   assert.equal(detail.reports[0].nextStep, 'Run tests');
+  assert.equal(detail.inputs.find((input: { id: string }) => input.id === 'long-input').text.length, 32_770);
   assert.equal(detail.events.some((event: { kind: string }) => event.kind === 'tool_output'), false);
   assert.doesNotMatch(JSON.stringify(detail), /SECRET_OUTPUT/);
-  assert.match(JSON.stringify(detail), /Visible progress/);
+  assert.match(JSON.stringify(detail), /VISIBLE_AFTER_GAP/);
+
+  const reader = new ProjectDashboardReader(store);
+  const hiddenStart = store.executionEvents(worker.id).find(event => event.itemId === 'legacy-tool-0')?.seq;
+  assert.ok(hiddenStart);
+  const firstPage = reader.events(worker.id, hiddenStart - 1);
+  assert.equal(firstPage.events.some(event => event.text === 'VISIBLE_AFTER_GAP'), true);
 
   const controller = new AbortController();
   const stream = await fetch(dashboard.url + '/api/events?taskId=' + worker.id, { signal: controller.signal });
-  const chunk = await stream.body!.getReader().read();
-  const streamText = new TextDecoder().decode(chunk.value);
+  const streamReader = stream.body!.getReader(); let streamText = '';
+  for (let attempt = 0; attempt < 5 && !streamText.includes('VISIBLE_AFTER_GAP'); attempt++) {
+    const chunk = await streamReader.read(); streamText += new TextDecoder().decode(chunk.value);
+  }
   controller.abort();
   assert.doesNotMatch(streamText, /tool_output|SECRET_OUTPUT/);
-  assert.match(streamText, /Visible progress/);
+  assert.match(streamText, /VISIBLE_AFTER_GAP/);
 });
