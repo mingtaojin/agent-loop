@@ -12,6 +12,7 @@ import { Store } from '../src/store.js';
 const execute = promisify(execFile);
 const cli = resolve('node_modules/tsx/dist/cli.mjs');
 const entry = resolve('src/cli.ts');
+const execution = { coordinator: { backend: 'codex', model: 'test-coordinator', reasoningEffort: 'high' }, worker: { backend: 'codex', model: 'test-worker', reasoningEffort: 'xhigh' }, backends: { codex: { executable: 'unavailable-codex-must-not-run', approvalPolicy: 'on-request', sandbox: 'workspace-write', requestTimeoutMs: 30_000 } } };
 
 test('doctor reports discovered projects and source-only collection without requiring local repository mappings', async t => {
   const root = await mkdtemp(join(tmpdir(), 'agent-loop-doctor-discovery-'));
@@ -20,6 +21,7 @@ test('doctor reports discovered projects and source-only collection without requ
   await mkdir(join(root, 'projects', '.metadata')); await writeFile(join(root, 'fixture.env'), '');
   const configPath = join(root, 'config.json');
   await writeFile(configPath, JSON.stringify({
+    execution,
     engineering: { projectRoot: './projects' }, repositories: [{ name: 'explicit/issues', criteria: {} }],
     github: { tokenEnv: 'FIXTURE_DOCTOR_TOKEN' },
     feishu: { userOpenId: 'owner', appIdEnv: 'FIXTURE_DOCTOR_APP', appSecretEnv: 'FIXTURE_DOCTOR_SECRET' },
@@ -28,7 +30,7 @@ test('doctor reports discovered projects and source-only collection without requ
   const run = () => execute(process.execPath, [cli, entry, 'doctor', '--config', configPath, '--env-file', join(root, 'fixture.env')], { cwd: root, env });
   const output = JSON.parse((await run()).stdout);
   assert.equal(output.ready, true); assert.equal(output.discovery.readable, true);
-  assert.deepEqual(output.codex, { mode: 'shared-daemon', executable: 'codex' });
+  assert.deepEqual(output.execution, { coordinator: execution.coordinator, worker: execution.worker });
   assert.equal(output.discovery.projectRoot, join(root, 'projects'));
   assert.deepEqual(output.discovery.projects.map((project: { name: string }) => project.name), ['multi-repo']);
   assert.equal(output.repositories[0].sourceOnly, true);
@@ -73,11 +75,11 @@ for (const scenario of [
   assert.ok(address && typeof address !== 'string');
   apiUrl = `http://127.0.0.1:${address.port}`;
   await writeFile(join(root, 'config.json'), JSON.stringify({
+    execution,
     dataDir: './data', repositories: [{ name: 'example/project', path: './repository', baseBranch: 'main', criteria: { assigneesAny: ['owner'], taskTypes: scenario.taskTypes, nativeTypes: { [scenario.classification]: scenario.classification }, typeLabels: { [scenario.classification]: scenario.classification } } }],
     engineering: { promptPath: './prompt.md', skillPath: './SKILL.md' },
     github: { tokenEnv: 'TEST_GITHUB_TOKEN', apiUrl },
     feishu: { appIdEnv: 'UNSET_FEISHU_APP_ID', appSecretEnv: 'UNSET_FEISHU_SECRET', userOpenId: 'REPLACE_WITH_YOUR_OPEN_ID' },
-    codex: { command: ['unavailable-codex-must-not-run'] },
   }));
   const options = { cwd: root, env: { ...process.env, TEST_GITHUB_TOKEN: 'test-token' }, timeout: 15_000 };
   const collect = await execute(process.execPath, [cli, entry, 'collect', '--config', 'config.json'], options);
@@ -126,10 +128,10 @@ async function runFixture(t: TestContext, options: {
     const reservation = await listen(); options.port = reservation.port; await reservation.close();
   }
   await writeFile(join(root, 'config.json'), JSON.stringify({
+    execution,
     dataDir: './data', repositories: [], github: { tokenEnv: 'UNSET_MANUAL_ONLY_GITHUB' },
     dashboard: { port: options.port }, executionPollMs: 50,
     feishu: { appIdEnv: 'FIXTURE_FEISHU_APP', appSecretEnv: 'FIXTURE_FEISHU_SECRET', userOpenId: 'ou_fixture' },
-    codex: { command: ['unavailable-codex-must-not-run-until-input'] },
   }));
   const sdk = `
     import { existsSync, writeFileSync } from 'node:fs';

@@ -1,3 +1,4 @@
+import { testExecution } from './test-config.js';
 import { SurfaceCodex, testProject, restoreSurface, tickSurface } from './coordinated-surfaces.js';
 import assert from 'node:assert/strict';
 import { realpath, mkdtemp, rm } from 'node:fs/promises';
@@ -96,7 +97,7 @@ async function fixture(t: TestContext, initialize = true) {
 }
 
 test('document config requires an explicit HTTPS origin only when enabled', () => {
-  const parse = (progress: unknown) => configSchema.parse({ feishu: { userOpenId: 'owner', progress } }).feishu.progress;
+  const parse = (progress: unknown) => configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner', progress } }).feishu.progress;
   assert.equal(parse({}).surface, 'card');
   assert.equal(parse({}).maxLines, 3000);
   assert.equal(parse({ maxLines: 100 }).maxLines, 100);
@@ -315,7 +316,7 @@ test('input-only changes retain original provenance, attachments and CLI submiss
   const original = incomingSchema.parse({ id: 'reply', chatId: 'chat-task', senderId: 'owner', text: 'Original directory reply',
     attachments: [{ key: 'file-key', kind: 'file', name: 'evidence.txt' }], createdAt: 2 });
   f.store.receive('task', { ...original, text: 'PRIVATE_EXPANDED_PROMPT', attachments: [] }, 'user',
-    { kind: 'user', message: original }, 'workspace-selection');
+    { kind: 'user', message: original });
   await f.pump();
   assert.match(f.transport.text(), /Original directory reply\n附件：evidence.txt/);
   assert.doesNotMatch(f.transport.text(), /PRIVATE_EXPANDED_PROMPT|file-key/);
@@ -326,7 +327,7 @@ test('input-only changes retain original provenance, attachments and CLI submiss
   assert.match(f.transport.text(), /CLI 提交[^\n]*\nCLI continuation/);
   assert.notDeepEqual(f.record().projectionRevision, userRevision);
   assert.equal(f.record().projectionRevision?.eventSeq, 0);
-  f.store.markInput('reply', 'delivered'); f.store.markSelectionHandled('reply', 'task');
+  f.store.markInput('reply', 'delivered');
   const reads = t.mock.method(f.store, 'documentConversationEvents');
   await f.pump(); assert.equal(reads.mock.callCount(), 0);
 });
@@ -480,7 +481,7 @@ async function runtime(t: TestContext, enabled = true) {
   const rejectCard = async () => { cards++; throw new Error('card publisher must not run'); };
   const progress: FeishuProgressPort = { createProgressCard: rejectCard, sendProgressCard: rejectCard, findProgressMessage: rejectCard, updateProgressContent: rejectCard, setProgressStreaming: rejectCard };
   const feishu = Object.assign(new FeishuFake(), { progress, documentProgress }), codex = new SurfaceCodex();
-  const config = configSchema.parse({ dataDir: directory, projects: [testProject(directory)], executionPollMs: 600_000, pollIntervalMs: 600_000,
+  const config = configSchema.parse({ execution: testExecution, dataDir: directory, projects: [testProject(directory)], executionPollMs: 600_000, pollIntervalMs: 600_000,
     feishu: { userOpenId: 'owner', progress: { enabled, surface: 'document', documentBaseUrl: baseUrl, intervalMs: 1000 } } });
   const ports = { feishu, codex, github: new GitHubFake(), workspace: { ensure: async () => directory, head: async () => 'head' } };
   let loop = new AgentLoop(config, ports);

@@ -1,3 +1,4 @@
+import { testExecution } from './test-config.js';
 import { testProject, tickWithCoordinator } from './coordinated-runtime.js';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
@@ -197,7 +198,7 @@ test('socket private events admit nothing while project-group delivery persists 
   } });
   const codex = new CodexAppServer({ command: [process.execPath, resolve('test/fixtures/debug-codex.mjs')],
     approvalPolicy: 'never', sandbox: 'read-only', requestTimeoutMs: 2000 });
-  const loop = new AgentLoop(configSchema.parse({ dataDir: root, projects: [testProject(root)], feishu: { userOpenId: owner } }), {
+  const loop = new AgentLoop(configSchema.parse({ execution: testExecution, dataDir: root, projects: [testProject(root)], feishu: { userOpenId: owner } }), {
     codex, feishu, github: new GitHubFake(),
     workspace: { async ensure(input) { if (input.kind === 'project-directory') return input.directory; throw new Error('No workspace needed'); }, async head() { return 'unused'; } },
   });

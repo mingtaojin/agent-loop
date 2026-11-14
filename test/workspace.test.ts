@@ -1,3 +1,4 @@
+import { testExecution } from './test-config.js';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises';
@@ -103,6 +104,7 @@ test('configuration resolves paths relative to its file and requires actual prom
   await writeFile(join(root, 'prompt.md'), 'exact prompt');
   await writeFile(join(root, 'SKILL.md'), 'required skill');
   const raw = {
+    execution: testExecution,
     repositories: [{ name: 'example/project', path: './repo', baseBranch: 'origin/main' }],
     engineering: { promptPath: './prompt.md', skillPath: './SKILL.md' },
     feishu: { userOpenId: 'ou_test' },
@@ -118,9 +120,8 @@ test('configuration resolves paths relative to its file and requires actual prom
   assert.equal(config.github.tokenEnv, 'GITHUB_TOKEN');
   assert.equal(config.pollIntervalMs, 30_000);
   assert.equal(config.executionPollMs, 2_000);
-  assert.equal(config.codex.model, undefined);
-  assert.equal(config.codex.selectionModel, undefined);
-  assert.equal(configSchema.parse({ ...raw, codex: { selectionModel: 'selection-model' } }).codex.selectionModel, 'selection-model');
+  assert.equal(config.execution.coordinator.model, 'test-coordinator');
+  assert.throws(() => configSchema.parse({ ...raw, codex: { model: 'legacy-model' } }));
   assert.throws(() => configSchema.parse({ ...raw, github: { token: 'never-store-secrets' } }));
   assert.throws(() => configSchema.parse({ ...raw, github: { tokenEnv: 'github-token-value' } }));
   assert.throws(() => configSchema.parse({ ...raw, bug: raw.engineering }), /Unrecognized key/);
@@ -198,7 +199,7 @@ test('project workspace configuration resolves its own path and rejects incomple
   t.after(() => rm(root, { recursive: true, force: true }));
   const repository = { name: 'example/project', path: './project/framework', baseBranch: 'main',
     workspace: { kind: 'project-directory', path: './project' } };
-  const raw = { feishu: { userOpenId: 'owner' }, repositories: [repository] };
+  const raw = { execution: testExecution, feishu: { userOpenId: 'owner' }, repositories: [repository] };
   await writeFile(join(root, 'config.json'), JSON.stringify(raw));
   const config = await loadConfig(join(root, 'config.json'));
   const configuredRepository = config.repositories[0]; assert.ok(configuredRepository && 'path' in configuredRepository);
@@ -214,7 +215,7 @@ test('loadConfig resolves discovery root and keeps source-only collection separa
   const root = await mkdtemp(join(tmpdir(), 'agent-loop-discovery-config-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const path = join(root, 'config.json');
-  const raw = { feishu: { userOpenId: 'owner' }, engineering: { projectRoot: './projects' }, repositories: [
+  const raw = { execution: testExecution, feishu: { userOpenId: 'owner' }, engineering: { projectRoot: './projects' }, repositories: [
     { name: 'source/issues', criteria: { labelsAll: ['collect-me'] } },
     { name: 'legacy/project', path: './local', baseBranch: 'stable' },
   ] };
@@ -226,7 +227,7 @@ test('loadConfig resolves discovery root and keeps source-only collection separa
   assert.deepEqual(source.criteria.labelsAll, ['collect-me']);
   const legacy = config.repositories[1]; assert.ok(legacy && 'path' in legacy);
   assert.equal(legacy.path, join(root, 'local')); assert.equal(legacy.baseBranch, 'stable');
-  assert.equal(configSchema.parse({ feishu: { userOpenId: 'owner' } }).engineering?.projectRoot, undefined);
+  assert.equal(configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner' } }).engineering?.projectRoot, undefined);
   for (const projectRoot of ['', '  ', 4, ['projects']]) {
     assert.equal(configSchema.safeParse({ ...raw, engineering: { projectRoot } }).success, false);
   }

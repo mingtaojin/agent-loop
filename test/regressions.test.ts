@@ -1,3 +1,4 @@
+import { testExecution } from './test-config.js';
 import { tickWithDirectGroups, workerCalls } from './coordinated-runtime.js';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
@@ -38,7 +39,7 @@ async function fixture(t: TestContext) {
   await execute('git', ['-C', repository, 'commit', '-m', 'Fixture']);
   await writeFile(join(root, 'prompt.md'), 'Continue authorized work and ask about unresolved decisions.');
   await writeFile(join(root, 'SKILL.md'), '# poteto-mode\nFollow the task prompt.\n');
-  const config = configSchema.parse({
+  const config = configSchema.parse({ execution: testExecution,
     dataDir: join(root, 'data'),
     repositories: [{ name: 'example/project', path: repository, baseBranch: 'main', criteria: { assigneesAny: ['developer'] } }],
     engineering: { promptPath: join(root, 'prompt.md'), skillPath: join(root, 'SKILL.md') },

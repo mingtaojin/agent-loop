@@ -1,3 +1,4 @@
+import { testExecution } from './test-config.js';
 import { SurfaceCodex, testProject, restoreSurface } from './coordinated-surfaces.js';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
@@ -23,24 +24,18 @@ import { WorkspaceProvider } from '../src/workspace.js';
 test('dashboard projects discovered resource identity and workspace without repository metadata', async t => {
   const root = await mkdtemp(join(tmpdir(), 'agent-dashboard-project-'));
   const projectRoot = join(root, 'projects'); await mkdir(join(projectRoot, 'local'), { recursive: true });
-  const config = configSchema.parse({ dataDir: join(root, 'data'), engineering: { projectRoot }, feishu: { userOpenId: 'owner' } });
+  const config = configSchema.parse({ execution: testExecution, dataDir: join(root, 'data'), engineering: { projectRoot }, projects: [testProject(join(projectRoot, 'local'))], feishu: { userOpenId: 'owner' } });
   const codex = new SurfaceCodex();
-  codex.selectWorkspace = async input => {
-    const candidate = input.candidates[0]; assert.ok(candidate && 'kind' in candidate);
-    return { temporaryThreadId: 'dashboard-selector', choice: { kind: 'project', projectId: candidate.id, reason: 'fits' } };
-  };
   const loop = new AgentLoop(config, { codex, feishu: new FeishuFake(), github: new GitHubFake(), workspace: new WorkspaceProvider(config.dataDir) });
   const dashboard = await startDashboard({ dataDir: config.dataDir, port: 0 });
   t.after(async () => { await dashboard.close(); await loop.close(); await rm(root, { recursive: true, force: true }); });
   await restoreSurface(loop, { id: 'dashboard-project-input', chatId: 'private', chatType: 'p2p', senderId: 'owner',
     text: 'Inspect the local project', attachments: [], createdAt: Date.now() });
   const task = loop.tasks()[0]; assert.ok(task);
-  const resource = task.resources[0]; assert.ok(resource && resource.kind === 'project');
   const response = await fetch(dashboard.url + '/api/snapshot'); assert.equal(response.status, 200);
   const snapshot = await response.json();
-  assert.deepEqual(snapshot.tasks[0].resources, [{ kind: 'project', project: resource.project, workspace: resource.workspace }]);
+  assert.deepEqual(snapshot.tasks[0].resources, []);
   assert.equal(snapshot.tasks[0].threadId, task.threadId);
-  assert.equal(snapshot.tasks[0].workspaceSelection.choice.projectId, resource.project.id);
 });
 
 test('dashboard serves a read-only local page before the runtime database exists', async t => {
@@ -69,7 +64,7 @@ test('dashboard serves a read-only local page before the runtime database exists
 
 test('group and dashboard titles share normalization while persisted manual source text stays original', async t => {
   const root = await mkdtemp(join(tmpdir(), 'agent-dashboard-title-'));
-  const config = configSchema.parse({ dataDir: root, projects: [testProject(root)], feishu: { userOpenId: 'owner' } });
+  const config = configSchema.parse({ execution: testExecution, dataDir: root, projects: [testProject(root)], feishu: { userOpenId: 'owner' } });
   const feishu = new FeishuFake();
   const groupTitles = new Map<string, string>();
   const ensureGroup = feishu.ensureGroup.bind(feishu);
@@ -101,7 +96,7 @@ test('group and dashboard titles share normalization while persisted manual sour
 
 test('real adapter to SQLite to SSE streams partial text, tools and capacity errors, resumes and isolates tasks', async t => {
   const root = await mkdtemp(join(tmpdir(), 'agent-dashboard-live-'));
-  const config = configSchema.parse({ dataDir: root, projects: [testProject(root)], feishu: { userOpenId: 'owner' } });
+  const config = configSchema.parse({ execution: testExecution, dataDir: root, projects: [testProject(root)], feishu: { userOpenId: 'owner' } });
   const codex = new CodexAppServer({ command: [process.execPath, resolve('test/fixtures/debug-codex.mjs')], approvalPolicy: 'never', sandbox: 'read-only', requestTimeoutMs: 2000 });
   const feishu = new FeishuFake();
   const loop = new AgentLoop(config, { codex, feishu, github: new GitHubFake(), workspace: { async ensure(input) { if (input.kind === 'project-directory') return input.directory; throw new Error('No workspace needed'); }, async head() { return 'unused'; } } });
@@ -155,14 +150,14 @@ test('debug event projection excludes untrusted protocol configuration and priva
   const value = executionEvent('error', { threadId: 't', turnId: 'u', willRetry: false, error: { message: 'capacity', sensitiveField: 'secret' }, secret: 'not exported' });
   assert.ok(value); assert.equal(value.kind, 'error');
   assert.doesNotMatch(JSON.stringify(value), /secret/);
-  assert.equal(configSchema.parse({ feishu: { userOpenId: 'owner' } }).dashboard.port, 8787);
-  assert.equal(configSchema.parse({ feishu: { userOpenId: 'owner' } }).dashboard.host, '0.0.0.0');
+  assert.equal(configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner' } }).dashboard.port, 8787);
+  assert.equal(configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner' } }).dashboard.host, '0.0.0.0');
   assert.equal(z.number().parse(value.createdAt) > 0, true);
 });
 
 test('dashboard close is idempotent and terminates active SSE and incomplete HTTP connections', { timeout: 5000 }, async t => {
   const root = await mkdtemp(join(tmpdir(), 'agent-dashboard-close-'));
-  const config = configSchema.parse({ dataDir: root, projects: [testProject(root)], feishu: { userOpenId: 'owner' } });
+  const config = configSchema.parse({ execution: testExecution, dataDir: root, projects: [testProject(root)], feishu: { userOpenId: 'owner' } });
   const loop = new AgentLoop(config, { codex: new SurfaceCodex(), feishu: new FeishuFake(), github: new GitHubFake(), workspace: new WorkspaceProvider(root) });
   const dashboard = await startDashboard({ dataDir: root, port: 0 });
   t.after(async () => { await dashboard.close(); await loop.close(); await rm(root, { recursive: true, force: true }); });

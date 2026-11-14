@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test, type TestContext } from 'node:test';
 import { z } from 'zod';
@@ -158,12 +158,12 @@ test('registered project JSON schema agrees with the authoritative action input 
 
 test('project role model remains attached when guidance updates resume its Thread', async t => {
   const f = await adapter(t);
-  const threadId = await f.server.createThread({ cwd: f.root, instructions: 'Verifier scope', model: 'configured-verifier' });
-  await f.server.inspect(threadId, 'Updated verifier scope');
+  const threadId = await f.server.createThread({ cwd: f.root, instructions: 'Worker scope', model: 'configured-worker' });
+  await f.server.inspect(threadId, 'Updated worker scope');
   const rows = await f.records();
   const configured = rows.filter(row => row.method === 'thread/start' || row.method === 'thread/resume');
   assert.equal(configured.length, 2);
-  for (const row of configured) assert.equal(z.object({ model: z.string() }).parse(row.params).model, 'configured-verifier');
+  for (const row of configured) assert.equal(z.object({ model: z.string() }).parse(row.params).model, 'configured-worker');
 });
 
 test('role reasoning is sent on Thread creation, resume and every new Turn', async t => {
@@ -186,7 +186,7 @@ const validActions = [
   { action: 'status' },
   ...['overview', 'issues', 'comments', 'records', 'tasks'].map(section => ({ action: 'status', section, offset: 2, limit: 10 })),
   { action: 'dispatch', requestId: 'dispatch-default', prompt: 'Investigate within the assigned scope.' },
-  { action: 'dispatch', requestId: 'dispatch-verifier', prompt: 'Verify the fixed artifact.', issueId: 'issue-1', role: 'verifier' },
+  { action: 'dispatch', requestId: 'dispatch-worker', prompt: 'Verify the fixed artifact.', issueId: 'issue-1', role: 'worker' },
   { action: 'send', requestId: 'send-1', taskId: 'task-1', text: 'Additional evidence' },
   { action: 'report', requestId: 'report-result', kind: 'result', text: 'Artifact and validation evidence' },
   { action: 'report', requestId: 'report-question', kind: 'question', text: 'A business decision is required.' },
@@ -324,21 +324,6 @@ test('project action bounds accept the largest valid identifiers, text, and stat
   await f.start();
   assert.ok((await f.results(actions.length)).every(reply => reply.success));
   assert.deepEqual(requests.map(request => request.action), actions.map(action => projectActionSchema.parse(action)));
-});
-
-test('workspace selection remains isolated from an installed project handler', async t => {
-  const root = await mkdtemp('/tmp/agent-loop-project-selector-');
-  const logFile = join(root, 'requests.jsonl');
-  const server = new CodexAppServer({ command: [process.execPath, resolve('test/fixtures/workspace-selection-codex.mjs'), 'none', logFile], approvalPolicy: 'never', sandbox: 'read-only', requestTimeoutMs: 2000 });
-  t.after(async () => { await server.close(); await rm(root, { recursive: true, force: true }); });
-  let calls = 0;
-  server.setProjectHandler(async () => { calls++; throw new Error('Selector reached project handler'); });
-  const selection = await server.selectWorkspace({ taskId: 'task', cwd: root, candidates: [], input: [{ kind: 'text', text: 'Discussion only' }], answers: [] });
-  assert.equal(selection.choice.kind, 'none');
-  const starts = (await readFile(logFile, 'utf8')).trim().split('\n').map(line => rowSchema.parse(JSON.parse(line))).filter(row => row.method === 'thread/start');
-  assert.equal(starts.length, 1);
-  assert.deepEqual(toolsSchema.parse(starts[0]?.params).dynamicTools, []);
-  assert.equal(calls, 0);
 });
 
 test('a project callback from a lost connection cannot answer its replacement transport', async t => {

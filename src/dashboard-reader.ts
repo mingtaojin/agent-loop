@@ -34,7 +34,7 @@ export interface DashboardExecutionEvent {
 export interface ProjectTaskCard {
   id: string;
   projectId: string;
-  role: 'coordinator' | 'worker' | 'verifier' | 'intake';
+  role: 'coordinator' | 'worker' | 'intake';
   title: string;
   sourceLabel: string;
   sourceKind: Task['source']['kind'];
@@ -46,7 +46,6 @@ export interface ProjectTaskCard {
   threadId: string | null;
   turnId: string | null;
   chatId: string | null;
-  workspaceSelection: Task['workspaceSelection'];
   resources: Task['resources'];
   currentTurn: string | null;
   latestActivity: DashboardExecutionEvent | null;
@@ -149,16 +148,14 @@ export class ProjectDashboardReader {
     const events = coalesce(this.allEvents(task.id));
     const latestActivity = events.at(-1) ?? null;
     const reports = this.reportsForTask(task.id);
-    const waiting = task.requests.map(request => `${request.kind}: ${boundedDashboardText(request.prompt)}`).concat(
-      task.workspaceSelection.kind === 'waiting' ? ['workspace-selection: ' + boundedDashboardText(task.workspaceSelection.question)] : [],
-    );
+    const waiting = task.requests.map(request => `${request.kind}: ${boundedDashboardText(request.prompt)}`);
     const source = presentTaskSource(task.source, 200);
     const repository = task.source.kind === 'github' ? task.source.issue.repository : task.resources.find(resource => resource.kind !== 'project')?.repository.name ?? null;
     return {
       id: task.id, projectId, role, title: source.title, sourceLabel: source.label, sourceKind: task.source.kind, sourceUrl: source.url, repository,
       issueId: issueId ?? (task.source.kind === 'github' ? task.source.issue.id : null),
       status: task.status, executionStatus: task.executionStatus, currentTurn: task.turnId ?? latestActivity?.turnId ?? null,
-      threadId: task.threadId, turnId: task.turnId, chatId: task.chatId, workspaceSelection: task.workspaceSelection, resources: task.resources,
+      threadId: task.threadId, turnId: task.turnId, chatId: task.chatId, resources: task.resources,
       latestActivity, waitingReason: waiting[0] ?? (task.reason ? boundedDashboardText(task.reason) : null) ?? (task.recovery.lastError ? boundedDashboardText(task.recovery.lastError) : null), requests: task.requests.map(request => ({ kind: request.kind, prompt: boundedDashboardText(request.prompt) })),
       recovery: task.recovery, createdAt: task.createdAt, updatedAt: task.updatedAt, latestReport: reports.at(-1) ?? null,
     };

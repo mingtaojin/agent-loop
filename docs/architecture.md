@@ -50,7 +50,7 @@ Runtime 状态为 `pending`、`running`、`idle`、`paused`、`failed`。原生�
 
 真实协议探针确认旧 Thread 的 dynamicTools 在 resume 时不能追加。Runtime 因此提供本地 Unix socket 与任务能力文件。客户端提交工程目标，能力决定所属 Task，Runtime 是唯一 SQLite 写入者。原有仓库请求保持兼容，发现的项目使用明确的项目身份。能力随进程更换，暂停任务和无活跃 Turn 不能调用。该入口与动态工具共享资源校验和持久化，不创建新 Thread，也不修改 Codex 内部持久化。
 
-目录选择使用独立的临时 App Server 与只读、无审批 Thread；`codex.selectionModel` 可让该 Thread 使用与正式任务不同的模型，省略时继承正式模型。模型选择只改变推理侧配置，不改变只读、禁用工具或释放时机。
+当前 Agent Loop 不再使用模型选择目录。任务先由项目配置或协调者完成工程归属，再创建 coordinator 或 Worker Thread。执行后端、模型和推理强度来自实例级 `execution` 配置。
 
 工作区路径返回不改变权限。Agent 读取项目说明，在实际 sandbox 与原生审批范围内使用目录。协议字段存在不代表目录访问已通过验证。
 

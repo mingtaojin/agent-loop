@@ -1,10 +1,11 @@
 import { access, readFile, stat } from 'node:fs/promises';
-import { constants } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { constants, watch, type FSWatcher } from 'node:fs';
+import { basename, dirname, resolve } from 'node:path';
 import { z } from 'zod';
 import { collectionRepositorySchema } from './domain.js';
 import { projectConfigInputSchema } from './project.js';
 import { daemonSettingsSchema, normalizeDaemonSettings } from './adapters/codex-daemon.js';
+import { assertSupportedExecutionBackends, executionConfigSchema } from './execution.js';
 
 const environmentName = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'Use an environment variable name, not a credential');
 const positiveMilliseconds = z.number().int().positive();
@@ -55,16 +56,22 @@ export const configSchema = z.strictObject({
     }).refine(value => !value.enabled || value.surface !== 'document' || !!value.documentBaseUrl,
       'documentBaseUrl is required for enabled document progress').default({ enabled: false, surface: 'card', intervalMs: 1000, maxLines: 3000 }),
   }),
-  codex: z.strictObject({
-    ...daemonSettingsSchema.shape,
-    selectionModel: z.string().min(1).optional(),
-    approvalPolicy: z.enum(['untrusted', 'on-request', 'never']).default('on-request'),
-    sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).default('workspace-write'),
-    requestTimeoutMs: positiveMilliseconds.default(120_000),
-  }).transform((value, context) => {
-    try { return { ...value, ...normalizeDaemonSettings(value), command: undefined }; }
-    catch (error) { context.addIssue({ code: 'custom', message: error instanceof Error ? error.message : String(error) }); return z.NEVER; }
-  }).prefault({}),
+  execution: executionConfigSchema.extend({
+    backends: z.strictObject({
+      codex: z.strictObject({
+        ...daemonSettingsSchema.shape,
+        approvalPolicy: z.enum(['untrusted', 'on-request', 'never']).default('on-request'),
+        sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).default('workspace-write'),
+        requestTimeoutMs: positiveMilliseconds.default(120_000),
+      }).transform((value, context) => {
+        try { return { ...value, ...normalizeDaemonSettings(value), command: undefined }; }
+        catch (error) { context.addIssue({ code: 'custom', message: error instanceof Error ? error.message : String(error) }); return z.NEVER; }
+      }).prefault({}),
+    }).prefault({ codex: {} }),
+  }).superRefine((execution, context) => {
+    try { assertSupportedExecutionBackends(execution); }
+    catch (error) { context.addIssue({ code: 'custom', message: error instanceof Error ? error.message : String(error), path: ['coordinator'] }); }
+  }),
   pollIntervalMs: positiveMilliseconds.default(30_000),
   executionPollMs: positiveMilliseconds.default(2_000),
   maxAttachmentBytes: z.number().int().positive().default(20 * 1024 * 1024),
@@ -98,4 +105,45 @@ export async function loadConfig(path: string): Promise<Config> {
     }
   }
   return config;
+}
+
+export class ExecutionConfigWatcher {
+  private watcher: FSWatcher | undefined;
+  private timer: ReturnType<typeof setTimeout> | undefined;
+  private loading = false;
+  private dirty = false;
+  constructor(private readonly path: string, private readonly target: Config, private readonly diagnostic: (error: unknown) => void) {}
+  start(): void {
+    const directory = dirname(this.path), filename = basename(this.path);
+    this.watcher = watch(directory, { persistent: false }, (_event, changed) => {
+      if (changed === undefined || changed === filename) this.schedule();
+    });
+  }
+  close(): void {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+    this.watcher?.close();
+    this.watcher = undefined;
+  }
+  private schedule(): void {
+    if (this.loading) { this.dirty = true; return; }
+    if (this.timer) return;
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      void this.reload();
+    }, 100);
+  }
+  private async reload(): Promise<void> {
+    if (this.loading) { this.dirty = true; return; }
+    this.loading = true;
+    try {
+      const next = await loadConfig(this.path);
+      this.target.execution = next.execution;
+    } catch (error) {
+      this.diagnostic(error);
+    } finally {
+      this.loading = false;
+      if (this.dirty) { this.dirty = false; this.schedule(); }
+    }
+  }
 }

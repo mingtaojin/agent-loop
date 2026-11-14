@@ -4,8 +4,9 @@ import { isAbsolute, relative } from 'node:path';
 import { z } from 'zod';
 import type { Config } from './config.js';
 import { ProjectCatalog } from './project-catalog.js';
-import { ProjectLedger, projectView, currentRecords, matchesProjectIssue, projectActionSchema, reasoningEffortSchema, type ReasoningEffort, type ProjectAction, type ProjectConfig, type ProjectState } from './project.js';
-import { criteriaSchema, intakeRouteSchema, presentTaskSource, sourceType, submissionSchema, type DiscoveredProject, type InputProvenance, type Source, type StructuredReport, type Task, type WorkspaceCandidate, type WorkspaceChoice } from './domain.js';
+import { ProjectLedger, projectView, currentRecords, matchesProjectIssue, projectActionSchema, type ProjectAction, type ProjectConfig, type ProjectState } from './project.js';
+import type { ExecutionProfile } from './execution.js';
+import { criteriaSchema, intakeRouteSchema, presentTaskSource, sourceType, submissionSchema, type InputProvenance, type Source, type StructuredReport, type Task } from './domain.js';
 import type { GitHubPort } from './ports.js';
 import type { TaskCloseout } from './task-closeout.js';
 import { Store, type Inbox } from './store.js';
@@ -54,9 +55,6 @@ export class ProjectRuntime {
   private get configs(): ProjectConfig[] { return this.catalog.configs; }
   projectConfig(projectId: string): ProjectConfig | null { return this.configs.find(item => item.id === projectId) ?? null; }
   async resolveRepository(repositoryName: string): Promise<ProjectConfig | null> { return this.catalog.resolveRepository(repositoryName); }
-  async resolveSelection(choice: WorkspaceChoice, candidates: WorkspaceCandidate[]): Promise<ProjectConfig | null> {
-    return this.catalog.resolveSelection(choice, candidates);
-  }
   async resolveTask(task: Task): Promise<ProjectConfig | null> {
     const route = this.intakeRoute(task.id);
     if (route) return this.catalog.byId(route.projectId);
@@ -76,9 +74,10 @@ export class ProjectRuntime {
     const membership = this.ledger.membership(taskId);
     return membership ? this.configs.find(item => item.id === membership.projectId) ?? null : null;
   }
-  reasoningEffort(taskId: string): ReasoningEffort | undefined {
-    const saved = this.store.meta(`project-task-effort:${taskId}`);
-    return saved === null ? undefined : reasoningEffortSchema.parse(saved);
+  executionProfile(taskId: string): ExecutionProfile | null {
+    const member = this.ledger.membership(taskId);
+    if (!member) return null;
+    return this.settings.execution[member.role];
   }
   private enqueue(taskId: string, key: string, text: string, provenance: InputProvenance): void {
     const task = this.store.task(taskId);
@@ -107,13 +106,10 @@ export class ProjectRuntime {
       const prompt = `Coordinate project ${config.name}. Read project status and follow Orchestrate. ${config.instructions}`;
       const sourceId = `project:${config.id}:coordinator`;
       const task = this.store.taskForSource(sourceId) ?? await this.host.makeTask(sourceId, prompt);
-      task.workspaceSelection = { kind: 'selected', temporaryThreadId: 'runtime-project', inputIds: [], choice: { kind: 'none', reason: 'Coordinator records live in the task directory' } };
       const canonical = { ...config, directory: await realpath(config.directory) };
       this.store.transaction(() => {
         this.store.saveTask(task);
         this.ledger.create(canonical, task.id);
-        if (config.models.coordinator) this.store.setMeta(`project-task-model:${task.id}`, config.models.coordinator);
-        this.store.setMeta(`project-task-effort:${task.id}`, config.reasoningEfforts.coordinator);
         this.enqueue(task.id, 'initial', prompt, { kind: 'agent', projectId: config.id, taskId: task.id, eventId: 'initial', category: 'project_start' });
       });
     });
@@ -156,9 +152,6 @@ export class ProjectRuntime {
       this.enqueue(state.coordinatorTaskId, key, `Intake request ${taskId}. Assess this request and existing work before dispatching.\n${material.text}`, {
         kind: 'agent', projectId, taskId, eventId: key, category: 'intake_request',
       });
-      for (const input of inputs) {
-        if (input.route === 'workspace-selection' && input.status !== 'failed' && input.status !== 'dropped') this.store.markSelectionHandled(input.id, taskId);
-      }
       return true;
     }));
   }
@@ -339,11 +332,6 @@ export class ProjectRuntime {
       if (resource.kind === 'project') directories.push(resource.project.canonicalPath);
       else repositories.push(resource.repository.name);
     }
-    if (task.workspaceSelection.kind === 'selected') {
-      const choice = task.workspaceSelection.choice;
-      if (choice.kind === 'repository') repositories.push(choice.repositoryName);
-      if (choice.kind === 'project') directories.push(choice.project.canonicalPath);
-    }
     return repositories.every(repository => {
       const owner = this.catalog.repositoryOwner(repository);
       return owner === null || owner === projectId;
@@ -379,16 +367,6 @@ export class ProjectRuntime {
         return suffix === '' || (!isAbsolute(suffix) && suffix !== '..' && !suffix.startsWith('../'));
       };
       if (task.resources.some(resource => !within(resource.workspace))) throw new Error('Saved resources require project ownership clarification');
-      if (task.workspaceSelection.kind === 'selected') {
-        const choice = task.workspaceSelection.choice;
-        if (choice.kind === 'project' && !within(choice.project.canonicalPath)) throw new Error('Saved selection belongs to another project');
-        if (choice.kind === 'repository') {
-          const owner = this.catalog.repositoryOwner(choice.repositoryName), repository = choice.repository;
-          if ((owner !== null && owner !== state.id) || (!owner && !repository)
-            || (repository && !within(repository.workspace?.kind === 'project-directory' ? repository.workspace.path : repository.path)))
-            throw new Error('Saved selection belongs to another project');
-        }
-      }
       const route = { projectId: state.id, coordinatorTaskId: callerId };
       const result = { taskId: task.id, ...route, claimed: true };
       this.store.setMeta(intentKey, fingerprint);
@@ -404,9 +382,9 @@ export class ProjectRuntime {
     const state = projectView(saved, callerId);
     const offset = action.offset ?? 0, limit = action.limit ?? 20, section = action.section ?? 'overview';
     const tasks = state.members.map(member => {
-      const task = this.store.task(member.taskId);
+        const task = this.store.task(member.taskId);
       return { ...member, closeout: this.host.closeout.read(task.id), status: task.status, executionStatus: task.executionStatus, reason: task.reason,
-        chatId: task.chatId, threadId: task.threadId, model: this.store.meta(`project-task-model:${task.id}`), reasoningEffort: this.reasoningEffort(task.id), resources: task.resources, requests: task.requests.map(request => ({ id: request.id, kind: request.kind, prompt: request.prompt })),
+        chatId: task.chatId, threadId: task.threadId, execution: this.executionProfile(task.id), resources: task.resources, requests: task.requests.map(request => ({ id: request.id, kind: request.kind, prompt: request.prompt })),
         outputs: this.store.outputs(task.id).slice(-3).map(output => ({ id: output.id, text: output.text.slice(0, 4000), truncated: output.text.length > 4000, status: output.status })) };
     });
     const intakes = this.store.tasks().filter(task => task.purpose === 'intake' && this.intakeRoute(task.id)?.projectId === projectId
@@ -524,10 +502,6 @@ export class ProjectRuntime {
           }
           if (task.purpose !== 'intake' || task.threadId) throw new Error('Task is not an unpromoted intake');
           if (task.status === 'paused') throw new Error('An operator-paused request must be resumed before delegation');
-          const project: DiscoveredProject = { kind: 'project', id: `coordinated:${state.id}`, name: state.name, entryPath: state.directory, canonicalPath: state.directory };
-          if (!task.resources.length) task.workspaceSelection = { kind: 'selected', temporaryThreadId: 'runtime-delegation',
-            inputIds: task.workspaceSelection.kind === 'selected' ? task.workspaceSelection.inputIds : [],
-            choice: { kind: 'project', projectId: project.id, reason: 'Project-scoped delegation', project } };
           this.store.transaction(() => {
             task.purpose = 'execution';
             task.status = 'pending'; task.executionStatus = 'unbound'; task.reason = null;
@@ -538,9 +512,6 @@ export class ProjectRuntime {
             this.ledger.addMember(state.id, task.id, action.role, issueId);
             this.store.setMeta(promotionKey, promotion);
             this.store.setMeta(`project-delegation:${task.id}`, delegationPrompt);
-            const model = config?.models[action.role], effort = config?.reasoningEfforts[action.role];
-            if (model) this.store.setMeta(`project-task-model:${task.id}`, model);
-            if (effort) this.store.setMeta(`project-task-effort:${task.id}`, effort);
           });
           return { taskId: task.id };
         }
@@ -552,16 +523,10 @@ export class ProjectRuntime {
           return { taskId: existing.id };
         }
         const task = await this.host.makeTask(sourceId, delegationPrompt);
-        const project: DiscoveredProject = { kind: 'project', id: `coordinated:${state.id}`, name: state.name, entryPath: state.directory, canonicalPath: state.directory };
-        task.workspaceSelection = { kind: 'selected', temporaryThreadId: 'runtime-delegation', inputIds: [], choice: { kind: 'project', projectId: project.id, reason: 'Project-scoped delegation', project } };
         this.store.transaction(() => {
           this.store.saveTask(task);
           if (featureAuthorization) this.store.setMeta(featureAuthorization.key, JSON.stringify(featureAuthorization.evidence));
           this.ledger.addMember(state.id, task.id, action.role, action.issueId);
-          const model = config.models[action.role];
-          if (model) this.store.setMeta(`project-task-model:${task.id}`, model);
-          const effort = config.reasoningEfforts[action.role];
-          if (effort) this.store.setMeta(`project-task-effort:${task.id}`, effort);
           if (predecessor) this.host.closeout.link(task.id, predecessor.taskId);
           this.enqueue(task.id, 'initial', delegationPrompt + (predecessor ? `\nCompleted predecessor ${predecessor.taskId}: ${JSON.stringify(predecessor.lifecycle)}. Deleted resources are not restored.` : ''), { kind: 'agent', projectId: state.id, taskId: callerId, eventId: action.requestId, category: 'delegation' });
         });
@@ -648,7 +613,7 @@ export class ProjectRuntime {
     if (!state || state.coordinatorTaskId !== task.id) return;
     const obsolete = this.store.inputs(task.id).filter(input => {
       const event = input.provenance;
-      if (!['pending', 'held', 'failed'].includes(input.status) || input.origin !== 'source' || input.route !== 'task'
+      if (!['pending', 'held', 'failed'].includes(input.status) || input.origin !== 'source'
         || event.kind !== 'agent' || event.projectId !== state.id || input.task_id !== task.id
         || input.id !== `project:${task.id}:${event.eventId}` || input.message.id !== input.id
         || input.message.senderId !== 'runtime:project' || input.message.chatType !== 'group' || input.message.attachments.length) return false;

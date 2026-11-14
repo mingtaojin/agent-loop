@@ -5,14 +5,14 @@ export const dashboardHtml = String.raw`<!doctype html>
     <a class="brand" href="/"><span class="brand-mark">a<span>↗</span></span><span>agent loop<small>PROJECT OBSERVATORY</small></span></a>
     <div class="sidebar-heading"><span>任务</span><span id="task-count" class="count">0</span></div>
     <label class="search"><span>⌕</span><input id="search" aria-label="搜索任务" placeholder="搜索名称、任务 ID…"></label>
-    <select id="status-filter" aria-label="筛选任务状态"><option value="">全部状态</option><option value="running">执行中</option><option value="idle">等待输入</option><option value="failed">执行失败</option><option value="paused">已暂停</option><option value="pending">待启动</option></select><select id="role-filter" aria-label="筛选任务角色"><option value="">全部角色</option><option value="coordinator">协调者</option><option value="worker">Worker</option><option value="verifier">verifier</option><option value="intake">intake</option></select>
+    <select id="status-filter" aria-label="筛选任务状态"><option value="">全部状态</option><option value="running">执行中</option><option value="idle">等待输入</option><option value="failed">执行失败</option><option value="paused">已暂停</option><option value="pending">待启动</option></select><select id="role-filter" aria-label="筛选任务角色"><option value="">全部角色</option><option value="coordinator">协调者</option><option value="worker">Worker</option><option value="intake">intake</option></select>
     <nav id="task-list" aria-label="任务列表"></nav>
     <div class="sidebar-footer"><div><span id="runtime-dot" class="dot"></span><strong id="runtime-status">读取服务状态…</strong></div><p id="runtime-detail">等待心跳</p><span class="footer-label">数据目录</span><code id="data-dir"></code></div>
   </aside>
   <main><header class="topbar"><div><span class="eyebrow">DEVELOPMENT</span><span class="topbar-title">运行观测</span></div><div class="connection"><span id="connection-dot" class="dot"></span><span id="connection-text" role="status">正在连接</span><span class="local-tag">网络调试 · 只读</span></div></header>
     <section class="overview"><div><h1>看见每一步执行<span>。</span></h1><p>模型输出、工具调用与执行异常，在同一个地方追踪。</p></div><div class="metrics"><div><strong id="metric-running">0</strong><span><i class="dot green"></i>执行中</span></div><div><strong id="metric-idle">0</strong><span><i class="dot"></i>等待输入</span></div><div><strong id="metric-failed">0</strong><span><i class="dot red"></i>执行失败</span></div></div></section>
     <div id="page-error" class="banner error" role="alert" hidden></div>
-    <section id="empty" class="empty-state"><div class="empty-icon">↳</div><h2>等待第一个项目</h2><p>项目协调者、Worker、verifier、已路由 intake 和历史任务会按 ProjectLedger 归入项目。<br>看板只读显示可见执行说明和结构化汇报，不保存工具输出正文或隐藏推理。</p><div class="empty-note">调试台已就绪 · 读取同一配置的数据目录</div></section>
+    <section id="empty" class="empty-state"><div class="empty-icon">↳</div><h2>等待第一个项目</h2><p>项目协调者、Worker、已路由 intake 和历史任务会按 ProjectLedger 归入项目。<br>看板只读显示可见执行说明和结构化汇报，不保存工具输出正文或隐藏推理。</p><div class="empty-note">调试台已就绪 · 读取同一配置的数据目录</div></section>
     <section id="project-overview" hidden><div class="project-overview-heading"><div><span class="eyebrow">PROJECTS</span><h2>项目总览</h2><p>按项目成员关系查看任务卡片和最近活动。</p></div></div><div id="project-cards"></div></section>
     <section id="task-panel" hidden>
       <div class="task-heading"><div><div class="task-heading-line"><span id="source-kind" class="eyebrow"></span><span id="task-badge" class="badge"></span></div><h2 id="task-title"></h2><div class="task-identifiers"><code id="task-id"></code><span id="updated-at"></span></div></div><a id="source-link" class="source-link" target="_blank" rel="noreferrer" hidden>查看 Issue ↗</a></div>
@@ -47,7 +47,7 @@ const allDashboardTasks = () => {
   return [...new Map([...snapshot.tasks, ...projectTasks].map(task => [task.id, task])).values()];
 };
 const projectName = id => snapshot?.projects?.find(project => project.id === id)?.name || '未关联项目';
-const roleLabels = { coordinator: '协调者', worker: 'Worker', verifier: 'verifier', intake: 'intake' };
+const roleLabels = { coordinator: '协调者', worker: 'Worker', intake: 'intake' };
 function statusDot(status) { return 'dot' + (status === 'running' ? ' green' : status === 'failed' ? ' red' : status === 'paused' ? ' amber' : ''); }
 function connection(ok, text) { $('connection-dot').className = 'dot' + (ok ? ' green' : ' amber'); $('connection-text').textContent = text; }
 function showError(message) { $('page-error').hidden = !message; $('page-error').textContent = message; }
@@ -207,7 +207,6 @@ function renderTask() {
   }
   $('metadata-list').replaceChildren(metadata);
   const alerts = [];
-  if (task.workspaceSelection && task.workspaceSelection.kind === 'waiting') alerts.push('等待目录确认：' + task.workspaceSelection.question);
   if (task.reason) alerts.push(task.reason);
   for (const request of task.requests) alerts.push((request.kind === 'question' ? '等待回答：' : '等待工具审批：') + request.prompt);
   if (task.recovery.nextAttemptAt) alerts.push('等待自动恢复 · ' + time(task.recovery.nextAttemptAt));
@@ -275,7 +274,7 @@ async function history(taskId) {
     const signature = JSON.stringify(data); if (signature === historySignature) return; historySignature = signature;
     const fragment = document.createDocumentFragment();
     for (const input of data.inputs) {
-      const el = node('article', 'history-message'); el.append(node('div', 'history-label', (input.route === 'workspace-selection' ? '目录答复 / 任务补充' : input.origin === 'user' ? '用户输入' : '任务输入') + ' · ' + input.status), node('small', '', time(input.createdAt)), node('pre', '', input.text));
+      const el = node('article', 'history-message'); el.append(node('div', 'history-label', (input.origin === 'user' ? '用户输入' : '任务输入') + ' · ' + input.status), node('small', '', time(input.createdAt)), node('pre', '', input.text));
       if (input.attachments.length) el.append(node('small', '', '附件：' + input.attachments.map(item => item.name).join('、')));
       if (input.error) el.append(node('pre', '', input.error)); fragment.append(el);
     }

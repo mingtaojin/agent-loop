@@ -1,11 +1,11 @@
+import { testExecution } from './test-config.js';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, realpath, rm, symlink, unlink } from 'node:fs/promises';
+import { mkdtemp, mkdir, realpath, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test, type TestContext } from 'node:test';
 import { configSchema, type Config } from '../src/config.js';
 import { criteriaSchema, taskSchema, type Task } from '../src/domain.js';
-import { discoverProjects } from '../src/project-discovery.js';
 import { ProjectCatalog } from '../src/project-catalog.js';
 import { ProjectRuntime, intakeMaterialVersion } from '../src/project-runtime.js';
 import { TaskCloseout } from '../src/task-closeout.js';
@@ -17,7 +17,7 @@ async function fixture(t: TestContext) {
   const root = await realpath(temporary);
   const engineering = join(root, 'engineering'), alpha = join(engineering, 'alpha'), beta = join(engineering, 'beta');
   await mkdir(alpha, { recursive: true }); await mkdir(beta);
-  const config: Config = configSchema.parse({ dataDir: join(root, 'data'), feishu: { userOpenId: 'owner' },
+  const config: Config = configSchema.parse({ execution: testExecution, dataDir: join(root, 'data'), feishu: { userOpenId: 'owner' },
     engineering: { projectRoot: engineering }, projects: [{ id: 'explicit-alpha', name: 'Alpha', directory: alpha,
       repositories: [{ name: 'owner/alpha', labelsAny: ['coordinate'] }] }],
     repositories: [{ name: 'owner/beta', path: beta, baseBranch: 'main', criteria: { assigneesAny: ['alice'] } }],
@@ -88,23 +88,6 @@ test('catalog uses canonical identities, explicit policy, durable automatic defi
   assert.deepEqual(f.runtime.projectConfig(automatic.id)?.repositories, []);
 });
 
-test('selection validates supplied candidates, canonical paths and explicit coordinated IDs', async t => {
-  const f = await fixture(t);
-  const alias = join(f.engineering, 'alias'); await symlink(f.beta, alias);
-  const candidates = await discoverProjects(f.engineering);
-  const beta = candidates.find(project => project.entryPath === alias); assert.ok(beta);
-  const choice = { kind: 'project', projectId: beta.id, reason: 'Selected by owner' } as const;
-  const selected = await f.runtime.resolveSelection(choice, candidates); assert.ok(selected);
-  assert.equal(selected.directory, f.beta);
-  await unlink(alias); await symlink(f.alpha, alias);
-  assert.equal(await f.runtime.resolveSelection(choice, candidates), null);
-  const explicit = { kind: 'project', id: 'coordinated:explicit-alpha', name: 'Alpha', entryPath: f.alpha, canonicalPath: f.alpha } as const;
-  assert.equal((await f.runtime.resolveSelection({ kind: 'project', projectId: explicit.id, reason: '' }, [explicit]))?.id, 'explicit-alpha');
-  assert.equal(await f.runtime.resolveSelection({ kind: 'project', projectId: 'invented', reason: '' }, candidates), null);
-  assert.equal(await f.runtime.resolveSelection({ kind: 'repository', repositoryName: 'owner/beta', reason: '' }, [{ name: 'owner/beta', path: f.alpha }]), null);
-  assert.equal(f.created, 0);
-});
-
 test('intake routes freeze atomically and repeated inbox revisions reach the coordinator exactly once', async t => {
   const f = await fixture(t);
   const config = await f.runtime.resolveRepository('owner/beta'); assert.ok(config);
@@ -144,7 +127,7 @@ test('dispatch promotes the same intake with old group and resources and rejects
   assert.deepEqual(f.store.task(intake.id), { ...intake, purpose: 'execution', status: 'pending', reason: null });
   assert.deepEqual(f.store.inputs(intake.id), originalInputs);
   assert.equal(f.store.meta(`project-delegation:${intake.id}`), action.prompt);
-  assert.equal(f.store.meta(`project-task-model:${intake.id}`), 'gpt-6.1-sol');
+  assert.equal(f.store.meta(`project-task-model:${intake.id}`), null);
   assert.equal(f.runtime.ledger.project('explicit-alpha')?.members.filter(member => member.taskId === intake.id).length, 1);
   assert.equal(f.created, 1);
   await f.restart();
@@ -219,7 +202,6 @@ test('concurrent source collection cannot overwrite a promoted intake with an ea
   await collecting;
   const latest = f.store.task(request.id);
   assert.equal(latest.purpose, 'execution');
-  assert.deepEqual(latest.workspaceSelection, promoted.workspaceSelection);
   assert.deepEqual(f.runtime.ledger.membership(request.id), { projectId: 'explicit-alpha', role: 'worker' });
   assert.equal(latest.source.kind === 'github' && latest.source.issue.body, 'Updated issue facts.');
 });
@@ -228,10 +210,8 @@ test('a source-only repository binding survives restart without expanding collec
   const f = await fixture(t);
   f.config.repositories = [{ name: 'owner/incoming', criteria: criteriaSchema.parse({ taskTypes: ['bug'], assigneesAny: ['alice'] }) }];
   const catalog = new ProjectCatalog(f.config, f.store);
-  const candidates = await discoverProjects(f.engineering);
-  const candidate = candidates.find(project => project.name === 'beta'); assert.ok(candidate);
-  const project = await catalog.resolveSelection({ kind: 'project', projectId: candidate.id, reason: 'Selected project' }, candidates);
-  assert.ok(project);
+  await catalog.refresh();
+  const project = catalog.configs.find(item => item.directory === f.beta); assert.ok(project);
   await catalog.bindRepository('owner/incoming', project.id);
   await f.restart();
   assert.equal((await f.runtime.resolveRepository('owner/incoming'))?.id, project.id);

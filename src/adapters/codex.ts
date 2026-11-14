@@ -1,21 +1,19 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
-import { RejectedInputError, TurnChangedError, UncertainOperationError, workspaceTargetSchema, type AgentInput, type AgentOutput, type ExecutionSnapshot, type PendingRequest, type WorkspaceRequest, type WorkspaceSelectionRequest, type WorkspaceSelectionResponse } from '../domain.js';
+import { RejectedInputError, TurnChangedError, UncertainOperationError, workspaceTargetSchema, type AgentInput, type AgentOutput, type ExecutionSnapshot, type PendingRequest, type WorkspaceRequest } from '../domain.js';
 import type { Activity, CodexPort, TurnIdentity } from '../ports.js';
 import { executionEvent, type ExecutionEvent } from '../execution-events.js';
-import { workspaceSelectionInput, workspaceSelectionInstructions, workspaceSelectionOutputSchema, workspaceSelectionWireSchema } from '../workspace-selection.js';
-import { projectActionSchema, type ReasoningEffort } from '../project.js';
+import { projectActionSchema } from '../project.js';
+import type { ReasoningEffort } from '../execution.js';
 import { normalizeDaemonSettings, sharedDaemonConnector, type CodexConnection, type CodexConnector, type DaemonSettings } from './codex-daemon.js';
 
 export interface CodexOptions {
   command?: string[];
   executable?: string;
   socketPath?: string;
-  modelProvider?: string;
   reasoningEffort?: ReasoningEffort;
   model?: string;
-  selectionModel?: string;
   approvalPolicy: 'untrusted' | 'on-request' | 'never';
   sandbox: 'read-only' | 'workspace-write' | 'danger-full-access';
   requestTimeoutMs: number;
@@ -169,12 +167,6 @@ export class CodexAppServer implements CodexPort {
   private sequence = 0;
   private eventHandler: ((event: ExecutionEvent) => void) | undefined;
   private completionPolicy: { isCompleted(threadId: string): boolean } | undefined;
-  private readonly selectors = new Set<CodexAppServer>();
-  private selectorsClosing = false;
-  private selectionThreadId: string | undefined;
-  private selectionTurnId: string | undefined;
-  private disposal: Promise<void> | undefined;
-  private selectionRun: { threadId: string; resolve: (turn: z.infer<typeof turnSchema>) => void; reject: (error: Error) => void } | undefined;
 
   setEventHandler(handler: (event: ExecutionEvent) => void): void { this.eventHandler = handler; }
   setThreadCompletionPolicy(policy: { isCompleted(threadId: string): boolean }): void { this.completionPolicy = policy; }
@@ -227,7 +219,6 @@ export class CodexAppServer implements CodexPort {
     this.startingTurns.clear();
     this.endedTurns.clear();
     this.failure ??= error;
-    this.selectionRun?.reject(this.failure);
     for (const call of this.calls.values()) if (call.kind === 'pending') { clearTimeout(call.timer); call.reject(this.failure); }
     for (const entry of this.threads.values()) entry.load = { kind: 'unloaded' };
     this.calls.clear();
@@ -271,7 +262,7 @@ export class CodexAppServer implements CodexPort {
   private receive(message: z.infer<typeof messageSchema>): void {
     if (message.method !== undefined) {
       const scope = threadScopeSchema.safeParse(message.params);
-      if (scope.success && !this.threads.has(scope.data.threadId) && this.selectionThreadId !== scope.data.threadId) return;
+      if (scope.success && !this.threads.has(scope.data.threadId)) return;
       if (!scope.success && message.id !== undefined) throw new Error(`Unsupported unscoped server request ${message.method}`);
     }
     if (message.method !== undefined) {
@@ -284,7 +275,6 @@ export class CodexAppServer implements CodexPort {
       if (event) this.eventHandler(event);
     }
     if (message.method !== undefined) {
-      if (this.selectionRun && message.id !== undefined) throw new Error(`Temporary directory selection cannot handle native request ${message.method}`);
       if (message.id !== undefined) this.request(message.id, message.method, message.params);
       else if (message.method === 'serverRequest/resolved') {
         const resolved = z.object({ requestId: rpcIdSchema, threadId: z.string() }).parse(message.params);
@@ -294,17 +284,11 @@ export class CodexAppServer implements CodexPort {
       } else if (message.method === 'turn/started') {
         const started = z.object({ threadId: z.string(), turn: z.object({ id: z.string() }) }).parse(message.params);
         this.activeTurns.set(started.threadId, started.turn.id);
-        if (this.selectionThreadId === started.threadId) this.selectionTurnId = started.turn.id;
       } else if (message.method === 'item/completed') {
         const completed = z.object({ threadId: z.string(), turnId: z.string(), item: itemSchema }).parse(message.params);
         this.captureOutput(completed.threadId, completed.turnId, completed.item, false);
       } else if (message.method === 'turn/completed') {
         const completed = z.object({ threadId: z.string(), turn: z.object({ id: z.string() }) }).parse(message.params);
-        if (this.selectionRun?.threadId === completed.threadId) {
-          const { turn } = z.object({ turn: turnSchema }).parse(message.params);
-          for (const item of turn.items) this.captureOutput(completed.threadId, turn.id, item, turn.status === 'completed');
-          this.selectionRun.resolve(turn);
-        }
         this.endedTurns.set(completed.threadId, completed.turn.id);
         this.needsCleanup.delete(completed.threadId);
         if (this.activeTurns.get(completed.threadId) === completed.turn.id) this.activeTurns.delete(completed.threadId);
@@ -383,89 +367,13 @@ export class CodexAppServer implements CodexPort {
   }
 
   private config() {
-    return { model: this.settings.model, modelProvider: this.settings.modelProvider, ...(this.settings.reasoningEffort ? { config: { model_reasoning_effort: this.settings.reasoningEffort } } : {}), approvalPolicy: this.options.approvalPolicy, sandbox: this.options.sandbox, approvalsReviewer: 'user' };
-  }
-
-  async selectWorkspace(input: WorkspaceSelectionRequest): Promise<WorkspaceSelectionResponse> {
-    if (this.closed || this.selectorsClosing) throw new Error('Codex owner is closed for directory selection');
-    input.signal?.throwIfAborted();
-    const selector = new CodexAppServer({ ...this.options, ...this.settings, command: undefined, approvalPolicy: 'never', sandbox: 'read-only' }, this.connector);
-    this.selectors.add(selector);
-    const abort = () => selector.fail(new Error('Temporary directory selection aborted'));
-    input.signal?.addEventListener('abort', abort, { once: true });
-    const timer = setTimeout(() => selector.fail(new UncertainOperationError('Temporary directory selection timed out; cleanup must be confirmed')), this.options.requestTimeoutMs);
-    let failure = new Error('Temporary directory selection closed');
-    try { return await selector.runWorkspaceSelection(input); }
-    catch (error) { failure = error instanceof Error ? error : new Error(String(error)); throw error; }
-    finally {
-      clearTimeout(timer);
-      input.signal?.removeEventListener('abort', abort);
-      await selector.dispose(failure);
-      this.selectors.delete(selector);
-    }
-  }
-
-  private async runWorkspaceSelection(input: WorkspaceSelectionRequest): Promise<WorkspaceSelectionResponse> {
-    await this.ready();
-    const startedThread = await this.rpc('thread/start', {
-      ...this.config(), model: this.options.selectionModel ?? this.settings.model,
-      cwd: input.cwd, developerInstructions: workspaceSelectionInstructions,
-      ephemeral: true, dynamicTools: [],
-    });
-    this.selectionThreadId = threadResponseSchema.parse(startedThread).thread.id;
-    const response = z.object({
-      thread: threadSchema, cwd: z.string(), approvalPolicy: z.literal('never'),
-      sandbox: z.object({ type: z.literal('readOnly'), networkAccess: z.literal(false).optional() }),
-    }).parse(startedThread);
-    if (response.cwd !== input.cwd || response.thread.status.type !== 'idle' || response.thread.turns.length) throw new Error('Temporary directory selection did not start in the requested empty read-only context');
-    const threadId = response.thread.id;
-    const completion = new Promise<z.infer<typeof turnSchema>>((resolve, reject) => { this.selectionRun = { threadId, resolve, reject }; });
-    void completion.catch(() => undefined);
-    const { turn: started } = z.object({ turn: turnSchema }).parse(await this.rpc('turn/start', {
-      threadId, cwd: input.cwd, approvalPolicy: 'never', sandboxPolicy: { type: 'readOnly', networkAccess: false },
-      input: wireInput(workspaceSelectionInput(input), `directory-selection:${input.taskId}`),
-      outputSchema: workspaceSelectionWireSchema,
-    }));
-    this.selectionTurnId = started.id;
-    if (!this.activeTurns.has(threadId) && this.endedTurns.get(threadId) !== started.id) this.activeTurns.set(threadId, started.id);
-    const completed = await completion;
-    this.activeTurns.delete(threadId);
-    if (completed.id !== started.id) throw new Error('Temporary directory selection completed a different turn');
-    if (completed.status !== 'completed') throw new Error(completed.error?.message ?? `Temporary directory selection ${completed.status}`);
-    const answers = [...this.outputs.values()].filter(output => output.threadId === threadId && output.turnId === completed.id && output.phase === 'final');
-    const answer = answers[0];
-    if (!answer || answers.length !== 1) throw new Error('Temporary directory selection must return one complete structured choice');
-    const { choice } = workspaceSelectionOutputSchema.parse(JSON.parse(answer.text));
-    if (choice.kind === 'repository' && !input.candidates.some(candidate => !('kind' in candidate) && candidate.name === choice.repositoryName)) throw new Error('Temporary directory selection chose an unconfigured repository');
-    if (choice.kind === 'project' && !input.candidates.some(candidate => 'kind' in candidate && candidate.id === choice.projectId)) throw new Error('Temporary directory selection chose an unknown project identity');
-    return { temporaryThreadId: threadId, choice };
-  }
-
-  private dispose(error: Error): Promise<void> {
-    this.selectionRun?.reject(error);
-    this.disposal ??= (async () => {
-      try {
-        if (this.selectionThreadId) {
-          if (this.failure) await this.reconnect();
-          await this.stopOwnedThread(this.selectionThreadId);
-          await this.rpc('thread/unsubscribe', { threadId: this.selectionThreadId });
-        }
-      } catch (cause) {
-        throw new UncertainOperationError(`${error.message}; temporary Thread ${this.selectionThreadId ?? 'unknown'} cleanup could not be confirmed: ${cause instanceof Error ? cause.message : String(cause)}`);
-      } finally {
-        this.closed = true;
-        const connection = this.connection;
-        this.fail(error);
-        await connection?.close();
-      }
-    })();
-    return this.disposal;
+    return { ...(this.options.model ? { model: this.options.model } : {}), ...(this.options.reasoningEffort ? { config: { model_reasoning_effort: this.options.reasoningEffort } } : {}), approvalPolicy: this.options.approvalPolicy, sandbox: this.options.sandbox, approvalsReviewer: 'user' };
   }
 
   private async stopOwnedThread(threadId: string): Promise<void> {
-    if (threadId !== this.selectionThreadId) await this.resume(threadId);
+    await this.resume(threadId);
     const read = async () => {
-      const { thread } = threadResponseSchema.parse(await this.rpc('thread/read', { threadId, includeTurns: this.selectionThreadId !== threadId }));
+      const { thread } = threadResponseSchema.parse(await this.rpc('thread/read', { threadId, includeTurns: true }));
       if (thread.id !== threadId) throw new Error('Codex returned a different cleanup Thread');
       return thread;
     };
@@ -473,13 +381,11 @@ export class CodexAppServer implements CodexPort {
       if (thread.turns.some(turn => turn.status === 'inProgress')) return false;
       if (thread.status.type === 'idle' || thread.status.type === 'notLoaded') return true;
       if (thread.status.type !== 'systemError') return false;
-      return threadId === this.selectionThreadId
-        ? this.selectionTurnId !== undefined && this.endedTurns.get(threadId) === this.selectionTurnId
-        : thread.turns.length > 0;
+      return thread.turns.length > 0;
     };
     let thread = await read();
     if (thread.status.type === 'active') {
-      const turnId = (threadId === this.selectionThreadId ? this.selectionTurnId : this.activeTurns.get(threadId)) ?? thread.turns.findLast(turn => turn.status === 'inProgress')?.id;
+      const turnId = this.activeTurns.get(threadId) ?? thread.turns.findLast(turn => turn.status === 'inProgress')?.id;
       if (!turnId) throw new Error('Active Thread has no identifiable Turn to interrupt');
       await this.rpc('turn/interrupt', { threadId, turnId });
       const deadline = Date.now() + this.options.requestTimeoutMs;
@@ -893,10 +799,7 @@ export class CodexAppServer implements CodexPort {
 
   async close(): Promise<void> {
     if (this.closed) return;
-    this.selectorsClosing = true;
     const failures: unknown[] = [];
-    const results = await Promise.allSettled([...this.selectors].map(selector => selector.dispose(new Error('Codex owner is closing'))));
-    for (const result of results) if (result.status === 'rejected') failures.push(result.reason);
     try {
       for (const threadId of [...this.threads.keys()]) {
         try {

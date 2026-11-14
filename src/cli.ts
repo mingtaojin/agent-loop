@@ -1,7 +1,7 @@
 import { parseArgs } from 'node:util';
 import { access, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import { loadConfig, type Config } from './config.js';
+import { ExecutionConfigWatcher, loadConfig, type Config } from './config.js';
 import { AgentLoop } from './loop.js';
 import { WorkspaceProvider } from './workspace.js';
 import { GitHubAdapter } from './adapters/github.js';
@@ -48,7 +48,8 @@ async function doctor(config: Config): Promise<void> {
   ) : null;
   const userConfigured = !config.feishu.userOpenId.startsWith('REPLACE_');
   const ready = credentials.every(item => item.present) && repositories.every(item => item.exists) && userConfigured && discovery?.readable !== false;
-  output({ ready, node: process.version, dataDir: config.dataDir, repositories, discovery, credentials, feishuUserConfigured: userConfigured, codex: { mode: 'shared-daemon', executable: config.codex.executable, socketPath: config.codex.socketPath, model: config.codex.model, modelProvider: config.codex.modelProvider, reasoningEffort: config.codex.reasoningEffort, selectionModel: config.codex.selectionModel }, note: '此检查未验证远端权限，也未创建群或启动 Codex 任务。' });
+  output({ ready, node: process.version, dataDir: config.dataDir, repositories, discovery, credentials, feishuUserConfigured: userConfigured,
+    execution: { coordinator: config.execution.coordinator, worker: config.execution.worker }, note: '此检查未验证远端权限，也未创建群或启动执行任务。' });
   if (!ready) process.exitCode = 1;
 }
 async function main(): Promise<void> {
@@ -59,7 +60,8 @@ async function main(): Promise<void> {
   if (!['doctor', 'collect', 'status', 'run'].includes(command)) throw new Error(`未知命令 ${command}`);
   if (args.positionals.length !== 1) throw new Error('多余的位置参数');
   if (args.values['request-id'] && command !== 'status') throw new Error('--request-id 只适用于 status');
-  const config = await loadConfig(resolve(args.values.config));
+  const configPath = resolve(args.values.config);
+  const config = await loadConfig(configPath);
   if (command === 'status') {
     if (args.values['request-id']) {
       const requestId = args.values['request-id'];
@@ -95,7 +97,7 @@ async function main(): Promise<void> {
   const loop = new AgentLoop(config, {
     github: new GitHubAdapter({ token, apiUrl: config.github.apiUrl, requestTimeoutMs: config.github.requestTimeoutMs }),
     feishu: new FeishuAdapter({ appId: command === 'run' ? secret(config.feishu.appIdEnv) : '', appSecret: command === 'run' ? secret(config.feishu.appSecretEnv) : '', userOpenId: config.feishu.userOpenId }),
-    codex: new CodexAppServer({ ...config.codex, env: Object.fromEntries(Object.entries(process.env).filter(([name]) => ![config.feishu.appIdEnv, config.feishu.appSecretEnv].includes(name))) }), workspace: new WorkspaceProvider(config.dataDir),
+    codex: new CodexAppServer({ ...config.execution.backends.codex, env: Object.fromEntries(Object.entries(process.env).filter(([name]) => ![config.feishu.appIdEnv, config.feishu.appSecretEnv].includes(name))) }), workspace: new WorkspaceProvider(config.dataDir),
   });
   if (command === 'collect') {
     try { await loop.collect(); output({ collectedTasks: loop.tasks().filter(task => loop.projects.ledger.membership(task.id)?.role !== 'coordinator').length, diagnostics: loop.store.diagnostics() }); if (loop.store.diagnostics().length) process.exitCode = 1; }
@@ -103,11 +105,13 @@ async function main(): Promise<void> {
     return;
   }
   let dashboardStart: ReturnType<typeof startDashboard> | undefined;
+  const executionWatcher = new ExecutionConfigWatcher(configPath, config, error => process.stderr.write(`execution config reload rejected: ${errorMessage(error)}\n`));
   let closing: Promise<void> | undefined;
   const close = () => {
     closing ??= (async () => {
       const results = await Promise.allSettled([
         loop.close(),
+        Promise.resolve(executionWatcher.close()),
         dashboardStart?.then(dashboard => dashboard.close(), () => undefined),
       ]);
       process.off('SIGINT', stop); process.off('SIGTERM', stop);
@@ -123,6 +127,7 @@ async function main(): Promise<void> {
     dashboardStart = startDashboard({ dataDir: config.dataDir, host: config.dashboard.host, port: config.dashboard.port });
     const dashboard = await dashboardStart;
     if (closing) { await closing; return; }
+    executionWatcher.start();
     await loop.start();
     if (closing) { await closing; return; }
     output({ event: 'started', dataDir: config.dataDir, tasks: loop.tasks().length,

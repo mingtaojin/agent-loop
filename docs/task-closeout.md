@@ -10,7 +10,7 @@ New Tasks receive a separate `artifacts-*` directory under their task data direc
 
 ## Completion action
 
-Only the project coordinator can complete a Worker or verifier. A final answer, result report, idle state, pause or failure does not complete a Task. The coordinator verifies delivery or explicit abandonment before submitting the action.
+Only the project coordinator can complete a Worker or Worker. A final answer, result report, idle state, pause or failure does not complete a Task. The coordinator verifies delivery or explicit abandonment before submitting the action.
 
 ```json
 {"action":"complete_task","requestId":"closeout-123","taskId":"worker-task-id","outcome":"delivered","summary":"The agreed result was delivered; temporary work can be released","deliveryReferences":["https://example.test/result"]}
@@ -18,7 +18,7 @@ Only the project coordinator can complete a Worker or verifier. A final answer, 
 
 Outcome is `delivered` or `terminated`. Completion and the frozen cleanup intent share one SQLite transaction. Completion is owned by the closeout ledger, separately from mutable Task execution snapshots. The immutable action receipt is `{operationId, taskId}`. Repeating the same action continues that operation; changing content under the same request ID fails.
 
-`{"action":"status","section":"closeout"}` returns live ledgers with `lifecycle`, `scopes` and `operations`, using normal project pagination and caller visibility. Workers and verifiers see only their own ledger; coordinators can query project Tasks. Every frozen target reports `pending`, `protected` or `removed`, its reason, and directory and branch results. A receipt alone does not mean deletion succeeded. Summary and delivery references survive deletion.
+`{"action":"status","section":"closeout"}` returns live ledgers with `lifecycle`, `scopes` and `operations`, using normal project pagination and caller visibility. Workers and Workers see only their own ledger; coordinators can query project Tasks. Every frozen target reports `pending`, `protected` or `removed`, its reason, and directory and branch results. A receipt alone does not mean deletion succeeded. Summary and delivery references survive deletion.
 
 An in-flight allocation or execution admission rejects completion until the same request can be retried. Uncertain input delivery and pending approvals must be reconciled before completion. A running turn can finish after completion is recorded. Runtime never interrupts it to reclaim files. Cleanup progresses after explicit actions, during polling and on restart without waking a model.
 

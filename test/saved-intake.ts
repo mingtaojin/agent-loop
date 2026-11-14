@@ -9,7 +9,7 @@ export function seedSavedIntake(loop: AgentLoop, message: IncomingMessage) {
   if (existing) return existing;
   const id = randomUUID(), prompt = 'Preserve the original request and its authorization.';
   const task = taskSchema.parse({ id, sourceId, source: { kind: 'manual', message }, purpose: 'intake',
-    contextDirectory: join(loop.config.dataDir, 'tasks', id), resources: [], workspaceSelection: { kind: 'pending' },
+    contextDirectory: join(loop.config.dataDir, 'tasks', id), resources: [],
     status: 'pending', reason: null, prompt, promptHash: createHash('sha256').update(prompt).digest('hex'), skillPath: null,
     chatId: null, threadId: null, turnId: null, lastHandledTurnId: null, requests: [], createdAt: message.createdAt, updatedAt: message.createdAt });
   loop.store.transaction(() => {
@@ -26,7 +26,7 @@ export async function recoverSavedIntake(loop: AgentLoop, message: IncomingMessa
 }
 
 export async function recoverSavedSupplement(loop: AgentLoop, taskId: string, message: IncomingMessage) {
-  loop.store.receive(taskId, message, 'user', undefined, 'workspace-selection');
+  loop.store.receive(taskId, message, 'user');
   await loop.tick();
 }
 

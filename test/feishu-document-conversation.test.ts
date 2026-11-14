@@ -33,7 +33,7 @@ test('Feishu timestamps display UTC+8 across date and year boundaries without ch
 test('conversation deduplicates original input, preserves directory replies and attachments, excludes synthetic inputs and tools', () => {
   const input = (seq: number, message: Inbox['message'] = initial): Inbox => ({ seq, id: message.id, task_id: task.id, message,
     provenance: { kind: 'user', message }, status: 'pending', origin: 'user', error: null,
-    requestId: null, route: 'workspace-selection', selectionHandled: false });
+    requestId: null });
   const reply = { ...initial, id: 'reply', text: 'Use this project', createdAt: 4,
     attachments: [{ key: 'image-key', kind: 'image' as const, name: 'screenshot.png' }] };
   const synthetic = { ...input(3, { ...initial, id: 'synthetic', text: 'PRIVATE_RECOVERY', createdAt: 5 }), origin: 'resume' as const };

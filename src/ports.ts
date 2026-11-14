@@ -1,6 +1,7 @@
-import type { AgentOutput, AgentInput, ApprovalAction, Attachment, CollectionRepository, ExecutionSnapshot, IncomingMessage, PendingRequest, Repository, Source, SourceComment, TaskResource, WorkspaceRequest, WorkspaceSelectionRequest, WorkspaceSelectionResponse } from './domain.js';
+import type { AgentOutput, AgentInput, ApprovalAction, Attachment, CollectionRepository, ExecutionSnapshot, IncomingMessage, PendingRequest, Repository, Source, SourceComment, TaskResource, WorkspaceRequest } from './domain.js';
 import type { ExecutionEvent } from './execution-events.js';
-import type { ProjectAction, ReasoningEffort } from './project.js';
+import type { ProjectAction } from './project.js';
+import type { ReasoningEffort } from './execution.js';
 
 export type Activity = { kind: 'reconcile' } | RunningActivity;
 export interface RunningActivity {
@@ -69,7 +70,6 @@ export interface FeishuProgressPort {
   setProgressStreaming(input: { cardId: string; enabled: boolean; sequence: number; uuid: string }, guard?: ProgressWriteGuard): Promise<void>;
 }
 export interface CodexPort {
-  selectWorkspace(input: WorkspaceSelectionRequest): Promise<WorkspaceSelectionResponse>;
   setEventHandler?(handler: (event: ExecutionEvent) => void): void;
   createThread(input: { cwd: string; instructions: string; model?: string; reasoningEffort?: ReasoningEffort }): Promise<string>;
   inspect(threadId: string, instructions?: string, model?: string, reasoningEffort?: ReasoningEffort): Promise<ExecutionSnapshot>;

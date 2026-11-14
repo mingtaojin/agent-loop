@@ -1,7 +1,7 @@
 # 正式会话提示词
 
 正式会话按项目角色读取模板。协调者使用
-[prompts/coordinator.md](../../prompts/coordinator.md)，Worker 和 verifier 使用
+[prompts/coordinator.md](../../prompts/coordinator.md)，Worker 使用
 [prompts/worker.md](../../prompts/worker.md)。只有项目成员可以启动正式执行。
 `engineering.promptPath` 保留创建记录的提示词快照，不替换角色指导。
 

@@ -1,3 +1,4 @@
+import { testExecution } from '../test/test-config.js';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -30,11 +31,9 @@ const errorText = (error: unknown) => error instanceof Error ? error.message : S
 const codexUnavailable = (message: string) => /\b(?:credit|quota|billing|auth(?:entication|orization)?|login)\b|not logged|connect|ENOTFOUND|ENOENT|timed out|rate.limit|model.*(not|unavailable)|\b(?:403|401|429|502|503)\b/i.test(message);
 const execute = promisify(execFile);
 const options = z.object({
-  model: z.string().trim().min(1).optional(),
   timeoutMs: z.coerce.number().int().min(10_000).max(1_200_000).default(480_000),
   restart: z.enum(['0', '1']).default('1'),
-}).parse({ model: process.env.PROJECT_COORDINATOR_VERIFY_MODEL,
-  timeoutMs: process.env.PROJECT_COORDINATOR_VERIFY_TIMEOUT_MS,
+}).parse({ timeoutMs: process.env.PROJECT_COORDINATOR_VERIFY_TIMEOUT_MS,
   restart: process.env.PROJECT_COORDINATOR_VERIFY_RESTART });
 const startedAt = Date.now();
 const deadline = startedAt + options.timeoutMs;
@@ -130,15 +129,14 @@ First call project_action {"action":"status"}. Inspect issues and existing tasks
 ${workerPrompt}
 After dispatch, END THIS TURN with COORDINATOR_WAITING_FOR_REPORT. Do not wait, sleep or poll inside that turn. The Runtime will wake you when the worker reports.
 On later turns call status first and do not dispatch again. When a worker result containing its unique proof marker is present, query status for the current version and records, then call project_action record with requestId ${recordId}, key ${recordKey}, expectedVersion equal to the current status version, and text containing the actual worker marker, worker task ID, proof file path, and an explicit receipt of the result. Never guess the marker or read proof.txt yourself. If this receipt already exists, do not record again. End with COORDINATOR_RECEIPT_RECORDED plus the actual marker. No rotation is requested in this probe.`;
-const config = configSchema.parse({ dataDir: join(root, 'data'),
+const config = configSchema.parse({ execution: { ...testExecution, backends: { codex: { command: ['codex', 'app-server'], approvalPolicy: 'never', sandbox: 'read-only', requestTimeoutMs: 30_000 } } }, dataDir: join(root, 'data'),
   feishu: { userOpenId: 'fixture-owner', progress: { enabled: false } },
   engineering: { skillPath: '/Users/developer/.codex/packages/pstack/skills/poteto-mode/SKILL.md' },
   projects: [{ id: projectId, name: 'Coordinator live fixture', directory,
     repositories: [{ name: repository, labelsAny: ['coordinate'], assigneesAny: ['fixture-owner'] }],
     instructions: policy }],
   recovery: { maxAttempts: 0, retryDelayMs: 1000 },
-  codex: { command: ['codex', 'app-server'], ...(options.model ? { model: options.model } : {}),
-    approvalPolicy: 'never', sandbox: 'read-only', requestTimeoutMs: 30_000 } });
+});
 const github = new GitHubFake();
 const feishu = new FeishuFake();
 github.sources = [
@@ -153,7 +151,7 @@ github.sources = [
 ];
 
 function newLoop(): AgentLoop {
-  const codex = new ObservedCodex(config.codex);
+  const codex = new ObservedCodex(config.execution.backends.codex);
   servers.push(codex);
   return new AgentLoop(config, { codex, feishu, github, workspace: new WorkspaceProvider(config.dataDir) });
 }
@@ -200,8 +198,7 @@ async function verify(): Promise<void> {
     proof: createHash('sha256').update(await readFile(proofFile)).digest('hex'),
     instructions: createHash('sha256').update(await readFile(join(directory, 'AGENTS.md'))).digest('hex') };
   const version = await execute('codex', ['--version'], { timeout: 10_000 });
-  note('native_codex', { version: version.stdout.trim(), fallbackModel: options.model ?? 'native default',
-    roleModels: config.projects[0]?.models, roleReasoningEfforts: config.projects[0]?.reasoningEfforts });
+  note('native_execution', { version: version.stdout.trim(), execution: config.execution });
   loop = newLoop();
   await bounded('Issue collection', loop.collect());
   const intake = loop.projects.ledger.project(projectId);
@@ -385,8 +382,7 @@ try {
   await writeFile(join(evidenceDirectory, 'summary.json'), sanitize({ ...outcome,
     scope: 'Actual AgentLoop, real SQLite, WorkspaceProvider and native CodexAppServer. Feishu/GitHub are local fakes. One read-only worker, result wakeup, coordinator CAS receipt, optional same-thread restart.',
     excluded: ['Real Feishu/GitHub writes', 'PR delivery/merge', 'Production service operations', 'Remote hosts', 'Images', 'Session rotation', 'Independent model review'],
-    fallbackModel: options.model ?? 'Native Codex default', roleModels: config.projects[0]?.models,
-    roleReasoningEfforts: config.projects[0]?.reasoningEfforts, command: 'npx --no-install tsx scripts/verify-project-coordinator.ts',
+    execution: config.execution, command: 'npx --no-install tsx scripts/verify-project-coordinator.ts',
     source: { script: resolve('scripts/verify-project-coordinator.ts'),
       sha256: createHash('sha256').update(await readFile(new URL(import.meta.url))).digest('hex'),
       atStart: sourceAtStart, atFinish: await fingerprintSources() },

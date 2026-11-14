@@ -34,7 +34,6 @@ export const discoveredProjectSchema = z.strictObject({
   entryPath: z.string().min(1), canonicalPath: z.string().min(1),
 });
 export type DiscoveredProject = z.infer<typeof discoveredProjectSchema>;
-export type WorkspaceCandidate = Pick<Repository, 'name' | 'path' | 'workspace'> | DiscoveredProject;
 export const sourceSchema = z.object({
   id: z.string(), repository: z.string(), number: z.number().int().positive(), url: z.string(),
   title: z.string(), body: z.string(), state: z.enum(['open', 'closed']),
@@ -102,17 +101,6 @@ export type AgentInput =
   | { kind: 'text'; text: string }
   | { kind: 'image'; path: string }
   | { kind: 'skill'; name: string; path: string };
-export const workspaceChoiceSchema = z.discriminatedUnion('kind', [
-  z.strictObject({ kind: z.literal('project'), projectId: z.string().min(1), reason: z.string() }),
-  z.strictObject({ kind: z.literal('repository'), repositoryName: z.string().min(1), reason: z.string() }),
-  z.strictObject({ kind: z.literal('none'), reason: z.string() }),
-  z.strictObject({ kind: z.literal('question'), question: z.string().min(1) }),
-]);
-export type WorkspaceChoice = z.infer<typeof workspaceChoiceSchema>;
-export const workspaceSelectionResponseSchema = z.strictObject({
-  temporaryThreadId: z.string().min(1), choice: workspaceChoiceSchema,
-});
-export type WorkspaceSelectionResponse = z.infer<typeof workspaceSelectionResponseSchema>;
 export const submissionRequestIdSchema = z.uuid().regex(/^[0-9a-f-]+$/, 'Use a canonical lowercase UUID').brand<'SubmissionRequestId'>();
 export const submissionSchema = z.strictObject({
   requestId: submissionRequestIdSchema,
@@ -120,23 +108,6 @@ export const submissionSchema = z.strictObject({
     .refine(text => !/[\uD800-\uDFFF]/u.test(text), 'Prompt contains an unpaired surrogate').brand<'SubmissionPrompt'>(),
 });
 export type Submission = z.infer<typeof submissionSchema>;
-export interface WorkspaceSelectionRequest {
-  taskId: string;
-  cwd: string;
-  candidates: WorkspaceCandidate[];
-  input: AgentInput[];
-  answers: { inputId: string; text: string }[];
-  signal?: AbortSignal;
-}
-const workspaceSelectionSchema = z.discriminatedUnion('kind', [
-  z.object({ kind: z.literal('pending') }),
-  z.object({ kind: z.literal('waiting'), question: z.string(), temporaryThreadId: z.string(), askedAt: z.number() }),
-  z.object({ kind: z.literal('selected'), temporaryThreadId: z.string(), inputIds: z.array(z.string()).default([]), choice: z.discriminatedUnion('kind', [
-    z.object({ kind: z.literal('project'), projectId: z.string(), reason: z.string(), project: discoveredProjectSchema }),
-    z.object({ kind: z.literal('repository'), repositoryName: z.string(), reason: z.string(), repository: repositorySchema.optional() }),
-    z.object({ kind: z.literal('none'), reason: z.string() }),
-  ]) }),
-]);
 export const taskSourceSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('github'), issue: sourceSchema, repository: collectionRepositorySchema, collectionReason: z.string() }),
   z.object({ kind: z.literal('manual'), message: incomingSchema }),
@@ -169,7 +140,6 @@ export const taskSchema = z.object({
   id: z.string(), sourceId: z.string(), source: taskSourceSchema,
   purpose: z.enum(['intake', 'execution', 'legacy']).default('legacy'),
   contextDirectory: z.string(), resources: z.array(taskResourceSchema),
-  workspaceSelection: workspaceSelectionSchema.default({ kind: 'pending' }),
   status: z.enum(['pending', 'running', 'idle', 'paused', 'failed']),
   reason: z.string().nullable(), prompt: z.string(), promptHash: z.string(), skillPath: z.string().nullable(),
   chatId: z.string().nullable(), threadId: z.string().nullable(), turnId: z.string().nullable(),

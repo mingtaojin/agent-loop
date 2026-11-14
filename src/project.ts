@@ -3,13 +3,13 @@ import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { criteriaSchema, matchSource, sourceSchema, sourceCommentSchema, structuredReportSchema, type Source, type SourceComment } from './domain.js';
 import type { Store } from './store.js';
+export { reasoningEffortSchema } from './execution.js';
+export type { ReasoningEffort } from './execution.js';
 
 const idSchema = z.string().min(1).max(512)
   .refine(value => value.trim().length > 0 && !/[\u0000-\u001f\u007f]/u.test(value), 'Invalid identifier');
 const textSchema = z.string().max(131_072).refine(value => value.trim().length > 0, 'Text must not be blank');
 const versionSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
-export const reasoningEffortSchema = z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
-export type ReasoningEffort = z.infer<typeof reasoningEffortSchema>;
 const repositoryNameSchema = z.string().max(512).regex(/^[\w.-]+\/[\w.-]+$/);
 const projectRepositorySchema = z.strictObject({
   name: repositoryNameSchema,
@@ -22,10 +22,6 @@ export const projectConfigSchema = z.strictObject({
     .refine(value => value.trim().length > 0 && !value.includes('\0'), 'Invalid project directory'),
   repositories: z.array(projectRepositorySchema).max(1_000),
   instructions: z.string().max(131_072).default(''),
-  models: z.strictObject({ coordinator: idSchema.default('gpt-6-astra'), worker: idSchema.default('gpt-6.1-sol'), verifier: idSchema.optional() })
-    .default({ coordinator: 'gpt-6-astra', worker: 'gpt-6.1-sol' }),
-  reasoningEfforts: z.strictObject({ coordinator: reasoningEffortSchema.default('high'), worker: reasoningEffortSchema.default('xhigh'), verifier: reasoningEffortSchema.optional() })
-    .default({ coordinator: 'high', worker: 'xhigh' }),
 }).refine(value => new Set(value.repositories.map(repository => repository.name.toLowerCase())).size === value.repositories.length,
   'Duplicate project repository');
 export type ProjectConfig = z.infer<typeof projectConfigSchema>;
@@ -52,7 +48,7 @@ export const projectActionSchema = z.discriminatedUnion('action', [
   z.strictObject({ action: z.literal('status'), section: z.enum(['overview', 'issues', 'comments', 'records', 'tasks', 'intakes', 'unassigned_intakes', 'closeout']).optional(),
     offset: versionSchema.optional(), limit: z.number().int().min(1).max(100).optional() }),
   z.strictObject({ action: z.literal('dispatch'), requestId: idSchema, prompt: textSchema,
-    predecessorTaskId: idSchema.optional(), issueId: idSchema.optional(), intakeTaskId: idSchema.optional(), role: z.enum(['worker', 'verifier']).default('worker'),
+    predecessorTaskId: idSchema.optional(), issueId: idSchema.optional(), intakeTaskId: idSchema.optional(), role: z.literal('worker').default('worker'),
     mode: z.enum(['investigation', 'implementation']).optional(), authorization: featureAuthorizationSchema.optional() }),
   z.strictObject({ action: z.literal('allocate_artifacts'), requestId: idSchema, label: textSchema, parent: z.string().min(1).optional() }),
   z.strictObject({ action: z.literal('register_artifact'), requestId: idSchema, taskId: idSchema.optional(), scopeId: idSchema, path: z.string().min(1), disposition: artifactDispositionSchema, reference: textSchema.optional() }),
@@ -72,7 +68,7 @@ export const projectActionSchema = z.discriminatedUnion('action', [
   z.strictObject({ action: z.literal('control'), requestId: idSchema, taskId: idSchema, operation: z.enum(['pause', 'resume']) }),
 ]);
 export type ProjectAction = z.infer<typeof projectActionSchema>;
-const roleSchema = z.enum(['coordinator', 'worker', 'verifier']);
+const roleSchema = z.enum(['coordinator', 'worker']);
 const memberSchema = z.strictObject({ taskId: idSchema, role: roleSchema, issueId: idSchema.optional() });
 const recordSchema = z.strictObject({
   requestId: idSchema, key: idSchema, text: textSchema, version: versionSchema.refine(value => value > 0),

@@ -1,3 +1,4 @@
+import { testExecution } from './test-config.js';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -27,18 +28,14 @@ async function fixture(t: TestContext, initialStatus = 'running') {
   const http = createServer();
   const service = new WebSocketServer({ server: http });
   await new Promise<void>(resolve => http.listen(socketPath, resolve));
-  const threads = new Map<string, { thread: Thread; ephemeral: boolean; socket: WebSocket }>();
+  const threads = new Map<string, { thread: Thread; socket: WebSocket }>();
   const records: { connection: number; message: z.infer<typeof messageSchema> }[] = [];
   const clients: CodexAppServer[] = [];
   let connections = 0;
   let loseNext: 'turn/start' | 'turn/steer' | undefined;
   let silentStart = false;
-  let holdSelections = false;
   let failReadThread: string | undefined;
   let failInitialization = false;
-  let selectionFailure: string | undefined;
-  let selectionTerminalStatus: Thread['status']['type'] | undefined;
-  let strictSelectionSchema = false;
   const send = (socket: WebSocket, value: object) => { if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(value)); };
   const broadcast = (value: object) => { for (const socket of service.clients) send(socket, value); };
   const terminal = (saved: { thread: Thread }, status: 'completed' | 'interrupted' | 'failed', error?: string) => {
@@ -62,16 +59,14 @@ async function fixture(t: TestContext, initialStatus = 'running') {
       if (message.method === 'initialized' || !message.method) return;
       if (message.method === 'thread/start') {
         const thread: Thread = { id: `thread-${threads.size + 1}`, status: { type: 'idle' }, turns: [] };
-        const ephemeral = params.ephemeral === true;
-        threads.set(thread.id, { thread, ephemeral, socket });
-        reply({ thread, cwd: params.cwd, approvalPolicy: params.approvalPolicy, sandbox: { type: ephemeral ? 'readOnly' : 'workspaceWrite', networkAccess: false } }); return;
+        threads.set(thread.id, { thread, socket });
+        reply({ thread, cwd: params.cwd, approvalPolicy: params.approvalPolicy, sandbox: { type: 'workspaceWrite', networkAccess: false } }); return;
       }
       const threadId = z.string().parse(params.threadId);
       const saved = threads.get(threadId);
       assert.ok(saved, `Known fixture Thread ${threadId}`);
       if (message.method === 'thread/read' || message.method === 'thread/resume') {
         if (message.method === 'thread/read' && threadId === failReadThread) { send(socket, { id: message.id, error: { code: -32600, message: 'Fixture history unavailable' } }); return; }
-        if (saved.ephemeral && (params.includeTurns || message.method === 'thread/resume')) { send(socket, { id: message.id, error: { code: -32600, message: 'ephemeral threads do not support includeTurns or resume' } }); return; }
         reply({ thread: { ...saved.thread, turns: params.includeTurns || message.method === 'thread/resume' ? saved.thread.turns : [] } }); return;
       }
       if (message.method === 'thread/unsubscribe') { reply({ status: 'unsubscribed' }); return; }
@@ -88,22 +83,9 @@ async function fixture(t: TestContext, initialStatus = 'running') {
         } else saved.thread.turns.at(-1)!.items.push(item);
         if (loseNext === message.method) {
           loseNext = undefined;
-          if (saved.ephemeral && selectionTerminalStatus) saved.thread.status = { type: selectionTerminalStatus };
           socket.terminate(); return;
         }
         reply(message.method === 'turn/start' ? { turn: saved.thread.turns.at(-1) } : { turnId: saved.thread.turns.at(-1)!.id });
-        if (saved.ephemeral && !holdSelections) {
-          const invalidSchema = strictSelectionSchema && JSON.stringify(params.outputSchema).includes('"oneOf":');
-          if (selectionFailure || invalidSchema) {
-            terminal(saved, 'failed', selectionFailure ?? 'Invalid schema: oneOf is not permitted when strict is true');
-            return;
-          }
-          const answer = { id: `answer-${threadId}`, type: 'agentMessage', phase: 'final_answer', text: JSON.stringify({ choice: { kind: 'none', reason: 'Discussion only' } }) };
-          saved.thread.turns.at(-1)!.items.push(answer);
-          broadcast({ method: 'item/completed', params: { threadId, turnId: saved.thread.turns.at(-1)!.id, item: answer } });
-          terminal(saved, 'completed');
-          if (selectionTerminalStatus) saved.thread.status = { type: selectionTerminalStatus };
-        }
         return;
       }
       throw new Error(`Unexpected fixture method ${message.method}`);
@@ -120,15 +102,11 @@ async function fixture(t: TestContext, initialStatus = 'running') {
     const value = new CodexAppServer({ executable, approvalPolicy: 'on-request', sandbox: 'workspace-write', requestTimeoutMs: 1000, ...options }, connector);
     clients.push(value); return value;
   };
-  const selection = (server: CodexAppServer, signal?: AbortSignal) => server.selectWorkspace({ taskId: 'selector', cwd: root, input: [{ kind: 'text', text: 'Discuss architecture' }], answers: [], candidates: [], signal });
   const wait = async (predicate: () => boolean) => { for (let i = 0; i < 100; i++) { if (predicate()) return; await delay(10); } throw new Error('Fixture condition did not occur'); };
-  return { root, socketPath, client, selection, threads, records, broadcast, terminal, wait,
+  return { root, socketPath, client, threads, records, broadcast, terminal, wait,
     failRead: (threadId: string) => { failReadThread = threadId; },
     initialization: (fail: boolean) => { failInitialization = fail; },
-    failSelection: (message: string) => { selectionFailure = message; },
-    selectionStatus: (status: Thread['status']['type']) => { selectionTerminalStatus = status; },
-    enforceSelectionSchema: () => { strictSelectionSchema = true; },
-    hold: () => { holdSelections = true; }, lose: (method: typeof loseNext, silent = false) => { loseNext = method; silentStart = silent; },
+    lose: (method: typeof loseNext, silent = false) => { loseNext = method; silentStart = silent; },
     state: (value: object) => writeFile(statePath, JSON.stringify(value)),
     controls: async () => (await readFile(callsPath, 'utf8')).trim().split('\n').map(line => z.array(z.string()).parse(JSON.parse(line))),
   };
@@ -136,32 +114,6 @@ async function fixture(t: TestContext, initialStatus = 'running') {
 
 const create = (client: CodexAppServer, cwd: string, extra: { model?: string } = {}) => client.createThread({ cwd, instructions: 'Read-only fixture work only', ...extra });
 const start = (client: CodexAppServer, threadId: string, deliveryId = 'input') => client.startTurn({ threadId, deliveryId, input: [{ kind: 'text', text: 'Wait' }] });
-
-test('formal clients and isolated selectors reuse a running daemon and preserve Thread settings', async t => {
-  const f = await fixture(t);
-  const formal = f.client({ command: [f.root + '/codex', 'app-server', '-c', 'model="main-model"', '-c', 'model_provider="provider"', '-c', 'model_reasoning_effort="xhigh"'], selectionModel: 'selector-model' });
-  const unrelated = f.client();
-  const [threadId, thirdParty] = await Promise.all([create(formal, f.root), create(unrelated, f.root)]);
-  const unrelatedTurn = await start(unrelated, thirdParty);
-  await f.selection(formal);
-  const starts = f.records.filter(row => row.message.method === 'thread/start');
-  const selected = starts.find(row => row.message.params?.ephemeral);
-  assert.equal(selected?.message.params?.model, 'selector-model');
-  assert.equal(selected?.message.params?.approvalPolicy, 'never');
-  assert.equal(selected?.message.params?.sandbox, 'read-only');
-  assert.deepEqual(selected?.message.params?.dynamicTools, []);
-  const main = starts.find(row => row.message.params?.model === 'main-model');
-  assert.equal(main?.message.params?.modelProvider, 'provider');
-  assert.deepEqual(main?.message.params?.config, { model_reasoning_effort: 'xhigh' });
-  assert.notEqual(main?.connection, selected?.connection);
-  assert.equal((await f.controls()).filter(args => args.at(-1) === 'start').length, 0);
-  await formal.close();
-  assert.equal((await unrelated.inspect(thirdParty)).turnId, unrelatedTurn);
-  assert.equal((await unrelated.inspect(thirdParty)).status, 'running');
-  await unrelated.interrupt({ threadId: thirdParty, turnId: unrelatedTurn });
-  await start(unrelated, thirdParty, 'after-other-client-closed');
-  assert.equal(f.threads.get(threadId)?.thread.status.type, 'idle');
-});
 
 test('concurrent clients start an absent daemon once through the official entry', async t => {
   const f = await fixture(t, 'stopped');
@@ -197,81 +149,6 @@ for (const method of ['turn/start', 'turn/steer'] as const) test(`${method} resp
   assert.equal(f.threads.get(threadId)?.thread.status.type, 'idle');
 });
 
-test('selector response loss cleans its exact notified Turn through a replacement connection', async t => {
-  const f = await fixture(t); const server = f.client(); f.hold(); f.lose('turn/start');
-  await assert.rejects(f.selection(server), UncertainOperationError);
-  const temporary = [...f.threads.values()].find(saved => saved.ephemeral)!;
-  assert.equal(temporary.thread.turns[0]?.status, 'interrupted');
-  assert.equal(temporary.thread.status.type, 'idle');
-  const reads = f.records.filter(row => row.message.method === 'thread/read');
-  assert.ok(reads.every(row => row.message.params?.includeTurns === false));
-  assert.ok(f.records.some(row => row.message.method === 'thread/unsubscribe'));
-  assert.ok(!f.records.some(row => row.message.method === 'thread/resume'));
-});
-
-test('selector structured output uses the supported strict schema and returns its validated choice', async t => {
-  const f = await fixture(t); const server = f.client(); f.enforceSelectionSchema();
-  const result = await f.selection(server);
-  assert.deepEqual(result.choice, { kind: 'none', reason: 'Discussion only' });
-  assert.ok(f.records.some(row => row.message.method === 'thread/unsubscribe' && row.message.params?.threadId === result.temporaryThreadId));
-});
-
-test('a failed selector preserves its original model error and releases the stopped Thread', async t => {
-  const f = await fixture(t); const server = f.client();
-  f.failSelection('HTTP 400 invalid_json_schema from the selection model');
-  await assert.rejects(f.selection(server), error => error instanceof Error && error.message === 'HTTP 400 invalid_json_schema from the selection model');
-  const temporary = [...f.threads.values()].find(saved => saved.ephemeral)!;
-  assert.equal(temporary.thread.status.type, 'systemError');
-  assert.ok(f.records.some(row => row.message.method === 'thread/unsubscribe' && row.message.params?.threadId === temporary.thread.id));
-  await server.close();
-});
-
-test('selector cleanup failure retains both the original model error and the cleanup cause', async t => {
-  const f = await fixture(t); const server = f.client();
-  f.failSelection('HTTP 400 invalid_json_schema from the selection model'); f.failRead('thread-1');
-  await assert.rejects(f.selection(server), error => error instanceof UncertainOperationError
-    && error.message.includes('HTTP 400 invalid_json_schema from the selection model')
-    && error.message.includes('Fixture history unavailable'));
-  assert.ok(!f.records.some(row => row.message.method === 'thread/unsubscribe'));
-  await assert.rejects(server.close(), /cleanup could not be confirmed/);
-});
-
-test('an unloaded selector is released after its exact Turn completed', async t => {
-  const f = await fixture(t); const server = f.client(); f.selectionStatus('notLoaded');
-  const result = await f.selection(server);
-  assert.equal(result.choice.kind, 'none');
-  assert.ok(f.records.some(row => row.message.method === 'thread/unsubscribe' && row.message.params?.threadId === result.temporaryThreadId));
-});
-
-test('a selector system error without terminal Turn evidence remains uncertain', async t => {
-  const f = await fixture(t); const server = f.client(); f.hold(); f.lose('turn/start', true); f.selectionStatus('systemError');
-  await assert.rejects(f.selection(server), error => error instanceof UncertainOperationError && /terminal state could not be confirmed/.test(error.message));
-  const temporary = [...f.threads.values()].find(saved => saved.ephemeral)!;
-  assert.ok(!f.records.some(row => row.message.method === 'thread/unsubscribe'));
-  f.terminal(temporary, 'interrupted');
-});
-
-test('selector abort stops only its owned active Turn and drains its subscription', async t => {
-  const f = await fixture(t); f.hold(); const server = f.client(); const unrelated = f.client();
-  const otherId = await create(unrelated, f.root); await start(unrelated, otherId);
-  const controller = new AbortController(); const pending = f.selection(server, controller.signal);
-  const rejection = assert.rejects(pending, /aborted/);
-  await f.wait(() => [...f.threads.values()].some(saved => saved.ephemeral && saved.thread.status.type === 'active'));
-  controller.abort(); await rejection;
-  assert.equal([...f.threads.values()].find(saved => saved.ephemeral)?.thread.status.type, 'idle');
-  assert.equal((await unrelated.inspect(otherId)).status, 'running');
-  assert.ok(f.records.some(row => row.message.method === 'thread/unsubscribe' && row.message.params?.threadId !== otherId));
-});
-
-test('an active selector with no observable Turn identity reports uncertain cleanup', async t => {
-  const f = await fixture(t); const server = f.client(); f.hold(); f.lose('turn/start', true);
-  await assert.rejects(f.selection(server), error => error instanceof UncertainOperationError && /no identifiable Turn/.test(error.message));
-  const temporary = [...f.threads.values()].find(saved => saved.ephemeral)!;
-  assert.equal(temporary.thread.status.type, 'active');
-  assert.ok(!f.records.some(row => row.message.method === 'turn/interrupt'));
-  f.terminal(temporary, 'interrupted');
-});
-
 test('foreign native requests and events are ignored before progress or tool handlers', async t => {
   const f = await fixture(t); const server = f.client(); let tools = 0; const events: string[] = [];
   server.setWorkspaceHandler(async () => { tools++; throw new Error('Foreign request escaped'); });
@@ -288,19 +165,11 @@ test('foreign native requests and events are ignored before progress or tool han
 });
 
 test('legacy daemon argv migration rejects unknown global settings before connecting', () => {
-  assert.throws(() => normalizeDaemonSettings({ command: ['codex', 'app-server', '--enable', 'feature'] }), /Unsupported.*argument/);
-  assert.throws(() => normalizeDaemonSettings({ command: ['codex', 'app-server', '-c', 'sandbox_mode="danger-full-access"'] }), /never changes global/);
-  assert.throws(() => new CodexAppServer({ command: ['sh', '-c', 'codex app-server'], approvalPolicy: 'never', sandbox: 'read-only', requestTimeoutMs: 1000 }), /official app-server/);
+  assert.throws(() => normalizeDaemonSettings({ command: ['codex', 'app-server', '--enable', 'feature'] }), /cannot contain model overrides/);
+  assert.throws(() => normalizeDaemonSettings({ command: ['codex', 'app-server', '-c', 'sandbox_mode="danger-full-access"'] }), /cannot contain model overrides/);
+  assert.throws(() => new CodexAppServer({ command: ['sh', '-c', 'codex app-server'], approvalPolicy: 'never', sandbox: 'read-only', requestTimeoutMs: 1000 }), /cannot contain model overrides/);
 });
 
-
-test('selector deadline interrupts its active Turn before reporting timeout', async t => {
-  const f = await fixture(t); f.hold(); const server = f.client({ requestTimeoutMs: 600 });
-  await assert.rejects(f.selection(server), /timed out/);
-  const temporary = [...f.threads.values()].find(saved => saved.ephemeral);
-  assert.equal(temporary?.thread.status.type, 'idle');
-  assert.equal(temporary?.thread.turns[0]?.status, 'interrupted');
-});
 
 test('shutdown attempts every owned Thread after one cleanup failure and preserves other clients', async t => {
   const f = await fixture(t); const owner = f.client(); const unrelated = f.client();
@@ -374,11 +243,11 @@ test('initial handshake failure is recoverable and explicit socket configuration
   f.initialization(false); await server.recover(); await create(server, f.root);
 });
 
-test('configuration normalizes legacy Thread overrides and rejects unmigratable argv before runtime', () => {
-  const config = configSchema.parse({ feishu: { userOpenId: 'owner' }, codex: { command: ['codex', 'app-server', '-c', 'model="legacy-model"', '-c', 'model_provider="legacy-provider"', '-c', 'model_reasoning_effort="high"'] } });
-  assert.equal(config.codex.executable, 'codex'); assert.equal(config.codex.command, undefined);
-  assert.equal(config.codex.model, 'legacy-model'); assert.equal(config.codex.modelProvider, 'legacy-provider'); assert.equal(config.codex.reasoningEffort, 'high');
-  assert.throws(() => configSchema.parse({ feishu: { userOpenId: 'owner' }, codex: { command: ['codex', 'app-server', '-c', 'network_access=true'] } }), /Cannot migrate/);
+test('configuration requires the shared execution roles and rejects legacy model settings', () => {
+  const config = configSchema.parse({ execution: { ...testExecution, backends: { codex: { command: ['codex', 'app-server'] } } }, feishu: { userOpenId: 'owner' } });
+  assert.equal(config.execution.backends.codex.executable, 'codex');
+  assert.throws(() => configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner' }, codex: { model: 'legacy-model' } }), /Unrecognized key/);
+  assert.throws(() => configSchema.parse({ execution: { ...testExecution, coordinator: { ...testExecution.coordinator, backend: 'unknown' } }, feishu: { userOpenId: 'owner' } }), /Unsupported execution backend/);
 });
 
 test('completion seals only the owning client Thread and late native requests do not affect another client', async t => {

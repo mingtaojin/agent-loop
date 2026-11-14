@@ -43,12 +43,25 @@
     "appSecretEnv": "FEISHU_APP_SECRET",
     "userOpenId": "REPLACE_WITH_YOUR_OPEN_ID"
   },
-  "codex": {
-    "executable": "codex",
-    "selectionModel": "deepseek/deepseek-v4.1-flash-1017",
-    "approvalPolicy": "on-request",
-    "sandbox": "workspace-write",
-    "requestTimeoutMs": 120000
+  "execution": {
+    "coordinator": {
+      "backend": "codex",
+      "model": "gpt-6-astra",
+      "reasoningEffort": "high"
+    },
+    "worker": {
+      "backend": "codex",
+      "model": "gpt-6.1-sol",
+      "reasoningEffort": "xhigh"
+    },
+    "backends": {
+      "codex": {
+        "executable": "codex",
+        "approvalPolicy": "on-request",
+        "sandbox": "workspace-write",
+        "requestTimeoutMs": 120000
+      }
+    }
   },
   "pollIntervalMs": 30000,
   "executionPollMs": 2000,

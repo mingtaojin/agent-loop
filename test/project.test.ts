@@ -1,3 +1,4 @@
+import { testExecution } from './test-config.js';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -56,8 +57,6 @@ test('project config applies defaults and rejects empty selectors, duplicate rep
   const project = config();
   assert.equal(project.instructions, '');
   assert.equal('supervisionIntervalMs' in project, false);
-  assert.deepEqual(project.models, { coordinator: 'gpt-6-astra', worker: 'gpt-6.1-sol' });
-  assert.deepEqual(project.reasoningEfforts, { coordinator: 'high', worker: 'xhigh' });
   assert.deepEqual(project.repositories[1]?.labelsAny, []);
   const invalid: unknown[] = [
     { ...project, id: '' }, { ...project, id: ' ' }, { ...project, id: 'a\0b' },
@@ -71,7 +70,6 @@ test('project config applies defaults and rejects empty selectors, duplicate rep
     { ...project, instructions: 'a'.repeat(131_073) }, { ...project, supervisionIntervalMs: 0 },
     { ...project, supervisionIntervalMs: 1.5 }, { ...project, supervisionIntervalMs: 2_147_483_648 },
     { ...project, workflow: 'bug-fix' },
-    { ...project, reasoningEfforts: { worker: 'unsupported' } },
   ];
   for (const input of invalid) assert.equal(projectConfigSchema.safeParse(input).success, false);
   assert.deepEqual(projectConfigSchema.parse({ ...project, repositories: [] }).repositories, []);
@@ -118,7 +116,6 @@ test('project intake can require an assigned account AND Bug classification', ()
 test('project actions are discriminated strict shapes with a default worker role', () => {
   const actions: ProjectAction[] = [
     { action: 'status' }, { action: 'dispatch', requestId: 'd', prompt: 'Investigate.', role: 'worker' },
-    { action: 'dispatch', requestId: 'v', prompt: 'Verify.', role: 'verifier', issueId: 'issue-1' },
     { action: 'send', requestId: 's', taskId: 'worker', text: 'Preserve order.' },
     { action: 'announce', requestId: 'a', kind: 'delivery', text: 'Delivered.' },
     { action: 'report', requestId: 'r', kind: 'question', text: 'Which format?' },
@@ -208,7 +205,7 @@ test('membership rejects cross-project reuse, role changes and missing issue ass
   fx.create(); fx.create(config('beta'), 'beta-coordinator');
   fx.write(ledger => ledger.addMember('alpha', 'worker', 'worker'));
   assert.throws(() => fx.write(ledger => ledger.addMember('beta', 'worker', 'worker')));
-  assert.throws(() => fx.write(ledger => ledger.addMember('alpha', 'worker', 'verifier')));
+  assert.throws(() => projectActionSchema.parse({ action: 'dispatch', requestId: 'v', prompt: 'Verify.', role: 'verifier', issueId: 'issue-1' }));
   assert.throws(() => fx.write(ledger => ledger.addMember('alpha', 'second-coordinator', 'coordinator')));
   assert.throws(() => fx.write(ledger => ledger.addMember('alpha', 'new-worker', 'worker', 'missing')));
   assert.throws(() => fx.write(ledger => ledger.addMember('missing', 'new-worker', 'worker')));
@@ -360,11 +357,11 @@ test('record CAS rejects stale writers and idempotent retries preserve immutable
 
 test('record request IDs are scoped to their author while the CAS version is project-wide', t => {
   const fx = fixture(t); fx.create();
-  fx.write(ledger => ledger.addMember('alpha', 'verifier', 'verifier'));
+  fx.write(ledger => ledger.addMember('alpha', 'second-worker', 'worker'));
   const input = { requestId: 'shared', key: 'evidence', text: 'Author report.', expectedVersion: 0, authorTaskId: 'coordinator' };
   fx.ledger.record('alpha', input);
-  const second = fx.ledger.record('alpha', { ...input, text: 'Independent result.', expectedVersion: 1, authorTaskId: 'verifier' });
-  assert.deepEqual(second.records.map(record => [record.authorTaskId, record.version]), [['coordinator', 1], ['verifier', 2]]);
+  const second = fx.ledger.record('alpha', { ...input, text: 'Worker result.', expectedVersion: 1, authorTaskId: 'second-worker' });
+  assert.deepEqual(second.records.map(record => [record.authorTaskId, record.version]), [['coordinator', 1], ['second-worker', 2]]);
 });
 
 test('save validates relational state invariants and forbids rewriting durable identities and history', t => {
@@ -468,7 +465,7 @@ test('project input compatibility validates and strips only the retired supervis
   for (const interval of [undefined, 1, 300_000, 2_147_483_647]) {
     const input = interval === undefined ? current : { ...current, supervisionIntervalMs: interval };
     assert.deepEqual(projectConfigInputSchema.parse(input), current);
-    const parsed = configSchema.parse({ feishu: { userOpenId: 'owner' }, projects: [input] });
+    const parsed = configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner' }, projects: [input] });
     assert.deepEqual(parsed.projects, [current]);
     assert.equal('supervisionIntervalMs' in parsed.projects[0]!, false);
   }

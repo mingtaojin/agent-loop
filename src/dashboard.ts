@@ -36,7 +36,6 @@ export async function startDashboard(options: { dataDir: string; port: number; h
         sourceLabel: presentTaskSource(task.source, 200).label,
         sourceKind: task.source.kind, sourceUrl: task.source.kind === 'github' ? task.source.issue.url : null,
         status: task.status, executionStatus: task.executionStatus, reason: task.reason,
-        workspaceSelection: task.workspaceSelection,
         threadId: task.threadId, turnId: task.turnId, chatId: task.chatId,
         createdAt: task.createdAt, updatedAt: task.updatedAt, recovery: task.recovery,
         requests: task.requests.map(request => ({ kind: request.kind, prompt: boundedDashboardText(request.prompt) })),
@@ -85,7 +84,7 @@ export async function startDashboard(options: { dataDir: string; port: number; h
         if (!db?.tasks().some(task => task.id === taskId)) { json(response, 404, { error: '任务不存在' }); return; }
         const detail = new ProjectDashboardReader(db).taskDetail(taskId);
         json(response, 200, {
-          inputs: db.inputs(taskId).map(input => ({ id: input.id, text: boundedDashboardText(input.message.text), createdAt: input.message.createdAt, origin: input.origin, route: input.route, selectionHandled: input.selectionHandled, status: input.status, error: input.error ? boundedDashboardText(input.error) : null, attachments: input.message.attachments.map(attachment => ({ name: attachment.name, kind: attachment.kind })) })),
+          inputs: db.inputs(taskId).map(input => ({ id: input.id, text: boundedDashboardText(input.message.text), createdAt: input.message.createdAt, origin: input.origin, status: input.status, error: input.error ? boundedDashboardText(input.error) : null, attachments: input.message.attachments.map(attachment => ({ name: attachment.name, kind: attachment.kind })) })),
           outputs: db.outputs(taskId).map(output => ({ ...output, text: boundedDashboardText(output.text), error: output.error ? boundedDashboardText(output.error) : null })), projectId: detail?.projectId ?? null, task: detail?.task ?? null,
           events: detail?.events ?? [], executionEvents: detail?.events ?? [], reports: detail?.reports ?? [], diagnostics: detail?.diagnostics ?? [],
         }); return;

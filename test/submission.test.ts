@@ -1,3 +1,4 @@
+import { testExecution } from './test-config.js';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -17,7 +18,7 @@ const built = import.meta.url.endsWith('.js');
 async function fixture(t: TestContext) {
   const root = await mkdtemp(join(tmpdir(), "retired-submit ' $()-"));
   const dataDir = join(root, 'data'), configPath = join(root, 'config.json');
-  const config = configSchema.parse({ dataDir, feishu: { userOpenId: 'owner' },
+  const config = configSchema.parse({ execution: testExecution, dataDir, feishu: { userOpenId: 'owner' },
     projects: [{ id: 'app', name: 'Application', directory: root, repositories: [] }] });
   await writeFile(configPath, JSON.stringify(config));
   const codex = new CodexFake(), feishu = new FeishuFake(), github = new GitHubFake();
@@ -38,12 +39,12 @@ async function fixture(t: TestContext) {
     const id = randomUUID();
     const task = taskSchema.parse({ id, sourceId: submissionSourceId(submission.requestId),
       source: { kind: 'cli', ...submission, submittedAt: Date.now() }, purpose: 'intake',
-      contextDirectory: join(dataDir, 'tasks', id), resources: [], workspaceSelection: { kind: 'pending' },
+      contextDirectory: join(dataDir, 'tasks', id), resources: [],
       status: 'pending', reason: null, prompt: 'Saved guidance', promptHash: 'saved-hash', skillPath: null,
       chatId: null, threadId: null, turnId: null, requests: [], lastHandledTurnId: null, createdAt: Date.now(), updatedAt: Date.now() });
     loop.store.saveTask(task);
     loop.store.receive(task.id, { id: `${id}:initial`, text: prompt, chatId: '', senderId: 'external:cli', chatType: 'group',
-      attachments: [], createdAt: task.createdAt }, 'initial', { kind: 'cli', requestId: submission.requestId }, 'workspace-selection');
+      attachments: [], createdAt: task.createdAt }, 'initial', { kind: 'cli', requestId: submission.requestId });
     return task;
   }
   return { root, dataDir, codex, feishu, cli, saved, get loop() { return loop; },
@@ -75,23 +76,13 @@ test('read-only status preserves historical CLI receipts without credentials or 
   assert.equal(JSON.parse(missing.stdout).status, 'not_found');
 });
 
-test('saved CLI intake recovers into its coordinator and delegates the same Task once without a group', async t => {
+test('saved CLI intake remains pending until a coordinator claims it', async t => {
   const f = await fixture(t), saved = f.saved();
-  f.codex.selectionResults.push({ kind: 'project', projectId: 'coordinated:app', reason: 'Saved Application request' });
   await f.restart(); await f.loop.tick();
-  const route = f.loop.projects.intakeRoute(saved.id); assert.ok(route);
+  assert.equal(f.loop.projects.intakeRoute(saved.id), null);
   assert.equal(f.loop.store.task(saved.id).threadId, null);
+  assert.equal(f.loop.store.task(saved.id).status, 'pending');
   assert.deepEqual(f.loop.store.task(saved.id).source, saved.source);
-  await delegateIntake(f.loop, saved.id);
-  const worker = f.loop.store.task(saved.id); assert.ok(worker.threadId); assert.equal(worker.chatId, null);
-  const failed = taskSchema.parse({ ...worker, status: 'failed', reason: 'Preserved execution failure' }); f.loop.store.saveTask(failed);
-  const created = f.codex.created.length, starts = f.codex.starts.length;
-  const receipt = await f.loop.projectAction(route.coordinatorTaskId, { action: 'dispatch', requestId: `delegate-${saved.id}`,
-    intakeTaskId: saved.id, role: 'worker', prompt: 'Investigate the supplied request within its original scope.' });
-  assert.equal(typeof receipt, 'object'); assert.deepEqual(f.loop.store.task(saved.id), failed);
-  assert.equal(f.codex.created.length, created); assert.equal(f.codex.starts.length, starts); assert.equal(f.feishu.groups.size, 1);
-  const instructions = f.codex.created.find(call => call.cwd === worker.resources[0]?.workspace)?.instructions ?? '';
-  assert.match(instructions, /project_action|project-client/); assert.doesNotMatch(instructions, /submit --config|prompt-file/);
 });
 
 test('historical CLI conversation and dashboard keep original request text and provenance', async t => {

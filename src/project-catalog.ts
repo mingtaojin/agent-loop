@@ -3,7 +3,7 @@ import { realpath, stat } from 'node:fs/promises';
 import { basename, isAbsolute, relative } from 'node:path';
 import { z } from 'zod';
 import type { Config } from './config.js';
-import type { Task, WorkspaceCandidate, WorkspaceChoice } from './domain.js';
+import type { Task } from './domain.js';
 import { errorMessage } from './domain.js';
 import { discoverProjects } from './project-discovery.js';
 import { ProjectLedger, projectConfigSchema, projectConfigInputSchema, type ProjectConfig } from './project.js';
@@ -178,31 +178,6 @@ export class ProjectCatalog {
     return parents.length === 1 ? parents[0] ?? null : null;
   }
 
-  async resolveSelection(choice: WorkspaceChoice, candidates: WorkspaceCandidate[]): Promise<ProjectConfig | null> {
-    await this.refresh();
-    if (choice.kind === 'none' || choice.kind === 'question') return null;
-    if (choice.kind === 'repository') {
-      const candidate = candidates.find(item => !('kind' in item) && item.name.toLowerCase() === choice.repositoryName.toLowerCase());
-      const repository = this.config.repositories.find(item => item.name.toLowerCase() === choice.repositoryName.toLowerCase());
-      if (!candidate || 'kind' in candidate || !repository || !('path' in repository)) return null;
-      const directory = await canonical(repository.path);
-      if (!directory || await canonical(candidate.path) !== directory) return null;
-      const candidateWorkspace = candidate.workspace?.kind === 'project-directory' ? candidate.workspace.path : candidate.path;
-      const workspace = repository.workspace?.kind === 'project-directory' ? repository.workspace.path : repository.path;
-      if (await canonical(candidateWorkspace) !== await canonical(workspace)) return null;
-      return this.resolveRepository(repository.name);
-    }
-    const candidate = candidates.find(item => 'kind' in item && item.id === choice.projectId);
-    if (!candidate || !('kind' in candidate)) return null;
-    const discovered = await this.discovered();
-    const entry = discovered.find(item => item.id === candidate.id && item.entryPath === candidate.entryPath && item.canonicalPath === candidate.canonicalPath);
-    const configured = this.effective.find(project => (project.id === candidate.id || `coordinated:${project.id}` === candidate.id)
-      && project.directory === candidate.canonicalPath);
-    if (!entry && !configured) return null;
-    if (configured && await canonical(candidate.entryPath) === candidate.canonicalPath) return configured;
-    return this.resolveDirectory(candidate.entryPath, candidate.canonicalPath);
-  }
-
   async resolveTask(task: Task): Promise<ProjectConfig | null> {
     await this.refresh();
     const member = new ProjectLedger(this.store).membership(task.id);
@@ -223,18 +198,6 @@ export class ProjectCatalog {
       }
       if (!project) return null;
       resolved.push(project);
-    }
-    if (task.workspaceSelection.kind === 'selected') {
-      const choice = task.workspaceSelection.choice;
-      if (choice.kind === 'project') {
-        const project = await this.resolveDirectory(choice.project.entryPath, choice.project.canonicalPath);
-        if (!project) return null;
-        resolved.push(project);
-      } else if (choice.kind === 'repository') {
-        const project = await this.resolveRepository(choice.repositoryName);
-        if (project) resolved.push(project);
-        else if (!resolved.length) return null;
-      }
     }
     const ids = new Set(resolved.map(project => project.id));
     return ids.size === 1 ? resolved[0] ?? null : null;
