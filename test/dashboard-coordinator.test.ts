@@ -74,7 +74,7 @@ test('project dashboard uses ledger membership, reports, and redacted task event
     store.recordExecutionEvent(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'legacy-tool', kind: 'tool_end', label: '命令 · completed · exit 0', text: '$ npm test\nSECRET_OUTPUT', createdAt: Date.now() });
     store.recordExecutionEvent(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'tool', kind: 'tool_output', label: '工具输出', text: 'SECRET_OUTPUT', createdAt: Date.now() });
     for (let index = 0; index < 501; index++) store.recordExecutionEvent(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'legacy-tool-' + index, kind: 'tool_output', label: '工具输出', text: 'OLD_OUTPUT_' + index, createdAt: Date.now() });
-    store.recordExecutionEvent(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'after-gap', kind: 'agent_message', label: 'Agent', text: 'VISIBLE_AFTER_GAP', createdAt: Date.now() });
+    store.recordExecutionEvent(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'after-gap', kind: 'agent_message', label: '最终回答', text: 'VISIBLE_AFTER_GAP', createdAt: Date.now() });
     store.receive(worker.id, { id: 'long-input', chatId: worker.chatId!, senderId: 'owner', text: 'x'.repeat(40_000), attachments: [], createdAt: Date.now(), chatType: 'group' }, 'user');
   });
   const dashboard = await startDashboard({ dataDir: root, port: 0 });
@@ -95,6 +95,13 @@ test('project dashboard uses ledger membership, reports, and redacted task event
   assert.equal(detail.reports[0].nextStep, 'Run tests');
   assert.equal(detail.inputs.find((input: { id: string }) => input.id === 'long-input').text.length, 32_770);
   assert.equal(detail.events.some((event: { kind: string }) => event.kind === 'tool_output'), false);
+  assert.equal(detail.timeline.some((event: { type: string }) => event.type === 'INPUT'), true);
+  assert.equal(detail.timeline.some((event: { type: string }) => event.type === 'NARRATIVE'), true);
+  assert.equal(detail.timeline.some((event: { type: string }) => event.type === 'TOOL_CALL'), true);
+  assert.equal(detail.timeline.some((event: { type: string }) => event.type === 'EVIDENCE'), true);
+  assert.equal(detail.timeline.some((event: { type: string }) => event.type === 'OUTPUT'), true);
+  assert.equal(detail.timeline.some((event: { type: string }) => event.type === 'WAITING'), false);
+  assert.doesNotMatch(JSON.stringify(detail.timeline), /tool_output|SECRET_OUTPUT/);
   assert.doesNotMatch(JSON.stringify(detail), /SECRET_OUTPUT/);
   assert.match(JSON.stringify(detail), /VISIBLE_AFTER_GAP/);
 

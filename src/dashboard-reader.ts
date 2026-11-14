@@ -41,9 +41,27 @@ export interface DashboardExecutionEvent {
   turnId: string | null;
   itemId: string | null;
   kind: Exclude<StoredExecutionEvent['kind'], 'tool_output'>;
+  type: DashboardEventType;
   label: string;
   text: string;
   createdAt: number;
+}
+
+export const dashboardEventTypes = ['INPUT', 'PHASE', 'NARRATIVE', 'TOOL_CALL', 'WAITING', 'BLOCKER', 'OUTPUT', 'EVIDENCE', 'RETRY'] as const;
+export type DashboardEventType = typeof dashboardEventTypes[number];
+
+export interface DashboardTimelineEntry {
+  id: string;
+  seq: number;
+  taskId: string;
+  threadId: string | null;
+  turnId: string | null;
+  itemId: string | null;
+  type: DashboardEventType;
+  label: string;
+  text: string;
+  createdAt: number;
+  phase: string | null;
 }
 
 export interface ProjectTaskCard {
@@ -87,6 +105,7 @@ export interface DashboardTaskDetail {
   inputs: ReturnType<Store['inputs']>;
   outputs: ReturnType<Store['outputs']>;
   events: DashboardExecutionEvent[];
+  timeline: DashboardTimelineEntry[];
   reports: DashboardReport[];
   diagnostics: ReturnType<Store['diagnostics']>;
 }
@@ -106,6 +125,15 @@ function reportFromInput(input: Inbox): DashboardReport | null {
   return report;
 }
 
+function eventType(event: Pick<StoredExecutionEvent, 'kind' | 'label' | 'text'>): DashboardEventType {
+  if (event.kind === 'agent_delta') return 'NARRATIVE';
+  if (event.kind === 'agent_message') return event.label === '最终回答' ? 'OUTPUT' : 'NARRATIVE';
+  if (event.kind === 'tool_start' || event.kind === 'tool_end') return 'TOOL_CALL';
+  if (event.kind === 'error') return event.label.includes('重试') ? 'RETRY' : 'BLOCKER';
+  if (event.kind === 'turn_status' && /wait|pending|idle|等待|阻塞/i.test(event.text)) return 'WAITING';
+  return 'PHASE';
+}
+
 function dashboardEvent(event: StoredExecutionEvent): DashboardExecutionEvent | null {
   if (event.kind === 'tool_output') return null;
   let text = event.text;
@@ -114,7 +142,7 @@ function dashboardEvent(event: StoredExecutionEvent): DashboardExecutionEvent | 
     else if (event.label.startsWith('文件变更 · ')) text = text.split('\n', 1)[0] ?? '';
     else text = '';
   }
-  return { ...event, text: boundedDashboardText(text) } as DashboardExecutionEvent;
+  return { ...event, type: eventType(event), text: boundedDashboardText(text) } as DashboardExecutionEvent;
 }
 
 function coalesce(events: StoredExecutionEvent[]): DashboardExecutionEvent[] {
@@ -263,6 +291,37 @@ export class ProjectDashboardReader {
     return { cursor, events };
   }
 
+  timeline(taskId: string, limit = 500): DashboardTimelineEntry[] {
+    const task = this.store.tasks().find(candidate => candidate.id === taskId);
+    if (!task) return [];
+    const detailEvents: DashboardTimelineEntry[] = this.allEvents(taskId).flatMap(raw => {
+      const event = dashboardEvent(raw);
+      return event ? [{ ...event, id: 'event:' + event.seq, phase: null }] : [];
+    });
+    const inputs = this.store.inputs(taskId).map((input, index): DashboardTimelineEntry => ({
+      id: 'input:' + input.id, seq: -(index + 1), taskId, threadId: null, turnId: null, itemId: null,
+      type: 'INPUT', label: input.origin === 'user' ? '用户输入' : '任务输入', text: boundedDashboardText(input.message.text), createdAt: input.message.createdAt, phase: null,
+    }));
+    const reports = this.reportsForTask(taskId, this.context(this.store.tasks())).flatMap((report, index): DashboardTimelineEntry[] => {
+      const type: DashboardEventType = report.kind === 'question' ? 'WAITING' : report.kind === 'result' ? 'OUTPUT' : report.evidence ? 'EVIDENCE' : 'NARRATIVE';
+      const evidence = report.evidence === undefined ? [] : [typeof report.evidence === 'string' ? report.evidence : report.evidence.join('\n')];
+      return [{
+        id: 'report:' + taskId + ':' + index, seq: -(inputs.length + index + 1), taskId, threadId: null, turnId: null, itemId: null,
+        type, label: 'Worker ' + report.kind, text: boundedDashboardText(report.text), createdAt: report.createdAt, phase: report.currentStep ?? null,
+      }, ...evidence.map((text, evidenceIndex) => ({
+        id: 'report-evidence:' + taskId + ':' + index + ':' + evidenceIndex, seq: -(inputs.length + index + evidenceIndex + 2), taskId, threadId: null, turnId: null, itemId: null,
+        type: 'EVIDENCE' as const, label: '证据', text: boundedDashboardText(text), createdAt: report.createdAt, phase: report.currentStep ?? null,
+      }))];
+    });
+    const waiting = task.requests.map((request, index): DashboardTimelineEntry => ({
+      id: 'waiting:' + taskId + ':' + index, seq: -(inputs.length + reports.length + index + 1), taskId, threadId: null, turnId: task.turnId, itemId: null,
+      type: request.kind === 'question' ? 'WAITING' : 'BLOCKER', label: request.kind === 'question' ? '等待回答' : '等待审批', text: boundedDashboardText(request.prompt), createdAt: task.updatedAt, phase: null,
+    }));
+    return [...inputs, ...reports, ...waiting, ...detailEvents]
+      .sort((a, b) => a.createdAt - b.createdAt || a.seq - b.seq)
+      .slice(-limit);
+  }
+
   taskDetail(taskId: string, tasks = this.store.tasks()): DashboardTaskDetail | null {
     const task = tasks.find(candidate => candidate.id === taskId);
     if (!task) return null;
@@ -273,7 +332,7 @@ export class ProjectDashboardReader {
     return {
       task: ownership && project ? this.card(task, project.id, ownership.role, context, project.members.find(member => member.taskId === taskId)?.issueId ?? null) : null,
       projectId: ownership?.projectId ?? null,
-      inputs: this.store.inputs(taskId), outputs: this.store.outputs(taskId), events: coalesce(this.allEvents(taskId)), reports,
+      inputs: this.store.inputs(taskId), outputs: this.store.outputs(taskId), events: coalesce(this.allEvents(taskId)), timeline: this.timeline(taskId), reports,
       diagnostics: this.store.diagnostics().filter(row => row.scope === taskId || row.scope.endsWith(':' + taskId)),
     };
   }
