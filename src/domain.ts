@@ -185,11 +185,24 @@ export interface ExecutionSnapshot {
   error: string | null;
 }
 const reportValueSchema = z.union([z.string().max(131_072), z.array(z.string().max(131_072)).max(100)]);
+export const reportRoutingSchema = z.enum(['intermediate', 'final', 'escalation']);
+export const reportEscalationSchema = z.enum(['authorization', 'scope_change', 'blocker']);
+export const reportSourceSchema = z.strictObject({
+  messageId: z.string().min(1).max(512),
+  chatId: z.string().min(1).max(512),
+  senderId: z.string().min(1).max(512),
+});
+export type ReportRouting = z.infer<typeof reportRoutingSchema>;
+export type ReportEscalation = z.infer<typeof reportEscalationSchema>;
+export type ReportSource = z.infer<typeof reportSourceSchema>;
 export const structuredReportSchema = z.strictObject({
   currentStep: z.string().max(131_072).optional(),
   nextStep: z.string().max(131_072).optional(),
   blockers: reportValueSchema.optional(),
   evidence: reportValueSchema.optional(),
+  routing: reportRoutingSchema.optional(),
+  escalation: reportEscalationSchema.optional(),
+  sources: z.array(reportSourceSchema).max(100).optional(),
 });
 export type StructuredReport = z.infer<typeof structuredReportSchema>;
 export const inputProvenanceSchema = z.discriminatedUnion('kind', [

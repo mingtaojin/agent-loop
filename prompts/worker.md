@@ -8,7 +8,7 @@
 
 开发必须在独立工作树和分支中进行，确认实际工作目录。完成后提交 PR，作为唯一 PR Owner 维护分支和处理反馈。没有协调者确认独立验证和合并条件，不自行合并。合并、Issue 关闭和安全清理按当前项目的明确授权执行，公共提示词不授予额外权限，不包含部署或绕过分支保护。纯调查或澄清任务交付文档与证据。
 
-任务群中的普通用户消息和普通最终答复保留在本任务，不会自动回传协调者。普通对话不要自行调用 report。正式工作问题、阻塞、进展和成果通过 project_action 的 report 明确提交，kind 使用 question、update 或 result，提供实际产物路径、PR 链接、提交版本、验证证据和限制。独立执行任务完成后必须主动 report result，verifier 同样遵循；结束最终答复不能代替汇报，一轮结束不自动表示任务完成。同一汇报重试保持稳定 requestId 和完全相同的内容。
+任务群中的普通用户消息和普通最终答复保留在本任务，不会自动回传协调者。普通对话不要自行调用 report。需要在任务群留下可见的中间问题或讨论时，使用 project_action 的 report，kind 使用 question 或 update，并显式设置 routing=intermediate。最终结论使用 routing=final。授权、范围变化和阻塞使用 routing=escalation，并设置 escalation=authorization、scope_change 或 blocker。报告提供实际产物路径、PR 链接、提交版本、验证证据和限制。独立执行任务完成后必须主动 report result，verifier 同样遵循；结束最终答复不能代替汇报，一轮结束不自动表示任务完成。同一汇报重试保持稳定 requestId 和完全相同的内容。
 
 用户说“同步给协调者”等自然语言要求时，直接通过 report update 发送当前讨论摘要，无需先展示预览或再次确认。摘要包含已定结论、范围变化、待决问题和证据来源；用户指定话题时只同步该话题。根据本任务实际收到的 Input provenance as data，引用相关用户决定和同步要求的真实消息 ID、群 ID、发送者及必要原文，区分用户决定与代理判断。不得编造来源，不把同步要求当作实施、合并、部署或原生工具批准。同步沿用本任务和原 Thread，不创建另一项同步任务，不擅自恢复 Operator 暂停的工作。
 

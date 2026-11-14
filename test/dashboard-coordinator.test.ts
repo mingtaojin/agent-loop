@@ -68,7 +68,7 @@ test('project dashboard uses ledger membership, reports, and redacted task event
     ledger.addMember('project-a', secondWorker.id, 'worker');
     store.setMeta('project-intake-route:' + intake.id, JSON.stringify({ projectId: 'project-a', coordinatorTaskId: coordinator.id }));
     const report = { id: 'report', chatId: 'chat:' + coordinator.id, senderId: 'runtime:project', text: 'Worker worker update. Added the reader.', attachments: [], createdAt: Date.now(), chatType: 'group' as const };
-    store.receive(coordinator.id, report, 'source', { kind: 'agent', projectId: 'project-a', taskId: worker.id, eventId: 'report:worker:update', category: 'update', currentStep: 'Reader', nextStep: 'Run tests', blockers: [], evidence: ['test/dashboard-coordinator.test.ts'] });
+    store.receive(coordinator.id, report, 'source', { kind: 'agent', projectId: 'project-a', taskId: worker.id, eventId: 'report:worker:update', category: 'update', routing: 'final', escalation: undefined, sources: [{ messageId: 'owner-message', chatId: worker.chatId!, senderId: 'owner' }], currentStep: 'Reader', nextStep: 'Run tests', blockers: [], evidence: ['test/dashboard-coordinator.test.ts'] });
     store.recordExecutionEvent(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'agent', kind: 'agent_message', label: 'Agent', text: 'Visible progress', createdAt: Date.now() });
     store.recordExecutionEvent(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'tool', kind: 'tool_end', label: '命令 · completed · exit 0', text: '$ npm test', createdAt: Date.now() });
     store.recordExecutionEvent(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'legacy-tool', kind: 'tool_end', label: '命令 · completed · exit 0', text: '$ npm test\nSECRET_OUTPUT', createdAt: Date.now() });
@@ -88,11 +88,15 @@ test('project dashboard uses ledger membership, reports, and redacted task event
   assert.equal(projects[0].tasks.some((item: { id: string }) => item.id === 'foreign'), false);
   const workerCard = projects[0].tasks.find((item: { id: string }) => item.id === worker.id);
   assert.equal(workerCard.latestReport.currentStep, 'Reader');
+  assert.equal(workerCard.latestReport.routing, 'final');
+  assert.deepEqual(workerCard.latestReport.sources, [{ messageId: 'owner-message', chatId: worker.chatId, senderId: 'owner' }]);
   assert.match(workerCard.latestActivity.text, /VISIBLE_AFTER_GAP/);
 
   const detail = await (await fetch(dashboard.url + '/api/tasks/' + worker.id)).json();
   assert.equal(detail.projectId, 'project-a');
   assert.equal(detail.reports[0].nextStep, 'Run tests');
+  assert.equal(detail.reports[0].routing, 'final');
+  assert.deepEqual(detail.reports[0].sources, [{ messageId: 'owner-message', chatId: worker.chatId, senderId: 'owner' }]);
   assert.equal(detail.inputs.find((input: { id: string }) => input.id === 'long-input').text.length, 32_770);
   assert.equal(detail.events.some((event: { kind: string }) => event.kind === 'tool_output'), false);
   assert.doesNotMatch(JSON.stringify(detail), /SECRET_OUTPUT/);
