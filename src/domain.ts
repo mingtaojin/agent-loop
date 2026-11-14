@@ -202,8 +202,17 @@ export interface ExecutionSnapshot {
   outputs: AgentOutput[];
   error: string | null;
 }
+const reportValueSchema = z.union([z.string().max(131_072), z.array(z.string().max(131_072)).max(100)]);
+export const structuredReportSchema = z.strictObject({
+  currentStep: z.string().max(131_072).optional(),
+  nextStep: z.string().max(131_072).optional(),
+  blockers: reportValueSchema.optional(),
+  evidence: reportValueSchema.optional(),
+});
+export type StructuredReport = z.infer<typeof structuredReportSchema>;
 export const inputProvenanceSchema = z.discriminatedUnion('kind', [
-  z.strictObject({ kind: z.literal('agent'), projectId: z.string(), taskId: z.string(), eventId: z.string(), category: z.string() }),
+  z.strictObject({ kind: z.literal('agent'), projectId: z.string(), taskId: z.string(), eventId: z.string(), category: z.string(),
+    ...structuredReportSchema.shape }),
   z.object({ kind: z.literal('user'), message: incomingSchema }),
   z.object({ kind: z.literal('github_issue'), sourceId: z.string(), revision: z.string(), url: z.string() }),
   z.object({ kind: z.literal('github_comment'), sourceId: z.string(), commentId: z.string(), revision: z.string(), url: z.string(), author: z.string() }),

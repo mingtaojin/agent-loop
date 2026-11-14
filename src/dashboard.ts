@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { hostname, networkInterfaces } from 'node:os';
 import { z } from 'zod';
 import { Store } from './store.js';
+import { ProjectDashboardReader } from './dashboard-reader.js';
 import { errorMessage, presentTaskSource } from './domain.js';
 import { dashboardHtml, dashboardCss, dashboardScript } from './dashboard-page.js';
 
@@ -27,6 +28,7 @@ export async function startDashboard(options: { dataDir: string; port: number; h
     const db = readStore();
     const rawHeartbeat = db?.meta('runtime-heartbeat');
     const heartbeat = rawHeartbeat ? heartbeatSchema.safeParse(JSON.parse(rawHeartbeat)) : null;
+    const projects = db ? new ProjectDashboardReader(db).projects() : [];
     return {
       dataDir: options.dataDir, now: Date.now(), runtime: heartbeat?.success ? heartbeat.data : null,
       tasks: (db?.tasks() ?? []).map(task => ({
@@ -41,7 +43,7 @@ export async function startDashboard(options: { dataDir: string; port: number; h
         resources: task.resources.map(resource => resource.kind === 'project'
           ? { kind: resource.kind, project: resource.project, workspace: resource.workspace }
           : { repository: resource.repository.name, workspace: resource.workspace }),
-      })), diagnostics: db?.diagnostics() ?? [],
+      })), projects, diagnostics: db?.diagnostics() ?? [],
     };
   };
   const server = createServer((request, response) => {
@@ -67,14 +69,25 @@ export async function startDashboard(options: { dataDir: string; port: number; h
     if (asset) { response.writeHead(200, { 'content-type': asset.type }); response.end(asset.body); return; }
     try {
       if (url.pathname === '/api/snapshot') { json(response, 200, snapshot()); return; }
+      if (url.pathname === '/api/projects') {
+        json(response, 200, readStore() ? new ProjectDashboardReader(readStore()!).projects() : []); return;
+      }
+      const projectMatch = /^\/api\/projects\/([^/]+)$/.exec(url.pathname);
+      if (projectMatch?.[1]) {
+        const project = readStore() ? new ProjectDashboardReader(readStore()!).project(decodeURIComponent(projectMatch[1])) : null;
+        if (!project) { json(response, 404, { error: '项目不存在' }); return; }
+        json(response, 200, project); return;
+      }
       const taskMatch = /^\/api\/tasks\/([^/]+)$/.exec(url.pathname);
       if (taskMatch?.[1]) {
         const taskId = decodeURIComponent(taskMatch[1]);
         const db = readStore();
         if (!db?.tasks().some(task => task.id === taskId)) { json(response, 404, { error: '任务不存在' }); return; }
+        const detail = new ProjectDashboardReader(db).taskDetail(taskId);
         json(response, 200, {
           inputs: db.inputs(taskId).map(input => ({ id: input.id, text: input.message.text, createdAt: input.message.createdAt, origin: input.origin, route: input.route, selectionHandled: input.selectionHandled, status: input.status, error: input.error, attachments: input.message.attachments.map(attachment => ({ name: attachment.name, kind: attachment.kind })) })),
-          outputs: db.outputs(taskId),
+          outputs: db.outputs(taskId), projectId: detail?.projectId ?? null, task: detail?.task ?? null,
+          events: detail?.events ?? [], executionEvents: detail?.events ?? [], reports: detail?.reports ?? [], diagnostics: detail?.diagnostics ?? [],
         }); return;
       }
       if (url.pathname !== '/api/events') { json(response, 404, { error: '未找到' }); return; }
@@ -95,6 +108,7 @@ export async function startDashboard(options: { dataDir: string; port: number; h
         try {
           for (const event of db.executionEvents(taskId, cursor)) {
             cursor = event.seq;
+            if (event.kind === 'tool_output') continue;
             if (!response.write('id: ' + event.seq + '\nevent: execution\ndata: ' + JSON.stringify(event) + '\n\n')) { blocked = true; break; }
           }
           if (Date.now() - lastKeepAlive > 10_000 && !blocked) {

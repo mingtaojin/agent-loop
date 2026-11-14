@@ -4,7 +4,7 @@ import { isAbsolute, relative } from 'node:path';
 import type { Config } from './config.js';
 import { ProjectCatalog } from './project-catalog.js';
 import { ProjectLedger, projectView, currentRecords, matchesProjectIssue, projectActionSchema, reasoningEffortSchema, type ReasoningEffort, type ProjectAction, type ProjectConfig, type ProjectState } from './project.js';
-import { intakeRouteSchema, presentTaskSource, submissionSchema, type DiscoveredProject, type InputProvenance, type Source, type Task, type WorkspaceCandidate, type WorkspaceChoice } from './domain.js';
+import { intakeRouteSchema, presentTaskSource, submissionSchema, type DiscoveredProject, type InputProvenance, type Source, type StructuredReport, type Task, type WorkspaceCandidate, type WorkspaceChoice } from './domain.js';
 import type { GitHubPort } from './ports.js';
 import type { TaskCloseout } from './task-closeout.js';
 import { Store, type Inbox } from './store.js';
@@ -74,10 +74,10 @@ export class ProjectRuntime {
     this.store.receive(taskId, { id: `project:${taskId}:${key}`, chatId: task.chatId ?? '', senderId: 'runtime:project',
       chatType: 'group', text, attachments: [], createdAt: Date.now() }, 'source', provenance);
   }
-  event(projectId: string, key: string, text: string, taskId: string, category: string): void {
+  event(projectId: string, key: string, text: string, taskId: string, category: string, report?: StructuredReport): void {
     const state = this.ledger.project(projectId);
     if (!state) throw new Error('Project has not been initialized');
-    this.enqueue(state.coordinatorTaskId, key, text, { kind: 'agent', projectId, taskId, eventId: key, category });
+    this.enqueue(state.coordinatorTaskId, key, text, { kind: 'agent', projectId, taskId, eventId: key, category, ...(report ?? {}) });
   }
   async ensure(): Promise<void> {
     await this.catalog.refresh();
@@ -504,7 +504,8 @@ export class ProjectRuntime {
       }
       case 'report': {
         if (member.role === 'coordinator') throw new Error('Coordinator reports directly to the project group');
-        this.event(state.id, `report:${callerId}:${action.requestId}`, `Worker ${callerId} ${action.kind}.\n${action.text}`, callerId, action.kind);
+        const { action: _action, requestId: _requestId, kind: _kind, text: _text, ...report } = action;
+        this.event(state.id, `report:${callerId}:${action.requestId}`, `Worker ${callerId} ${action.kind}.\n${action.text}`, callerId, action.kind, report);
         return { accepted: true };
       }
       case 'record': {
