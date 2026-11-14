@@ -1,4 +1,4 @@
-import { intakeRouteSchema, presentTaskSource, type InputProvenance, type Task, type TaskResource } from './domain.js';
+import { intakeRouteSchema, presentTaskSource, type InputProvenance, type ReportEscalation, type ReportRouting, type ReportSource, type Task, type TaskResource } from './domain.js';
 import { ProjectLedger, type ProjectState } from './project.js';
 import { Store, type Inbox } from './store.js';
 import type { StoredExecutionEvent } from './execution-events.js';
@@ -28,6 +28,9 @@ export interface DashboardReport {
   kind: 'result' | 'question' | 'update';
   text: string;
   createdAt: number;
+  routing?: ReportRouting;
+  escalation?: ReportEscalation;
+  sources?: ReportSource[];
   currentStep?: string;
   nextStep?: string;
   blockers?: string | string[];
@@ -97,6 +100,9 @@ function reportFromInput(input: Inbox): DashboardReport | null {
   const report = {
     kind: provenance.category as DashboardReport['kind'],
     text: boundedDashboardText(input.message.text),
+    ...(provenance.routing === undefined ? {} : { routing: provenance.routing }),
+    ...(provenance.escalation === undefined ? {} : { escalation: provenance.escalation }),
+    ...(provenance.sources === undefined ? {} : { sources: provenance.sources }),
     createdAt: input.message.createdAt,
     ...(provenance.currentStep === undefined ? {} : { currentStep: boundedDashboardText(provenance.currentStep) }),
     ...(provenance.nextStep === undefined ? {} : { nextStep: boundedDashboardText(provenance.nextStep) }),

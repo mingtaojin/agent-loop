@@ -697,7 +697,7 @@ for (const kind of ['result', 'question', 'update'] as const) test(`worker ${kin
   const worker = await f.dispatch('investigate', 'Investigate the existing export behavior.');
   await f.idleCoordinator();
   const starts = f.codex.starts.filter(input => input.threadId === f.coordinator().threadId).length;
-  const action: ProjectAction = { action: 'report', requestId: `report-${kind}`, kind,
+  const action: ProjectAction = { action: 'report', requestId: `report-${kind}`, kind, routing: 'final',
     text: kind === 'question' ? 'Batch size is undefined. Choose a fixed size or all rows; recommend a fixed size.' : 'Investigation report is ready at docs/export.md. Implementation is still pending.' };
   await f.loop.projectAction(worker.id, action); await f.loop.projectAction(worker.id, action); await f.loop.tick();
   const events = f.events(f.coordinator().id, kind); assert.equal(events.length, 1);
@@ -709,6 +709,65 @@ for (const kind of ['result', 'question', 'update'] as const) test(`worker ${kin
   assert.equal(f.events(f.coordinator().id, kind).length, 1);
   await assert.rejects(f.loop.projectAction(worker.id, { ...action, text: 'Changed report under the same ID' }), /different|conflict|already/i);
 });
+
+test('intermediate Worker reports stay in the Worker group, survive restart and never wake the coordinator', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('intermediate-report', 'Discuss the assigned contract.');
+  const group = await f.openGroup(worker.id); assert.ok(group.chatId);
+  await f.idleCoordinator();
+  const action: ProjectAction = { action: 'report', requestId: 'intermediate-discussion', kind: 'question',
+    text: '中间问题留在任务群。', routing: 'intermediate' };
+  const first = await f.loop.projectAction(worker.id, action);
+  assert.deepEqual(first, { accepted: true, destination: 'worker_group', taskId: worker.id, routing: 'intermediate' });
+  assert.deepEqual(await f.loop.projectAction(worker.id, action), first);
+  await f.loop.tick();
+  assert.equal(f.events(f.coordinator().id, 'question').length, 0);
+  assert.equal(f.feishu.sent.filter(message => message.chatId === group.chatId && message.text === action.text).length, 1);
+  const audit = JSON.parse(f.loop.store.meta(`project-report:${JSON.stringify(['app', worker.id, action.requestId])}`) ?? '{}');
+  assert.equal(audit.routing, 'intermediate');
+  await f.restart(); await f.loop.projectAction(worker.id, action); await f.loop.tick();
+  assert.equal(f.events(f.coordinator().id, 'question').length, 0);
+  assert.equal(f.feishu.sent.filter(message => message.chatId === group.chatId && message.text === action.text).length, 1);
+});
+
+test('final Worker reports retain task-group sources and reach only the coordinator once', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('final-report', 'Resolve the assigned discussion.');
+  const group = await f.openGroup(worker.id); assert.ok(group.chatId);
+  const owner = f.message('final-source', '确认采用当前范围。', group.chatId);
+  await f.loop.receive(owner); await f.loop.tick();
+  const action: ProjectAction = { action: 'report', requestId: 'final-conclusion', kind: 'result', text: '结论已确认。' };
+  const first = await f.loop.projectAction(worker.id, action);
+  assert.deepEqual(first, { accepted: true, destination: 'coordinator', taskId: worker.id, routing: 'final' });
+  assert.deepEqual(await f.loop.projectAction(worker.id, action), first);
+  await f.loop.tick();
+  const event = f.events(f.coordinator().id, 'result'); assert.equal(event.length, 1);
+  assert.equal(event[0]?.provenance.kind, 'agent');
+  if (event[0]?.provenance.kind === 'agent') {
+    assert.equal(event[0].provenance.routing, 'final');
+    assert.deepEqual(event[0].provenance.sources, [{ messageId: owner.id, chatId: owner.chatId, senderId: owner.senderId }]);
+  }
+  await f.restart(); await f.loop.projectAction(worker.id, action); await f.loop.tick();
+  assert.equal(f.events(f.coordinator().id, 'result').length, 1);
+});
+
+test('escalation reports reach the coordinator without a Worker group and require a reason', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('escalate-report', 'Escalate only coordination matters.');
+  const action: ProjectAction = { action: 'report', requestId: 'authorization-escalation', kind: 'question',
+    text: '需要确认授权范围。', routing: 'escalation', escalation: 'authorization' };
+  const first = await f.loop.projectAction(worker.id, action);
+  assert.deepEqual(first, { accepted: true, destination: 'coordinator', taskId: worker.id, routing: 'escalation' });
+  await f.loop.projectAction(worker.id, action); await f.loop.tick();
+  const event = f.events(f.coordinator().id, 'question'); assert.equal(event.length, 1);
+  assert.equal(event[0]?.provenance.kind, 'agent');
+  if (event[0]?.provenance.kind === 'agent') {
+    assert.equal(event[0].provenance.routing, 'escalation');
+    assert.equal(event[0].provenance.escalation, 'authorization');
+  }
+  await assert.rejects(f.loop.projectAction(worker.id, { ...action, requestId: 'missing-escalation', escalation: undefined }), /Escalation reports require/);
+});
+
 
 test('native Worker questions wake the coordinator and its answer resumes that Worker without blocking others', async t => {
   const f = await fixture(t); await f.initialize();
@@ -762,11 +821,18 @@ test('a direct owner decision stays in the Worker group until a sourced discussi
   assert.equal(f.events(f.coordinator().id, 'owner_input').length, 0);
   const request = f.message('sync-scope', '只把选中行范围同步给协调者。', worker.chatId!);
   await f.loop.receive(request);
-  const summary: ProjectAction = { action: 'report', requestId: `sync-${request.id}`, kind: 'update',
+  const summary: ProjectAction = { action: 'report', requestId: `sync-${request.id}`, kind: 'update', routing: 'final',
     text: `主题：选中行。已定：仅选中行。范围变化：更新后端契约。待决：无。证据：scope.log。用户决定 ${decision.id}，群 ${decision.chatId}，发送者 ${decision.senderId}；同步要求 ${request.id}，群 ${request.chatId}，发送者 ${request.senderId}。不部署。` };
   await f.loop.projectAction(worker.id, summary); await f.loop.projectAction(worker.id, summary); await f.loop.tick();
   const reports = f.events(f.coordinator().id, 'update'); assert.equal(reports.length, 1);
-  assert.deepEqual(reports[0]?.provenance, { kind: 'agent', projectId: 'app', taskId: worker.id, eventId: `report:${worker.id}:${summary.requestId}`, category: 'update' });
+  assert.equal(reports[0]?.provenance.kind, 'agent');
+  if (reports[0]?.provenance.kind === 'agent') {
+    assert.equal(reports[0].provenance.routing, 'final');
+    assert.deepEqual(reports[0].provenance.sources, [
+      { messageId: decision.id, chatId: decision.chatId, senderId: decision.senderId },
+      { messageId: request.id, chatId: request.chatId, senderId: request.senderId },
+    ]);
+  }
   assert.ok(reports[0]?.message.text.includes(summary.text));
   assert.equal(f.coordinator().status, 'running');
   assert.equal(f.loop.store.task(worker.id).threadId, worker.threadId);
@@ -1467,7 +1533,7 @@ for (const role of ['worker', 'worker'] as const) for (const kind of ['result', 
     if (grouped) await f.openGroup(worker.id);
     if (!running) await f.idleCoordinator();
     const coordinator = f.coordinator(), starts = f.codex.starts.length, steers = f.codex.steers.length;
-    const action: ProjectAction = { action: 'report', kind, requestId: `formal-${kind}`, text: `Formal ${kind} with evidence docs/findings.md.` };
+    const action: ProjectAction = { action: 'report', kind, routing: 'final', requestId: `formal-${kind}`, text: `Formal ${kind} with evidence docs/findings.md.` };
     await f.loop.projectAction(worker.id, action); await f.loop.projectAction(worker.id, action); await f.loop.tick();
     assert.equal(f.events(coordinator.id, kind).length, 1);
     assert.equal(f.events(coordinator.id, kind)[0]?.status, 'delivered');
@@ -1493,7 +1559,7 @@ test('elapsed time and restarts leave idle project members waiting until an expl
   assert.equal(f.codex.starts.length, starts); assert.equal(f.codex.steers.length, steers);
   assert.deepEqual(f.loop.store.inputs(f.coordinator().id), inputs);
   assert.equal(f.events(f.coordinator().id, 'supervision').length, 0);
-  await f.loop.projectAction(secondWorker.id, { action: 'report', requestId: 'new-evidence', kind: 'update', text: 'New evidence arrived.' });
+  await f.loop.projectAction(secondWorker.id, { action: 'report', requestId: 'new-evidence', kind: 'update', routing: 'final', text: 'New evidence arrived.' });
   await f.loop.tick();
   assert.equal(f.codex.starts.length, starts + 1);
   assert.equal(f.events(f.coordinator().id, 'update')[0]?.status, 'delivered');
@@ -1539,7 +1605,7 @@ for (const status of ['pending', 'held', 'failed'] as const) test(`obsolete auto
     assert.equal(retired.status, 'dropped'); assert.match(retired.error ?? '', /Retired automatic project event/);
     assert.deepEqual({ ...retired, status: input.status, error: input.error }, input);
   }
-  await f.loop.projectAction(worker.id, { action: 'report', requestId: 'paused-report', kind: 'update', text: 'Explicit new evidence while paused.' });
+  await f.loop.projectAction(worker.id, { action: 'report', requestId: 'paused-report', kind: 'update', routing: 'final', text: 'Explicit new evidence while paused.' });
   await f.loop.tick();
   assert.equal(f.coordinator().status, 'paused');
   assert.equal(f.events(coordinator.id, 'update')[0]?.status, 'held');
@@ -1673,7 +1739,7 @@ test('a constructed initial-batch fixture excludes dropped copies while deliveri
   const eventId = `${receipt.taskId}:user:obsolete-before-start`;
   f.loop.projects.event('app', eventId, 'Obsolete initial copy.', receipt.taskId, 'owner_input');
   f.loop.store.setMeta(`project-intake-promotion:${coordinator.id}`, 'constructed initial-batch fixture');
-  await f.loop.projectAction(receipt.taskId, { action: 'report', requestId: 'early-report', kind: 'update', text: 'Valid early report.' });
+  await f.loop.projectAction(receipt.taskId, { action: 'report', requestId: 'early-report', kind: 'update', routing: 'final', text: 'Valid early report.' });
   await f.loop.tick();
   const started = f.codex.starts.find(input => input.threadId === f.coordinator().threadId); assert.ok(started);
   const retiredId = `project:${coordinator.id}:${eventId}`;
