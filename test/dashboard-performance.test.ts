@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { performance } from 'node:perf_hooks';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -76,4 +77,40 @@ test('retention trims the 2002-row final-plus-sampled-delta case to the exact du
     const final = db.prepare("SELECT payload FROM execution_events WHERE task_id=? AND json_extract(payload,'$.kind')='agent_message'").get(saved.id) as { payload: string } | undefined;
     assert.equal(JSON.parse(final!.payload).text, 'final answer');
   } finally { db.close(); }
+});
+
+
+test('Dashboard v1 timeline exposes typed visible events and omits private tool output', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-dashboard-v1-timeline-'));
+  const store = new Store(root); const saved = task(root); store.saveTask(saved);
+  t.after(async () => { store.close(); await rm(root, { recursive: true, force: true }); });
+  store.recordExecutionEvent(saved.id, event('turn_start', 'inProgress', 10));
+  store.recordExecutionEvent(saved.id, { ...event('agent_message', 'Visible output', 11), label: '最终回答' });
+  store.recordExecutionEvent(saved.id, event('tool_output', 'PRIVATE_OUTPUT', 12));
+  const dashboard = await startDashboard({ dataDir: root, port: 0, host: '127.0.0.1' });
+  t.after(async () => dashboard.close());
+  const detail = await (await fetch(dashboard.url + '/api/tasks/' + saved.id)).json();
+  assert.ok(detail.timeline.some((entry: { type: string }) => entry.type === 'PHASE'));
+  assert.ok(detail.timeline.some((entry: { type: string }) => entry.type === 'OUTPUT'));
+  assert.equal(detail.timeline.some((entry: { text: string }) => entry.text.includes('PRIVATE_OUTPUT')), false);
+});
+
+test('Dashboard v1 API remains under the 500 ms interface budget with a retained event fixture', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-dashboard-v1-api-'));
+  const store = new Store(root); const saved = task(root); store.saveTask(saved);
+  for (let index = 0; index < 500; index++) store.recordExecutionEvent(saved.id, event('turn_status', 'running', index + 1));
+  const dashboard = await startDashboard({ dataDir: root, port: 0, host: '127.0.0.1' });
+  t.after(async () => { await dashboard.close(); store.close(); await rm(root, { recursive: true, force: true }); });
+  const samples: number[] = [];
+  for (let index = 0; index < 12; index++) {
+    const started = performance.now();
+    const response = await fetch(dashboard.url + (index % 2 ? '/api/projects' : '/api/snapshot'));
+    await response.arrayBuffer();
+    assert.equal(response.status, 200);
+    samples.push(performance.now() - started);
+  }
+  samples.sort((a, b) => a - b);
+  const p95 = samples[Math.ceil(samples.length * 0.95) - 1]!;
+  console.log(JSON.stringify({ benchmark: 'dashboard-v1-interface', count: samples.length, p50Ms: Number(samples[Math.floor(samples.length / 2)]!.toFixed(3)), p95Ms: Number(p95.toFixed(3)), maxMs: Number(samples.at(-1)!.toFixed(3)), thresholdMs: 500 }));
+  assert.ok(p95 < 500, `dashboard p95 ${p95.toFixed(3)}ms exceeded 500ms`);
 });
