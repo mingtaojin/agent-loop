@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { criteriaSchema, requestSchema, workspaceTargetSchema } from './domain.js';
 import { discoverProjects } from './project-discovery.js';
 import type { Config } from './config.js';
-import { errorMessage, presentTaskSource, matchSource, RejectedInputError, TurnChangedError, type AgentInput, type ApprovalAction, type DiscoveredProject, type ExecutionSnapshot, type IncomingMessage, type Repository, type Source, type SourceComment, type Task, type TaskResource, type TaskSource, type WorkspaceTarget } from './domain.js';
+import { errorMessage, projectDecisionActionSchema, presentTaskSource, matchSource, RejectedInputError, TurnChangedError, type AgentInput, type ApprovalAction, type DiscoveredProject, type ExecutionSnapshot, type IncomingMessage, type ProjectDecisionAction, type Repository, type Source, type SourceComment, type Task, type TaskResource, type TaskSource, type WorkspaceTarget } from './domain.js';
 import { fitsTaskTitle, parseTaskTitle } from './task-title.js';
 import { CodexProviderMismatchError, FeishuApiError, TaskGroupUnavailable, type FeishuReconnectEvent, type RunningActivity, type TurnIdentity, type CodexPort, type FeishuPort, type GitHubPort, type WorkspacePort } from './ports.js';
 import { TaskGroups, assertGroupBinding, groupGeneration, retireTaskGroup } from './task-groups.js';
@@ -191,9 +191,36 @@ export class AgentLoop {
       && this.store.outputs(task.id).find(output => output.id === id)?.status === 'pending')
       this.store.markOutput(id, 'dropped', '任务当前无群，不补发历史');
   }
-  private announce(taskId: string, action: Extract<ProjectAction, { action: 'announce' }>): { accepted: true; requestId: string } {
+  private async announce(taskId: string, action: Extract<ProjectAction, { action: 'announce' }>): Promise<unknown> {
     const task = this.store.task(taskId);
     if (!task.chatId) throw new Error('Project coordinator group is unavailable');
+    if (action.kind === 'decision' && action.options?.length && this.ports.feishu.sendDecisionCard) {
+      const expiresAt = action.expiresAt ?? Date.now() + 7 * 24 * 60 * 60 * 1000;
+      const cardRecordId = `project:${taskId}:${action.requestId}`;
+      const existing = this.store.feishuCard(cardRecordId);
+      if (existing?.status === 'uncertain') throw new Error('Project decision card delivery is uncertain; reconcile it before retrying');
+      if (existing?.receipt) return { accepted: true, requestId: action.requestId, receipt: existing.receipt };
+      const uuid = digest(`project-card:${taskId}:${action.requestId}`).slice(0, 32);
+      const pending = existing ?? {
+        id: cardRecordId, kind: 'project_decision' as const, requestId: action.requestId, taskId,
+        projectId: this.projects.ledger.membership(taskId)?.projectId, chatId: task.chatId, ownerId: this.config.feishu.userOpenId,
+        cardId: null, messageId: null, sequence: 0, uuid, status: 'pending' as const, expiresAt,
+        fingerprint: digest(JSON.stringify({ taskId, requestId: action.requestId, key: action.key ?? action.requestId, options: action.options, text: action.text })),
+        receipt: null, updatedAt: Date.now(),
+      };
+      const parsed = pending.projectId ? pending : { ...pending, projectId: this.projects.ledger.membership(taskId)?.projectId };
+      if (!parsed.projectId) throw new Error('Project decision requires a project-bound coordinator');
+      this.store.saveFeishuCard(parsed);
+      try {
+        const delivery = await this.ports.feishu.sendDecisionCard({ id: cardRecordId, projectId: parsed.projectId, coordinatorTaskId: taskId,
+          requestId: action.requestId, key: action.key ?? action.requestId, prompt: action.text, options: action.options, context: action.context,
+          chatId: task.chatId, ownerId: this.config.feishu.userOpenId, expiresAt });
+        this.store.updateFeishuCard(cardRecordId, { cardId: delivery.cardId, messageId: delivery.messageId, sequence: delivery.sequence,
+          uuid: delivery.uuid, status: 'pending' });
+      } catch (error) { this.store.updateFeishuCard(cardRecordId, { status: 'uncertain' }); throw error; }
+      this.projects.markCoordinatorAnnouncement(taskId, task.turnId);
+      return { accepted: true, requestId: action.requestId, cardId: this.store.feishuCard(cardRecordId)?.cardId };
+    }
     const headings = { decision: '【需要决定】', blocker: '【任务阻塞】', approval: '【需要处理审批】', delivery: '【交付结论】' } as const;
     this.store.enqueue(task.id, `${headings[action.kind]}\n${action.text}`, `project-announcement:${action.requestId}`);
     return { accepted: true, requestId: action.requestId };
@@ -850,12 +877,43 @@ export class AgentLoop {
     this.forwardCompletedInputs(task);
     return received;
   }
-  async approve(action: ApprovalAction): Promise<void> {
+  async approve(action: ApprovalAction | ProjectDecisionAction): Promise<void> {
+    if ('kind' in action) {
+      if (action.senderId !== this.config.feishu.userOpenId) throw new Error('Decision actor is not authorized');
+      const card = this.store.feishuCardForRequest(action.requestId);
+      if (card && card.status === 'uncertain') throw new Error('Decision card outcome is uncertain');
+      if (card && card.expiresAt <= Date.now()) { this.store.updateFeishuCard(card.id, { status: 'expired' }); throw new Error('Project decision card expired'); }
+      if (card?.messageId && action.messageId && card.messageId !== action.messageId) throw new Error('Project decision card identity expired');
+      const actionFingerprint = digest(JSON.stringify({ choice: action.choice, customText: action.customText }));
+      if (card?.status === 'confirmed' && card.receipt) {
+        if (card.fingerprint !== actionFingerprint) throw new Error('Project decision conflicts with the original receipt');
+        return;
+      }
+      if (card) this.store.updateFeishuCard(card.id, { status: 'processing', receipt: null, sequence: card.sequence + 1, uuid: `${card.uuid}:processing` });
+      try {
+        const result = await this.projects.acceptProjectDecision(projectDecisionActionSchema.parse(action));
+        if (card) {
+          const current = this.store.feishuCard(card.id);
+          this.store.updateFeishuCard(card.id, { status: 'confirmed', receipt: result.receipt, fingerprint: actionFingerprint,
+            sequence: (current?.sequence ?? card.sequence) + 1, uuid: `${current?.uuid ?? card.uuid}:confirmed` });
+        }
+      } catch (error) {
+        if (card) {
+          const current = this.store.feishuCard(card.id);
+          this.store.updateFeishuCard(card.id, { status: error instanceof Error && /expired|binding|empty/u.test(error.message) ? 'rejected' : 'uncertain',
+            sequence: (current?.sequence ?? card.sequence) + 1, uuid: `${current?.uuid ?? card.uuid}:failed` });
+        }
+        throw error;
+      }
+      return;
+    }
     if (this.stopping) throw new Error('Agent Loop is closing');
     if (action.senderId !== this.config.feishu.userOpenId) throw new Error('Approval actor is not authorized');
     const task = this.store.task(action.taskId);
     this.closeout.assertOpen(task.id);
     this.requireMember(task);
+    const card = this.store.feishuCardForRequest(action.requestId);
+    if (card?.kind === 'native_approval' && card.messageId && action.messageId && card.messageId !== action.messageId) throw new Error('Approval card identity expired');
     const request = task.requests.find(item => item.id === action.requestId && item.connectionEpoch === action.epoch);
     if (task.status === 'paused' || task.status === 'failed' || task.chatId !== action.chatId || task.threadId !== action.threadId || task.turnId !== action.turnId || !request || !['approval', 'permissions'].includes(request.kind)) throw new Error('Approval task association expired');
     if (!this.store.queueApproval(action)) throw new Error('Approval action was already received');
@@ -866,6 +924,8 @@ export class AgentLoop {
     for (const queued of this.store.approvals(task.id)) {
       if (queued.status === 'processing') {
         this.store.markApproval(queued.id, 'uncertain', 'Approval acknowledgement was lost across restart');
+        const card = this.store.feishuCardForRequest(queued.action.requestId);
+        if (card && card.kind === 'native_approval') this.store.updateFeishuCard(card.id, { status: 'uncertain' });
         this.notify(task, '工具审批结果不确定，已保留操作记录，未自动再次批准。', queued.id);
         continue;
       }
@@ -873,17 +933,31 @@ export class AgentLoop {
       const action = queued.action;
       const request = snapshot.requests.find(item => item.id === action.requestId && item.threadId === action.threadId && item.turnId === action.turnId && item.connectionEpoch === action.epoch && ['approval', 'permissions'].includes(item.kind));
       if (!request || task.status === 'paused' || task.status === 'failed') {
-        this.store.markApproval(queued.id, 'rejected', 'Native approval request expired'); continue;
+        this.store.markApproval(queued.id, 'rejected', 'Native approval request expired');
+        const expiredCard = this.store.feishuCardForRequest(action.requestId);
+        if (expiredCard && expiredCard.kind === 'native_approval') this.store.updateFeishuCard(expiredCard.id, { status: 'expired' });
+        continue;
       }
       const releaseAdmission = this.closeout.reserve(task.id);
       this.store.markApproval(queued.id, 'processing');
+      const card = this.store.feishuCardForRequest(action.requestId);
+      if (card && card.kind === 'native_approval') this.store.updateFeishuCard(card.id, { status: 'processing', sequence: card.sequence + 1, uuid: `${card.uuid}:processing` });
       try {
         this.closeout.assertOpen(task.id);
         const result = await this.ports.codex.respondApproval({ request, decision: action.decision });
         this.store.markApproval(queued.id, result, result === 'uncertain' ? 'Native approval resolution is unconfirmed' : null);
+        if (card && card.kind === 'native_approval') {
+          const current = this.store.feishuCard(card.id);
+          this.store.updateFeishuCard(card.id, { status: result === 'uncertain' ? 'uncertain' : action.decision === 'approve' ? 'confirmed' : 'rejected', receipt: queued.id,
+            sequence: (current?.sequence ?? card.sequence) + 1, uuid: `${current?.uuid ?? card.uuid}:final` });
+        }
         if (result === 'uncertain') this.notify(task, '工具审批结果不确定，已保留操作记录，未自动再次批准。', queued.id);
       } catch (error) {
         this.store.markApproval(queued.id, 'uncertain', errorMessage(error)); this.problem(task.id, error);
+        if (card && card.kind === 'native_approval') {
+          const current = this.store.feishuCard(card.id);
+          this.store.updateFeishuCard(card.id, { status: 'uncertain', sequence: (current?.sequence ?? card.sequence) + 1, uuid: `${current?.uuid ?? card.uuid}:uncertain` });
+        }
         this.notify(task, '工具审批结果不确定，已保留操作记录，未自动再次批准。', queued.id);
       } finally { releaseAdmission(); }
     }
@@ -1085,7 +1159,12 @@ export class AgentLoop {
             continue;
           }
           this.store.setMeta(`approval-output:${output.id}`, JSON.stringify({ ...data, chatId, lastAttemptAt: Date.now() }));
-          await this.ports.feishu.sendApproval({ chatId, id: output.id, taskId: task.id, request: data.request });
+          const delivery = await this.ports.feishu.sendApproval({ chatId, id: output.id, taskId: task.id, request: data.request });
+          if (delivery) this.store.saveFeishuCard({ id: `native:${task.id}:${data.request.connectionEpoch}:${data.request.id}`, kind: 'native_approval',
+            requestId: data.request.id, taskId: task.id, chatId, ownerId: this.config.feishu.userOpenId,
+            cardId: delivery.cardId, messageId: delivery.messageId, sequence: delivery.sequence, uuid: delivery.uuid,
+            status: 'pending', expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
+            fingerprint: digest(JSON.stringify({ taskId: task.id, requestId: data.request.id, epoch: data.request.connectionEpoch })), receipt: null, updatedAt: Date.now() });
         } else await this.ports.feishu.send({ chatId, text: output.text, id: output.id });
         this.store.markOutput(output.id, 'sent');
       } catch (error) {
@@ -1198,7 +1277,7 @@ export class AgentLoop {
   private async startService(): Promise<void> {
     if (this.running) return;
     this.started = true;
-    await this.ports.feishu.start(message => this.receive(message), error => this.problem('feishu', error), action => this.approve(action), event => this.requestBackfill(event));
+    await this.ports.feishu.start(message => this.receive(message), error => this.problem('feishu', error), action => this.approve(action), event => this.requestBackfill(event), action => this.approve(action));
     if (this.stopping) return;
     await this.projects.ensure();
     await this.recover();

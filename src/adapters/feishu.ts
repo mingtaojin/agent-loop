@@ -6,8 +6,8 @@ import { pipeline } from 'node:stream/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Client, WSClient, EventDispatcher, Domain, LoggerLevel, defaultHttpInstance, type HttpInstance, type HttpRequestOptions } from '@larksuiteoapi/node-sdk';
 import { z } from 'zod';
-import { UncertainOperationError, errorMessage, type ApprovalAction, type Attachment, type IncomingMessage, type PendingRequest, type ReplyTarget } from '../domain.js';
-import { FeishuApiError, GroupCreationRejected, TaskGroupUnavailable, type FeishuPort, type FeishuProgressPort, type FeishuReconnectEvent, type ProgressWriteGuard } from '../ports.js';
+import { UncertainOperationError, errorMessage, projectDecisionActionSchema, type ApprovalAction, type Attachment, type IncomingMessage, type PendingRequest, type ProjectDecisionAction, type ReplyTarget } from '../domain.js';
+import { FeishuApiError, GroupCreationRejected, TaskGroupUnavailable, type FeishuCardDelivery, type FeishuDecisionCardInput, type FeishuPort, type FeishuProgressPort, type FeishuReconnectEvent, type ProgressWriteGuard } from '../ports.js';
 import { FeishuDocumentAdapter, type FeishuDocumentApi } from './feishu-document.js';
 
 export interface FeishuOptions {
@@ -25,6 +25,7 @@ export interface FeishuDependencies {
   document?: FeishuDocumentApi;
   api?: FeishuApi;
   cardkit?: { card: Pick<Client['cardkit']['v1']['card'], 'create' | 'settings' | 'idConvert'>; cardElement: Pick<Client['cardkit']['v1']['cardElement'], 'content'> };
+  cardkitNative?: boolean;
   socket?: Pick<WSClient, 'start' | 'close'>;
 }
 const id = z.string().min(1);
@@ -122,11 +123,15 @@ const approvalSchema = z.object({
   id, taskId: id, threadId: id, turnId: id, requestId: id,
   decision: z.enum(['approve', 'reject']), chatId: id, senderId: id, epoch: id,
 });
+const decisionTokenSchema = z.strictObject({ kind: z.literal('project_decision'), id, projectId: id, coordinatorTaskId: id,
+  requestId: id, key: id, chatId: id, senderId: id, expiresAt: z.number().int().nonnegative(), epoch: id,
+  options: z.array(z.string().trim().min(1).max(8_192)).max(20) });
 const actionEventSchema = z.object({
   operator: z.object({ open_id: id }),
-  context: z.object({ open_chat_id: id }).optional(),
+  context: z.object({ open_chat_id: id, open_message_id: id.optional() }).optional(),
   open_chat_id: id.optional(),
-  action: z.object({ value: z.object({ agent_loop_approval: id }), tag: z.literal('button') }),
+  action: z.object({ value: z.record(z.string(), z.unknown()).optional(), tag: z.enum(['button', 'input']).optional(),
+    form_value: z.record(z.string(), z.unknown()).optional() }),
 });
 function approvalKey(options: FeishuOptions): Buffer {
   return createHash('sha256').update(`agent-loop:approval:v1:${options.appId}:`).update(options.appSecret).digest();
@@ -137,11 +142,26 @@ function approvalToken(action: ApprovalAction, options: FeishuOptions): string {
   const encrypted = Buffer.concat([cipher.update(JSON.stringify(action), 'utf8'), cipher.final()]);
   return Buffer.concat([nonce, cipher.getAuthTag(), encrypted]).toString('base64url');
 }
-function parseApproval(raw: unknown, options: FeishuOptions): ApprovalAction | null {
+function cardToken(value: unknown, options: FeishuOptions): string {
+  const nonce = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', approvalKey(options), nonce);
+  const encrypted = Buffer.concat([cipher.update(JSON.stringify(value), 'utf8'), cipher.final()]);
+  return Buffer.concat([nonce, cipher.getAuthTag(), encrypted]).toString('base64url');
+}
+function decodeCardToken(token: string, options: FeishuOptions): unknown {
+  if (!/^[A-Za-z0-9_-]+$/.test(token)) throw new Error('Invalid Feishu card action');
+  const bytes = Buffer.from(token, 'base64url');
+  if (bytes.length < 29) throw new Error('Invalid Feishu card action');
+  const decipher = createDecipheriv('aes-256-gcm', approvalKey(options), bytes.subarray(0, 12));
+  decipher.setAuthTag(bytes.subarray(12, 28));
+  return JSON.parse(Buffer.concat([decipher.update(bytes.subarray(28)), decipher.final()]).toString('utf8'));
+}
+function parseApproval(raw: unknown, options: FeishuOptions, includeMessageId = false): ApprovalAction | null {
   const envelope = z.object({ operator: z.object({ open_id: z.string().optional() }).optional() }).parse(raw);
   if (envelope.operator?.open_id !== options.userOpenId) return null;
   const event = actionEventSchema.parse(raw);
-  const token = event.action.value.agent_loop_approval;
+  const token = event.action.value?.agent_loop_approval;
+  if (typeof token !== 'string') throw new Error('Invalid Feishu approval action');
   if (!/^[A-Za-z0-9_-]+$/.test(token)) throw new Error('Invalid Feishu approval action');
   const bytes = Buffer.from(token, 'base64url');
   if (bytes.length < 29) throw new Error('Invalid Feishu approval action');
@@ -154,6 +174,26 @@ function parseApproval(raw: unknown, options: FeishuOptions): ApprovalAction | n
     || action.chatId !== chatId || action.senderId !== event.operator.open_id) {
     throw new Error('Feishu approval actor or chat does not match its request');
   }
+  return includeMessageId && event.context?.open_message_id ? { ...action, messageId: event.context.open_message_id } : action;
+}
+function parseCardAction(raw: unknown, options: FeishuOptions, includeMessageId = false): ApprovalAction | ProjectDecisionAction | null {
+  const envelope = actionEventSchema.parse(raw);
+  if (envelope.operator.open_id !== options.userOpenId) return null;
+  const values = { ...(envelope.action.value ?? {}), ...(envelope.action.form_value ?? {}) };
+  const token = typeof values.agent_loop_approval === 'string' ? values.agent_loop_approval
+    : typeof values.agent_loop_card === 'string' ? values.agent_loop_card : undefined;
+  if (!token) throw new Error('Invalid Feishu card action');
+  if (values.agent_loop_approval) return parseApproval(raw, options, includeMessageId);
+  const { options: presetOptions, ...payload } = decisionTokenSchema.parse(decodeCardToken(token, options));
+  if (Date.now() >= payload.expiresAt) throw new Error('Feishu decision card expired');
+  const chatId = envelope.context?.open_chat_id ?? envelope.open_chat_id;
+  if (!chatId || payload.chatId !== chatId || payload.senderId !== envelope.operator.open_id) throw new Error('Feishu decision actor or chat does not match its request');
+  const choice = typeof values.agent_loop_choice === 'string' && values.agent_loop_choice.trim() ? values.agent_loop_choice.trim() : undefined;
+  const customCandidate = typeof values.agent_loop_custom_text === 'string' ? values.agent_loop_custom_text.trim() : '';
+  const customText = customCandidate && customCandidate !== '${agent_loop_custom_text}' ? customCandidate : undefined;
+  const action = projectDecisionActionSchema.parse({ ...payload, id: `${payload.id}:${choice ?? customText}`, choice, customText,
+    ...(includeMessageId && envelope.context?.open_message_id ? { messageId: envelope.context.open_message_id } : {}), sequence: 0 });
+  if (choice && presetOptions.length && !presetOptions.includes(choice)) throw new Error('Invalid project decision option');
   return action;
 }
 function stableUuid(value: string): string {
@@ -200,11 +240,13 @@ export class FeishuAdapter implements FeishuPort, FeishuProgressPort {
   private cardkitInstance: FeishuDependencies['cardkit'];
   private socket: Pick<WSClient, 'start' | 'close'> | undefined;
   private readonly http: HttpInstance;
+  private readonly cardkitNative: boolean;
   private nextProgressRequestAt = 0;
   constructor(private readonly options: FeishuOptions, dependencies: FeishuDependencies = {}) {
     this.http = timeoutTransport(options.requestTimeoutMs ?? 30_000);
     this.apiInstance = dependencies.api;
     this.cardkitInstance = dependencies.cardkit;
+    this.cardkitNative = dependencies.cardkitNative ?? !dependencies.api;
     this.socket = dependencies.socket;
     let documentApi = dependencies.document;
     this.documentProgress = new FeishuDocumentAdapter(() => {
@@ -364,7 +406,7 @@ export class FeishuAdapter implements FeishuPort, FeishuProgressPort {
     const data = checkWrite(response);
     if (!id.safeParse(data.message_id).success) throw new UncertainOperationError('Feishu message delivery returned no valid message_id');
   }
-  async sendApproval(input: { chatId: string; id: string; taskId: string; request: PendingRequest }): Promise<void> {
+  async sendApproval(input: { chatId: string; id: string; taskId: string; request: PendingRequest }): Promise<FeishuCardDelivery> {
     if (input.request.kind !== 'approval' && input.request.kind !== 'permissions') throw new Error('Only native approvals can create approval cards');
     const button = (decision: ApprovalAction['decision'], text: string) => ({
       tag: 'button', text: { tag: 'plain_text', content: text }, type: decision === 'approve' ? 'primary' : 'default',
@@ -374,22 +416,97 @@ export class FeishuAdapter implements FeishuPort, FeishuProgressPort {
         epoch: input.request.connectionEpoch, decision,
       }, this.options) },
     });
-    const card = { config: { wide_screen_mode: true }, header: { title: { tag: 'plain_text', content: '工具操作请求' } },
+    const legacyCard = { config: { wide_screen_mode: true }, header: { title: { tag: 'plain_text', content: '工具操作请求' } },
       elements: [
         { tag: 'div', text: { tag: 'plain_text', content: input.request.prompt } },
         { tag: 'div', text: { tag: 'plain_text', content: `原生请求 ${input.request.method}` } },
         { tag: 'action', actions: [button('approve', '批准此请求'), button('reject', '拒绝此请求')] },
       ] };
+    const uuid = stableUuid(`message:${input.id}`);
+    if (this.apiInstance && !this.cardkitNative) {
+      let response: Awaited<ReturnType<FeishuApi['message']['create']>>;
+      try { response = await this.api.message.create({ params: { receive_id_type: 'chat_id' }, data: {
+        receive_id: input.chatId, msg_type: 'interactive', content: JSON.stringify(legacyCard), uuid,
+      } }); } catch (error) { throw new UncertainOperationError(`Feishu approval card delivery outcome is unknown: ${errorMessage(error)}`); }
+      const data = checkWrite(response); const messageId = id.parse(data.message_id);
+      return { kind: 'native_approval', requestId: input.request.id, cardId: messageId, messageId, sequence: 0, uuid };
+    }
+    const card = { schema: '2.0', config: { update_multi: true }, header: { title: { tag: 'plain_text', content: '工具操作请求' } },
+      body: { elements: [
+        { tag: 'div', text: { tag: 'plain_text', content: input.request.prompt.slice(0, 8_000) } },
+        { tag: 'div', text: { tag: 'plain_text', content: `原生请求 ${input.request.method.slice(0, 512)}` } },
+        { tag: 'action', actions: [button('approve', '批准此请求'), button('reject', '拒绝此请求')] },
+        { tag: 'div', text: { tag: 'plain_text', element_id: 'card_status', content: '等待处理' } },
+      ] } };
+    let cardResponse: Awaited<ReturnType<NonNullable<FeishuDependencies['cardkit']>['card']['create']>>;
+    try { cardResponse = await this.cardkit.card.create({ data: { type: 'card_json', data: JSON.stringify(card) } }); }
+    catch (error) { throw new UncertainOperationError(`Feishu approval card creation outcome is unknown: ${errorMessage(error)}`); }
+    const cardId = id.parse(checkWrite(cardResponse).card_id);
     let response: Awaited<ReturnType<FeishuApi['message']['create']>>;
     try {
       response = await this.api.message.create({ params: { receive_id_type: 'chat_id' }, data: {
-        receive_id: input.chatId, msg_type: 'interactive', content: JSON.stringify(card), uuid: stableUuid(`message:${input.id}`),
+        receive_id: input.chatId, msg_type: 'interactive', content: JSON.stringify({ type: 'card', data: { card_id: cardId } }), uuid,
       } });
     } catch (error) {
       throw new UncertainOperationError(`Feishu approval card delivery outcome is unknown: ${errorMessage(error)}`);
     }
     const data = checkWrite(response);
-    if (!id.safeParse(data.message_id).success) throw new UncertainOperationError('Feishu approval card delivery returned no valid message_id');
+    const messageId = id.safeParse(data.message_id);
+    if (!messageId.success) throw new UncertainOperationError('Feishu approval card delivery returned no valid message_id');
+    return { kind: 'native_approval', requestId: input.request.id, cardId, messageId: messageId.data, sequence: 0, uuid };
+  }
+  async sendDecisionCard(input: FeishuDecisionCardInput): Promise<FeishuCardDelivery> {
+    if (input.options.length < 1) throw new Error('Project decision cards require at least one preset option');
+    const token = cardToken({ kind: 'project_decision', id: input.id, projectId: input.projectId, coordinatorTaskId: input.coordinatorTaskId,
+      requestId: input.requestId, key: input.key, chatId: input.chatId, senderId: input.ownerId, expiresAt: input.expiresAt,
+      epoch: String(input.expiresAt), options: input.options }, this.options);
+    const optionButtons = input.options.map(choice => ({ tag: 'button', text: { tag: 'plain_text', content: choice.slice(0, 256) }, type: 'default',
+      value: { agent_loop_card: token, agent_loop_choice: choice } }));
+    const card = { schema: '2.0', config: { update_multi: true }, header: { title: { tag: 'plain_text', content: '项目协调决策' } },
+      body: { elements: [
+        { tag: 'div', text: { tag: 'plain_text', content: input.prompt.slice(0, 8_000) } },
+        ...(input.context ? [{ tag: 'div', text: { tag: 'plain_text', content: input.context.slice(0, 4_000) } }] : []),
+        { tag: 'action', actions: optionButtons },
+        { tag: 'form', name: 'agent_loop_decision_form', elements: [
+          { tag: 'input', name: 'agent_loop_custom_text', placeholder: { tag: 'plain_text', content: '也可以输入自定义决定' },
+            label: { tag: 'plain_text', content: '自定义决定' }, required: false },
+          { tag: 'button', name: 'agent_loop_submit_custom', text: { tag: 'plain_text', content: '提交自定义决定' },
+            type: 'primary', value: { agent_loop_card: token, agent_loop_custom_text: '${agent_loop_custom_text}' } },
+        ] },
+        { tag: 'div', text: { tag: 'plain_text', element_id: 'card_status', content: '等待处理' } },
+      ] } };
+    const uuid = stableUuid(`message:${input.id}`);
+    let cardId: string;
+    if (this.apiInstance && !this.cardkitInstance) {
+      let response: Awaited<ReturnType<FeishuApi['message']['create']>>;
+      try { response = await this.api.message.create({ params: { receive_id_type: 'chat_id' }, data: {
+        receive_id: input.chatId, msg_type: 'interactive', content: JSON.stringify(card), uuid,
+      } }); } catch (error) { throw new UncertainOperationError(`Feishu decision card delivery outcome is unknown: ${errorMessage(error)}`); }
+      const data = checkWrite(response); const messageId = id.parse(data.message_id);
+      return { kind: 'project_decision', requestId: input.requestId, cardId: messageId, messageId, sequence: 0, uuid };
+    }
+    let created: Awaited<ReturnType<NonNullable<FeishuDependencies['cardkit']>['card']['create']>>;
+    try { created = await this.cardkit.card.create({ data: { type: 'card_json', data: JSON.stringify(card) } }); }
+    catch (error) { throw new UncertainOperationError(`Feishu decision card creation outcome is unknown: ${errorMessage(error)}`); }
+    cardId = id.parse(checkWrite(created).card_id);
+    let response: Awaited<ReturnType<FeishuApi['message']['create']>>;
+    try { response = await this.api.message.create({ params: { receive_id_type: 'chat_id' }, data: {
+      receive_id: input.chatId, msg_type: 'interactive', content: JSON.stringify({ type: 'card', data: { card_id: cardId } }), uuid,
+    } }); } catch (error) { throw new UncertainOperationError(`Feishu decision card delivery outcome is unknown: ${errorMessage(error)}`); }
+    const messageId = id.safeParse(checkWrite(response).message_id);
+    if (!messageId.success) throw new UncertainOperationError('Feishu decision card delivery returned no valid message_id');
+    return { kind: 'project_decision', requestId: input.requestId, cardId, messageId: messageId.data, sequence: 0, uuid };
+  }
+  async updateCard(input: { cardId: string; sequence: number; uuid: string; content: string; closed?: boolean }): Promise<void> {
+    if (this.apiInstance && !this.cardkitInstance) return;
+    await this.paceProgressRequest();
+    checkWrite(await this.cardkit.cardElement.content({ path: { card_id: input.cardId, element_id: 'card_status' },
+      data: { content: input.content.slice(0, 8_000), sequence: input.sequence, uuid: input.uuid } }));
+    if (input.closed) {
+      await this.paceProgressRequest();
+      checkWrite(await this.cardkit.card.settings({ path: { card_id: input.cardId },
+        data: { settings: JSON.stringify({ config: { update_multi: false } }), sequence: input.sequence + 1, uuid: input.uuid } }));
+    }
   }
   async download(input: { messageId: string; attachment: Attachment; destination: string; maxBytes: number }): Promise<void> {
     const resource = await this.api.messageResource.get({ path: { message_id: input.messageId, file_key: input.attachment.key }, params: { type: input.attachment.kind } });
@@ -428,21 +545,30 @@ export class FeishuAdapter implements FeishuPort, FeishuProgressPort {
     } while (token);
     return [...messages.values()].sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
   }
-  async start(onMessage: (message: IncomingMessage) => Promise<void>, onError: (error: unknown) => void, onAction?: (action: ApprovalAction) => Promise<void>, onReconnect?: (event: FeishuReconnectEvent) => void): Promise<void> {
+  async start(onMessage: (message: IncomingMessage) => Promise<void>, onError: (error: unknown) => void, onAction?: (action: ApprovalAction) => Promise<void>, onReconnect?: (event: FeishuReconnectEvent) => void, onDecision?: (action: ProjectDecisionAction) => Promise<void>): Promise<void> {
     const eventDispatcher = new EventDispatcher({ loggerLevel: LoggerLevel.error }).register({
       'card.action.trigger': async (raw: unknown) => {
         const receivedAt = Date.now();
-        let action: ApprovalAction | null = null;
+        let action: ApprovalAction | ProjectDecisionAction | null = null;
         try {
-          action = parseApproval(raw, this.options);
+          action = parseCardAction(raw, this.options, this.cardkitNative);
           if (!action) return { toast: { type: 'warning', content: '此操作仅限任务所有者' } };
-          if (!onAction) throw new Error('Feishu approval actions have no registered handler');
-          await onAction(action);
-          const receipt = `${action.decision === 'approve' ? '批准' : '拒绝'}决定已接收，等待执行器确认`;
+          if ('kind' in action) {
+            if (!onDecision) throw new Error('Feishu decision actions have no registered handler');
+            await onDecision(action);
+          } else {
+            if (!onAction) throw new Error('Feishu approval actions have no registered handler');
+            await onAction(action);
+          }
+          await this.updateCallbackCard(raw, action, '已接收，正在处理', false, 1);
+          const receipt = 'kind' in action
+            ? '项目决策已接收，等待运行时确认'
+            : `${action.decision === 'approve' ? '批准' : '拒绝'}决定已接收，等待执行器确认`;
+          await this.updateCallbackCard(raw, action, '已确认，卡片已关闭', true, 2);
           return {
             toast: { type: 'info', content: receipt },
             card: { type: 'raw', data: {
-              config: { wide_screen_mode: true }, header: { title: { tag: 'plain_text', content: '工具审批决定已接收' } },
+              config: { wide_screen_mode: true }, header: { title: { tag: 'plain_text', content: '卡片决定已接收' } },
               elements: [
                 { tag: 'div', text: { tag: 'plain_text', content: receipt } },
                 { tag: 'div', text: { tag: 'plain_text', content: '请查看执行进度，了解后续处理结果。' } },
@@ -454,8 +580,10 @@ export class FeishuAdapter implements FeishuPort, FeishuProgressPort {
           try {
             onError(new Error(`Feishu approval callback failed: ${JSON.stringify({
               receivedAt, durationMs: Date.now() - receivedAt, eventId: event.success ? event.data.event_id : undefined,
-              taskId: action?.taskId, threadId: action?.threadId, turnId: action?.turnId,
-              requestId: action?.requestId, decision: action?.decision,
+              taskId: action && 'taskId' in action ? action.taskId : undefined,
+              threadId: action && 'threadId' in action ? action.threadId : undefined,
+              turnId: action && 'turnId' in action ? action.turnId : undefined,
+              requestId: action?.requestId, decision: action && 'decision' in action ? action.decision : undefined,
             })}`));
           } catch {}
           return { toast: { type: 'error', content: '此次点击未被接收，请查看最新审批状态。' } };
@@ -497,6 +625,16 @@ export class FeishuAdapter implements FeishuPort, FeishuProgressPort {
       });
       void this.socket.start({ eventDispatcher }).catch(error => { clearTimeout(timer); reject(error); });
     });
+  }
+  private async updateCallbackCard(raw: unknown, action: ApprovalAction | ProjectDecisionAction, content: string, closed: boolean, sequence: number): Promise<void> {
+    if (!this.cardkitNative) return;
+    const event = actionEventSchema.parse(raw);
+    const messageId = event.context?.open_message_id;
+    if (!messageId) return;
+    await this.paceProgressRequest();
+    const converted = check(await this.cardkit.card.idConvert({ data: { message_id: messageId } }));
+    const cardId = id.parse(converted.card_id);
+    await this.updateCard({ cardId, sequence, uuid: stableUuid(`callback:${messageId}:${action.requestId}:${sequence}`), content, closed });
   }
   async close(): Promise<void> { this.socket?.close({ force: true }); }
 }
