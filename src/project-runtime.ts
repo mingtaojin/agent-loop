@@ -6,7 +6,7 @@ import type { Config } from './config.js';
 import { ProjectCatalog } from './project-catalog.js';
 import { ProjectLedger, projectView, currentRecords, matchesProjectIssue, projectActionSchema, type ProjectAction, type ProjectConfig, type ProjectState } from './project.js';
 import type { ExecutionProfile } from './execution.js';
-import { criteriaSchema, intakeRouteSchema, presentTaskSource, reportRoutingSchema, sourceType, submissionSchema, type InputProvenance, type ReportRouting, type ReportSource, type Source, type StructuredReport, type Task } from './domain.js';
+import { criteriaSchema, intakeRouteSchema, presentTaskSource, projectDecisionActionSchema, reportRoutingSchema, sourceType, submissionSchema, type InputProvenance, type ProjectDecisionAction, type ReportRouting, type ReportSource, type Source, type StructuredReport, type Task } from './domain.js';
 import type { GitHubPort } from './ports.js';
 import type { TaskCloseout } from './task-closeout.js';
 import { Store, type Inbox } from './store.js';
@@ -286,6 +286,31 @@ export class ProjectRuntime {
     const current = saved === null ? { directUserMessage: false, visibleLifecycleEvent: false, announced: false } : coordinatorTurnContextSchema.parse(JSON.parse(saved));
     this.store.setMeta(key, JSON.stringify({ ...current, announced: true }));
   }
+  async acceptProjectDecision(action: ProjectDecisionAction): Promise<{ receipt: string; value: string }> {
+    const decision = projectDecisionActionSchema.parse(action);
+    const state = this.ledger.project(decision.projectId);
+    if (!state || state.coordinatorTaskId !== decision.coordinatorTaskId) throw new Error('Project decision is not bound to its coordinator');
+    const coordinator = this.store.task(state.coordinatorTaskId);
+    if (!coordinator.chatId || coordinator.chatId !== decision.chatId) throw new Error('Project decision group binding expired');
+    if (coordinator.status === 'paused' || coordinator.status === 'failed' || coordinator.status === 'completed' || Date.now() >= decision.expiresAt) throw new Error('Project decision has expired');
+    const value = decision.customText ?? decision.choice;
+    if (!value) throw new Error('Project decision value is empty');
+    const request = `feishu-decision:${decision.projectId}:${decision.requestId}`;
+    const existing = state.records.find(record => record.authorTaskId === coordinator.id && record.requestId === request);
+    if (existing) {
+      if (existing.text !== value || existing.key !== decision.key) throw new Error('Project decision conflicts with the original receipt');
+      return { receipt: request, value: existing.text };
+    }
+    this.ledger.record(decision.projectId, { requestId: request, key: decision.key, text: value, expectedVersion: state.version,
+      authorTaskId: coordinator.id, scope: { kind: 'project' } });
+    const messageId = `project-decision:${decision.projectId}:${decision.requestId}`;
+    const message = { id: messageId, chatId: coordinator.chatId, senderId: this.settings.feishu.userOpenId, chatType: 'group' as const,
+      text: `项目决策卡已提交。\n${decision.key}\n项目决策：\n${value}`, attachments: [], createdAt: Date.now() };
+    this.store.receive(coordinator.id, message, 'user', { kind: 'project_decision_card', projectId: decision.projectId,
+      cardId: decision.cardId ?? `request:${decision.requestId}`, ...(decision.messageId ? { messageId: decision.messageId } : {}),
+      requestId: decision.requestId, ownerId: decision.senderId, value });
+    return { receipt: request, value };
+  }
   publishCoordinatorFinal(task: Task, turnId: string): boolean {
     const member = this.ledger.membership(task.id);
     if (!member || member.role !== 'coordinator') return true;
@@ -564,6 +589,12 @@ export class ProjectRuntime {
         this.enqueue(action.taskId, `instruction:${callerId}:${action.requestId}`, action.text,
           { kind: 'agent', projectId: state.id, taskId: callerId, eventId: action.requestId, category: 'instruction' });
         return { accepted: true, taskId: action.taskId };
+      }
+      case 'request_decision': {
+        if (member.role !== 'coordinator') throw new Error('Only the coordinator can request a project decision');
+        return this.host.announce(callerId, { action: 'announce', requestId: action.requestId, kind: 'decision', text: action.prompt,
+          key: action.key, options: action.options, ...(action.context === undefined ? {} : { context: action.context }),
+          ...(action.expiresAt === undefined ? {} : { expiresAt: action.expiresAt }) });
       }
       case 'announce': {
         if (member.role !== 'coordinator') throw new Error('Only the coordinator can announce to the project group');

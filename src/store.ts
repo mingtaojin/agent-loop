@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { executionEventSchema, storedExecutionEventSchema, type ExecutionEvent, type StoredExecutionEvent } from './execution-events.js';
-import { approvalActionSchema, inputProvenanceSchema, incomingSchema, repositorySchema, sourceSchema, taskSchema, type ApprovalAction, type IncomingMessage, type InputProvenance, type Source, type Task } from './domain.js';
+import { approvalActionSchema, feishuCardRecordSchema, inputProvenanceSchema, incomingSchema, repositorySchema, sourceSchema, taskSchema, type ApprovalAction, type FeishuCardRecord, type IncomingMessage, type InputProvenance, type Source, type Task } from './domain.js';
 
 const payloadRow = z.object({ payload: z.string() });
 export const documentSourcePositionSchema = z.strictObject({
@@ -62,6 +62,8 @@ export class Store {
         CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id),text TEXT NOT NULL,status TEXT NOT NULL,error TEXT);
         CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id),kind TEXT NOT NULL,status TEXT NOT NULL,result TEXT,error TEXT);
         CREATE TABLE IF NOT EXISTS approval_actions(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id),payload TEXT NOT NULL,status TEXT NOT NULL,error TEXT);
+        CREATE TABLE IF NOT EXISTS feishu_cards(id TEXT PRIMARY KEY,request_id TEXT NOT NULL,payload TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS feishu_cards_request ON feishu_cards(request_id);
         CREATE TABLE IF NOT EXISTS diagnostics(id INTEGER PRIMARY KEY,created_at INTEGER NOT NULL,scope TEXT NOT NULL,message TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS diagnostic_rollups(scope TEXT NOT NULL,fingerprint TEXT NOT NULL,first_created_at INTEGER NOT NULL,last_created_at INTEGER NOT NULL,count INTEGER NOT NULL,message TEXT NOT NULL,PRIMARY KEY(scope,fingerprint));
         CREATE INDEX IF NOT EXISTS diagnostic_rollups_recent ON diagnostic_rollups(last_created_at DESC);
@@ -185,6 +187,32 @@ export class Store {
   }
   markApproval(id: string, status: 'processing' | 'confirmed' | 'uncertain' | 'rejected', error: string | null = null): void {
     this.db.prepare('UPDATE approval_actions SET status=?,error=? WHERE id=?').run(status, error, id);
+  }
+  saveFeishuCard(record: FeishuCardRecord): void {
+    const card = feishuCardRecordSchema.parse(record);
+    this.db.prepare('INSERT INTO feishu_cards(id,request_id,payload) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET request_id=excluded.request_id,payload=excluded.payload')
+      .run(card.id, card.requestId, JSON.stringify(card));
+  }
+  feishuCard(id: string): FeishuCardRecord | null {
+    const row = this.db.prepare('SELECT payload FROM feishu_cards WHERE id=?').get(id);
+    return row ? feishuCardRecordSchema.parse(JSON.parse(payloadRow.parse(row).payload)) : null;
+  }
+  feishuCardForRequest(requestId: string): FeishuCardRecord | null {
+    const rows = this.db.prepare('SELECT payload FROM feishu_cards WHERE request_id=? ORDER BY rowid DESC LIMIT 1').all(requestId);
+    return rows.length ? feishuCardRecordSchema.parse(JSON.parse(payloadRow.parse(rows[0]).payload)) : null;
+  }
+  feishuCards(): FeishuCardRecord[] {
+    return this.db.prepare('SELECT payload FROM feishu_cards ORDER BY rowid').all().map(row => feishuCardRecordSchema.parse(JSON.parse(payloadRow.parse(row).payload)));
+  }
+  updateFeishuCard(id: string, patch: Partial<FeishuCardRecord>): FeishuCardRecord {
+    const current = this.feishuCard(id);
+    if (!current) throw new Error('Unknown Feishu card');
+    const next = feishuCardRecordSchema.parse({ ...current, ...patch, id: current.id, updatedAt: Date.now() });
+    if (next.sequence < current.sequence) throw new Error('Feishu CardKit update sequence is out of order');
+    const terminal = new Set(['confirmed', 'rejected', 'expired', 'failed', 'closed', 'uncertain']);
+    if (terminal.has(current.status) && next.status !== current.status) throw new Error('Feishu card cannot leave its terminal state');
+    this.saveFeishuCard(next);
+    return next;
   }
   diagnostic(scope: string, message: string): void {
     const createdAt = Date.now();
