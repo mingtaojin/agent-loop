@@ -198,6 +198,7 @@ export class AgentLoop {
       const expiresAt = action.expiresAt ?? Date.now() + 7 * 24 * 60 * 60 * 1000;
       const cardRecordId = `project:${taskId}:${action.requestId}`;
       const existing = this.store.feishuCard(cardRecordId);
+      if (existing?.status === 'uncertain') throw new Error('Project decision card delivery is uncertain; reconcile it before retrying');
       if (existing?.receipt) return { accepted: true, requestId: action.requestId, receipt: existing.receipt };
       const uuid = digest(`project-card:${taskId}:${action.requestId}`).slice(0, 32);
       const pending = existing ?? {
