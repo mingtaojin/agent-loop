@@ -62,6 +62,14 @@ test('dashboard serves a read-only local page before the runtime database exists
   assert.doesNotThrow(() => new Script(dashboardScript));
 });
 
+test('Dashboard v1 UI guards stale Worker switches and preserves collapsed stages', () => {
+  assert.match(dashboardScript, /selectionGeneration = 0/);
+  assert.match(dashboardScript, /generation !== selectionGeneration \|\| selectedId !== id/);
+  assert.match(dashboardScript, /stageDisclosure\.get\(group\.key\) \?\? true/);
+  assert.match(dashboardScript, /stageDisclosure\.set\(group\.key, stage\.open\)/);
+  assert.doesNotMatch(dashboardScript, /stage\.open = true;/);
+});
+
 test('group and dashboard titles share normalization while persisted manual source text stays original', async t => {
   const root = await mkdtemp(join(tmpdir(), 'agent-dashboard-title-'));
   const config = configSchema.parse({ execution: testExecution, dataDir: root, projects: [testProject(root)], feishu: { userOpenId: 'owner' } });
