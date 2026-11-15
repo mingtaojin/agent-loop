@@ -292,7 +292,7 @@ export class ProjectRuntime {
     if (!state || state.coordinatorTaskId !== decision.coordinatorTaskId) throw new Error('Project decision is not bound to its coordinator');
     const coordinator = this.store.task(state.coordinatorTaskId);
     if (!coordinator.chatId || coordinator.chatId !== decision.chatId) throw new Error('Project decision group binding expired');
-    if (coordinator.status === 'paused' || coordinator.status === 'failed' || coordinator.status === 'completed' || Date.now() >= decision.expiresAt) throw new Error('Project decision has expired');
+    if (coordinator.status === 'paused' || coordinator.status === 'failed' || this.host.closeout.completed(coordinator.id) || Date.now() >= decision.expiresAt) throw new Error('Project decision has expired');
     const value = decision.customText ?? decision.choice;
     if (!value) throw new Error('Project decision value is empty');
     const request = `feishu-decision:${decision.projectId}:${decision.requestId}`;

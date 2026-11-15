@@ -93,7 +93,7 @@ test('project decision submission is a one-shot project record and coordinator i
       requests: [], recovery: { attempts: 0, nextAttemptAt: null, lastError: null, interruptedTurnId: null, lastUserInputSeq: null }, createdAt: 1, updatedAt: 1 });
     store.saveTask(task);
     const config = configSchema.parse({ dataDir: root, execution: testExecution, feishu: { userOpenId: 'owner' }, projects: [{ id: 'project', name: 'Project', directory: root, repositories: [] }] });
-    const runtime = new ProjectRuntime(config, store, { closeout: { assertOpen() {} } as any, makeTask: async () => { throw new Error('not used'); },
+    const runtime = new ProjectRuntime(config, store, { closeout: { assertOpen() {}, completed() { return false; } } as any, makeTask: async () => { throw new Error('not used'); },
       releaseWorkspace: async () => undefined, control: async () => undefined, openGroup: async () => 'chat', announce: async () => undefined,
       groupCleanup: async () => undefined });
     runtime.ledger.create(config.projects[0]!, task.id);
