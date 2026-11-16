@@ -5,7 +5,7 @@ import { z } from 'zod';
 import type { Config } from './config.js';
 import type { Task } from './domain.js';
 import { errorMessage } from './domain.js';
-import { discoverProjects } from './project-discovery.js';
+import { discoverProjectsCached } from './project-discovery.js';
 import { ProjectLedger, projectConfigSchema, projectConfigInputSchema, type ProjectConfig } from './project.js';
 import type { Store } from './store.js';
 
@@ -44,7 +44,7 @@ export class ProjectCatalog {
 
   private async discovered() {
     if (!this.config.engineering?.projectRoot) return [];
-    try { return await discoverProjects(this.config.engineering.projectRoot); }
+    try { return await discoverProjectsCached(this.config.engineering.projectRoot); }
     catch (error) { this.store.diagnostic('project-discovery', errorMessage(error)); return []; }
   }
 
