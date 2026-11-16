@@ -23,6 +23,20 @@ function event(kind: ExecutionEvent['kind'], text: string, createdAt = 10): Exec
   return { threadId: 'thread', turnId: 'turn', itemId: 'item', kind, label: kind, text, createdAt };
 }
 
+test('thread event routing resolves only the task identity', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-dashboard-thread-lookup-'));
+  const store = new Store(root); const saved = task(root); store.saveTask(saved);
+  t.after(async () => { store.close(); await rm(root, { recursive: true, force: true }); });
+  assert.equal(store.taskIdForThread(saved.threadId!), saved.id);
+  assert.equal(store.taskIdForThread('missing-thread'), null);
+  saved.threadId = 'new-thread'; store.saveTask(saved);
+  assert.equal(store.taskIdForThread('thread'), null);
+  assert.equal(store.taskIdForThread('new-thread'), saved.id);
+  assert.throws(() => store.transaction(() => { saved.threadId = 'rolled-back-thread'; store.saveTask(saved); throw new Error('rollback'); }));
+  assert.equal(store.taskIdForThread('new-thread'), saved.id);
+  assert.equal(store.taskIdForThread('rolled-back-thread'), null);
+});
+
 test('runtime event durability drops private output, samples deltas, and keeps durable messages after restart', async t => {
   const root = await mkdtemp(join(tmpdir(), 'agent-dashboard-retention-'));
   const store = new Store(root); const saved = task(root); store.saveTask(saved);
