@@ -126,9 +126,12 @@ export class AgentLoop {
         intervalMs: progress.intervalMs, dashboardUrl: progress.dashboardUrl }) : null;
     ports.codex.setEventHandler?.(event => {
       try {
-        const archived = this.store.meta(`project-archived-thread:${event.threadId}`);
-        const task = this.store.taskForThread(event.threadId) ?? (archived ? this.store.task(archived) : null);
-        if (task) this.store.recordExecutionEvent(task.id, event);
+        const taskId = this.store.taskIdForThread(event.threadId);
+        if (taskId) this.store.recordExecutionEvent(taskId, event);
+        else {
+          const archived = this.store.meta(`project-archived-thread:${event.threadId}`);
+          if (archived) this.store.recordExecutionEvent(archived, event);
+        }
       } catch (error) { this.problem('debug:' + event.threadId, error); }
     });
     this.workspaceBridge = new WorkspaceBridge(config.dataDir, async (taskId, repository) => {

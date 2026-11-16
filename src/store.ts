@@ -35,6 +35,8 @@ export class Store {
   private readonly lock: DatabaseSync | null;
   private readonly lastDeltaAt = new Map<string, number>();
   private readonly metaRevisions = new Map<string, symbol>();
+  private readonly taskThreads = new Map<string, string | null>();
+  private readonly taskIdsByThread = new Map<string, string>();
   private lastMetaDataVersion: number | null = null;
   private readonly ephemeralEvents: StoredExecutionEvent[] = [];
   private logicalSequence = 0;
@@ -97,7 +99,15 @@ export class Store {
     try { const result = fn(); this.db.exec('COMMIT'); return result; }
     catch (error) {
       try { this.db.exec('ROLLBACK'); }
-      finally { this.metaRevisions.clear(); }
+      finally {
+        this.metaRevisions.clear();
+        this.taskThreads.clear(); this.taskIdsByThread.clear();
+        for (const row of this.db.prepare('SELECT id,thread_id FROM tasks WHERE thread_id IS NOT NULL').all() as { id?: unknown; thread_id?: unknown }[]) {
+          if (typeof row.id === 'string' && typeof row.thread_id === 'string') {
+            this.taskThreads.set(row.id, row.thread_id); this.taskIdsByThread.set(row.thread_id, row.id);
+          }
+        }
+      }
       throw error;
     }
   }
@@ -110,13 +120,18 @@ export class Store {
     return this.db.prepare('SELECT payload,reason FROM sources').all().map(row => { const parsed = payloadRow.extend({ reason: z.string() }).parse(row); return { source: sourceSchema.parse(JSON.parse(parsed.payload)), reason: parsed.reason }; });
   }
   saveTask(task: Task): void {
+    const previousThread = this.taskThreads.get(task.id);
+    if (previousThread && previousThread !== task.threadId) this.taskIdsByThread.delete(previousThread);
     this.db.prepare('INSERT INTO tasks VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET chat_id=excluded.chat_id,thread_id=excluded.thread_id,payload=excluded.payload').run(task.id, task.sourceId, task.chatId, task.threadId, JSON.stringify(task));
+    this.taskThreads.set(task.id, task.threadId);
+    if (task.threadId) this.taskIdsByThread.set(task.threadId, task.id);
   }
   tasks(): Task[] { return this.db.prepare('SELECT payload FROM tasks ORDER BY rowid').all().map(row => this.normalizeTask(JSON.parse(payloadRow.parse(row).payload))); }
   task(id: string): Task { const row = this.db.prepare('SELECT payload FROM tasks WHERE id=?').get(id); if (!row) throw new Error(`Unknown task ${id}`); return this.normalizeTask(JSON.parse(payloadRow.parse(row).payload)); }
   taskForSource(id: string): Task | null { return this.findTask('source_id', id); }
   taskForChat(id: string): Task | null { return this.findTask('chat_id', id); }
   taskForThread(id: string): Task | null { return this.findTask('thread_id', id); }
+  taskIdForThread(id: string): string | null { return this.taskIdsByThread.get(id) ?? null; }
   private findTask(column: 'source_id' | 'chat_id' | 'thread_id', id: string): Task | null {
     const row = this.db.prepare(`SELECT payload FROM tasks WHERE ${column}=?`).get(id);
     return row ? this.normalizeTask(JSON.parse(payloadRow.parse(row).payload)) : null;
@@ -298,7 +313,7 @@ export class Store {
     const compact = event.kind === 'tool_start' || event.kind === 'tool_end'
       ? { ...event, text: event.text.split('\n', 1)[0]!.slice(0, 4_096) }
       : event;
-    const stored = storedExecutionEventSchema.parse({ ...compact, seq: sequence, taskId });
+    const stored = { ...compact, seq: sequence, taskId } as StoredExecutionEvent;
     if (!persist) {
       const live = { ...stored, text: stored.text.length <= 16_384 ? stored.text : stored.text.slice(-16_384) };
       this.ephemeralEvents.push(live);
