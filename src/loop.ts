@@ -194,11 +194,11 @@ export class AgentLoop {
     return work;
   }
   private sweepBatch(tasks: Task[]): Task[] {
-    const running = tasks.filter(task => task.status === 'running' && task.threadId);
+    const running = tasks.filter(task => task.status === 'running' && task.threadId && !this.closeout.completed(task.id));
     if (running.length <= this.sweepConcurrency) return tasks;
     const urgent = running.filter(task => {
       const member = this.projects.ledger.membership(task.id);
-      return member?.role === 'coordinator' || this.store.inputs(task.id).some(input => ['pending', 'delivering', 'uncertain'].includes(input.status));
+      return member?.role === 'coordinator' || this.store.hasInputs(task.id, { statuses: ['pending', 'delivering', 'uncertain'] });
     });
     const workers = running.filter(task => !urgent.includes(task));
     const selectedUrgent = urgent.slice(0, this.sweepConcurrency);
@@ -214,6 +214,8 @@ export class AgentLoop {
     this.recordProgressStatus(task);
     task.resources = [...new Map([...task.resources, ...latest.resources].map(resource => [resource.id, resource])).values()]
       .filter(resource => this.store.meta(`released-resource:${task.id}:${resource.id}`) !== 'released');
+    const current = this.store.task(task.id);
+    if (JSON.stringify({ ...current, updatedAt: undefined }) === JSON.stringify({ ...task, updatedAt: undefined })) { task.updatedAt = current.updatedAt; return; }
     task.updatedAt = Date.now(); this.store.saveTask(task);
   }
   private notify(task: Task, text: string, key: string): void {
@@ -690,7 +692,7 @@ export class AgentLoop {
       : { ...common, kind: 'git-worktree', repository: resource.repository, branch: resource.branch });
     if (actual !== resource.workspace) throw new Error('Workspace association changed');
   }
-  private hasUnknownInput(task: Task): boolean { return this.store.inputs(task.id).some(input => ['delivering', 'uncertain'].includes(input.status)); }
+  private hasUnknownInput(task: Task): boolean { return this.store.hasInputs(task.id, { statuses: ['delivering', 'uncertain'] }); }
   private fault(task: Task, error: unknown, turnId: string | null = task.turnId): void {
     const message = errorMessage(error);
     task.executionStatus = 'unknown'; task.reason = message;
@@ -836,14 +838,17 @@ export class AgentLoop {
   private async observe(task: Task, snapshot: ExecutionSnapshot | RunningActivity): Promise<void> {
     const status = 'kind' in snapshot ? snapshot.kind : snapshot.status;
     const error = 'error' in snapshot ? snapshot.error : null;
+    const previousStatus = task.executionStatus;
+    const previousTurnId = task.lastHandledTurnId;
     task.turnId = snapshot.turnId; task.executionStatus = status;
     const waitingForRequest = task.requests.length > 0;
     const oldRequests = new Set(task.requests.map(request => `${request.connectionEpoch}:${request.id}`)); task.requests = snapshot.requests;
-    for (const output of snapshot.outputs) {
+    const processOutputs = !('kind' in snapshot) && (snapshot.turnId !== previousTurnId || previousStatus !== status);
+    for (const output of processOutputs ? snapshot.outputs : []) {
       if (output.threadId !== task.threadId) throw new Error('Agent output thread identity changed');
       if (output.phase !== 'final' || 'kind' in snapshot) continue;
       if (task.legacy && this.store.hasOutput(task.id, `turn:${output.turnId}`)) continue;
-      if (output.text.trim()) this.store.setMeta(`task-summary:${task.id}`, output.text);
+      if (output.text.trim() && this.store.meta(`task-summary:${task.id}`) !== output.text) this.store.setMeta(`task-summary:${task.id}`, output.text);
       if (output.text.trim() && this.projects.publishCoordinatorFinal(task, output.turnId)) this.notify(task, output.text, `agent-output:${output.id}`);
     }
     for (const request of snapshot.requests) {
@@ -902,7 +907,7 @@ export class AgentLoop {
       const member = this.projects.ledger.membership(task.id), state = member && this.projects.ledger.project(member.projectId);
       if (!state) throw new Error('Completed task coordinator is unavailable');
       const completion = this.closeout.read(task.id).lifecycle;
-      for (const input of this.store.inputs(task.id)) {
+      for (const input of this.store.inputs(task.id, { statuses: ['pending', 'delivering', 'uncertain', 'failed', 'held'] })) {
         if (input.origin !== 'user' || ['delivered', 'dropped'].includes(input.status)) continue;
         const message = input.message;
         this.store.receive(state.coordinatorTaskId, { ...message, id: `completed-followup:${task.id}:${message.id}`,
@@ -1016,7 +1021,8 @@ export class AgentLoop {
     this.closeout.assertOpen(task.id);
     this.requireMember(task);
     const threadId = task.threadId;
-    const inputs = this.store.inputs(task.id).sort((a, b) => Number(b.origin === 'initial') - Number(a.origin === 'initial') || a.seq - b.seq);
+    const inputs = this.store.inputs(task.id, { statuses: ['pending', 'delivering', 'uncertain', 'held'] })
+      .sort((a, b) => Number(b.origin === 'initial') - Number(a.origin === 'initial') || a.seq - b.seq);
     if (threadId && !this.stopping && task.status !== 'paused' && task.status !== 'failed'
       && this.store.meta(`project-intake-promotion:${task.id}`) !== null
       && !inputs.some(input => input.status === 'delivering' || input.status === 'uncertain')) {
