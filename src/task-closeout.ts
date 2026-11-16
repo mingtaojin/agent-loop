@@ -127,6 +127,9 @@ export class TaskCloseout {
   }
   private save(value: Ledger) { this.store.setMeta(`task-closeout:${value.taskId}`, JSON.stringify(taskCloseoutSchema.parse(value))); }
   completed(taskId: string) { return this.read(taskId).lifecycle.kind === 'completed'; }
+  hasPendingCleanup(taskId: string): boolean {
+    return this.read(taskId).operations.some(operation => operation.targets.some(target => target.state !== 'removed'));
+  }
   assertOpen(taskId: string) { if (this.completed(taskId)) throw new Error('Task is completed; dispatch a new linked task'); }
   reserve(taskId: string): () => void {
     this.assertOpen(taskId);
