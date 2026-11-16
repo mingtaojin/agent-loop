@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { test, type TestContext } from 'node:test';
 import { z } from 'zod';
 import { configSchema } from '../src/config.js';
@@ -505,4 +506,59 @@ test('an open reader observes committed project changes and rejects corruption a
   assert.throws(() => ledger.project('alpha'));
   fx.store.setMeta(key, payload);
   assert.equal(state(ledger).name, 'Renamed project');
+});
+
+test('a rolled-back cached document cannot leak into the next transaction', t => {
+  const fx = fixture(t); fx.create();
+  assert.throws(() => fx.write(ledger => {
+    ledger.save({ ...state(ledger), name: 'Rolled back' });
+    assert.equal(state(ledger).name, 'Rolled back');
+    throw new Error('Abort');
+  }), /Abort/);
+  fx.write(ledger => {
+    assert.equal(state(ledger).name, 'alpha');
+    ledger.save({ ...state(ledger), name: 'Committed next' });
+  });
+  assert.equal(state(fx.ledger).name, 'Committed next');
+});
+
+test('a warm writer sees external replacement, deletion and corruption, including a write during save', t => {
+  const fx = fixture(t); fx.create();
+  const external = new DatabaseSync(join(fx.directory, 'tasks.sqlite'));
+  t.after(() => external.close());
+  const key = 'project:["state","alpha"]';
+  const original = fx.store.meta(key); assert.ok(original);
+  const replace = (payload: string) => external.prepare('INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, payload);
+  assert.equal(state(fx.ledger).name, 'alpha');
+  const changed = JSON.stringify({ ...JSON.parse(original), state: { ...state(fx.ledger), name: 'External replacement' } });
+  replace(changed); assert.equal(state(fx.ledger).name, 'External replacement');
+  external.prepare('DELETE FROM meta WHERE key=?').run(key); assert.equal(fx.ledger.project('alpha'), null);
+  replace('{'); assert.throws(() => fx.ledger.project('alpha'));
+  replace(original); assert.equal(state(fx.ledger).name, 'alpha');
+  fx.store.deleteMeta(key); assert.equal(fx.ledger.project('alpha'), null);
+  fx.store.setMeta(key, original); assert.equal(state(fx.ledger).name, 'alpha');
+  const setMeta = fx.store.setMeta.bind(fx.store);
+  fx.store.setMeta = (name, payload) => { setMeta(name, payload); if (name === key) replace(changed); };
+  fx.ledger.save({ ...state(fx.ledger), name: 'Local save' });
+  assert.equal(state(fx.ledger).name, 'External replacement');
+});
+
+test('an external commit during a payload read is visible on the next cached lookup', t => {
+  const fx = fixture(t); fx.create();
+  const external = new DatabaseSync(join(fx.directory, 'tasks.sqlite'));
+  t.after(() => external.close());
+  const key = 'project:["state","alpha"]', read = fx.store.meta.bind(fx.store);
+  let changed = false;
+  fx.store.meta = name => {
+    const payload = read(name);
+    if (name === key && payload && !changed) {
+      changed = true;
+      const document = JSON.parse(payload); document.state.name = 'Committed during read';
+      external.prepare('UPDATE meta SET value=? WHERE key=?').run(JSON.stringify(document), key);
+    }
+    return payload;
+  };
+  const reader = new ProjectLedger(fx.store);
+  assert.equal(state(reader).name, 'alpha');
+  assert.equal(state(reader).name, 'Committed during read');
 });
