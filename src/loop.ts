@@ -190,6 +190,11 @@ export class AgentLoop {
         && !this.closeout.hasPendingCleanup(taskId)) return;
       await this.closeout.progress(taskId);
       if (this.stopping || this.lanes.has(taskId)) return;
+      const task = this.store.task(taskId);
+      if (task.status === 'idle' && task.executionStatus === 'completed'
+        && !this.store.hasInputs(taskId, { statuses: ['pending', 'delivering', 'uncertain', 'held'] })
+        && !this.store.hasOutputs(taskId, ['pending', 'sending', 'uncertain'])
+        && !this.store.approvals(taskId).some(item => ['processing', 'uncertain', 'pending'].includes(item.status))) return;
       await this.serial(taskId, () => this.advance(taskId));
     });
     this.sweeps.set(taskId, work);
