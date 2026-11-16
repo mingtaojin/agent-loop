@@ -194,6 +194,10 @@ export class Store {
     return this.db.prepare('SELECT id FROM outbox WHERE id=?').get(id) !== undefined;
   }
   outputs(taskId: string): Outbox[] { return this.db.prepare('SELECT * FROM outbox WHERE task_id=? ORDER BY rowid').all(taskId).map(row => outboxSchema.parse(row)); }
+  hasOutputs(taskId: string, statuses: readonly Outbox['status'][]): boolean {
+    if (!statuses.length) return false;
+    return this.db.prepare(`SELECT 1 FROM outbox WHERE task_id=? AND status IN (${statuses.map(() => '?').join(',')}) LIMIT 1`).get(taskId, ...statuses) !== undefined;
+  }
   markOutput(id: string, status: Outbox['status'], error: string | null = null): void { this.db.prepare('UPDATE outbox SET status=?,error=? WHERE id=?').run(status, error, id); }
   operation(id: string): Operation | null { const row = this.db.prepare('SELECT * FROM operations WHERE id=?').get(id); return row ? operationSchema.parse(row) : null; }
   beginOperation(id: string, taskId: string, kind: string): void { this.db.prepare("INSERT INTO operations VALUES(?,?,?,'attempting',NULL,NULL)").run(id, taskId, kind); }

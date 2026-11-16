@@ -184,6 +184,10 @@ export class AgentLoop {
     const existing = this.sweeps.get(taskId);
     if (existing) return existing;
     const work = Promise.resolve().then(async () => {
+      if (this.closeout.completed(taskId)
+        && !this.store.hasInputs(taskId, { statuses: ['pending', 'delivering', 'uncertain', 'failed', 'held'] })
+        && !this.store.hasOutputs(taskId, ['pending', 'sending', 'uncertain'])
+        && !this.closeout.hasPendingCleanup(taskId)) return;
       await this.closeout.progress(taskId);
       if (this.stopping || this.lanes.has(taskId)) return;
       await this.serial(taskId, () => this.advance(taskId));
