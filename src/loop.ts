@@ -210,7 +210,7 @@ export class AgentLoop {
     const selected = [...selectedUrgent, ...Array.from({ length: Math.min(slots, workers.length) }, (_, offset) => workers[(this.sweepCursor + offset) % workers.length]!)];
     this.sweepCursor = workers.length ? (this.sweepCursor + Math.max(1, slots)) % workers.length : 0;
     const selectedIds = new Set(selected.map(task => task.id));
-    return tasks.filter(task => task.status !== 'running' || !task.threadId || selectedIds.has(task.id));
+    return tasks.filter(task => task.status !== 'running' || !task.threadId || this.closeout.completed(task.id) || selectedIds.has(task.id));
   }
   private persist(task: Task): void {
     const latest = this.store.task(task.id);
