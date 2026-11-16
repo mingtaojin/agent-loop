@@ -191,7 +191,7 @@ export function matchesProjectIssue(source: Source, project: ProjectConfig): boo
 }
 
 export class ProjectLedger {
-  private readonly documents = new Map<string, { payload: string; document: ProjectDocument }>();
+  private readonly documents = new Map<string, { payload: string; document: ProjectDocument; revision: symbol }>();
 
   constructor(private readonly store: Store) {}
 
@@ -249,7 +249,7 @@ export class ProjectLedger {
       if (!previous?.state.members.some(candidate => candidate.taskId === member.taskId))
         this.store.setMeta(metadataKey('member', member.taskId), JSON.stringify({ projectId: next.id, role: member.role }));
     }
-    this.documents.set(next.id, { payload, document: validated });
+    this.documents.delete(next.id);
   }
 
   membership(taskId: string): z.infer<typeof membershipSchema> | null {
@@ -371,17 +371,23 @@ export class ProjectLedger {
 
   private document(projectId: string): ProjectDocument | null {
     const id = idSchema.parse(projectId);
-    const payload = this.store.meta(metadataKey('state', id));
+    const key = metadataKey('state', id);
+    const revision = this.store.metaRevision(key);
     const cached = this.documents.get(id);
+    if (cached?.revision === revision) return cached.document;
+    const payload = this.store.meta(key);
     if (payload === null) {
       this.documents.delete(id);
       return null;
     }
-    if (cached?.payload === payload) return cached.document;
+    if (cached?.payload === payload) {
+      cached.revision = revision;
+      return cached.document;
+    }
     this.documents.delete(id);
     const document = documentSchema.parse(JSON.parse(payload));
     if (document.state.id !== id) throw new Error('Persisted project identity does not match its key');
-    this.documents.set(id, { payload, document });
+    this.documents.set(id, { payload, document, revision });
     return document;
   }
 

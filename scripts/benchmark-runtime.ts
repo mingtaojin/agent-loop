@@ -26,13 +26,13 @@ const { values } = parseArgs({ options: {
   help: { type: 'boolean', default: false },
 } });
 if (values.help) {
-  process.stdout.write('Usage: tsx scripts/benchmark-runtime.ts [--source REPO] [--label NAME] [--shape live|revisions] [--duration 9000] [--poll 2000] [--output FILE] [--profile FILE] [--compiled] [--keep-fixture]\n');
+  process.stdout.write('Usage: tsx scripts/benchmark-runtime.ts [--source REPO] [--label NAME] [--shape live|unicode|revisions] [--duration 9000] [--poll 2000] [--output FILE] [--profile FILE] [--compiled] [--keep-fixture]\n');
   process.exit(0);
 }
 const durationMs = Number(values.duration), pollMs = Number(values.poll);
 assert.ok(Number.isInteger(durationMs) && durationMs >= 6000 && durationMs <= 15000, 'duration must be 6000..15000 ms');
 assert.ok(Number.isInteger(pollMs) && pollMs > 0, 'poll must be positive milliseconds');
-assert.ok(values.shape === 'live' || values.shape === 'revisions', 'shape must be live or revisions');
+assert.ok(values.shape === 'live' || values.shape === 'unicode' || values.shape === 'revisions', 'shape must be live, unicode or revisions');
 const sourceRoot = await realpath(values.source);
 const sourceFile = (name: string) => join(sourceRoot, values.compiled ? 'dist/src' : 'src', `${name}.${values.compiled ? 'js' : 'ts'}`);
 const { AgentLoop }: typeof import('../src/loop.js') = await import(pathToFileURL(sourceFile('loop')).href);
@@ -232,7 +232,9 @@ try {
     const rawBeforeRecords = store.meta(`project:${JSON.stringify(['state', project.id])}`); assert.ok(rawBeforeRecords);
     const projectedBytes = Buffer.byteLength(rawBeforeRecords) + Buffer.byteLength(JSON.stringify(current.records));
     const textLength = Math.max(128, Math.floor((project.targetBytes - projectedBytes) / project.records));
-    for (const record of current.records) record.text = 'Local investigation notes, decisions, acceptance, evidence, and retained result. '.repeat(Math.ceil(textLength / 78)).slice(0, textLength);
+    for (const record of current.records) record.text = values.shape === 'unicode'
+      ? '项目协调者的历史决策与验收记录。'.repeat(Math.max(1, Math.floor(textLength / Buffer.byteLength('项目协调者的历史决策与验收记录。'))))
+      : 'Local investigation notes, decisions, acceptance, evidence, and retained result. '.repeat(Math.ceil(textLength / 78)).slice(0, textLength);
     ledger.save(current);
     const raw = store.meta(`project:${JSON.stringify(['state', project.id])}`); assert.ok(raw);
     fixtureProjects.push({ id: project.id, bytes: Buffer.byteLength(raw), members: current.members.length,

@@ -7,6 +7,8 @@ import { executionEventSchema, storedExecutionEventSchema, type ExecutionEvent, 
 import { approvalActionSchema, feishuCardRecordSchema, inputProvenanceSchema, incomingSchema, repositorySchema, sourceSchema, taskSchema, type ApprovalAction, type FeishuCardRecord, type IncomingMessage, type InputProvenance, type Source, type Task } from './domain.js';
 
 const payloadRow = z.object({ payload: z.string() });
+const metaRow = z.object({ value: z.string() });
+const dataVersionRow = z.object({ data_version: z.number() });
 export const documentSourcePositionSchema = z.strictObject({
   eventSeq: z.number().int().nonnegative(), inputSeq: z.number().int().nonnegative(),
 });
@@ -31,6 +33,8 @@ export class Store {
   private readonly db: DatabaseSync;
   private readonly lock: DatabaseSync | null;
   private readonly lastDeltaAt = new Map<string, number>();
+  private readonly metaRevisions = new Map<string, symbol>();
+  private lastMetaDataVersion: number | null = null;
   private readonly ephemeralEvents: StoredExecutionEvent[] = [];
   private logicalSequence = 0;
   private logicalSequenceLoaded = false;
@@ -89,7 +93,11 @@ export class Store {
   transaction<T>(fn: () => T): T {
     this.db.exec('BEGIN IMMEDIATE');
     try { const result = fn(); this.db.exec('COMMIT'); return result; }
-    catch (error) { this.db.exec('ROLLBACK'); throw error; }
+    catch (error) {
+      try { this.db.exec('ROLLBACK'); }
+      finally { this.metaRevisions.clear(); }
+      throw error;
+    }
   }
   saveSource(source: Source, reason: string): void {
     const payload = JSON.stringify(source);
@@ -236,7 +244,20 @@ export class Store {
       seen.add(identity); return true;
     }).slice(0, diagnosticReadLimit);
   }
-  meta(key: string): string | null { const row = this.db.prepare('SELECT value FROM meta WHERE key=?').get(key); return row ? z.object({ value: z.string() }).parse(row).value : null; }
+  meta(key: string): string | null { const row = this.db.prepare('SELECT value FROM meta WHERE key=?').get(key); return row ? metaRow.parse(row).value : null; }
+  metaRevision(key: string): symbol {
+    const dataVersion = this.dataVersion();
+    if (dataVersion !== this.lastMetaDataVersion) {
+      this.metaRevisions.clear();
+      this.lastMetaDataVersion = dataVersion;
+    }
+    const cached = this.metaRevisions.get(key);
+    if (cached !== undefined) return cached;
+    if (this.metaRevisions.size >= 256) this.metaRevisions.clear();
+    const revision = Symbol();
+    this.metaRevisions.set(key, revision);
+    return revision;
+  }
   recordExecutionEvent(taskId: string, event: ExecutionEvent): void {
     const sequence = this.nextExecutionSequence();
     let persist = event.kind !== 'tool_output' && event.kind !== 'agent_delta';
@@ -350,12 +371,16 @@ export class Store {
     }
   }
   setMeta(key: string, value: string): void {
-    this.db.prepare('INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE meta.value IS NOT excluded.value').run(key, value);
+    const result = this.db.prepare('INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE meta.value IS NOT excluded.value').run(key, value);
+    if (result.changes > 0) this.metaRevisions.delete(key);
   }
-  deleteMeta(key: string): void { this.db.prepare('DELETE FROM meta WHERE key=?').run(key); }
+  deleteMeta(key: string): void {
+    const result = this.db.prepare('DELETE FROM meta WHERE key=?').run(key);
+    if (result.changes > 0) this.metaRevisions.delete(key);
+  }
   dataVersion(): number {
     const row = this.db.prepare('PRAGMA data_version').get();
-    return z.object({ data_version: z.number() }).parse(row).data_version;
+    return dataVersionRow.parse(row).data_version;
   }
   latestExecutionSequence(): number {
     const persisted = z.object({ seq: z.number() }).parse(this.db.prepare('SELECT COALESCE(MAX(seq),0) AS seq FROM execution_events').get()).seq;
