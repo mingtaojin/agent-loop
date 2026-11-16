@@ -64,6 +64,7 @@ export class AgentLoop {
   private readonly resourceLanes = new Map<string, Promise<TaskResource>>();
   private readonly timers: ReturnType<typeof setInterval>[] = [];
   private readonly sweepConcurrency = 4;
+  private readonly settledCompletedAt = new Map<string, number>();
   private sweepCursor = 0;
   private running = false;
   private started = false;
@@ -184,10 +185,14 @@ export class AgentLoop {
     const existing = this.sweeps.get(taskId);
     if (existing) return existing;
     const work = Promise.resolve().then(async () => {
-      if (this.closeout.completed(taskId)
-        && !this.store.hasInputs(taskId, { statuses: ['pending', 'delivering', 'uncertain', 'failed', 'held'] })
-        && !this.store.hasOutputs(taskId, ['pending', 'sending', 'uncertain'])
-        && !this.closeout.hasPendingCleanup(taskId)) return;
+      if (this.closeout.completed(taskId)) {
+        const now = Date.now();
+        const hasInput = this.store.hasInputs(taskId, { statuses: ['pending', 'delivering', 'uncertain', 'failed', 'held'] });
+        const hasOutput = this.store.hasOutputs(taskId, ['pending', 'sending', 'uncertain']);
+        if (!hasInput && !hasOutput && now - (this.settledCompletedAt.get(taskId) ?? 0) < 10_000) return;
+        if (!hasInput && !hasOutput && !this.closeout.hasPendingCleanup(taskId)) { this.settledCompletedAt.set(taskId, now); return; }
+        this.settledCompletedAt.delete(taskId);
+      }
       await this.closeout.progress(taskId);
       if (this.stopping || this.lanes.has(taskId)) return;
       const task = this.store.task(taskId);
