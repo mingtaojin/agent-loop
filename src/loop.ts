@@ -60,6 +60,7 @@ export class AgentLoop {
   private readonly workspaceBridge: WorkspaceBridge;
   private readonly progress: FeishuProgressPublisher | FeishuDocumentProgressPublisher | null;
   private readonly lanes = new Map<string, Promise<void>>();
+  private readonly sweeps = new Map<string, Promise<void>>();
   private readonly resourceLanes = new Map<string, Promise<TaskResource>>();
   private readonly timers: ReturnType<typeof setInterval>[] = [];
   private running = false;
@@ -176,6 +177,19 @@ export class AgentLoop {
     this.lanes.set(id, next);
     void next.finally(() => { if (this.lanes.get(id) === next) this.lanes.delete(id); }).catch(() => undefined);
     return next;
+  }
+  private sweep(taskId: string): Promise<void> {
+    const existing = this.sweeps.get(taskId);
+    if (existing) return existing;
+    const work = Promise.resolve().then(async () => {
+      await this.closeout.progress(taskId);
+      if (this.stopping || this.lanes.has(taskId)) return;
+      await this.serial(taskId, () => this.advance(taskId));
+    });
+    this.sweeps.set(taskId, work);
+    const release = () => { if (this.sweeps.get(taskId) === work) this.sweeps.delete(taskId); };
+    void work.then(release, release);
+    return work;
   }
   private persist(task: Task): void {
     const latest = this.store.task(task.id);
@@ -450,9 +464,10 @@ export class AgentLoop {
     });
   }
   async tick(): Promise<void> {
+    if (this.stopping) return;
     if (this.running) this.heartbeat('running');
-    await Promise.all(this.store.tasks().map(task => this.closeout.progress(task.id)));
-    await Promise.all(this.store.tasks().filter(task => !this.lanes.has(task.id)).map(task => this.serial(task.id, () => this.advance(task.id))));
+    const tasks = this.store.tasks();
+    await Promise.all(tasks.map(task => this.sweep(task.id)));
   }
   private executionDirectory(task: Task): string {
     const project = this.projects.config(task.id);
@@ -1302,6 +1317,7 @@ export class AgentLoop {
     await this.progress?.close();
     await this.ports.feishu.close();
     await this.collecting;
+    await Promise.allSettled([...this.sweeps.values()]);
     await Promise.allSettled([...this.lanes.values(), ...this.resourceLanes.values()]);
     await this.workspaceBridge.close();
     await this.projects.close();

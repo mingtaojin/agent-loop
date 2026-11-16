@@ -191,9 +191,14 @@ export function matchesProjectIssue(source: Source, project: ProjectConfig): boo
 }
 
 export class ProjectLedger {
+  private readonly documents = new Map<string, { payload: string; document: ProjectDocument }>();
+
   constructor(private readonly store: Store) {}
 
-  project(projectId: string): ProjectState | null { return this.document(projectId)?.state ?? null; }
+  project(projectId: string): ProjectState | null {
+    const document = this.document(projectId);
+    return document ? structuredClone(document.state) : null;
+  }
 
   save(state: ProjectState): void {
     const next = projectStateSchema.parse(state);
@@ -224,7 +229,7 @@ export class ProjectLedger {
         throw new Error('Task already belongs to a project or role');
     }
     const document: ProjectDocument = { state: next,
-      issueRevisions: previous?.issueRevisions ?? [], commentRevisions: previous?.commentRevisions ?? [] };
+      issueRevisions: [...(previous?.issueRevisions ?? [])], commentRevisions: [...(previous?.commentRevisions ?? [])] };
     for (const source of next.issues) {
       const revisions = document.issueRevisions.filter(revision => revision.source.id === source.id);
       if (issueFingerprint(revisions.at(-1)?.source ?? source) !== issueFingerprint(source) || revisions.length === 0) {
@@ -237,18 +242,21 @@ export class ProjectLedger {
         document.commentRevisions.push({ eventId: `project-comment:${digest([next.id, comment.id, revisions.length + 1, commentFingerprint(comment)])}`, comment });
       }
     }
-    this.store.setMeta(metadataKey('state', next.id), JSON.stringify(document));
+    const validated = documentSchema.parse(document);
+    const payload = JSON.stringify(validated);
+    this.store.setMeta(metadataKey('state', next.id), payload);
     for (const member of next.members) {
       if (!previous?.state.members.some(candidate => candidate.taskId === member.taskId))
         this.store.setMeta(metadataKey('member', member.taskId), JSON.stringify({ projectId: next.id, role: member.role }));
     }
+    this.documents.set(next.id, { payload, document: validated });
   }
 
   membership(taskId: string): z.infer<typeof membershipSchema> | null {
     const payload = this.store.meta(metadataKey('member', idSchema.parse(taskId)));
     if (payload === null) return null;
     const membership = membershipSchema.parse(JSON.parse(payload));
-    const member = this.project(membership.projectId)?.members.find(candidate => candidate.taskId === taskId);
+    const member = this.document(membership.projectId)?.state.members.find(candidate => candidate.taskId === taskId);
     if (!member || member.role !== membership.role) throw new Error('Inconsistent project membership');
     return membership;
   }
@@ -362,20 +370,32 @@ export class ProjectLedger {
   }
 
   private document(projectId: string): ProjectDocument | null {
-    const payload = this.store.meta(metadataKey('state', idSchema.parse(projectId)));
-    if (payload === null) return null;
+    const id = idSchema.parse(projectId);
+    const payload = this.store.meta(metadataKey('state', id));
+    const cached = this.documents.get(id);
+    if (payload === null) {
+      this.documents.delete(id);
+      return null;
+    }
+    if (cached?.payload === payload) return cached.document;
+    this.documents.delete(id);
     const document = documentSchema.parse(JSON.parse(payload));
-    if (document.state.id !== projectId) throw new Error('Persisted project identity does not match its key');
+    if (document.state.id !== id) throw new Error('Persisted project identity does not match its key');
+    this.documents.set(id, { payload, document });
     return document;
   }
 
   private requiredDocument(projectId: string): ProjectDocument {
     const document = this.document(projectId);
     if (!document) throw new Error(`Unknown project ${projectId}`);
-    return document;
+    return structuredClone(document);
   }
 
-  private required(projectId: string): ProjectState { return this.requiredDocument(projectId).state; }
+  private required(projectId: string): ProjectState {
+    const document = this.document(projectId);
+    if (!document) throw new Error(`Unknown project ${projectId}`);
+    return structuredClone(document.state);
+  }
 
   private lastIssueEvent(document: ProjectDocument, sourceId: string): string {
     const revision = document.issueRevisions.findLast(candidate => candidate.source.id === sourceId);

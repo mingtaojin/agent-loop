@@ -474,6 +474,42 @@ test('cleanup admission racing attachment preparation leaves input pending until
   assert.equal(await exists(scope.location.root.path), false);
 });
 
+test('a slow cleanup does not delay another task reply across successive sweeps', { timeout: 10_000 }, async t => {
+  const f = await fixture(t), worker = await f.worker(), coordinator = f.loop.store.task(f.coordinatorId);
+  assert.ok(worker.threadId); assert.ok(coordinator.threadId); assert.ok(coordinator.chatId);
+  await f.complete(worker.id);
+  let releaseUsage!: () => void, enteredUsage!: () => void;
+  const usageGate = new Promise<void>(resolve => { releaseUsage = resolve; });
+  const usageStarted = new Promise<void>(resolve => { enteredUsage = resolve; });
+  const usage = f.codex.executionUse.bind(f.codex);
+  f.codex.executionUse = async threadId => {
+    if (threadId === worker.threadId) { enteredUsage(); await usageGate; }
+    return usage(threadId);
+  };
+  const sweeps: Promise<void>[] = [];
+  const send = f.feishu.send.bind(f.feishu);
+  let delivered!: () => void;
+  f.feishu.send = async input => { await send(input); if (input.text === 'Responsive reply') delivered(); };
+  try {
+    for (let index = 0; index < 2; index++) {
+      if (index) await f.loop.receive({ id: 'second-owner-input', chatId: coordinator.chatId, senderId: 'owner',
+        chatType: 'group', text: 'Another question', attachments: [], createdAt: Date.now() });
+      const reply = new Promise<void>(resolve => { delivered = resolve; });
+      f.codex.complete(coordinator.threadId, 'Responsive reply');
+      sweeps.push(f.loop.tick());
+      await usageStarted;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([reply, new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('Unrelated cleanup blocked a coordinator reply')), 1500);
+        })]);
+      } finally { clearTimeout(timer); }
+    }
+    assert.equal(f.feishu.sent.filter(message => message.text === 'Responsive reply').length, 2);
+    assert.equal(f.loop.store.inputs(coordinator.id).find(input => input.id === 'second-owner-input')?.status, 'delivered');
+  } finally { releaseUsage(); await Promise.allSettled(sweeps); }
+});
+
 test('lost generic receipts do not allocate a second scope or lose the atomic completion intent', async t => {
   const f = await fixture(t), worker = await f.worker();
   const setMeta = f.loop.store.setMeta.bind(f.loop.store); let failRequest = 'allocation-ack';
@@ -714,4 +750,30 @@ test('constructed interrupted disposal preserves a new coordinator scope allocat
   assert.equal(await readFile(file, 'utf8'), 'next coordinator work');
   const state = await f.state(f.coordinatorId);
   assert.equal(state.lifecycle.kind, 'open'); assert.equal(state.operations[0]?.targets[0]?.state, 'pending');
+});
+
+test('shutdown drains an in-flight cleanup sweep before closing its store', { timeout: 10_000 }, async t => {
+  const f = await fixture(t), worker = await f.worker();
+  assert.ok(worker.threadId);
+  await f.complete(worker.id);
+  let release!: () => void, entered!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const usage = f.codex.executionUse.bind(f.codex);
+  f.codex.executionUse = async threadId => {
+    if (threadId === worker.threadId) { entered(); await gate; }
+    return usage(threadId);
+  };
+  const sweep = f.loop.tick();
+  await started;
+  let closed = false;
+  const close = f.loop.close().then(() => { closed = true; });
+  try {
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(closed, false, 'shutdown must wait for cleanup that still owns the store');
+  } finally {
+    release();
+    await Promise.all([sweep, close]);
+  }
+  await f.loop.tick();
 });
