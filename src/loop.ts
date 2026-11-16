@@ -63,6 +63,8 @@ export class AgentLoop {
   private readonly sweeps = new Map<string, Promise<void>>();
   private readonly resourceLanes = new Map<string, Promise<TaskResource>>();
   private readonly timers: ReturnType<typeof setInterval>[] = [];
+  private readonly sweepConcurrency = 4;
+  private sweepCursor = 0;
   private running = false;
   private started = false;
   private stopping = false;
@@ -190,6 +192,21 @@ export class AgentLoop {
     const release = () => { if (this.sweeps.get(taskId) === work) this.sweeps.delete(taskId); };
     void work.then(release, release);
     return work;
+  }
+  private sweepBatch(tasks: Task[]): Task[] {
+    const running = tasks.filter(task => task.status === 'running' && task.threadId);
+    if (running.length <= this.sweepConcurrency) return tasks;
+    const urgent = running.filter(task => {
+      const member = this.projects.ledger.membership(task.id);
+      return member?.role === 'coordinator' || this.store.inputs(task.id).some(input => ['pending', 'delivering', 'uncertain'].includes(input.status));
+    });
+    const workers = running.filter(task => !urgent.includes(task));
+    const selectedUrgent = urgent.slice(0, this.sweepConcurrency);
+    const slots = Math.max(0, this.sweepConcurrency - selectedUrgent.length);
+    const selected = [...selectedUrgent, ...Array.from({ length: Math.min(slots, workers.length) }, (_, offset) => workers[(this.sweepCursor + offset) % workers.length]!)];
+    this.sweepCursor = workers.length ? (this.sweepCursor + Math.max(1, slots)) % workers.length : 0;
+    const selectedIds = new Set(selected.map(task => task.id));
+    return tasks.filter(task => task.status !== 'running' || !task.threadId || selectedIds.has(task.id));
   }
   private persist(task: Task): void {
     const latest = this.store.task(task.id);
@@ -466,8 +483,15 @@ export class AgentLoop {
   async tick(): Promise<void> {
     if (this.stopping) return;
     if (this.running) this.heartbeat('running');
-    const tasks = this.store.tasks();
-    await Promise.all(tasks.map(task => this.sweep(task.id)));
+    const tasks = this.sweepBatch(this.store.tasks());
+    let next = 0;
+    const worker = async () => {
+      while (next < tasks.length) {
+        const task = tasks[next++];
+        if (task) await this.sweep(task.id);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(this.sweepConcurrency, tasks.length) }, () => worker()));
   }
   private executionDirectory(task: Task): string {
     const project = this.projects.config(task.id);
