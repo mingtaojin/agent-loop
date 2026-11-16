@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { WorkspaceBridge } from './workspace-bridge.js';
 import { z } from 'zod';
 import { criteriaSchema, requestSchema, workspaceTargetSchema } from './domain.js';
-import { discoverProjects } from './project-discovery.js';
+import { discoverProjectsCached } from './project-discovery.js';
 import type { Config } from './config.js';
 import { errorMessage, projectDecisionActionSchema, presentTaskSource, matchSource, RejectedInputError, TurnChangedError, type AgentInput, type ApprovalAction, type DiscoveredProject, type ExecutionSnapshot, type IncomingMessage, type ProjectDecisionAction, type Repository, type Source, type SourceComment, type Task, type TaskResource, type TaskSource, type WorkspaceTarget } from './domain.js';
 import { fitsTaskTitle, parseTaskTitle } from './task-title.js';
@@ -297,7 +297,7 @@ export class AgentLoop {
     let projects: DiscoveredProject[] = [];
     let discoveryError = '';
     if (this.config.engineering?.projectRoot) {
-      try { projects = await discoverProjects(this.config.engineering.projectRoot); }
+      try { projects = await discoverProjectsCached(this.config.engineering.projectRoot); }
       catch (error) {
         discoveryError = ` Additional project discovery is unavailable: ${errorMessage(error)}.`;
         this.problem(`discovery:${task.id}`, error);
@@ -622,7 +622,7 @@ export class AgentLoop {
       } else {
         if ('projectId' in target) {
           const project = snapshot && 'kind' in snapshot ? snapshot
-            : this.config.engineering?.projectRoot ? (await discoverProjects(this.config.engineering.projectRoot)).find(project => project.id === target.projectId) : undefined;
+            : this.config.engineering?.projectRoot ? (await discoverProjectsCached(this.config.engineering.projectRoot)).find(project => project.id === target.projectId) : undefined;
           if (!project || project.id !== target.projectId) throw new Error('Project identity is not available');
           const id = 'project-' + digest(project.id).slice(0, 32);
           const workspace = await this.ports.workspace.ensure({ taskId, resourceId: id, kind: 'project-directory',
