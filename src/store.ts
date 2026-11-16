@@ -17,6 +17,7 @@ const operationSchema = z.object({ id: z.string(), task_id: z.string(), kind: z.
 export type Operation = z.infer<typeof operationSchema>;
 const inboxRow = z.object({ seq: z.number(), id: z.string(), task_id: z.string(), payload: z.string(), status: z.enum(['pending', 'delivering', 'delivered', 'failed', 'uncertain', 'held', 'dropped']), origin: z.enum(['user', 'source', 'initial', 'resume']), error: z.string().nullable() });
 export type Inbox = Omit<z.infer<typeof inboxRow>, 'payload'> & { message: IncomingMessage; provenance: InputProvenance; requestId: string | null };
+export type InboxFilter = { statuses?: readonly Inbox['status'][]; origin?: Inbox['origin'] };
 const outboxSchema = z.object({ id: z.string(), task_id: z.string(), text: z.string(), status: z.enum(['pending', 'sending', 'sent', 'uncertain', 'dropped']), error: z.string().nullable() });
 export type Outbox = z.infer<typeof outboxSchema>;
 
@@ -63,6 +64,7 @@ export class Store {
         CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY,source_id TEXT NOT NULL UNIQUE,chat_id TEXT UNIQUE,thread_id TEXT UNIQUE,payload TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS inbox(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,task_id TEXT NOT NULL REFERENCES tasks(id),payload TEXT NOT NULL,status TEXT NOT NULL,origin TEXT NOT NULL DEFAULT 'user',error TEXT);
         CREATE INDEX IF NOT EXISTS inbox_task ON inbox(task_id,seq);
+        CREATE INDEX IF NOT EXISTS inbox_task_status ON inbox(task_id,status,seq);
         CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id),text TEXT NOT NULL,status TEXT NOT NULL,error TEXT);
         CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id),kind TEXT NOT NULL,status TEXT NOT NULL,result TEXT,error TEXT);
         CREATE TABLE IF NOT EXISTS approval_actions(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id),payload TEXT NOT NULL,status TEXT NOT NULL,error TEXT);
@@ -142,8 +144,16 @@ export class Store {
       : origin === 'initial' ? { kind: 'initial', sourceId: task.sourceId } : { kind: 'recovery', previousTurnId: task.turnId ?? 'legacy' });
     return this.db.prepare("INSERT OR IGNORE INTO inbox(id,task_id,payload,status,origin) VALUES(?,?,?,'pending',?)").run(message.id, taskId, JSON.stringify({ message, provenance: facts, requestId: null }), origin).changes > 0;
   }
-  inputs(taskId: string): Inbox[] {
-    return this.db.prepare('SELECT * FROM inbox WHERE task_id=? ORDER BY seq').all(taskId).map(raw => {
+  inputs(taskId: string, filter: InboxFilter = {}): Inbox[] {
+    const clauses = ['task_id=?'];
+    const params: (string | number)[] = [taskId];
+    if (filter.statuses) {
+      if (!filter.statuses.length) return [];
+      clauses.push(`status IN (${filter.statuses.map(() => '?').join(',')})`);
+      params.push(...filter.statuses);
+    }
+    if (filter.origin) { clauses.push('origin=?'); params.push(filter.origin); }
+    return this.db.prepare(`SELECT * FROM inbox WHERE ${clauses.join(' AND ')} ORDER BY seq`).all(...params).map(raw => {
       const { payload, ...row } = inboxRow.parse(raw);
       const json: unknown = JSON.parse(payload);
       const wrapped = z.object({ message: incomingSchema, provenance: inputProvenanceSchema, requestId: z.string().nullable().default(null) }).safeParse(json);
@@ -156,6 +166,18 @@ export class Store {
       return { ...row, message, provenance, requestId: null };
     });
   }
+  hasInputs(taskId: string, filter: InboxFilter): boolean {
+    const clauses = ['task_id=?'];
+    const params: (string | number)[] = [taskId];
+    if (filter.statuses) {
+      if (!filter.statuses.length) return false;
+      clauses.push(`status IN (${filter.statuses.map(() => '?').join(',')})`);
+      params.push(...filter.statuses);
+    }
+    if (filter.origin) { clauses.push('origin=?'); params.push(filter.origin); }
+    return this.db.prepare(`SELECT 1 FROM inbox WHERE ${clauses.join(' AND ')} LIMIT 1`).get(...params) !== undefined;
+  }
+  input(taskId: string, id: string): Inbox | null { return this.inputs(taskId).find(item => item.id === id) ?? null; }
   associateRequest(id: string, taskId: string, requestId: string): void {
     const input = this.inputs(taskId).find(item => item.id === id);
     if (!input) throw new Error('Unknown inbox input');
