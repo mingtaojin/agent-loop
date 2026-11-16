@@ -31,6 +31,7 @@ function fixture(t: TestContext) {
   let ledger = new ProjectLedger(store);
   t.after(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
   return {
+    directory,
     get store() { return store; }, get ledger() { return ledger; },
     create(projectConfig = config(), coordinator = 'coordinator') {
       return store.transaction(() => ledger.create(projectConfig, coordinator));
@@ -479,4 +480,29 @@ test('project input compatibility validates and strips only the retired supervis
     { ...current, supervisionIntervalMs: 300_000, unexpected: true },
     { ...current, repositories: [current.repositories[0], current.repositories[0]], supervisionIntervalMs: 300_000 },
   ]) assert.equal(projectConfigInputSchema.safeParse(input).success, false);
+});
+
+
+test('an open reader observes committed project changes and rejects corruption after a valid read', t => {
+  const fx = fixture(t); fx.create(); fx.ledger.issue('alpha', source());
+  const reader = new Store(fx.directory, { readOnly: true });
+  t.after(() => reader.close());
+  const ledger = new ProjectLedger(reader);
+  assert.equal(state(ledger).name, 'alpha');
+  fx.write(writer => writer.save({ ...state(writer), name: 'Renamed project' }));
+  assert.equal(state(ledger).name, 'Renamed project');
+  assert.throws(() => fx.write(writer => {
+    writer.save({ ...state(writer), name: 'Uncommitted rename' });
+    assert.equal(state(writer).name, 'Uncommitted rename');
+    assert.equal(state(ledger).name, 'Renamed project');
+    throw new Error('Abort rename');
+  }));
+  assert.equal(state(fx.ledger).name, 'Renamed project');
+  assert.equal(state(ledger).name, 'Renamed project');
+  const key = 'project:["state","alpha"]';
+  const payload = fx.store.meta(key); assert.ok(payload);
+  fx.store.setMeta(key, JSON.stringify({ ...fx.persisted(), issueRevisions: [] }));
+  assert.throws(() => ledger.project('alpha'));
+  fx.store.setMeta(key, payload);
+  assert.equal(state(ledger).name, 'Renamed project');
 });
