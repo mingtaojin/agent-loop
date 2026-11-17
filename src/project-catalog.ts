@@ -30,7 +30,8 @@ async function canonical(path: string): Promise<string | null> {
 export class ProjectCatalog {
   private effective: ProjectConfig[] = [];
   private refreshing: Promise<void> | null = null;
-  constructor(private readonly config: Config, private readonly store: Store) {}
+  private readonly ledger: ProjectLedger;
+  constructor(private readonly config: Config, private readonly store: Store) { this.ledger = new ProjectLedger(store); }
 
   get configs(): ProjectConfig[] { return this.effective; }
   isExplicit(id: string): boolean { return this.config.projects.some(project => project.id === id); }
@@ -53,15 +54,14 @@ export class ProjectCatalog {
     for (const config of this.config.projects) {
       const directory = await canonical(config.directory);
       if (!directory) throw new Error(`Project directory unavailable: ${config.id}`);
-      const state = new ProjectLedger(this.store).project(config.id);
+      const state = this.ledger.project(config.id);
       if (state && state.directory !== directory) throw new Error(`Project directory identity changed: ${config.id}`);
       explicit.push({ ...config, directory });
     }
     const saved = definitionsSchema.parse(JSON.parse(this.store.meta(catalogKey) ?? '[]'));
     const bindings = bindingsSchema.parse(JSON.parse(this.store.meta(bindingsKey) ?? '[]'));
-    const ledger = new ProjectLedger(this.store);
-    const projects = new Set(this.store.tasks().map(task => ledger.membership(task.id)?.projectId).filter(id => id !== undefined));
-    for (const projectId of projects) for (const issue of ledger.project(projectId)?.issues ?? []) {
+    const projects = new Set(this.store.tasks().map(task => this.ledger.membership(task.id)?.projectId).filter(id => id !== undefined));
+    for (const projectId of projects) for (const issue of this.ledger.project(projectId)?.issues ?? []) {
       const previous = bindings.find(binding => binding.repository.toLowerCase() === issue.repository.toLowerCase());
       if (previous && previous.projectId !== projectId) throw new Error(`Conflicting durable repository ownership: ${issue.repository}`);
       if (!previous) bindings.push({ repository: issue.repository, projectId });
@@ -70,7 +70,7 @@ export class ProjectCatalog {
     const automatic = new Map<string, ProjectConfig>();
     for (const config of saved) {
       const replacement = explicit.find(item => item.directory === config.directory && item.id !== config.id);
-      if (replacement && new ProjectLedger(this.store).project(config.id)) throw new Error(`Project directory already belongs to ${config.id}; preserve its project ID`);
+      if (replacement && this.ledger.project(config.id)) throw new Error(`Project directory already belongs to ${config.id}; preserve its project ID`);
       if (explicit.some(item => item.id === config.id || item.directory === config.directory)) continue;
       if (await canonical(config.directory) !== config.directory) continue;
       automatic.set(config.directory, { ...config, repositories: [] });
@@ -180,7 +180,7 @@ export class ProjectCatalog {
 
   async resolveTask(task: Task): Promise<ProjectConfig | null> {
     await this.refresh();
-    const member = new ProjectLedger(this.store).membership(task.id);
+    const member = this.ledger.membership(task.id);
     if (member) return this.effective.find(project => project.id === member.projectId) ?? null;
     const resolved: ProjectConfig[] = [];
     if (task.source.kind === 'github') {

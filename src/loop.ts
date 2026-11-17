@@ -1311,10 +1311,11 @@ export class AgentLoop {
         this.store.setMeta(failureKey, JSON.stringify(next));
         if (next.failures === historyNoticeAfterFailures) this.notify(this.store.task(task.id), historyDelayedNotice, `history-delayed:${task.id}:${next.episodeId}`);
       });
-      await this.serial(task.id, () => this.advance(task.id));
-      return;
     }
-    await this.serial(task.id, () => this.advance(task.id));
+    if (recovered > 0) await this.serial(task.id, () => this.advance(task.id));
+    else if (this.store.hasOutputs(task.id, ['pending', 'sending', 'uncertain'])) {
+      await this.serial(task.id, () => this.flush(this.store.task(task.id)));
+    }
   }
   private async backfill(): Promise<void> {
     if (this.backfilling) return this.backfilling;

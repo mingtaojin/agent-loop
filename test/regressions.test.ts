@@ -137,6 +137,32 @@ test('a source update racing with turn completion starts once without manufactur
   assert.equal(workerCalls(f.loop, f.codex).replies.length, 0);
 });
 
+test('empty history polls and outage notices do not inspect a settled execution', async t => {
+  const f = await fixture(t);
+  await f.launch();
+  await f.loop.start();
+  const snapshot = f.codex.snapshot(f.thread());
+  snapshot.status = 'completed';
+  await tickWithDirectGroups(f.loop);
+  assert.equal(f.task().executionStatus, 'completed');
+  let inspections = 0;
+  const inspect = f.codex.inspect.bind(f.codex);
+  f.codex.inspect = async (...args) => { if (args[0] === f.thread()) inspections++; return inspect(...args); };
+  await f.loop.collect();
+  f.feishu.historyError = new Error('history unavailable');
+  await f.loop.collect();
+  await f.loop.collect();
+  f.feishu.historyError = null;
+  await f.loop.collect();
+  assert.equal(inspections, 0);
+  assert.ok(f.feishu.sent.some(message => message.chatId === f.task().chatId && message.text.includes('飞书历史消息暂时拉取失败')));
+  assert.ok(f.feishu.sent.some(message => message.chatId === f.task().chatId && message.text.includes('飞书历史消息已恢复拉取')));
+  f.feishu.offline = [f.message('fresh-history-input', 'Continue with this new input.')];
+  await f.loop.collect();
+  assert.ok(inspections > 0);
+  assert.equal(f.loop.store.input(f.task().id, 'fresh-history-input')?.status, 'delivered');
+});
+
 test('periodic collection recovers history-only messages after a connection gap without restarting', async t => {
   const f = await fixture(t);
   await f.launch();
