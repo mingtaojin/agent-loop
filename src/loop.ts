@@ -426,7 +426,7 @@ export class AgentLoop {
             const repositoryKey = source.repository.toLowerCase();
             if (!resolvedRepositories.has(repositoryKey)) resolvedRepositories.set(repositoryKey, await this.projects.resolveRepository(source.repository));
             const project = resolvedRepositories.get(repositoryKey) ?? null;
-            const state = project ? this.projects.ledger.project(project.id) : null;
+            const state = project ? this.projects.ledger.routing(project.id) : null;
             const existingWorker = state?.members.find(member => member.issueId === source.id);
             if (!existing && project && !existingWorker && matchesProjectIssue(source, project)) {
               const selector = project.repositories.find(item => item.name.toLowerCase() === source.repository.toLowerCase());
@@ -895,7 +895,7 @@ export class AgentLoop {
           const saved = this.store.meta(`approval-output:${key}`);
           this.store.setMeta(`approval-output:${key}`, JSON.stringify({ ...(saved ? approvalOutputSchema.parse(JSON.parse(saved)) : {}), taskId: task.id, request, chatId: task.chatId }));
           const membership = this.projects.ledger.membership(task.id);
-          const coordinator = membership && membership.role !== 'coordinator' ? this.projects.ledger.project(membership.projectId)?.coordinatorTaskId : null;
+          const coordinator = membership && membership.role !== 'coordinator' ? this.projects.ledger.routing(membership.projectId)?.coordinatorTaskId : null;
           if (coordinator) this.store.enqueue(coordinator, `任务 ${task.id} 需要点击审批，请打开任务群。\nhttps://applink.feishu.cn/client/chat/open?chatId=${encodeURIComponent(task.chatId)}`, `approval-group:${task.id}:${identity}`);
         }
       } catch (error) {
@@ -928,7 +928,7 @@ export class AgentLoop {
   private forwardCompletedInputs(task: Task): void {
     if (!this.closeout.completed(task.id)) return;
     this.store.transaction(() => {
-      const member = this.projects.ledger.membership(task.id), state = member && this.projects.ledger.project(member.projectId);
+      const member = this.projects.ledger.membership(task.id), state = member && this.projects.ledger.routing(member.projectId);
       if (!state) throw new Error('Completed task coordinator is unavailable');
       const completion = this.closeout.read(task.id).lifecycle;
       for (const input of this.store.inputs(task.id, { statuses: ['pending', 'delivering', 'uncertain', 'failed', 'held'] })) {

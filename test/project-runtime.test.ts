@@ -1767,3 +1767,27 @@ test('a constructed initial-batch fixture excludes dropped copies while deliveri
   assert.ok(!started.additionalDeliveryIds?.includes(retiredId));
   assert.equal(f.events(coordinator.id, 'update')[0]?.status, 'delivered');
 });
+
+test('project polling and task instructions retain routing without reading full project history', async t => {
+  const f = await fixture(t); const source = projectIssue(901); f.github.sources = [source];
+  await f.initialize();
+  const worker = await f.dispatch('routing-worker', 'Inspect the tracked issue.', { issueId: source.id });
+  const coordinator = f.coordinator();
+  const instructions = f.loop.projects.instructions(worker.id);
+  const identities = f.loop.tasks().map(task => ({ id: task.id, sourceId: task.sourceId, threadId: task.threadId, chatId: task.chatId }));
+  f.github.sourceComments = [{ id: 'routing-comment', sourceId: source.id, url: `${source.url}#comment`, author: 'reporter',
+    body: 'New evidence.', createdAt: '2026-11-12T02:00:00Z', updatedAt: '2026-11-12T02:00:00Z' }];
+  const read = t.mock.method(f.loop.projects.ledger, 'project');
+  await f.loop.collect();
+  assert.equal(f.loop.projects.instructions(worker.id), instructions);
+  assert.equal(read.mock.callCount(), 0);
+  assert.deepEqual(f.loop.tasks().map(task => ({ id: task.id, sourceId: task.sourceId, threadId: task.threadId, chatId: task.chatId })), identities);
+  const events = f.events(coordinator.id, 'github_comment');
+  assert.equal(events.length, 1);
+  const provenance = events[0]?.provenance; assert.equal(provenance?.kind, 'agent');
+  assert.ok(provenance?.kind === 'agent');
+  assert.equal(provenance.projectId, 'app');
+  assert.equal(provenance.taskId, coordinator.id);
+  assert.equal(provenance.category, 'github_comment');
+  assert.equal(f.events(worker.id, 'github_comment').length, 0);
+});

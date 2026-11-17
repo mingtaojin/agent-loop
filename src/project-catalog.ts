@@ -54,14 +54,14 @@ export class ProjectCatalog {
     for (const config of this.config.projects) {
       const directory = await canonical(config.directory);
       if (!directory) throw new Error(`Project directory unavailable: ${config.id}`);
-      const state = this.ledger.project(config.id);
+      const state = this.ledger.routing(config.id);
       if (state && state.directory !== directory) throw new Error(`Project directory identity changed: ${config.id}`);
       explicit.push({ ...config, directory });
     }
     const saved = definitionsSchema.parse(JSON.parse(this.store.meta(catalogKey) ?? '[]'));
     const bindings = bindingsSchema.parse(JSON.parse(this.store.meta(bindingsKey) ?? '[]'));
     const projects = new Set(this.store.tasks().map(task => this.ledger.membership(task.id)?.projectId).filter(id => id !== undefined));
-    for (const projectId of projects) for (const issue of this.ledger.project(projectId)?.issues ?? []) {
+    for (const projectId of projects) for (const issue of this.ledger.routing(projectId)?.issues ?? []) {
       const previous = bindings.find(binding => binding.repository.toLowerCase() === issue.repository.toLowerCase());
       if (previous && previous.projectId !== projectId) throw new Error(`Conflicting durable repository ownership: ${issue.repository}`);
       if (!previous) bindings.push({ repository: issue.repository, projectId });
@@ -70,7 +70,7 @@ export class ProjectCatalog {
     const automatic = new Map<string, ProjectConfig>();
     for (const config of saved) {
       const replacement = explicit.find(item => item.directory === config.directory && item.id !== config.id);
-      if (replacement && this.ledger.project(config.id)) throw new Error(`Project directory already belongs to ${config.id}; preserve its project ID`);
+      if (replacement && this.ledger.routing(config.id)) throw new Error(`Project directory already belongs to ${config.id}; preserve its project ID`);
       if (explicit.some(item => item.id === config.id || item.directory === config.directory)) continue;
       if (await canonical(config.directory) !== config.directory) continue;
       automatic.set(config.directory, { ...config, repositories: [] });
