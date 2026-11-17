@@ -11,6 +11,7 @@ import { promisify } from 'node:util';
 import { configSchema } from '../src/config.js';
 import { RejectedInputError, type IncomingMessage } from '../src/domain.js';
 import { AgentLoop } from '../src/loop.js';
+import { projectConfigSchema } from '../src/project.js';
 import { WorkspaceProvider } from '../src/workspace.js';
 import { type LegacyReport, CodexFake, FeishuFake, GitHubFake, issue } from './fakes.js';
 
@@ -567,3 +568,50 @@ for (const previous of ['running', 'waiting_user', 'paused'] as const) {
     } finally { await restored.close(); }
   });
 }
+
+test('one collection resolves each project repository once and the next collection resolves it again', async t => {
+  const f = await fixture(t);
+  const repository = f.config.repositories[0]; assert.ok(repository && 'path' in repository);
+  f.config.projects.push(projectConfigSchema.parse({ id: 'collection', name: 'Collection', directory: repository.path,
+    repositories: [{ name: repository.name, labelsAny: ['bug'] }] }));
+  f.github.sources = [issue(1), issue(2), issue(3)];
+  let resolutions = 0;
+  const resolveRepository = f.loop.projects.resolveRepository.bind(f.loop.projects);
+  f.loop.projects.resolveRepository = async name => { resolutions++; return resolveRepository(name); };
+  await f.loop.collect();
+  assert.equal(resolutions, 1);
+  assert.equal(f.loop.projects.ledger.project('collection')?.issues.length, 3);
+  assert.equal(f.loop.tasks().filter(task => task.purpose === 'intake').length, 3);
+  await f.loop.collect();
+  assert.equal(resolutions, 2);
+  assert.equal(f.loop.projects.ledger.project('collection')?.issues.length, 3);
+});
+
+for (const checkpoint of ['sequence', 'timestamp'] as const) test(`failed task sweeps ignore old pending owner input (${checkpoint}) while retaining delivery and recovery`, async t => {
+  const f = await fixture(t);
+  await f.launch();
+  f.config.recovery.maxAttempts = 0;
+  f.codex.snapshot(f.thread()).status = 'failed';
+  await tickWithDirectGroups(f.loop);
+  assert.equal(f.task().status, 'failed');
+  const taskId = f.task().id;
+  const stale = { ...f.message('old-owner-input', 'Old request already attempted.'), createdAt: 0 };
+  f.loop.store.receive(taskId, stale);
+  const failed = f.task();
+  failed.recovery.lastUserInputSeq = checkpoint === 'sequence' ? f.loop.store.input(taskId, stale.id)!.seq : null;
+  f.loop.store.saveTask(failed);
+  let inboxReads = 0;
+  const inputs = f.loop.store.inputs.bind(f.loop.store);
+  f.loop.store.inputs = (id, filter) => { if (id === taskId && !filter) inboxReads++; return inputs(id, filter); };
+  for (let i = 0; i < 3; i++) await f.loop.tick();
+  assert.equal(inboxReads, 0);
+  const outputId = f.loop.store.enqueue(taskId, 'Failure details ready for the owner.', 'failed-output');
+  await f.loop.tick();
+  assert.equal(f.loop.store.outputs(taskId).find(output => output.id === outputId)?.status, 'sent');
+  assert.equal(f.task().status, 'failed');
+  const message = { ...f.message('retry-failed-task', 'Continue with the corrected input.'), createdAt: f.task().updatedAt + 1 };
+  f.loop.store.receive(taskId, message);
+  await f.loop.tick();
+  assert.equal(f.task().status, 'running');
+  assert.equal(f.loop.store.input(taskId, message.id)?.status, 'delivered');
+});

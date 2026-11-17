@@ -167,7 +167,7 @@ test('collect tracks eligible Issue facts without enrolling a threadless intake 
   const source = { id: 'owner/alpha#1', repository: 'owner/alpha', number: 1, url: 'https://example.test/1', title: 'Request', body: '',
     state: 'open', assignees: [], labels: ['coordinate'], nativeType: 'Bug', updatedAt: '2026-11-12T00:00:00Z', isPullRequest: false } as const;
   const intake = f.task('github-intake', { purpose: 'intake' }); f.store.saveTask(intake);
-  await f.runtime.collect({ ...source, labels: [...source.labels], assignees: [] }, intake);
+  await f.runtime.collect({ ...source, labels: [...source.labels], assignees: [] }, intake, await f.runtime.resolveRepository(source.repository));
   assert.equal(f.runtime.ledger.membership(intake.id), null);
   assert.equal(f.runtime.ledger.project('explicit-alpha')?.issues.length, 1);
   assert.equal(f.created, 1);
@@ -194,8 +194,9 @@ test('concurrent source collection cannot overwrite a promoted intake with an ea
     source: { kind: 'github', issue: source, repository: { name: source.repository, criteria: criteriaSchema.parse({}) }, collectionReason: 'project:explicit-alpha' } });
   f.store.saveTask(request); f.input(request.id, 'race-input');
   await f.runtime.acceptIntake(request.id, 'explicit-alpha', f.material(request.id, 'Accepted source material.'));
+  const resolved = await f.runtime.resolveRepository(source.repository);
   const earlier = f.store.task(request.id);
-  const collecting = f.runtime.collect({ ...source, body: 'Updated issue facts.' }, earlier);
+  const collecting = f.runtime.collect({ ...source, body: 'Updated issue facts.' }, earlier, resolved);
   const route = f.runtime.intakeRoute(request.id); assert.ok(route);
   await f.runtime.action(route.coordinatorTaskId, { action: 'dispatch', requestId: 'concurrent-promotion', intakeTaskId: request.id, prompt: 'Use the original request and scope.' });
   const promoted = f.store.task(request.id);
@@ -262,4 +263,20 @@ test('catalog refresh reuses unchanged project documents while rechecking direct
   assert.deepEqual(catalog.configs, expected);
   await rm(f.alpha, { recursive: true });
   await assert.rejects(catalog.refresh(), /Project directory unavailable/);
+});
+
+test('collection with a resolved project still rejects changed repository ownership', async t => {
+  const f = await fixture(t);
+  const resolved = await f.runtime.resolveRepository('owner/alpha'); assert.ok(resolved);
+  f.store.setMeta('project-catalog:repositories', JSON.stringify([{ repository: 'owner/alpha', projectId: 'other-project' }]));
+  await assert.rejects(f.runtime.collect(issue(81, { repository: 'owner/alpha', labels: ['coordinate'] }), null, resolved), /ownership|another project/);
+  assert.equal(f.runtime.ledger.project('explicit-alpha'), null);
+});
+
+test('collection with a resolved project still rejects a disappeared project directory', async t => {
+  const f = await fixture(t);
+  const resolved = await f.runtime.resolveRepository('owner/alpha'); assert.ok(resolved);
+  await rm(f.alpha, { recursive: true });
+  await assert.rejects(f.runtime.collect(issue(82, { repository: 'owner/alpha', labels: ['coordinate'] }), null, resolved), /Project directory unavailable/);
+  assert.equal(f.runtime.ledger.project('explicit-alpha'), null);
 });
