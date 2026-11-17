@@ -242,3 +242,24 @@ for (const extra of [{ supervisionIntervalMs: 0 }, { supervisionIntervalMs: 300_
     await assert.rejects(f.runtime.ensure());
   });
 }
+
+test('catalog refresh reuses unchanged project documents while rechecking directory identity', async t => {
+  const f = await fixture(t);
+  await f.runtime.ensure();
+  const catalog = new ProjectCatalog(f.config, f.store);
+  let reads = 0;
+  const meta = f.store.meta.bind(f.store);
+  f.store.meta = key => {
+    if (key.startsWith('project:["state",')) reads++;
+    return meta(key);
+  };
+  await catalog.refresh();
+  const expected = structuredClone(catalog.configs);
+  const firstReads = reads;
+  assert.ok(firstReads > 0);
+  for (let i = 0; i < 5; i++) await catalog.refresh();
+  assert.equal(reads, firstReads, 'unchanged ledger documents must not be read and decoded for every catalog refresh');
+  assert.deepEqual(catalog.configs, expected);
+  await rm(f.alpha, { recursive: true });
+  await assert.rejects(catalog.refresh(), /Project directory unavailable/);
+});
