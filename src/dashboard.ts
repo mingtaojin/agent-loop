@@ -16,7 +16,8 @@ export async function startDashboard(options: { dataDir: string; port: number; h
   const networkAddresses = () => Object.values(networkInterfaces()).flatMap(addresses => (addresses ?? []).filter(address => address.family === 'IPv4' && !address.internal).map(address => address.address));
   let store: Store | null = null;
   const clients = new Set<ServerResponse>();
-  const readerFor = (db: Store) => new ProjectDashboardReader(db);
+  let dashboardReader: ProjectDashboardReader | null = null;
+  const readerFor = (db: Store) => dashboardReader ??= new ProjectDashboardReader(db);
   let readModelCache: { version: number; expiresAt: number; tasks: ReturnType<Store['tasks']>; projects: ReturnType<ProjectDashboardReader['projects']>; diagnostics: ReturnType<Store['diagnostics']> } | null = null;
   const readStore = () => {
     if (!store && existsSync(join(options.dataDir, 'tasks.sqlite'))) store = new Store(options.dataDir, { readOnly: true });
