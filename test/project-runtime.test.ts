@@ -1580,6 +1580,24 @@ test('an acknowledged report with a lost delivery response reconciles once after
   assert.equal(f.codex.starts.length, starts + 1);
 });
 
+test('obsolete input checks leave delivered history untouched without copying the project', async t => {
+  const f = await fixture(t); await f.initialize();
+  const coordinator = f.coordinator();
+  const eventId = 'supervision:1794614400000';
+  f.loop.projects.event('app', eventId, 'Previously attempted supervision.', coordinator.id, 'supervision');
+  const inputId = `project:${coordinator.id}:${eventId}`;
+  f.loop.store.markInput(inputId, 'delivered');
+  const before = f.loop.store.inputs(coordinator.id);
+  const project = t.mock.method(f.loop.projects.ledger, 'project');
+  f.loop.projects.retireObsoleteInputs(coordinator);
+  assert.equal(project.mock.callCount(), 0);
+  assert.deepEqual(f.loop.store.inputs(coordinator.id), before);
+  f.loop.store.markInput(inputId, 'pending');
+  f.loop.projects.retireObsoleteInputs(coordinator);
+  assert.equal(project.mock.callCount(), 1);
+  assert.equal(f.loop.store.input(coordinator.id, inputId)?.status, 'dropped');
+});
+
 for (const status of ['pending', 'held', 'failed'] as const) test(`obsolete automatic ${status} inputs are retained as dropped across pause, retry and restart`, async t => {
   const f = await fixture(t); await f.initialize();
   const worker = await f.dispatch('old-events', 'Discuss the work.'); await f.idleCoordinator();

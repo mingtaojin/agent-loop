@@ -37,6 +37,36 @@ test('thread event routing resolves only the task identity', async t => {
   assert.equal(store.taskIdForThread('rolled-back-thread'), null);
 });
 
+test('a rejected task save retains both existing thread routes', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-dashboard-thread-conflict-'));
+  const store = new Store(root); const saved = task(root);
+  t.after(async () => { store.close(); await rm(root, { recursive: true, force: true }); });
+  store.saveTask(saved);
+  store.saveTask({ ...saved, id: 'other', sourceId: 'other-source', chatId: 'other-chat', threadId: 'other-thread' });
+  assert.throws(() => store.saveTask({ ...saved, threadId: 'other-thread' }), /UNIQUE constraint failed/);
+  assert.equal(store.task(saved.id).threadId, 'thread');
+  assert.equal(store.taskIdForThread('thread'), saved.id);
+  assert.equal(store.taskIdForThread('other-thread'), 'other');
+});
+
+test('outbox status selection preserves insertion order and isolates tasks', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-dashboard-outbox-filter-'));
+  const store = new Store(root); const saved = task(root);
+  t.after(async () => { store.close(); await rm(root, { recursive: true, force: true }); });
+  store.saveTask(saved);
+  store.saveTask({ ...saved, id: 'other', sourceId: 'other-source', chatId: 'other-chat', threadId: 'other-thread' });
+  const ids = (['sent', 'pending', 'dropped', 'uncertain', 'sending'] as const).map(status => {
+    const id = store.enqueue(saved.id, status, status); store.markOutput(id, status); return id;
+  });
+  store.enqueue('other', 'Other pending message', 'other');
+  assert.deepEqual(store.outputs(saved.id).map(row => row.id), ids);
+  assert.deepEqual(store.outputs(saved.id, ['sending', 'pending', 'uncertain']).map(row => row.id), [ids[1], ids[3], ids[4]]);
+  assert.deepEqual(store.outputs(saved.id, []), []);
+  assert.deepEqual(store.outputs(saved.id, ['sent']).map(row => row.text), ['sent']);
+  assert.equal(store.hasOutputs(saved.id, ['pending']), true);
+  assert.equal(store.hasOutputs(saved.id, []), false);
+});
+
 test('runtime event durability drops private output, samples deltas, and keeps durable messages after restart', async t => {
   const root = await mkdtemp(join(tmpdir(), 'agent-dashboard-retention-'));
   const store = new Store(root); const saved = task(root); store.saveTask(saved);

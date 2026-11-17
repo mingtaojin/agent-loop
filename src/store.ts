@@ -7,6 +7,7 @@ import { executionEventSchema, storedExecutionEventSchema, type ExecutionEvent, 
 import { approvalActionSchema, feishuCardRecordSchema, inputProvenanceSchema, incomingSchema, repositorySchema, sourceSchema, taskSchema, type ApprovalAction, type FeishuCardRecord, type IncomingMessage, type InputProvenance, type Source, type Task } from './domain.js';
 
 const payloadRow = z.object({ payload: z.string() });
+const taskIdRow = z.object({ task_id: z.string() });
 const metaRow = z.object({ value: z.string() });
 const dataVersionRow = z.object({ data_version: z.number() });
 export const documentSourcePositionSchema = z.strictObject({
@@ -68,8 +69,10 @@ export class Store {
         CREATE INDEX IF NOT EXISTS inbox_task ON inbox(task_id,seq);
         CREATE INDEX IF NOT EXISTS inbox_task_status ON inbox(task_id,status,seq);
         CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id),text TEXT NOT NULL,status TEXT NOT NULL,error TEXT);
+        CREATE INDEX IF NOT EXISTS outbox_task_status ON outbox(task_id,status);
         CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id),kind TEXT NOT NULL,status TEXT NOT NULL,result TEXT,error TEXT);
         CREATE TABLE IF NOT EXISTS approval_actions(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id),payload TEXT NOT NULL,status TEXT NOT NULL,error TEXT);
+        CREATE INDEX IF NOT EXISTS approval_actions_task ON approval_actions(task_id);
         CREATE TABLE IF NOT EXISTS feishu_cards(id TEXT PRIMARY KEY,request_id TEXT NOT NULL,payload TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS feishu_cards_request ON feishu_cards(request_id);
         CREATE TABLE IF NOT EXISTS diagnostics(id INTEGER PRIMARY KEY,created_at INTEGER NOT NULL,scope TEXT NOT NULL,message TEXT NOT NULL);
@@ -121,8 +124,8 @@ export class Store {
   }
   saveTask(task: Task): void {
     const previousThread = this.taskThreads.get(task.id);
-    if (previousThread && previousThread !== task.threadId) this.taskIdsByThread.delete(previousThread);
     this.db.prepare('INSERT INTO tasks VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET chat_id=excluded.chat_id,thread_id=excluded.thread_id,payload=excluded.payload').run(task.id, task.sourceId, task.chatId, task.threadId, JSON.stringify(task));
+    if (previousThread && previousThread !== task.threadId) this.taskIdsByThread.delete(previousThread);
     this.taskThreads.set(task.id, task.threadId);
     if (task.threadId) this.taskIdsByThread.set(task.threadId, task.id);
   }
@@ -208,7 +211,11 @@ export class Store {
     const id = createHash('sha256').update(`${taskId}:${key}`).digest('hex').slice(0, 32);
     return this.db.prepare('SELECT id FROM outbox WHERE id=?').get(id) !== undefined;
   }
-  outputs(taskId: string): Outbox[] { return this.db.prepare('SELECT * FROM outbox WHERE task_id=? ORDER BY rowid').all(taskId).map(row => outboxSchema.parse(row)); }
+  outputs(taskId: string, statuses?: readonly Outbox['status'][]): Outbox[] {
+    if (statuses?.length === 0) return [];
+    const condition = statuses ? ` AND status IN (${statuses.map(() => '?').join(',')})` : '';
+    return this.db.prepare(`SELECT * FROM outbox WHERE task_id=?${condition} ORDER BY rowid`).all(taskId, ...(statuses ?? [])).map(row => outboxSchema.parse(row));
+  }
   hasOutputs(taskId: string, statuses: readonly Outbox['status'][]): boolean {
     if (!statuses.length) return false;
     return this.db.prepare(`SELECT 1 FROM outbox WHERE task_id=? AND status IN (${statuses.map(() => '?').join(',')}) LIMIT 1`).get(taskId, ...statuses) !== undefined;
@@ -448,9 +455,16 @@ export class Store {
     this.db.prepare('INSERT INTO feishu_progress VALUES(?,?,?,?) ON CONFLICT(task_id,turn_id) DO UPDATE SET payload=excluded.payload,active=excluded.active').run(taskId, turnId, JSON.stringify(record), Number(active));
   }
   close(): void { this.unsubscribeLive?.(); this.unsubscribeLive = null; this.db.close(); this.lock?.close(); }
-  documentProgressRecord(taskId: string): unknown | null {
+  documentProgressPayload(taskId: string): string | null {
     const row = this.db.prepare('SELECT payload FROM feishu_document_progress WHERE task_id=?').get(taskId);
-    return row ? JSON.parse(payloadRow.parse(row).payload) : null;
+    return row ? payloadRow.parse(row).payload : null;
+  }
+  documentProgressTaskIds(): string[] {
+    return this.db.prepare('SELECT task_id FROM feishu_document_progress ORDER BY rowid').all().map(row => taskIdRow.parse(row).task_id);
+  }
+  documentProgressRecord(taskId: string): unknown | null {
+    const payload = this.documentProgressPayload(taskId);
+    return payload === null ? null : JSON.parse(payload);
   }
   documentProgressRecords(): unknown[] {
     return this.db.prepare('SELECT payload FROM feishu_document_progress ORDER BY rowid').all().map(row => JSON.parse(payloadRow.parse(row).payload));

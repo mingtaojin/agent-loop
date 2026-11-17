@@ -56,6 +56,7 @@ function sameRevision(previous: DocumentProjectionRevision | null, current: Docu
 
 export class FeishuDocumentProgressPublisher {
   private readonly inFlight = new Map<string, Promise<void>>();
+  private readonly publications = new Map<string, { payload: string; record: DocumentPublication }>();
   private readonly now: () => number;
   private readonly intervalMs: number;
   private readonly baseUrl: string;
@@ -77,7 +78,9 @@ export class FeishuDocumentProgressPublisher {
   async poll(): Promise<void> {
     if (this.stopped || !this.discoverSafely()) return;
     const work: Promise<void>[] = [];
-    const records = this.options.store.documentProgressRecords().map(raw => documentPublicationSchema.parse(raw));
+    const taskIds = new Set(this.options.store.documentProgressTaskIds());
+    for (const taskId of this.publications.keys()) if (!taskIds.has(taskId)) this.publications.delete(taskId);
+    const records = [...taskIds].flatMap(taskId => { const record = this.load(taskId); return record ? [record] : []; });
     for (const record of records.sort((a, b) => a.lastAttemptAt - b.lastAttemptAt)) {
       if (this.options.store.task(record.taskId).chatId !== record.chatId) continue;
       if (this.inFlight.size >= 2) break;
@@ -95,11 +98,18 @@ export class FeishuDocumentProgressPublisher {
     this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     await Promise.allSettled(this.inFlight.values());
+    this.publications.clear();
   }
   private report(error: unknown): void { this.options.store.diagnostic('feishu-document-progress', errorMessage(error)); }
   private load(taskId: string): DocumentPublication | null {
-    const raw = this.options.store.documentProgressRecord(taskId);
-    return raw === null ? null : documentPublicationSchema.parse(raw);
+    const payload = this.options.store.documentProgressPayload(taskId);
+    if (payload === null) { this.publications.delete(taskId); return null; }
+    let cached = this.publications.get(taskId);
+    if (cached?.payload !== payload) {
+      cached = { payload, record: documentPublicationSchema.parse(JSON.parse(payload)) };
+      this.publications.set(taskId, cached);
+    }
+    return structuredClone(cached.record);
   }
   private save(record: DocumentPublication): void { this.options.store.saveDocumentProgressRecord(record.taskId, record); }
   private saveDelivery(record: DocumentPublication): void {
