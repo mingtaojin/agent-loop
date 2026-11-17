@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync, StatementSync } from 'node:sqlite';
 import { test, type TestContext } from 'node:test';
-import { taskSchema } from '../src/domain.js';
+import { incomingSchema, taskSchema } from '../src/domain.js';
 import { Store } from '../src/store.js';
 import { TaskCloseout, taskCloseoutSchema } from '../src/task-closeout.js';
 
@@ -147,4 +147,27 @@ test('closeout pending cleanup changes remain visible after status was cached', 
   assert.equal(closeout.hasPendingCleanup(task.id), true);
   store.setMeta(key, JSON.stringify(ledger));
   assert.equal(closeout.hasPendingCleanup(task.id), false);
+});
+
+test('event and inbox polling reuse compiled validation and preserve ordered facts', async t => {
+  const { store, task, db } = await fixture(t);
+  for (let i = 0; i < 12; i++) {
+    store.recordExecutionEvent(task.id, { threadId: 'thread', turnId: 'turn', itemId: `item-${i}`, kind: 'agent_message',
+      label: 'Assistant', text: `Reply ${i}`, createdAt: i + 1 });
+    const message = incomingSchema.parse({ id: `input-${i}`, chatId: 'chat', senderId: 'owner', text: `Request ${i}`, attachments: [], createdAt: i + 1 });
+    assert.equal(store.receive(task.id, message), true);
+  }
+  const legacy = { id: 'legacy', chatId: 'chat', senderId: 'owner', text: 'Legacy request', attachments: [], createdAt: 13 };
+  db.prepare("INSERT INTO inbox(id,task_id,payload,status,origin) VALUES(?,?,?,'pending','user')").run(legacy.id, task.id, JSON.stringify(legacy));
+  const events = [...store.documentConversationEvents(task.id)];
+  const inputs = store.inputs(task.id);
+  assert.deepEqual(events.map(event => event.text), Array.from({ length: 12 }, (_, i) => `Reply ${i}`));
+  assert.deepEqual(inputs.map(input => input.message.text), [...Array.from({ length: 12 }, (_, i) => `Request ${i}`), 'Legacy request']);
+  assert.ok(inputs.every(input => input.provenance.kind === 'user' && input.provenance.message.id === input.id));
+  const compile = t.mock.method(globalThis, 'Function');
+  for (let i = 0; i < 3; i++) {
+    assert.deepEqual([...store.documentConversationEvents(task.id)], events);
+    assert.deepEqual(store.inputs(task.id), inputs);
+  }
+  assert.equal(compile.mock.callCount(), 0);
 });

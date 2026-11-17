@@ -11,6 +11,18 @@ const taskPayloadRow = payloadRow.extend({ id: z.string() });
 const taskIdRow = z.object({ task_id: z.string() });
 const metaRow = z.object({ value: z.string() });
 const dataVersionRow = z.object({ data_version: z.number() });
+const nameRow = z.object({ name: z.string() });
+const sourceRow = payloadRow.extend({ reason: z.string() });
+const sequenceRow = z.object({ seq: z.number() });
+const executionRow = z.object({ seq: z.number(), task_id: z.string(), payload: z.string() });
+const countRow = z.object({ count: z.number() });
+const approvalRow = z.object({ id: z.string(), payload: z.string(), status: z.string(), error: z.string().nullable() });
+const diagnosticRow = z.object({ created_at: z.number(), scope: z.string(), message: z.string() });
+const inputPayloadSchema = z.object({ message: incomingSchema, provenance: inputProvenanceSchema, requestId: z.string().nullable().default(null) });
+const legacyTaskSchema = z.object({
+  id: z.string(), sourceId: z.string(), source: sourceSchema, repository: repositorySchema,
+  workspace: z.string().nullable(), branch: z.string(), status: z.string(), prUrl: z.string().nullable().default(null),
+}).passthrough();
 export const documentSourcePositionSchema = z.strictObject({
   eventSeq: z.number().int().nonnegative(), inputSeq: z.number().int().nonnegative(),
 });
@@ -91,7 +103,7 @@ export class Store {
         CREATE INDEX IF NOT EXISTS feishu_progress_active ON feishu_progress(active);
         CREATE TABLE IF NOT EXISTS feishu_document_progress(task_id TEXT PRIMARY KEY REFERENCES tasks(id),payload TEXT NOT NULL);
         `);
-      const columns = this.prepare('PRAGMA table_info(inbox)').all().map(row => z.object({ name: z.string() }).parse(row).name);
+      const columns = this.prepare('PRAGMA table_info(inbox)').all().map(row => nameRow.parse(row).name);
       if (!columns.includes('origin')) this.db.exec("ALTER TABLE inbox ADD COLUMN origin TEXT NOT NULL DEFAULT 'user'");
       this.transaction(() => {
         for (const raw of this.prepare('SELECT payload FROM tasks').all()) {
@@ -134,7 +146,7 @@ export class Store {
     this.prepare('INSERT OR IGNORE INTO source_revisions VALUES(?,?,?)').run(source.id, createHash('sha256').update(payload).digest('hex'), payload);
   }
   sources(): { source: Source; reason: string }[] {
-    return this.prepare('SELECT payload,reason FROM sources').all().map(row => { const parsed = payloadRow.extend({ reason: z.string() }).parse(row); return { source: sourceSchema.parse(JSON.parse(parsed.payload)), reason: parsed.reason }; });
+    return this.prepare('SELECT payload,reason FROM sources').all().map(row => { const parsed = sourceRow.parse(row); return { source: sourceSchema.parse(JSON.parse(parsed.payload)), reason: parsed.reason }; });
   }
   saveTask(task: Task): void {
     const previousThread = this.taskThreads.get(task.id);
@@ -171,10 +183,7 @@ export class Store {
   private normalizeTask(raw: unknown): Task {
     const current = taskSchema.safeParse(raw);
     if (current.success) return current.data;
-    const legacy = z.object({
-      id: z.string(), sourceId: z.string(), source: sourceSchema, repository: repositorySchema,
-      workspace: z.string().nullable(), branch: z.string(), status: z.string(), prUrl: z.string().nullable().default(null),
-    }).passthrough().parse(raw);
+    const legacy = legacyTaskSchema.parse(raw);
     return taskSchema.parse({
       ...legacy, source: { kind: 'github', issue: legacy.source, repository: legacy.repository, collectionReason: 'legacy' },
       contextDirectory: legacy.workspace ?? join(this.dataDir, 'tasks', legacy.id),
@@ -203,7 +212,7 @@ export class Store {
     return this.prepare(`SELECT * FROM inbox WHERE ${clauses.join(' AND ')} ORDER BY seq`).all(...params).map(raw => {
       const { payload, ...row } = inboxRow.parse(raw);
       const json: unknown = JSON.parse(payload);
-      const wrapped = z.object({ message: incomingSchema, provenance: inputProvenanceSchema, requestId: z.string().nullable().default(null) }).safeParse(json);
+      const wrapped = inputPayloadSchema.safeParse(json);
       if (wrapped.success) return { ...row, ...wrapped.data };
       const message = incomingSchema.parse(json);
       const task = this.task(taskId);
@@ -264,9 +273,8 @@ export class Store {
   }
   approvalKey(action: ApprovalAction): string { return `approval:${action.taskId}:${action.epoch}:${action.requestId}`; }
   approvals(taskId: string): { id: string; action: ApprovalAction; status: string; error: string | null }[] {
-    const schema = z.object({ id: z.string(), payload: z.string(), status: z.string(), error: z.string().nullable() });
     return this.prepare('SELECT id,payload,status,error FROM approval_actions WHERE task_id=? ORDER BY rowid').all(taskId).map(raw => {
-      const row = schema.parse(raw);
+      const row = approvalRow.parse(raw);
       return { id: row.id, action: approvalActionSchema.parse(JSON.parse(row.payload)), status: row.status, error: row.error };
     });
   }
@@ -310,10 +318,9 @@ export class Store {
       .run(diagnosticRetentionLimit);
   }
   diagnostics(): { created_at: number; scope: string; message: string }[] {
-    const schema = z.object({ created_at: z.number(), scope: z.string(), message: z.string() });
-    const legacy = this.prepare('SELECT created_at,scope,message FROM diagnostics ORDER BY id DESC LIMIT ?').all(diagnosticReadLimit).map(row => schema.parse(row));
+    const legacy = this.prepare('SELECT created_at,scope,message FROM diagnostics ORDER BY id DESC LIMIT ?').all(diagnosticReadLimit).map(row => diagnosticRow.parse(row));
     const hasRollups = this.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='diagnostic_rollups'").get();
-    const rollups = hasRollups ? this.prepare('SELECT last_created_at AS created_at,scope,message FROM diagnostic_rollups ORDER BY last_created_at DESC LIMIT ?').all(diagnosticReadLimit).map(row => schema.parse(row)) : [];
+    const rollups = hasRollups ? this.prepare('SELECT last_created_at AS created_at,scope,message FROM diagnostic_rollups ORDER BY last_created_at DESC LIMIT ?').all(diagnosticReadLimit).map(row => diagnosticRow.parse(row)) : [];
     const seen = new Set<string>();
     return [...legacy, ...rollups].sort((a, b) => b.created_at - a.created_at).filter(row => {
       const identity = `${row.scope}\u0000${row.message}`;
@@ -362,21 +369,21 @@ export class Store {
   }
   private nextExecutionSequence(): number {
     if (!this.logicalSequenceLoaded) {
-      const row = z.object({ seq: z.number() }).parse(this.prepare('SELECT COALESCE(MAX(seq),0) AS seq FROM execution_events').get());
+      const row = sequenceRow.parse(this.prepare('SELECT COALESCE(MAX(seq),0) AS seq FROM execution_events').get());
       this.logicalSequence = row.seq; this.logicalSequenceLoaded = true;
     }
     return ++this.logicalSequence;
   }
   private eventRows(taskId: string, after = 0, limit = 500, includeToolOutput = true): StoredExecutionEvent[] {
     const durable = this.prepare('SELECT seq,task_id,payload FROM execution_events WHERE task_id=? AND seq>? ORDER BY seq LIMIT ?').all(taskId, after, limit).map(raw => {
-      const row = z.object({ seq: z.number(), task_id: z.string(), payload: z.string() }).parse(raw);
+      const row = executionRow.parse(raw);
       return storedExecutionEventSchema.parse({ ...executionEventSchema.parse(JSON.parse(row.payload)), seq: row.seq, taskId: row.task_id });
     });
     const transient = this.ephemeralEvents.filter(event => event.taskId === taskId && event.seq > after && (includeToolOutput || event.kind !== 'tool_output'));
     return [...durable, ...transient].sort((a, b) => a.seq - b.seq).slice(0, limit);
   }
   private pruneExecutionEvents(taskId: string): void {
-    const count = z.object({ count: z.number() }).parse(this.prepare('SELECT COUNT(*) AS count FROM execution_events WHERE task_id=?').get(taskId)).count;
+    const count = countRow.parse(this.prepare('SELECT COUNT(*) AS count FROM execution_events WHERE task_id=?').get(taskId)).count;
     const overflow = count - executionEventRetentionLimit;
     if (overflow <= 0) return;
     // Keep final answers and lifecycle facts longest. Drop sampled/tool metadata first,
@@ -409,7 +416,7 @@ export class Store {
       WHERE task_id=? AND COALESCE(json_extract(payload,'$.kind'),'') <> 'tool_output'
       ORDER BY seq DESC LIMIT 1`).get(taskId);
     if (!raw) return null;
-    const row = z.object({ seq: z.number(), task_id: z.string(), payload: z.string() }).parse(raw);
+    const row = executionRow.parse(raw);
     return storedExecutionEventSchema.parse({ ...executionEventSchema.parse(JSON.parse(row.payload)), seq: row.seq, taskId: row.task_id });
   }
   latestVisibleExecutionEvents(taskIds: readonly string[]): Map<string, StoredExecutionEvent> {
@@ -421,7 +428,7 @@ export class Store {
         WHERE task_id IN (${placeholders}) AND COALESCE(json_extract(payload,'$.kind'),'') <> 'tool_output'
         GROUP BY task_id) latest ON latest.task_id=event.task_id AND latest.seq=event.seq`).all(...taskIds);
     for (const raw of rows) {
-      const row = z.object({ seq: z.number(), task_id: z.string(), payload: z.string() }).parse(raw);
+      const row = executionRow.parse(raw);
       result.set(row.task_id, storedExecutionEventSchema.parse({ ...executionEventSchema.parse(JSON.parse(row.payload)), seq: row.seq, taskId: row.task_id }));
     }
     for (const event of this.ephemeralEvents) {
@@ -440,7 +447,7 @@ export class Store {
   }
   *documentConversationEvents(taskId: string): IterableIterator<StoredExecutionEvent> {
     const rows = this.prepare("SELECT seq,payload FROM execution_events WHERE task_id=? AND json_extract(payload,'$.kind') IN ('agent_delta','agent_message','turn_start','turn_end','turn_status') ORDER BY seq").all(taskId)
-      .map(raw => ({ seq: z.object({ seq: z.number() }).parse(raw).seq, payload: z.object({ payload: z.string() }).parse(raw).payload }));
+      .map(raw => ({ seq: sequenceRow.parse(raw).seq, payload: payloadRow.parse(raw).payload }));
     const transient = this.ephemeralEvents.filter(event => event.taskId === taskId && event.kind !== 'tool_output');
     for (const item of [...rows.map(row => ({ seq: row.seq, payload: row.payload })), ...transient.map(event => ({ seq: event.seq, event }))].sort((a, b) => a.seq - b.seq)) {
       const event = 'event' in item ? item.event : storedExecutionEventSchema.parse({ ...JSON.parse(item.payload), seq: item.seq, taskId });
@@ -460,12 +467,12 @@ export class Store {
     return dataVersionRow.parse(row).data_version;
   }
   latestExecutionSequence(): number {
-    const persisted = z.object({ seq: z.number() }).parse(this.prepare('SELECT COALESCE(MAX(seq),0) AS seq FROM execution_events').get()).seq;
+    const persisted = sequenceRow.parse(this.prepare('SELECT COALESCE(MAX(seq),0) AS seq FROM execution_events').get()).seq;
     return Math.max(persisted, this.logicalSequence, this.ephemeralEvents.at(-1)?.seq ?? 0);
   }
   progressEvents(after: number, limit = 500): StoredExecutionEvent[] {
     const durable = this.prepare("SELECT seq,task_id,payload FROM execution_events WHERE seq>? AND COALESCE(json_extract(payload,'$.kind'),'') <> 'tool_output' ORDER BY seq LIMIT ?").all(after, limit).map(raw => {
-      const row = z.object({ seq: z.number(), task_id: z.string(), payload: z.string() }).parse(raw);
+      const row = executionRow.parse(raw);
       return storedExecutionEventSchema.parse({ ...JSON.parse(row.payload), seq: row.seq, taskId: row.task_id });
     });
     return [...durable, ...this.ephemeralEvents.filter(event => event.seq > after)].sort((a, b) => a.seq - b.seq).slice(0, limit);
