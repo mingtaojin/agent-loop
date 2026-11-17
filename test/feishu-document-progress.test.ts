@@ -439,8 +439,13 @@ test('unchanged document publications reuse validation and still publish new pro
   const f = await fixture(t); f.store.saveTask(task()); f.event('agent_message', 'First progress'); await f.pump(6);
   const before = f.store.documentProgressRecord('task'); const calls = f.transport.calls.length;
   const parsing = t.mock.method(documentPublicationSchema, 'parse');
+  const cloning = t.mock.method(globalThis, 'structuredClone');
   await f.pump(3);
   assert.equal(parsing.mock.callCount(), 0);
+  assert.equal(cloning.mock.calls.filter(call => {
+    const value: unknown = call.arguments[0];
+    return value !== null && typeof value === 'object' && 'delivery' in value && 'projectionRevision' in value;
+  }).length, 0);
   assert.deepEqual(f.store.documentProgressRecord('task'), before);
   assert.equal(f.transport.calls.length, calls);
   f.event('agent_message', 'Updated progress', { itemId: 'next' }); await f.pump(2);
