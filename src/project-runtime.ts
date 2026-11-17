@@ -684,12 +684,14 @@ export class ProjectRuntime {
   }
   retireObsoleteInputs(task: Task): void {
     const member = this.ledger.membership(task.id);
-    const state = member?.role === 'coordinator' ? this.ledger.project(member.projectId) : null;
+    if (member?.role !== 'coordinator') return;
+    const inputs = this.store.inputs(task.id, { statuses: ['pending', 'held', 'failed'], origin: 'source' });
+    if (!inputs.length) return;
+    const state = this.ledger.project(member.projectId);
     if (!state || state.coordinatorTaskId !== task.id) return;
-    const obsolete = this.store.inputs(task.id).filter(input => {
+    const obsolete = inputs.filter(input => {
       const event = input.provenance;
-      if (!['pending', 'held', 'failed'].includes(input.status) || input.origin !== 'source'
-        || event.kind !== 'agent' || event.projectId !== state.id || input.task_id !== task.id
+      if (event.kind !== 'agent' || event.projectId !== state.id || input.task_id !== task.id
         || input.id !== `project:${task.id}:${event.eventId}` || input.message.id !== input.id
         || input.message.senderId !== 'runtime:project' || input.message.chatType !== 'group' || input.message.attachments.length) return false;
       if (event.category === 'supervision') {

@@ -615,3 +615,16 @@ for (const checkpoint of ['sequence', 'timestamp'] as const) test(`failed task s
   assert.equal(f.task().status, 'running');
   assert.equal(f.loop.store.input(taskId, message.id)?.status, 'delivered');
 });
+
+
+test('delivery skips metadata for sent and dropped replies while sending new output', async t => {
+  const f = await fixture(t); await f.launch();
+  for (const status of ['sent', 'dropped'] as const) {
+    const outputId = f.loop.store.enqueue(f.task().id, `Historical ${status}`, status);
+    f.loop.store.markOutput(outputId, status);
+    f.loop.store.setMeta(`approval-output:${outputId}`, 'Malformed retired approval metadata');
+  }
+  const outputId = f.loop.store.enqueue(f.task().id, 'Current output', 'new-output');
+  await f.loop.tick();
+  assert.equal(f.loop.store.outputs(f.task().id).find(output => output.id === outputId)?.status, 'sent');
+});

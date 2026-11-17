@@ -1199,10 +1199,9 @@ export class AgentLoop {
     });
   }
   private async flush(task: Task): Promise<void> {
-    for (const output of this.store.outputs(task.id)) {
+    for (const output of this.store.outputs(task.id, ['pending', 'sending', 'uncertain'])) {
       const approval = this.store.meta(`approval-output:${output.id}`);
       const native = approval ? approvalOutputSchema.parse(JSON.parse(approval)) : null;
-      if (output.status === 'sent' || output.status === 'dropped') continue;
       if (output.status === 'uncertain' || output.status === 'sending') {
         if (!native?.chatId) {
           if (output.status === 'sending') this.store.markOutput(output.id, 'uncertain', '重启前发送结果未知');

@@ -435,6 +435,34 @@ test('maxLines and renderer revision changes re-render unchanged histories once'
   assert.equal(reads.mock.callCount(), 2); assert.deepEqual(f.record(), before);
 });
 
+test('unchanged document publications reuse validation and still publish new progress', async t => {
+  const f = await fixture(t); f.store.saveTask(task()); f.event('agent_message', 'First progress'); await f.pump(6);
+  const before = f.store.documentProgressRecord('task'); const calls = f.transport.calls.length;
+  const parsing = t.mock.method(documentPublicationSchema, 'parse');
+  await f.pump(3);
+  assert.equal(parsing.mock.callCount(), 0);
+  assert.deepEqual(f.store.documentProgressRecord('task'), before);
+  assert.equal(f.transport.calls.length, calls);
+  f.event('agent_message', 'Updated progress', { itemId: 'next' }); await f.pump(2);
+  assert.ok(parsing.mock.callCount() > 0);
+  assert.match(f.transport.text(), /Updated progress/);
+  assert.equal(f.transport.count('document'), 1);
+});
+
+test('publication cache observes external payload replacement without a source revision change', async t => {
+  const f = await fixture(t); f.store.saveTask(task()); f.event('agent_message', 'Original'); await f.pump(6);
+  const previous = f.record();
+  const db = new DatabaseSync(join(f.directory, 'tasks.sqlite'));
+  try {
+    db.prepare('UPDATE feishu_document_progress SET payload=? WHERE task_id=?')
+      .run(JSON.stringify({ ...previous, text: 'Externally corrected content' }), 'task');
+  } finally { db.close(); }
+  await f.pump(2);
+  assert.equal(f.transport.text(), 'Externally corrected content');
+  assert.deepEqual(f.record().projectionRevision, previous.projectionRevision);
+  assert.equal(f.transport.count('document'), 1);
+});
+
 test('source positions are per task and include tool events without moving the conversation cursor', async t => {
   const f = await fixture(t); f.store.saveTask(task()); f.store.saveTask(task('other'));
   f.event('agent_message', 'Answer'); await f.pump(5);
