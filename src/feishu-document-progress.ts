@@ -88,7 +88,7 @@ export class FeishuDocumentProgressPublisher {
       const delivery = record.delivery;
       if (delivery.kind === 'document' && delivery.pending) continue;
       if (delivery.kind === 'ready' && !delivery.write && delivery.content === content(record)) continue;
-      const request = this.deliver(record).catch(error => this.report(error)).finally(() => this.inFlight.delete(record.taskId));
+      const request = this.deliver(structuredClone(record)).catch(error => this.report(error)).finally(() => this.inFlight.delete(record.taskId));
       this.inFlight.set(record.taskId, request);
       work.push(request);
     }
@@ -109,7 +109,7 @@ export class FeishuDocumentProgressPublisher {
       cached = { payload, record: documentPublicationSchema.parse(JSON.parse(payload)) };
       this.publications.set(taskId, cached);
     }
-    return structuredClone(cached.record);
+    return cached.record;
   }
   private save(record: DocumentPublication): void { this.options.store.saveDocumentProgressRecord(record.taskId, record); }
   private saveDelivery(record: DocumentPublication): void {
@@ -147,6 +147,7 @@ export class FeishuDocumentProgressPublisher {
         }
         const revision = projectionRevision(task, store.documentConversationPosition(task.id), this.maxLines);
         if (sameRevision(record.projectionRevision, revision)) continue;
+        record = structuredClone(record);
         record.turnId = task.turnId;
         const conversation = projectDocumentConversation(task, store.inputs(task.id), store.documentConversationEvents(task.id));
         record.view = { status: conversation.status, cursor: conversation.cursor,

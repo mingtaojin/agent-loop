@@ -113,6 +113,7 @@ async function processUse(path: string): Promise<string | null> {
 export class CleanupAdmissionBusy extends Error {}
 
 export class TaskCloseout {
+  private readonly statuses = new Map<string, { revision: symbol; completed: boolean; pendingCleanup: boolean }>();
   private readonly destructing = new Set<string>();
   private readonly reservations = new Map<string, number>();
   private readonly progressing = new Map<string, Promise<void>>();
@@ -126,10 +127,19 @@ export class TaskCloseout {
     return value ? taskCloseoutSchema.parse(JSON.parse(value)) : { taskId, projectId: null, lifecycle: { kind: 'open' }, scopes: [], operations: [], predecessorTaskId: null };
   }
   private save(value: Ledger) { this.store.setMeta(`task-closeout:${value.taskId}`, JSON.stringify(taskCloseoutSchema.parse(value))); }
-  completed(taskId: string) { return this.read(taskId).lifecycle.kind === 'completed'; }
-  hasPendingCleanup(taskId: string): boolean {
-    return this.read(taskId).operations.some(operation => operation.targets.some(target => target.state !== 'removed'));
+  private status(taskId: string) {
+    const revision = this.store.metaRevision(`task-closeout:${taskId}`);
+    const cached = this.statuses.get(taskId);
+    if (cached?.revision === revision) return cached;
+    const value = this.read(taskId);
+    const status = { revision, completed: value.lifecycle.kind === 'completed',
+      pendingCleanup: value.operations.some(operation => operation.targets.some(target => target.state !== 'removed')) };
+    if (this.statuses.size >= 256) this.statuses.clear();
+    this.statuses.set(taskId, status);
+    return status;
   }
+  completed(taskId: string) { return this.status(taskId).completed; }
+  hasPendingCleanup(taskId: string): boolean { return this.status(taskId).pendingCleanup; }
   assertOpen(taskId: string) { if (this.completed(taskId)) throw new Error('Task is completed; dispatch a new linked task'); }
   reserve(taskId: string): () => void {
     this.assertOpen(taskId);
