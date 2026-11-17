@@ -113,6 +113,10 @@ export const projectStateSchema = z.strictObject({
     invalid('Duplicate record request');
 });
 export type ProjectState = z.infer<typeof projectStateSchema>;
+export type ProjectRouting = Pick<ProjectState, 'id' | 'directory' | 'coordinatorTaskId'> & {
+  issues: Pick<ProjectState['issues'][number], 'id' | 'repository' | 'number'>[];
+  members: Pick<ProjectState['members'][number], 'taskId' | 'role' | 'issueId'>[];
+};
 export function projectView(state: ProjectState, callerTaskId: string): ProjectState {
   const caller = state.members.find(member => member.taskId === callerTaskId);
   if (!caller) throw new Error('Task does not belong to this project');
@@ -198,6 +202,15 @@ export class ProjectLedger {
   project(projectId: string): ProjectState | null {
     const document = this.document(projectId);
     return document ? structuredClone(document.state) : null;
+  }
+
+  routing(projectId: string): ProjectRouting | null {
+    const document = this.document(projectId);
+    if (!document) return null;
+    const state = document.state;
+    return { id: state.id, directory: state.directory, coordinatorTaskId: state.coordinatorTaskId,
+      issues: state.issues.map(({ id, repository, number }) => ({ id, repository, number })),
+      members: state.members.map(({ taskId, role, issueId }) => ({ taskId, role, ...(issueId === undefined ? {} : { issueId }) })) };
   }
 
   save(state: ProjectState): void {

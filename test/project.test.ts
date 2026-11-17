@@ -562,3 +562,73 @@ test('an external commit during a payload read is visible on the next cached loo
   assert.equal(state(reader).name, 'alpha');
   assert.equal(state(reader).name, 'Committed during read');
 });
+
+test('routing snapshots contain only independent project identity and ownership facts', t => {
+  const fx = fixture(t);
+  assert.equal(fx.ledger.routing('alpha'), null);
+  fx.create();
+  fx.write(ledger => {
+    ledger.issue('alpha', source());
+    ledger.comment('alpha', comment());
+    ledger.addMember('alpha', 'worker', 'worker', 'issue-1');
+    ledger.record('alpha', { requestId: 'record', key: 'decision', text: 'Preserve history.', expectedVersion: 0, authorTaskId: 'coordinator' });
+  });
+  const full = state(fx.ledger);
+  const expected = { id: 'alpha', directory: '/projects/alpha', coordinatorTaskId: 'coordinator',
+    issues: [{ id: 'issue-1', repository: 'owner/frontend', number: 1 }],
+    members: [{ taskId: 'coordinator', role: 'coordinator' }, { taskId: 'worker', role: 'worker', issueId: 'issue-1' }] };
+  const snapshot = fx.ledger.routing('alpha'); assert.ok(snapshot);
+  assert.deepEqual(snapshot, expected);
+  snapshot.id = 'changed'; snapshot.directory = '/changed'; snapshot.coordinatorTaskId = 'changed';
+  const issue = snapshot.issues[0]; assert.ok(issue); issue.id = 'changed'; issue.repository = 'other/repo'; issue.number = 7;
+  const member = snapshot.members[1]; assert.ok(member); member.taskId = 'changed'; member.role = 'coordinator'; member.issueId = 'changed';
+  snapshot.issues.splice(0); snapshot.members.push({ taskId: 'invented', role: 'worker' });
+  assert.deepEqual(fx.ledger.routing('alpha'), expected);
+  assert.deepEqual(state(fx.ledger), full);
+  const clone = t.mock.method(globalThis, 'structuredClone');
+  for (let i = 0; i < 5; i++) assert.deepEqual(fx.ledger.routing('alpha'), expected);
+  assert.equal(clone.mock.callCount(), 0);
+});
+
+test('routing snapshots observe local commits and discard observed rolled-back routes', t => {
+  const fx = fixture(t); fx.create();
+  const original = fx.ledger.routing('alpha'); assert.ok(original);
+  fx.write(ledger => ledger.issue('alpha', source()));
+  const committed = fx.ledger.routing('alpha'); assert.ok(committed);
+  assert.equal(committed.issues.length, 1);
+  assert.equal(original.issues.length, 0);
+  assert.throws(() => fx.write(ledger => {
+    ledger.issue('alpha', source({ id: 'issue-2', number: 2 }));
+    ledger.addMember('alpha', 'temporary', 'worker', 'issue-2');
+    assert.equal(ledger.routing('alpha')?.issues.length, 2);
+    assert.equal(ledger.routing('alpha')?.members.length, 2);
+    throw new Error('Abort routes');
+  }), /Abort routes/);
+  assert.deepEqual(fx.ledger.routing('alpha'), committed);
+  fx.write(ledger => ledger.addMember('alpha', 'worker', 'worker', 'issue-1'));
+  assert.equal(fx.ledger.routing('alpha')?.members.length, 2);
+  assert.equal(committed.members.length, 1);
+});
+
+test('routing snapshots observe external replacement and deletion and reject changed corrupt data', t => {
+  const fx = fixture(t); fx.create();
+  const key = 'project:["state","alpha"]';
+  const original = fx.store.meta(key); assert.ok(original);
+  const before = fx.ledger.routing('alpha'); assert.ok(before);
+  fx.write(ledger => ledger.issue('alpha', source()));
+  const replacement = fx.store.meta(key); assert.ok(replacement);
+  const expected = fx.ledger.routing('alpha'); assert.ok(expected);
+  fx.store.setMeta(key, original);
+  assert.deepEqual(fx.ledger.routing('alpha'), before);
+  const external = new DatabaseSync(join(fx.directory, 'tasks.sqlite'));
+  t.after(() => external.close());
+  const replace = (payload: string) => external.prepare('INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, payload);
+  replace(replacement); assert.deepEqual(fx.ledger.routing('alpha'), expected);
+  external.prepare('DELETE FROM meta WHERE key=?').run(key); assert.equal(fx.ledger.routing('alpha'), null);
+  replace('{'); assert.throws(() => fx.ledger.routing('alpha'));
+  replace(JSON.stringify({ ...JSON.parse(original), state: { ...JSON.parse(original).state, directory: 42 } }));
+  assert.throws(() => fx.ledger.routing('alpha'));
+  replace(original); assert.deepEqual(fx.ledger.routing('alpha'), before);
+  fx.store.deleteMeta(key); assert.equal(fx.ledger.routing('alpha'), null);
+  fx.store.setMeta(key, replacement); assert.deepEqual(fx.ledger.routing('alpha'), expected);
+});
