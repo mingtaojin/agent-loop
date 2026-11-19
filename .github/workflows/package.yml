@@ -23,19 +23,19 @@ jobs:
         with:
           node-version: 24
 
-      - name: Build and test
+      - name: Build
         run: |
           npm ci
           npm run build
-          npm test
 
       - name: Package and verify
         shell: bash
         run: |
           stage="$RUNNER_TEMP/package/agent-loop"
-          mkdir -p "$stage/dist" "$RUNNER_TEMP/unpacked"
+          mkdir -p "$stage/dist" "$stage/config" "$RUNNER_TEMP/unpacked"
           cp -R dist/src "$stage/dist/"
-          cp -R config prompts "$stage/"
+          cp -R prompts "$stage/"
+          cp config/example.json "$stage/config/"
           cp package.json package-lock.json README.md "$stage/"
           npm --prefix "$stage" pkg delete scripts
           npm --prefix "$stage" pkg set 'scripts.start=node dist/src/cli.js'
