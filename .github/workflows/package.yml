@@ -37,13 +37,17 @@ jobs:
           cp -R prompts "$stage/"
           cp config/example.json "$stage/config/"
           cp package.json package-lock.json README.md "$stage/"
-          npm --prefix "$stage" pkg delete scripts
-          npm --prefix "$stage" pkg set 'scripts.start=node dist/src/cli.js'
-          npm --prefix "$stage" ci --omit=dev
+          (
+            cd "$stage"
+            npm pkg delete scripts
+            npm pkg set 'scripts.start=node dist/src/cli.js'
+            npm ci --omit=dev
+          )
 
           tar -czf "$RUNNER_TEMP/$PACKAGE_NAME" -C "$(dirname "$stage")" agent-loop
           tar -xzf "$RUNNER_TEMP/$PACKAGE_NAME" -C "$RUNNER_TEMP/unpacked"
-          npm --prefix "$RUNNER_TEMP/unpacked/agent-loop" start -- --help
+          cd "$RUNNER_TEMP/unpacked/agent-loop"
+          npm start -- --help
 
       - name: Upload package
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
