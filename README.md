@@ -4,6 +4,22 @@
 
 Agent Loop 保存项目和任务的持续上下文。用户在项目协调群交办新需求，GitHub Issue 作为协调者证据。CLI 和机器人私聊不再接单。协调者决定是否派发 Worker，正式执行复用持续 Thread。Worker 默认无群，需要直接交流或点击审批时按需建群。Agent 选择技能、实现和交付流程，Runtime 保存关系、材料、原生请求与恢复记录。
 
+## 下载自动构建包
+
+每个合入 `main` 的 PR 都会生成一个运行包。在对应运行记录的 **Artifacts** 下载 `agent-loop-pr-<PR 编号>-<提交 SHA>.tar.gz`。 [查看打包记录](https://github.com/mingtaojin/agent-loop/actions/workflows/package.yml)
+
+将包解压到新目录。运行包自带生产依赖。安装 Node.js 24、Git 和 Codex CLI 后，在解压出的 `agent-loop` 目录中复制示例配置。
+
+```sh
+cp config/example.json config.json
+```
+
+按下面的说明修改本机路径，并通过环境变量提供凭证。然后检查配置。
+
+```sh
+npm start -- doctor --config config.json
+```
+
 ## 准备配置
 
 安装 Node.js 24 或更高版本、Git 和支持 `codex app-server daemon` 的 Codex CLI。完成 Codex 登录后运行以下命令。

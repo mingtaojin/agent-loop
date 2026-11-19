@@ -1,0 +1,55 @@
+name: Package Agent Loop
+
+on:
+  pull_request:
+    branches: [main]
+    types: [closed]
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    env:
+      PACKAGE_NAME: agent-loop-pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.merge_commit_sha }}.tar.gz
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Build and test
+        run: |
+          npm ci
+          npm run build
+          npm test
+
+      - name: Package and verify
+        shell: bash
+        run: |
+          stage="$RUNNER_TEMP/package/agent-loop"
+          mkdir -p "$stage/dist" "$RUNNER_TEMP/unpacked"
+          cp -R dist/src "$stage/dist/"
+          cp -R config prompts "$stage/"
+          cp package.json package-lock.json README.md "$stage/"
+          npm --prefix "$stage" pkg delete scripts
+          npm --prefix "$stage" pkg set 'scripts.start=node dist/src/cli.js'
+          npm --prefix "$stage" ci --omit=dev
+
+          tar -czf "$RUNNER_TEMP/$PACKAGE_NAME" -C "$(dirname "$stage")" agent-loop
+          tar -xzf "$RUNNER_TEMP/$PACKAGE_NAME" -C "$RUNNER_TEMP/unpacked"
+          npm --prefix "$RUNNER_TEMP/unpacked/agent-loop" start -- --help
+
+      - name: Upload package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.PACKAGE_NAME }}
+          path: ${{ runner.temp }}/${{ env.PACKAGE_NAME }}
+          archive: false
+          if-no-files-found: error
+          overwrite: true
