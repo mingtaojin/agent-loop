@@ -913,7 +913,7 @@ export class AgentLoop {
         await this.observe(task, snapshot); task = this.store.task(id);
         if (this.projects.rotateIfReady(task)) return;
         if (!completed && ['interrupted', 'failed'].includes(status) && task.status === 'running' && snapshot.turnId && !this.hasUnknownInput(task)
-          && !this.store.inputs(task.id, { statuses: ['pending'], origin: 'user' }).some(input => input.origin === 'user' && input.status === 'pending')) {
+          && !this.closeout.pendingInputs(task.id).some(input => input.status === 'pending' && isContinuationInput(input))) {
           if (task.recovery.interruptedTurnId !== snapshot.turnId) this.fault(task, new Error('已确认原执行中断，等待有限恢复'), snapshot.turnId);
           else this.store.receive(task.id, { id: `recovery:${snapshot.turnId}:${task.recovery.attempts}`, chatId: task.chatId ?? '', senderId: 'runtime:recovery', chatType: 'group',
             text: 'The previous execution was confirmed interrupted. Reconcile existing work and effects before continuing the assigned work. Preserve prior decisions and authorization. Do not replay effects whose outcomes are unknown.', attachments: [], createdAt: Date.now() }, 'resume', { kind: 'recovery', previousTurnId: snapshot.turnId });
@@ -1099,9 +1099,7 @@ export class AgentLoop {
   private async drain(task: Task): Promise<void> {
     this.requireMember(task);
     const threadId = task.threadId;
-    const completedThrough = this.closeout.read(task.id).completionHistory.at(-1)?.inboxSequence ?? 0;
-    const inputs = this.store.inputs(task.id, { statuses: ['pending', 'delivering', 'uncertain', 'held'] })
-      .filter(input => input.seq > completedThrough || input.status === 'delivering' || input.status === 'uncertain')
+    const inputs = this.closeout.pendingInputs(task.id)
       .sort((a, b) => Number(b.origin === 'initial') - Number(a.origin === 'initial') || a.seq - b.seq);
     if (threadId && !this.stopping && task.status !== 'paused' && task.status !== 'failed'
       && this.store.meta(`project-intake-promotion:${task.id}`) !== null

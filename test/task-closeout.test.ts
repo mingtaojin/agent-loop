@@ -30,12 +30,12 @@ class CloseoutCodexFake extends CodexFake {
   setProjectHandler(handler: Parameters<NonNullable<CodexPort['setProjectHandler']>>[0]): void { this.projectHandler = handler; }
 }
 const receipt = z.object({ taskId: z.string(), operationId: z.string() });
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, maxAttempts?: number) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'closeout-runtime-'))), project = join(root, 'project'), data = join(root, 'data');
   await mkdir(project);
   await git(project, 'init', '-b', 'main'); await git(project, 'config', 'user.email', 'fixture@example.test'); await git(project, 'config', 'user.name', 'Fixture');
   await writeFile(join(project, 'source.txt'), 'original source'); await git(project, 'add', '.'); await git(project, 'commit', '-m', 'initial');
-  const config = configSchema.parse({ execution: testExecution, dataDir: data, feishu: { userOpenId: 'owner' },
+  const config = configSchema.parse({ execution: testExecution, dataDir: data, feishu: { userOpenId: 'owner' }, recovery: maxAttempts === undefined ? undefined : { maxAttempts },
     repositories: [{ name: 'example/app', path: project, baseBranch: 'main', criteria: { labelsAny: ['work'] } }],
     projects: [{ id: 'app', name: 'App', directory: project, repositories: [{ name: 'example/app', labelsAny: ['work'] }] }],
   });
@@ -857,6 +857,15 @@ for (const interrupted of [false, true]) test(`legacy implicit cleanup migration
   await f.cleanup(worker.id, [scope.id], 'explicit-after-migration');
   assert.equal(await exists(retainedPath), false);
   assert.equal((await f.state(worker.id)).operations[1]?.targets[0]?.state, 'removed');
+  await f.loop.projectCall(f.coordinatorId, { tool: 'send_agent_message', arguments: { taskId: worker.id, requestId: 'after-legacy-migration', text: 'Continue with new work' } });
+  await f.loop.tick();
+  await eventually(() => assert.equal(f.loop.store.inputs(worker.id).find(input => input.provenance.kind === 'agent_message')?.status, 'delivered'));
+  await f.finish(worker.id); await f.action(f.completeAction(worker.id, 'complete-new-cycle'));
+  await f.restart(); await f.loop.tick();
+  assert.equal((await f.state(worker.id)).lifecycle.kind, 'completed');
+  assert.equal((await f.state(worker.id)).completionHistory.length, 2);
+  assert.equal(f.loop.store.inputs(worker.id).find(input => input.id === legacyInput.id)?.status, 'pending');
+  assert.equal([...f.codex.starts, ...f.codex.steers].some(input => input.deliveryId === legacyInput.id), false);
 });
 
 test('legacy partial worktree cleanup preserves its branch until a new explicit cleanup and cannot affect its replacement', async t => {
@@ -939,4 +948,62 @@ test('a due self-reminder continues completed work on its original Thread withou
   assert.equal((await f.state(worker.id)).completionHistory.length, 1);
   await f.loop.tick();
   assert.equal(f.codex.starts.filter(input => input.deliveryId === reminder.id).length, 1);
+});
+
+for (const source of ['agent', 'reminder'] as const) test(`fresh ${source} input continues a failed Worker with automatic retries disabled`, async t => {
+  const f = await fixture(t, 0), worker = await f.worker(); assert.ok(worker.threadId);
+  const dueAt = Date.now() + 60_000;
+  if (source === 'reminder') await f.action({ action: 'schedule_reminder', requestId: 'failed-followup', dueAt, text: 'Inspect after the failed turn' }, worker.id);
+  const snapshot = f.codex.snapshot(worker.threadId); snapshot.status = 'failed'; snapshot.error = 'Controlled backend failure';
+  await f.loop.tick(); assert.equal(f.loop.store.task(worker.id).status, 'failed');
+  if (source === 'agent') await f.loop.projectCall(f.coordinatorId, { tool: 'send_agent_message', arguments: { requestId: 'failed-followup', taskId: worker.id, text: 'Continue after the failed turn' } });
+  else t.mock.method(Date, 'now', () => dueAt);
+  await f.loop.tick();
+  await eventually(() => assert.equal(f.loop.store.inputs(worker.id).find(input => input.provenance.kind === (source === 'agent' ? 'agent_message' : 'reminder'))?.status, 'delivered'));
+  assert.equal(f.loop.store.task(worker.id).status, 'running'); assert.equal(f.loop.store.task(worker.id).threadId, worker.threadId);
+  const input = f.loop.store.inputs(worker.id).find(input => input.provenance.kind === (source === 'agent' ? 'agent_message' : 'reminder')); assert.ok(input);
+  await f.loop.tick(); assert.equal(f.codex.starts.filter(start => start.deliveryId === input.id).length, 1);
+});
+
+for (const source of ['user', 'agent', 'reminder'] as const) test(`${source} input queued before paused completion survives restart and explicit resume`, async t => {
+  const f = await fixture(t), worker = await f.worker();
+  await f.action({ action: 'open_group', taskId: worker.id, requestId: 'open-queued-before-completion' });
+  const before = f.loop.store.task(worker.id); assert.ok(before.chatId);
+  const dueAt = Date.now() + 60_000;
+  if (source === 'reminder') await f.action({ action: 'schedule_reminder', requestId: 'queued-before-completion', dueAt, text: 'Queued before completion' }, worker.id);
+  await f.loop.control(worker.id, 'pause');
+  if (source === 'user') await f.loop.receive({ id: 'queued-before-completion', chatId: before.chatId, senderId: 'owner', chatType: 'group', text: 'Queued before completion', attachments: [], createdAt: Date.now() });
+  else if (source === 'agent') await f.loop.projectCall(f.coordinatorId, { tool: 'send_agent_message', arguments: { requestId: 'queued-before-completion', taskId: worker.id, text: 'Queued before completion' } });
+  else t.mock.method(Date, 'now', () => dueAt);
+  await f.loop.tick();
+  const queued = f.loop.store.inputs(worker.id).find(input => input.provenance.kind === (source === 'agent' ? 'agent_message' : source)); assert.ok(queued);
+  await eventually(() => assert.equal(f.loop.store.inputs(worker.id).find(input => input.id === queued.id)?.status, 'held'));
+  await f.complete(worker.id); await f.restart(); await f.loop.tick();
+  assert.equal(f.loop.store.task(worker.id).status, 'paused'); assert.equal(f.loop.store.inputs(worker.id).find(input => input.id === queued.id)?.status, 'held');
+  assert.equal((await f.state(worker.id)).lifecycle.kind, 'completed');
+  assert.equal(f.codex.starts.some(start => start.deliveryId === queued.id), false);
+  await f.loop.control(worker.id, 'resume'); await f.loop.tick();
+  await eventually(() => assert.equal(f.loop.store.inputs(worker.id).find(input => input.id === queued.id)?.status, 'delivered'));
+  const after = f.loop.store.task(worker.id);
+  assert.equal(after.threadId, before.threadId); assert.equal(after.chatId, before.chatId); assert.deepEqual(after.workerExecution, before.workerExecution);
+  assert.equal((await f.state(worker.id)).lifecycle.kind, 'open'); assert.equal((await f.state(worker.id)).completionHistory.length, 1);
+  assert.equal(f.codex.starts.filter(start => start.deliveryId === queued.id).length, 1);
+  await f.finish(worker.id);
+  await f.action(f.completeAction(worker.id, 'complete-after-queued-delivery'));
+  await f.restart(); await f.loop.tick();
+  assert.equal((await f.state(worker.id)).lifecycle.kind, 'completed');
+  assert.equal((await f.state(worker.id)).completionHistory.length, 2);
+  assert.equal(f.codex.starts.filter(start => start.deliveryId === queued.id).length, 1);
+});
+
+test('a new owner receipt with an old provider timestamp continues completed work once', async t => {
+  const f = await fixture(t), worker = await f.worker();
+  await f.action({ action: 'open_group', taskId: worker.id, requestId: 'delayed-owner' });
+  const before = f.loop.store.task(worker.id); assert.ok(before.chatId);
+  await f.finish(worker.id); await f.complete(worker.id);
+  const message = { id: 'delayed-owner', chatId: before.chatId, senderId: 'owner', chatType: 'group' as const, text: 'A delayed new message', attachments: [], createdAt: worker.createdAt - 60_000 };
+  await f.loop.receive(message); await f.loop.receive(message); await f.loop.tick();
+  assert.equal(f.loop.store.inputs(worker.id).find(input => input.id === message.id)?.status, 'delivered');
+  assert.equal(f.loop.store.task(worker.id).threadId, before.threadId); assert.equal((await f.state(worker.id)).lifecycle.kind, 'open');
+  assert.equal((await f.state(worker.id)).completionHistory.length, 1); assert.equal(f.codex.starts.filter(start => start.deliveryId === message.id).length, 1);
 });

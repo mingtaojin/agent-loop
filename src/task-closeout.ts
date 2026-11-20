@@ -21,7 +21,7 @@ const scopeSchema = z.strictObject({
   ]),
   artifacts: z.array(z.strictObject({ path: z.string(), dev: z.number(), ino: z.number(), disposition: z.enum(['temporary', 'undelivered', 'delivered', 'superseded', 'abandoned']), reference: z.string().nullable() })),
 });
-const completionSchema = z.strictObject({ kind: z.literal('completed'), outcome: z.enum(['delivered', 'terminated']), summary: z.string(), deliveryReferences: z.array(z.string()), at: z.number(), operationId: z.string(), inboxSequence: z.number().int().nonnegative().default(0) });
+const completionSchema = z.strictObject({ kind: z.literal('completed'), outcome: z.enum(['delivered', 'terminated']), summary: z.string(), deliveryReferences: z.array(z.string()), at: z.number(), operationId: z.string(), inboxSequence: z.number().int().nonnegative().default(0), pendingInputIds: z.array(z.string()).default([]) });
 const completionRecordSchema = completionSchema.extend({ requestId: z.string(), callerId: z.string(), fingerprint: z.string() });
 const targetSchema = z.strictObject({ scope: scopeSchema, branchHead: z.string().nullable(), branchIdentity: branchIdentitySchema.nullable().default(null), disposalPath: z.string(),
   state: z.enum(['pending', 'removed', 'protected', 'retained']), reason: z.string().nullable(), directoryRemoved: z.boolean(), branchRemoved: z.boolean() });
@@ -147,12 +147,17 @@ export class TaskCloseout {
   completed(taskId: string) { return this.status(taskId).completed; }
   hasPendingCleanup(taskId: string): boolean { return this.status(taskId).pendingCleanup; }
   isCleaning(taskId: string) { return this.destructing.has(taskId); }
+  pendingInputs(taskId: string): Inbox[] {
+    const completion = this.read(taskId).completionHistory.at(-1);
+    const retained = new Set(completion?.pendingInputIds);
+    return this.store.inputs(taskId, { statuses: ['pending', 'delivering', 'uncertain', 'held', 'failed'] })
+      .filter(input => !completion || input.seq > completion.inboxSequence || retained.has(input.id)
+        || input.status === 'delivering' || input.status === 'uncertain');
+  }
   reopenOnInput(taskId: string): boolean {
     const state = this.read(taskId);
     if (state.lifecycle.kind !== 'completed' || this.isCleaning(taskId) || this.store.task(taskId).status === 'paused') return false;
-    const { inboxSequence: sequence, at } = state.lifecycle;
-    const fresh = this.store.inputs(taskId, { statuses: ['pending', 'held'] }).some(input => input.seq > sequence
-      && input.message.createdAt >= at && isContinuationInput(input));
+    const fresh = this.pendingInputs(taskId).some(input => (input.status === 'pending' || input.status === 'held') && isContinuationInput(input));
     if (!fresh) return false;
     state.lifecycle = { kind: 'open' }; this.save(state); return true;
   }
@@ -279,7 +284,8 @@ export class TaskCloseout {
       }
       const completion = { kind: 'completed' as const, outcome: input.outcome, summary: input.summary,
         deliveryReferences: input.deliveryReferences, at: Date.now(), operationId: randomUUID(),
-        inboxSequence: this.store.inputs(input.taskId).at(-1)?.seq ?? 0 };
+        inboxSequence: this.store.inputSequence(input.taskId),
+        pendingInputIds: this.pendingInputs(input.taskId).filter(isContinuationInput).map(item => item.id) };
       state.projectId = input.projectId; state.lifecycle = completion;
       state.completionHistory.push({ ...completion, requestId: input.requestId, callerId: input.callerId, fingerprint: input.fingerprint });
       this.save(state);
