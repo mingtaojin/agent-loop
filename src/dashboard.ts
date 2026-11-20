@@ -5,8 +5,8 @@ import { join } from 'node:path';
 import { hostname, networkInterfaces } from 'node:os';
 import { z } from 'zod';
 import { Store } from './store.js';
-import { boundedDashboardText, dashboardResources, ProjectDashboardReader } from './dashboard-reader.js';
-import { errorMessage, presentTaskSource } from './domain.js';
+import { boundedDashboardText, ProjectDashboardReader } from './dashboard-reader.js';
+import { errorMessage } from './domain.js';
 import { dashboardHtml, dashboardCss, dashboardScript } from './dashboard-page.js';
 
 const heartbeatSchema = z.object({ pid: z.number(), lastSeenAt: z.number(), intervalMs: z.number(), status: z.enum(['running', 'stopped']) });
@@ -19,13 +19,11 @@ export async function startDashboard(options: { execution?: LiveExecution; dataD
   const clients = new Set<ServerResponse>();
   let dashboardReader: ProjectDashboardReader | null = null;
   const readerFor = (db: Store) => dashboardReader ??= new ProjectDashboardReader(db, execution);
-  let readModelCache: { version: number; cursor: string; expiresAt: number; tasks: ReturnType<Store['tasks']>; projects: ReturnType<ProjectDashboardReader['projects']>; diagnostics: ReturnType<Store['diagnostics']> } | null = null;
+  let readModelCache: { version: number; cursor: string; expiresAt: number; tasks: ReturnType<ProjectDashboardReader['overview']>['tasks']; projects: ReturnType<ProjectDashboardReader['projects']>; diagnostics: ReturnType<Store['diagnostics']> } | null = null;
   const readStore = () => {
     if (!store && existsSync(join(options.dataDir, 'tasks.sqlite'))) store = new Store(options.dataDir, { readOnly: true });
     return store;
   };
-  // Open the read-only connection before listening so the first API request measures the
-  // dashboard query rather than SQLite connection and schema setup.
   readStore();
   const json = (response: ServerResponse, status: number, value: unknown) => {
     response.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
@@ -36,8 +34,7 @@ export async function startDashboard(options: { execution?: LiveExecution; dataD
     const db = readStore();
     const version = db?.dataVersion() ?? 0;
     if (readModelCache && readModelCache.version === version && readModelCache.cursor === execution.cursor && readModelCache.expiresAt > now) return readModelCache;
-    const tasks = db?.tasks() ?? [];
-    const projects = db ? readerFor(db).projects(tasks) : [];
+    const { tasks, projects } = db ? readerFor(db).overview() : { tasks: [], projects: [] };
     const diagnostics = db?.diagnostics() ?? [];
     readModelCache = { version, cursor: execution.cursor, expiresAt: now + 250, tasks, projects, diagnostics };
     return readModelCache;
@@ -50,16 +47,7 @@ export async function startDashboard(options: { execution?: LiveExecution; dataD
     const heartbeat = rawHeartbeat ? heartbeatSchema.safeParse(JSON.parse(rawHeartbeat)) : null;
     const value = {
       dataDir: options.dataDir, now, runtime: heartbeat?.success ? heartbeat.data : null,
-      tasks: model.tasks.map(task => ({
-        id: task.id, title: presentTaskSource(task.source, 200).title,
-        sourceLabel: presentTaskSource(task.source, 200).label,
-        sourceKind: task.source.kind, sourceUrl: task.source.kind === 'github' ? task.source.issue.url : null,
-        status: task.status, executionStatus: task.executionStatus, reason: task.reason,
-        threadId: task.threadId, turnId: task.turnId, chatId: task.chatId,
-        createdAt: task.createdAt, updatedAt: task.updatedAt, recovery: task.recovery,
-        requests: task.requests.map(request => ({ kind: request.kind, prompt: boundedDashboardText(request.prompt) })),
-        resources: dashboardResources(task.resources),
-      })), projects: model.projects, diagnostics: model.diagnostics,
+      tasks: model.tasks, projects: model.projects, diagnostics: model.diagnostics,
     };
     return value;
   };

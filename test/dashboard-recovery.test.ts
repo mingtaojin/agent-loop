@@ -11,28 +11,32 @@ class Element {
   hidden = false;
   checked = false;
   dataset = {};
-  classList = { toggle() {} };
+  classList = { toggle() {}, add() {} };
   append(...children: Element[]) { this.childNodes.push(...children); }
   replaceChildren(...children: Element[]) { this.childNodes = children; }
   addEventListener() {}
   removeAttribute() {}
+  scrollIntoView() {}
+  get innerText(): string { return [this.textContent, ...this.childNodes.map(child => child.innerText)].join('\n'); }
 }
 
-async function browser(options: { threadId: string | null; unavailable?: boolean }) {
+async function browser(options: { threadId: string | null; unavailable?: boolean; beforeDetail?: () => Promise<void>; runtime?: { pid: number; lastSeenAt: number; intervalMs: number; status: 'running' | 'stopped' } }) {
   const elements = new Map<string, Element>();
   const element = (id: string) => { let result = elements.get(id); if (!result) { result = new Element(); elements.set(id, result); } return result; };
   const requests: string[] = [];
   const streams: Stream[] = [];
   class Stream {
     closed = false;
+    onopen = () => {};
+    onerror = () => {};
     listeners = new Map<string, (message: { data: string }) => void>();
     constructor(readonly url: string) { streams.push(this); }
     close() { this.closed = true; }
     addEventListener(name: string, listener: (message: { data: string }) => void) { this.listeners.set(name, listener); }
     emit(name: string, value: unknown = {}) { this.listeners.get(name)?.({ data: JSON.stringify(value) }); }
   }
-  let now = 0, unavailable = options.unavailable ?? false;
-  const task = { id: 'task', title: 'Task', threadId: options.threadId, status: 'running', role: 'worker', updatedAt: 0 };
+  let now = 0, unavailable = options.unavailable ?? false, snapshotUnavailable = false;
+  const task = { id: 'task', title: 'Task', threadId: options.threadId, status: 'running', role: 'worker', updatedAt: 0, latestReport: { text: 'Business report', createdAt: 0 } };
   const context = createContext({
     document: { getElementById: element, createElement: () => new Element(), createDocumentFragment: () => new Element(), querySelectorAll: () => [] },
     EventSource: Stream,
@@ -40,15 +44,20 @@ async function browser(options: { threadId: string | null; unavailable?: boolean
     window: { addEventListener() {}, setInterval() {}, setTimeout() {} },
     fetch: async (url: string) => {
       requests.push(url);
+      if (url === '/api/snapshot' && snapshotUnavailable) throw new Error('Snapshot unavailable');
+      if (url !== '/api/snapshot') await options.beforeDetail?.();
       return { ok: true, status: 200, json: async () => url === '/api/snapshot'
-        ? { tasks: [task], projects: [], now, runtime: null, dataDir: '/test' }
-        : { task, threadId: task.threadId, cursor: 'epoch:0', history: { kind: unavailable ? 'unavailable' : 'available' }, timeline: unavailable ? [] : [{ id: 'historical', kind: 'agent_message', text: 'Recovered answer', createdAt: 0 }], inputs: [], outputs: [], diagnostics: [] } };
+        ? { tasks: [task], projects: [], now, runtime: options.runtime ?? null, dataDir: '/test' }
+        : { task, threadId: task.threadId, cursor: 'epoch:0', history: { kind: unavailable ? 'unavailable' : 'available' }, timeline: unavailable ? [] : [{ id: 'historical', kind: 'agent_message', text: 'Recovered answer', createdAt: 0 }], inputs: [{ text: 'Business input' }], outputs: [{ text: 'Business output' }], diagnostics: [] } };
     },
   });
   runInContext(dashboardScript, context);
   await new Promise<void>(resolve => setImmediate(resolve));
   return {
     streams, requests, element,
+    async select() { await runInContext('selectTask("task")', context); },
+    failSnapshot() { snapshotUnavailable = true; },
+    recoverSnapshot() { snapshotUnavailable = false; },
     recover() { unavailable = false; },
     rebind(threadId: string) { task.threadId = threadId; unavailable = true; },
     async refresh(elapsed = 0) { now += elapsed; await runInContext('refresh()', context); },
@@ -57,6 +66,7 @@ async function browser(options: { threadId: string | null; unavailable?: boolean
 
 test('the selected bound task retries unavailable history with backoff and recovers without another selection', async () => {
   const page = await browser({ threadId: 'thread', unavailable: true });
+  await page.select();
   const reads = () => page.requests.filter(url => url === '/api/tasks/task').length;
   assert.equal(reads(), 1);
   await page.refresh(500); assert.equal(reads(), 1);
@@ -71,6 +81,7 @@ test('the selected bound task retries unavailable history with backoff and recov
 
 test('reset notifications do not create an immediate detail subscription loop for an unbound task', async () => {
   const page = await browser({ threadId: null });
+  await page.select();
   assert.equal(page.streams.length, 1);
   const first = page.streams[0]!;
   assert.match(first.url, /threadId=$/);
@@ -84,20 +95,135 @@ test('reset notifications do not create an immediate detail subscription loop fo
   assert.equal(page.streams.length, 2);
 });
 
+test('reset retains business messages and shows recovery through snapshot polling before retry', async () => {
+  const page = await browser({ threadId: 'thread' });
+  await page.select();
+  const first = page.streams[0]!;
+  first.onopen();
+  assert.match(page.element('stream-status').textContent, /LIVE/);
+  assert.match(page.element('output').innerText, /Recovered answer/);
+  first.emit('reset');
+  await page.refresh(500);
+  assert.match(page.element('history').innerText, /Business input/);
+  assert.match(page.element('history').innerText, /Business output/);
+  assert.match(page.element('task-summary').innerText, /Business report/);
+  assert.equal(page.element('event-count').textContent, '0 条事件');
+  assert.doesNotMatch(page.element('output').innerText, /Recovered answer/);
+  assert.equal(page.element('page-error').hidden, false);
+  assert.match(page.element('page-error').textContent, /不可用|重新读取/);
+  assert.match(page.element('connection-text').textContent, /重连|重新读取/);
+  assert.match(page.element('stream-status').textContent, /RECONNECTING/);
+  assert.equal(first.closed, true);
+  assert.equal(page.streams.length, 1);
+  assert.equal(page.requests.filter(url => url === '/api/tasks/task').length, 1);
+
+  first.onopen();
+  assert.match(page.element('stream-status').textContent, /RECONNECTING/);
+  first.onerror();
+  first.emit('execution', { taskId: 'task', threadId: 'thread', key: 'late', turnId: 'turn', kind: 'agent_message', text: 'Closed stream answer', createdAt: 1 });
+  assert.equal(page.element('event-count').textContent, '0 条事件');
+  assert.match(page.element('stream-status').textContent, /RECONNECTING/);
+
+  await page.refresh(500);
+  assert.equal(page.streams.length, 2);
+  page.streams[1]!.onopen();
+  assert.equal(page.element('page-error').hidden, true);
+  assert.match(page.element('stream-status').textContent, /LIVE/);
+  assert.match(page.element('output').innerText, /Recovered answer/);
+  assert.doesNotMatch(page.element('output').innerText, /Closed stream answer/);
+});
+
+test('Thread rebind during reset recovery retains business facts while the new detail is loading', async () => {
+  let detailReady = Promise.resolve(), releaseDetail = () => {};
+  const page = await browser({ threadId: 'thread-a', beforeDetail: () => detailReady });
+  await page.select();
+  const first = page.streams[0]!;
+  first.onopen();
+  first.emit('reset');
+  detailReady = new Promise<void>(resolve => { releaseDetail = resolve; });
+  page.rebind('thread-b');
+  const refresh = page.refresh(500);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  try {
+    assert.match(page.element('history').innerText, /Business input/);
+    assert.match(page.element('history').innerText, /Business output/);
+    assert.match(page.element('task-summary').innerText, /Business report/);
+    assert.equal(page.element('event-count').textContent, '0 条事件');
+    assert.doesNotMatch(page.element('output').innerText, /Recovered answer/);
+    assert.equal(page.element('page-error').hidden, false);
+    assert.match(page.element('page-error').textContent, /重新读取/);
+    first.onopen();
+    first.emit('execution', { taskId: 'task', threadId: 'thread-a', key: 'late', turnId: 'turn', kind: 'agent_message', text: 'Previous Thread answer', createdAt: 1 });
+    assert.equal(page.element('event-count').textContent, '0 条事件');
+    assert.match(page.element('stream-status').textContent, /RECONNECTING/);
+  } finally {
+    releaseDetail();
+    await refresh;
+  }
+  assert.match(page.streams[1]!.url, /threadId=thread-b/);
+  assert.equal(page.element('event-count').textContent, '0 条事件');
+  assert.match(page.element('history').innerText, /Business input/);
+  page.recover();
+  await page.refresh(1000);
+  assert.equal(page.streams.length, 2);
+  await page.refresh(1000);
+  page.streams[2]!.onopen();
+  assert.equal(page.element('page-error').hidden, true);
+  assert.match(page.element('stream-status').textContent, /LIVE/);
+  assert.doesNotMatch(page.element('output').innerText, /Previous Thread answer/);
+});
+
 test('live item upserts retain at most five hundred visible timeline entries', async () => {
   const page = await browser({ threadId: 'thread' });
+  await page.select();
   const stream = page.streams[0]!;
-  for (let index = 0; index < 510; index++) stream.emit('execution', { taskId: 'task', key: String(index), turnId: 'turn', kind: 'agent_message', text: 'Message ' + index, createdAt: index });
+  for (let index = 0; index < 510; index++) stream.emit('execution', { taskId: 'task', threadId: 'thread', key: String(index), turnId: 'turn', kind: 'agent_message', text: 'Message ' + index, createdAt: index });
   assert.equal(page.element('event-count').textContent, '500 条事件');
-  stream.emit('execution', { taskId: 'task', key: '509', turnId: 'turn', kind: 'agent_message', text: 'Updated message', createdAt: 509 });
+  stream.emit('execution', { taskId: 'task', threadId: 'thread', key: '509', turnId: 'turn', kind: 'agent_message', text: 'Updated message', createdAt: 509 });
   assert.equal(page.element('event-count').textContent, '500 条事件');
 });
 
 test('unavailable history after Thread rebind does not preserve the previous Thread timeline', async () => {
   const page = await browser({ threadId: 'thread-a' });
+  await page.select();
   assert.equal(page.element('event-count').textContent, '1 条事件');
   page.rebind('thread-b');
   await page.refresh(1000);
   assert.equal(page.element('event-count').textContent, '0 条事件');
   assert.equal(page.element('page-error').hidden, false);
+});
+
+test('overview polling reads no task history before explicit task selection', async () => {
+  const page = await browser({ threadId: 'thread' });
+  await page.refresh(1000);
+  await page.refresh(1000);
+  assert.deepEqual(page.requests, ['/api/snapshot', '/api/snapshot', '/api/snapshot']);
+  assert.equal(page.streams.length, 0);
+  await page.select();
+  assert.equal(page.requests.filter(url => url === '/api/tasks/task').length, 1);
+  await page.refresh(1000);
+  assert.equal(page.requests.filter(url => url === '/api/tasks/task').length, 1);
+});
+
+test('snapshot failures mark task status as last known while heartbeat age keeps advancing', async () => {
+  const page = await browser({ threadId: 'thread', runtime: { pid: 10, status: 'running', lastSeenAt: 0, intervalMs: 1000 } });
+  await page.select();
+  assert.equal(page.element('runtime-status').textContent, '服务心跳正常');
+  page.failSnapshot();
+  await page.refresh(16000);
+  assert.match(page.element('runtime-status').textContent, /服务心跳已过期/);
+  assert.match(page.element('task-badge').textContent, /最后已知/);
+  assert.match(page.element('page-error').textContent, /最后已知状态/);
+  page.recoverSnapshot(); await page.refresh(1000);
+  assert.doesNotMatch(page.element('task-badge').textContent, /最后已知/);
+  assert.equal(page.element('page-error').hidden, true);
+});
+
+test('selected detail ignores an execution event from a different Thread', async () => {
+  const page = await browser({ threadId: 'thread' }); await page.select();
+  const stream = page.streams[0]!;
+  stream.emit('execution', { taskId: 'task', threadId: 'previous-thread', key: 'old', turnId: 'turn', kind: 'agent_message', text: 'Old Thread', createdAt: 1 });
+  assert.equal(page.element('event-count').textContent, '1 条事件');
+  stream.emit('execution', { taskId: 'task', threadId: 'thread', key: 'new', turnId: 'turn', kind: 'agent_message', text: 'Current Thread', createdAt: 2 });
+  assert.equal(page.element('event-count').textContent, '2 条事件');
 });
