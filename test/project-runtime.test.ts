@@ -60,6 +60,7 @@ test('delegated workers and secondWorkers stay group-less until the coordinator 
   assert.ok(worker.threadId);
   const snapshot = f.codex.snapshot(worker.threadId);
   assert.ok(snapshot.turnId);
+  snapshot.outputs.push({ id: 'private-progress', threadId: worker.threadId, turnId: snapshot.turnId, phase: 'progress', text: 'Draft before the group opened.' });
   snapshot.requests = [{ id: 'clarify', threadId: worker.threadId, turnId: snapshot.turnId, kind: 'question',
     prompt: 'Which behavior is intended?', method: 'item/tool/requestUserInput', payload: {}, isBlocking: true, connectionEpoch: 'live' }];
   await f.loop.tick();
@@ -78,7 +79,7 @@ test('delegated workers and secondWorkers stay group-less until the coordinator 
   assert.match(sent[0]!.text, /当前摘要：Current investigation summary/);
   assert.ok(!sent.some(output => output.text === 'Which behavior is intended?'));
   await f.openGroup(worker.id);
-  await f.openGroup(worker.id, 'another-open');
+  await f.openGroup(worker.id, 'another-open'); await f.restart(); await f.loop.tick();
   assert.equal(f.feishu.groups.size, 3);
   assert.equal(f.feishu.sent.filter(output => output.chatId === opened.chatId).length, 1);
   await assert.rejects(f.loop.projectAction(worker.id, { action: 'open_group', requestId: 'forbidden', taskId: worker.id }), /Only the coordinator/);
@@ -664,10 +665,15 @@ test('background coordinator events stay local until an idempotent typed announc
 test('a direct project-group message keeps the coordinator final reply visible', async t => {
   const f = await fixture(t); const coordinator = await f.initialize(); await f.idleCoordinator();
   const message = f.message('direct-coordinator', '请说明当前任务状态。', coordinator.chatId!);
+  const messages = () => f.feishu.sent.filter(output => output.chatId === coordinator.chatId).map(output => output.text);
+  const before = messages();
   await f.loop.receive(message);
-  const running = f.loop.store.task(coordinator.id); assert.ok(running.threadId);
+  const running = f.loop.store.task(coordinator.id); assert.ok(running.threadId && running.turnId);
+  f.codex.snapshot(running.threadId).outputs.push({ id: 'intermediate', threadId: running.threadId, turnId: running.turnId, phase: 'progress', text: '正在核实任务进度。' });
+  await f.loop.tick();
+  assert.deepEqual(messages(), before);
   f.codex.complete(running.threadId, '当前任务仍在调查。'); await f.loop.tick();
-  assert.ok(f.feishu.sent.some(output => output.chatId === coordinator.chatId && output.text === '当前任务仍在调查。'));
+  assert.deepEqual(messages(), [...before, '当前任务仍在调查。']);
 });
 
 test('Feature implementation needs owner authorization while investigation remains allowed', async t => {

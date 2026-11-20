@@ -28,6 +28,8 @@ export type Inbox = Omit<z.infer<typeof inboxRow>, 'payload'> & { message: Incom
 export type InboxFilter = { statuses?: readonly Inbox['status'][]; origin?: Inbox['origin'] };
 const outboxSchema = z.object({ id: z.string(), task_id: z.string(), text: z.string(), status: z.enum(['pending', 'sending', 'sent', 'uncertain', 'dropped']), error: z.string().nullable() });
 export type Outbox = z.infer<typeof outboxSchema>;
+const workerDeliverySchema = z.object({ chat_id: z.string().nullable(), turn_key: z.string(), kind: z.enum(['body', 'working', 'ended']) });
+type WorkerDelivery = z.infer<typeof workerDeliverySchema>;
 
 export const diagnosticRetentionLimit = 1_000;
 const diagnosticReadLimit = 100;
@@ -61,6 +63,8 @@ export class Store {
         CREATE INDEX IF NOT EXISTS inbox_task_status ON inbox(task_id,status,seq);
         CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id),text TEXT NOT NULL,status TEXT NOT NULL,error TEXT);
         CREATE INDEX IF NOT EXISTS outbox_task_status ON outbox(task_id,status);
+        CREATE TABLE IF NOT EXISTS worker_chat_deliveries(output_id TEXT PRIMARY KEY REFERENCES outbox(id) ON DELETE CASCADE,chat_id TEXT,turn_key TEXT NOT NULL,kind TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS worker_chat_turn ON worker_chat_deliveries(turn_key,chat_id,kind);
         CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id),kind TEXT NOT NULL,status TEXT NOT NULL,result TEXT,error TEXT);
         CREATE TABLE IF NOT EXISTS approval_actions(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id),payload TEXT NOT NULL,status TEXT NOT NULL,error TEXT);
         CREATE INDEX IF NOT EXISTS approval_actions_task ON approval_actions(task_id);
@@ -215,6 +219,19 @@ export class Store {
     const id = createHash('sha256').update(`${taskId}:${key}`).digest('hex').slice(0, 32);
     this.prepare("INSERT OR IGNORE INTO outbox VALUES(?,?,?,'pending',NULL)").run(id, taskId, text);
     return id;
+  }
+  enqueueWorkerOutput(taskId: string, text: string, key: string, delivery: WorkerDelivery): void {
+    const id = this.enqueue(taskId, text, key);
+    this.prepare('INSERT INTO worker_chat_deliveries VALUES(?,?,?,?)').run(id, delivery.chat_id, delivery.turn_key, delivery.kind);
+    if (!delivery.chat_id) this.markOutput(id, 'dropped', '任务当前无群，不补发历史');
+  }
+  workerOutput(id: string): WorkerDelivery | null {
+    const row = this.prepare('SELECT chat_id,turn_key,kind FROM worker_chat_deliveries WHERE output_id=?').get(id);
+    return row ? workerDeliverySchema.parse(row) : null;
+  }
+  hasUndeliveredWorkerBody(turnKey: string, chatId: string): boolean {
+    return this.prepare(`SELECT 1 FROM worker_chat_deliveries w JOIN outbox o ON w.output_id=o.id
+      WHERE w.turn_key=? AND w.chat_id=? AND w.kind='body' AND o.status!='sent' LIMIT 1`).get(turnKey, chatId) !== undefined;
   }
   hasOutput(taskId: string, key: string): boolean {
     const id = createHash('sha256').update(`${taskId}:${key}`).digest('hex').slice(0, 32);

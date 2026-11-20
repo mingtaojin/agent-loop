@@ -1,4 +1,4 @@
-import { executionKey, type ExecutionHistory } from '../src/execution-events.js';
+import { executionKey, type ExecutionEvent, type ExecutionHistory } from '../src/execution-events.js';
 import { writeFile } from 'node:fs/promises';
 import { TurnChangedError, UncertainOperationError, type ApprovalAction, type ExecutionSnapshot, type IncomingMessage, type PendingRequest, type ProjectDecisionAction, type Source, type SourceComment, type TaskResource, type WorkspaceRequest } from '../src/domain.js';
 export interface LegacyReport { status: 'waiting_user' | 'awaiting_review' | 'failed'; summary: string; question: string | null; prUrl: string | null; validation: string[]; limitations: string[] }
@@ -96,6 +96,8 @@ export class FeishuFake implements FeishuPort {
 }
 
 export class CodexFake implements CodexPort {
+  onEvent?: (event: ExecutionEvent) => void;
+  setEventHandler(handler: (event: ExecutionEvent) => void): void { this.onEvent = handler; }
   async readHistory(threadId: string): Promise<ExecutionHistory> {
     const snapshot = this.snapshot(threadId);
     return snapshot.outputs.map(output => {
@@ -173,7 +175,7 @@ export class CodexFake implements CodexPort {
     const snapshot = await this.inspect(...args);
     if (snapshot.status !== 'running' || !snapshot.turnId) return { kind: 'reconcile' };
     return { kind: 'running', threadId, turnId: snapshot.turnId, connectionEpoch: 'fake-epoch',
-      requests: structuredClone(snapshot.requests), outputs: structuredClone(snapshot.outputs.filter(output => output.phase === 'progress')) };
+      requests: structuredClone(snapshot.requests), outputs: snapshot.outputs.filter(output => output.turnId === snapshot.turnId) };
   }
   isActiveTurn(identity: TurnIdentity): boolean {
     const snapshot = this.snapshot(identity.threadId);

@@ -533,7 +533,7 @@ export class CodexAppServer implements CodexPort {
     return { kind: 'running', threadId, turnId, connectionEpoch: epoch,
       requests: [...this.requests.values()].map(live => live.request).filter(request => request.threadId === threadId
         && (request.turnId === turnId || (request.kind === 'unsupported' && !request.turnId))),
-      outputs: [...this.outputs.values()].filter(output => output.threadId === threadId && output.turnId === turnId && output.phase === 'progress') };
+      outputs: [...this.outputs.values()].filter(output => output.threadId === threadId && output.turnId === turnId) };
   }
 
   async executionUse(threadId: string): Promise<'idle' | 'busy' | 'unknown'> {
@@ -641,8 +641,10 @@ export class CodexAppServer implements CodexPort {
     const expectedTurn = this.awaitingHistory.get(threadId);
     if (expectedTurn && !thread.turns.some(turn => turn.id === expectedTurn)) throw new TurnHistoryPendingError('Accepted Codex turn is not visible in history yet; reconcile before continuing');
     for (const turn of thread.turns) {
-      if (turn.status === 'inProgress') continue;
-      for (const item of turn.items) this.captureOutput(threadId, turn.id, item, turn.status === 'completed');
+      for (const item of turn.items) {
+        if (turn.status === 'inProgress' && typeof item.completedAtMs !== 'number') continue;
+        this.captureOutput(threadId, turn.id, item, turn.status === 'completed');
+      }
     }
     const mismatched = (thread.status.type === 'active') !== (latest?.status === 'inProgress');
     if (expectedTurn && mismatched) throw new TurnHistoryPendingError('Accepted Codex turn state is still materializing; reconcile before continuing');

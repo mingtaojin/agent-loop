@@ -1,3 +1,5 @@
+import { WorkerChatTurn } from './worker-chat-turn.js';
+import type { ExecutionEvent } from './execution-events.js';
 import { LiveExecution } from './live-execution.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
@@ -130,7 +132,10 @@ export class AgentLoop {
     ports.codex.setEventHandler?.(event => {
       try {
         const taskId = this.store.taskIdForThread(event.threadId);
-        if (taskId) this.execution.publish(taskId, event);
+        if (taskId) {
+          this.execution.publish(taskId, event);
+          this.onWorkerEvent(taskId, event);
+        }
       } catch (error) { this.problem('debug:' + event.threadId, error); }
     });
     this.workspaceBridge = new WorkspaceBridge(config.dataDir, async (taskId, repository) => {
@@ -237,6 +242,48 @@ export class AgentLoop {
     if (JSON.stringify({ ...current, updatedAt: undefined }) === JSON.stringify({ ...task, updatedAt: undefined })) { task.updatedAt = current.updatedAt; return; }
     task.updatedAt = Date.now(); this.store.saveTask(task);
   }
+  private workerChatTurn(task: Task, threadId: string, turnId: string | null): WorkerChatTurn | null {
+    if (!turnId || task.threadId !== threadId || this.projects.ledger.membership(task.id)?.role !== 'worker') return null;
+    if (task.legacy && this.store.hasOutput(task.id, `turn:${turnId}`)) return null;
+    return new WorkerChatTurn(this.store, task, threadId, turnId);
+  }
+  private onWorkerEvent(taskId: string, event: ExecutionEvent): void {
+    if (this.stopping || !event.turnId || !['turn_start', 'agent_message', 'turn_end'].includes(event.kind)) return;
+    const task = this.store.task(taskId);
+    if (task.lastHandledTurnId === event.turnId || this.closeout.completed(taskId)) return;
+    const turn = this.workerChatTurn(task, event.threadId, event.turnId);
+    if (!turn || turn.ended) return;
+    if (event.kind === 'turn_end') {
+      void this.serial(taskId, async () => {
+        const latest = this.store.task(taskId);
+        if (this.stopping || latest.threadId !== event.threadId || latest.turnId !== event.turnId || latest.lastHandledTurnId === event.turnId || this.closeout.completed(taskId)) return;
+        this.publishWorkerSnapshot(latest, await this.inspect(event.threadId));
+        await this.flush(this.store.task(taskId));
+      }).catch(error => this.problem(taskId, error));
+      return;
+    }
+    this.store.transaction(() => {
+      turn.start();
+      if (event.kind === 'agent_message' && event.itemId) turn.message({
+        id: `${event.threadId}:${event.turnId}:${event.itemId}`, text: event.text, phase: event.isFinalAnswer ? 'final' : 'progress',
+      }, true);
+    });
+    if (task.chatId) void this.serial(taskId, () => this.flush(this.store.task(taskId))).catch(error => this.problem(taskId, error));
+  }
+  private publishWorkerSnapshot(task: Task, snapshot: ExecutionSnapshot | RunningActivity): void {
+    if (snapshot.turnId === task.lastHandledTurnId) return;
+    const turn = this.workerChatTurn(task, snapshot.threadId, snapshot.turnId);
+    if (!turn || turn.ended) return;
+    const running = ('kind' in snapshot ? snapshot.kind : snapshot.status) === 'running';
+    this.store.transaction(() => {
+      turn.start();
+      for (const output of snapshot.outputs) {
+        if (output.threadId !== snapshot.threadId) throw new Error('Agent output thread identity changed');
+        if (output.turnId === turn.turnId) turn.message(output, running);
+      }
+      if (!running) turn.end();
+    });
+  }
   private notify(task: Task, text: string, key: string): void {
     const id = this.store.enqueue(task.id, text, key);
     if (!task.chatId
@@ -280,8 +327,20 @@ export class AgentLoop {
   private async openGroup(taskId: string): Promise<string> {
     let chatId = '';
     await this.serial(taskId, async () => {
+      const previous = this.store.task(taskId);
+      let activeTurnId = previous.executionStatus === 'running' ? previous.turnId : null;
+      if (!previous.chatId && previous.threadId && activeTurnId) {
+        const snapshot = await this.observation(previous);
+        this.publishWorkerSnapshot(previous, snapshot);
+        activeTurnId = ('kind' in snapshot ? snapshot.kind : snapshot.status) === 'running' ? snapshot.turnId : null;
+      }
       chatId = await this.groups.open(taskId);
-      await this.flush(this.store.task(taskId));
+      const task = this.store.task(taskId);
+      if (task.threadId && activeTurnId && activeTurnId !== task.lastHandledTurnId) {
+        const turn = this.workerChatTurn(task, task.threadId, activeTurnId);
+        if (turn) this.store.transaction(() => turn.start());
+      }
+      await this.flush(task);
       assertGroupBinding(this.store, taskId, chatId);
     });
     return chatId;
@@ -852,13 +911,14 @@ export class AgentLoop {
     task.turnId = snapshot.turnId; task.executionStatus = status;
     const waitingForRequest = task.requests.length > 0;
     const oldRequests = new Set(task.requests.map(request => `${request.connectionEpoch}:${request.id}`)); task.requests = snapshot.requests;
+    this.publishWorkerSnapshot(task, snapshot);
     const processOutputs = !('kind' in snapshot) && (snapshot.turnId !== previousTurnId || previousStatus !== status);
     for (const output of processOutputs ? snapshot.outputs : []) {
       if (output.threadId !== task.threadId) throw new Error('Agent output thread identity changed');
       if (output.phase !== 'final' || 'kind' in snapshot) continue;
       if (task.legacy && this.store.hasOutput(task.id, `turn:${output.turnId}`)) continue;
       if (output.text.trim() && this.store.meta(`task-summary:${task.id}`) !== output.text) this.store.setMeta(`task-summary:${task.id}`, output.text);
-      if (output.text.trim() && this.projects.publishCoordinatorFinal(task, output.turnId)) this.notify(task, output.text, `agent-output:${output.id}`);
+      if (output.text.trim() && this.projects.ledger.membership(task.id)?.role !== 'worker' && this.projects.publishCoordinatorFinal(task, output.turnId)) this.notify(task, output.text, `agent-output:${output.id}`);
     }
     for (const request of snapshot.requests) {
       const identity = `${request.connectionEpoch}:${request.id}`;
@@ -872,6 +932,10 @@ export class AgentLoop {
     if (approvals.length && task.status !== 'paused') {
       try {
         task.chatId = await this.groups.open(task.id);
+        if (status === 'running') {
+          const turn = this.workerChatTurn(task, snapshot.threadId, snapshot.turnId);
+          if (turn) this.store.transaction(() => turn.start());
+        }
         assertGroupBinding(this.store, task.id, task.chatId);
         const generation = groupGeneration(this.store, task.id);
         for (const request of approvals) {
@@ -1056,6 +1120,7 @@ export class AgentLoop {
           task.turnId = await this.ports.codex.startTurn({ threadId: threadId, input: prepared, deliveryId: first.id, additionalContext: this.projects.context(task.id), additionalDeliveryIds: initial.slice(1).map(input => input.id) });
           for (const input of initial) this.projects.markCoordinatorInput(task, task.turnId, input);
           this.store.transaction(() => {
+            this.workerChatTurn(task, threadId, task.turnId)?.start();
             for (const input of initial) this.store.markInput(input.id, 'delivered');
             task.status = 'running'; task.executionStatus = 'running'; task.reason = null; this.persist(task);
           });
@@ -1086,6 +1151,7 @@ export class AgentLoop {
       }
       if (task.status === 'paused' || task.status === 'failed') { this.store.markInput(input.id, 'held'); continue; }
       const snapshot = await this.observation(task);
+      this.publishWorkerSnapshot(task, snapshot);
       let prepared: AgentInput[];
       try { prepared = await this.prepare(task, input); }
       catch (error) { this.store.markInput(input.id, 'failed', errorMessage(error)); this.notify(task, `附件准备失败，文字与原文件仍保留，消息尚未投递。\n${errorMessage(error)}`, `attachment:${input.id}`); break; }
@@ -1109,6 +1175,7 @@ export class AgentLoop {
             catch (error) {
               if (!(error instanceof TurnChangedError)) throw error;
               current = await this.inspect(threadId);
+              this.publishWorkerSnapshot(task, current);
               this.closeout.assertOpen(task.id);
               if (current.seenInputIds.includes(input.id)) { this.store.markInput(input.id, 'delivered'); continue; }
               if (current.status === 'running' && current.turnId) await this.ports.codex.steer({ threadId: threadId, turnId: current.turnId, input: prepared, deliveryId: input.id, additionalContext: this.projects.context(task.id) });
@@ -1117,7 +1184,10 @@ export class AgentLoop {
           } else task.turnId = await this.ports.codex.startTurn({ threadId: threadId, input: prepared, deliveryId: input.id, additionalContext: this.projects.context(task.id) });
         }
         if (task.turnId) this.projects.markCoordinatorInput(task, task.turnId, input);
-        this.store.transaction(() => { this.store.markInput(input.id, 'delivered'); task.status = 'running'; task.executionStatus = 'running'; task.reason = null; this.persist(task); });
+        this.store.transaction(() => {
+          this.workerChatTurn(task, threadId, task.turnId)?.start();
+          this.store.markInput(input.id, 'delivered'); task.status = 'running'; task.executionStatus = 'running'; task.reason = null; this.persist(task);
+        });
       } catch (error) {
         if (error instanceof RejectedInputError) { this.store.markInput(input.id, 'failed', errorMessage(error)); this.notify(task, `原生问题回复未被接受，消息已保留。\n${errorMessage(error)}`, `reply-error:${input.id}`); break; }
         this.store.markInput(input.id, 'uncertain', errorMessage(error)); task.executionStatus = 'unknown'; this.persist(task);
@@ -1160,7 +1230,10 @@ export class AgentLoop {
     if (task.threadId) {
       const snapshot = this.projects.ledger.membership(task.id)
         ? await this.inspect(task.threadId) : await this.ports.codex.inspect(task.threadId);
-      if (snapshot.status === 'running' && snapshot.turnId) await this.ports.codex.interrupt({ threadId: task.threadId, turnId: snapshot.turnId });
+      if (snapshot.status === 'running' && snapshot.turnId) {
+        await this.ports.codex.interrupt({ threadId: task.threadId, turnId: snapshot.turnId });
+        if (this.workerChatTurn(task, task.threadId, snapshot.turnId)) this.publishWorkerSnapshot(task, await this.inspect(task.threadId));
+      } else this.publishWorkerSnapshot(task, snapshot);
     }
   }
   async control(taskId: string, action: 'pause' | 'resume' | 'status'): Promise<void> {
@@ -1200,6 +1273,12 @@ export class AgentLoop {
         if (!approval) this.store.markOutput(output.id, 'dropped', '任务当前无群，不补发历史');
         continue;
       }
+      const worker = this.store.workerOutput(output.id);
+      if (worker && worker.chat_id !== chatId) {
+        this.store.markOutput(output.id, 'dropped', '任务群绑定已改变');
+        continue;
+      }
+      if (worker?.kind === 'ended' && this.store.hasUndeliveredWorkerBody(worker.turn_key, chatId)) continue;
       this.store.markOutput(output.id, 'sending');
       try {
         if (native) {
