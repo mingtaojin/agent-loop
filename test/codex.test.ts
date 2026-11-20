@@ -106,9 +106,11 @@ createInterface({ input: process.stdin }).on('line', line => {
   if (mode.startsWith('workspace')) send({ id: 'workspace-wire', method: 'item/tool/call', params: { threadId: mode === 'workspace-unknown' ? 'unknown-thread' : 'thread-1', turnId: mode === 'workspace-stale' ? 'old-turn' : turns.at(-1).id, callId: 'workspace-call', tool: 'ensure_workspace', arguments: mode === 'workspace-project' ? { projectId: 'project-fixture' } : mode === 'workspace-ambiguous' ? { projectId: 'project-fixture', repository: 'example/one' } : mode === 'workspace-project-path' ? { projectId: 'project-fixture', path: '/invented/path' } : { repository: 'example/one' } } });
   if (mode === 'outputs') {
     const item = { id: 'progress-1', type: 'agentMessage', phase: 'commentary', text: 'Complete progress sentence.' };
-    turns.at(-1).items.push(item, { id: 'reasoning-1', type: 'reasoning', text: 'private reasoning' }, { id: 'tool-1', type: 'commandExecution', text: 'raw tool log' }, { id: 'incomplete-1', type: 'agentMessage', phase: 'final_answer', text: 'partial' });
+    const partial = { id: 'partial-1', type: 'agentMessage', phase: 'partial_answer', text: 'First part of the answer.' };
+    const completeFinal = { id: 'complete-final', type: 'agentMessage', phase: 'final_answer', text: 'Complete final before turn end.' };
+    turns.at(-1).items.push(item, partial, completeFinal, { id: 'reasoning-1', type: 'reasoning', text: 'private reasoning' }, { id: 'tool-1', type: 'commandExecution', text: 'raw tool log' }, { id: 'incomplete-1', type: 'agentMessage', phase: 'final_answer', text: 'partial' });
     send({ method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: turns.at(-1).id, itemId: 'incomplete-1', delta: 'partial' } });
-    send({ method: 'item/completed', params: { threadId: 'thread-1', turnId: turns.at(-1).id, item } });
+    for (const output of [item, partial, completeFinal]) send({ method: 'item/completed', params: { threadId: 'thread-1', turnId: turns.at(-1).id, item: output } });
   }
   if (['approval', 'file-approval', 'permissions', 'question', 'multi-question', 'unsupported', 'mcp-unsupported', 'expired', 'nonblocking-question', 'unconfirmed-approval', 'lost-approval', 'duplicate-approval', 'recover-request'].includes(mode)) {
    let method = 'item/commandExecution/requestApproval';
@@ -642,17 +644,29 @@ test('an approval without native resolution stays uncertain and cannot be replay
 });
 
 
-test('completed progress survives repeated snapshots without leaking deltas, reasoning or tools', async t => {
+test('completed assistant phases reach running and completed snapshots without leaking deltas, reasoning or tools', async t => {
   const server = adapter('outputs'); t.after(() => server.close());
   const active = await start(server);
   const first = await server.inspect(active.threadId);
-  assert.deepEqual(first.outputs.map(output => [output.phase, output.text]), [['progress', 'Complete progress sentence.']]);
+  assert.deepEqual(first.outputs.map(output => output.text), ['Complete progress sentence.', 'First part of the answer.', 'Complete final before turn end.']);
+  const running = await server.activity(active.threadId);
+  assert.equal(running.kind, 'running');
+  assert.deepEqual(running.outputs, first.outputs);
   assert.deepEqual((await server.inspect(active.threadId)).outputs, first.outputs);
   await server.steer({ ...active, deliveryId: 'complete', input: [] });
   const done = await server.inspect(active.threadId);
-  assert.equal(done.outputs.length, 2);
-  assert.deepEqual(done.outputs.map(output => output.id), ['thread-1:turn-1:progress-1', 'thread-1:turn-1:agent-final']);
-  assert.equal(done.outputs[1]?.phase, 'final');
+  assert.deepEqual(done.outputs.map(output => output.id), ['thread-1:turn-1:progress-1', 'thread-1:turn-1:partial-1', 'thread-1:turn-1:complete-final', 'thread-1:turn-1:agent-final']);
+  assert.equal(done.outputs.at(-1)?.phase, 'final');
+});
+
+test('interrupt retains finished messages and excludes unfinished assistant text', async t => {
+  const server = adapter('outputs'); t.after(() => server.close());
+  const active = await start(server);
+  const before = await server.inspect(active.threadId);
+  await server.interrupt(active);
+  const after = await server.inspect(active.threadId);
+  assert.equal(after.status, 'interrupted');
+  assert.deepEqual(after.outputs, before.outputs);
 });
 
 test('workspace provisioning remains asynchronous while an RPC and callback inspect are pending', async t => {

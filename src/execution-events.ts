@@ -3,7 +3,7 @@ import { z } from 'zod';
 export const executionEventSchema = z.object({
   threadId: z.string(), turnId: z.string().nullable(), itemId: z.string().nullable(),
   kind: z.enum(['agent_start', 'agent_delta', 'agent_message', 'tool_start', 'tool_output', 'tool_end', 'turn_start', 'turn_end', 'turn_status', 'error']),
-  label: z.string(), text: z.string(), createdAt: z.number(),
+  label: z.string(), text: z.string(), createdAt: z.number(), isFinalAnswer: z.boolean().optional(),
 });
 export type ExecutionEvent = z.infer<typeof executionEventSchema>;
 export type VisibleExecution = Omit<ExecutionEvent, 'createdAt'> & { key: string; seq: number; taskId: string; createdAt: number | null };
@@ -57,7 +57,7 @@ export function executionEvent(method: string, params: unknown): ExecutionEvent 
   const { threadId, turnId, item } = parsed.data;
   const scope = { ...base, threadId, turnId, itemId: item.id };
   if (item.type === 'agentMessage') {
-    return { ...scope, kind: method === 'item/started' ? 'agent_start' : 'agent_message', label: item.phase === 'final_answer' ? '最终回答' : 'Agent', text: item.text };
+    return { ...scope, kind: method === 'item/started' ? 'agent_start' : 'agent_message', label: item.phase === 'final_answer' ? '最终回答' : 'Agent', ...(item.phase === 'final_answer' ? { isFinalAnswer: true } : {}), text: item.text };
   }
   const kind = method === 'item/started' ? 'tool_start' : 'tool_end';
   switch (item.type) {

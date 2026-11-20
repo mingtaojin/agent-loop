@@ -303,20 +303,67 @@ test('external comments do not answer a native Worker question while owner input
   assert.equal(f.codex.replies[0]?.text, 'user answer');
 });
 
-test('Feishu forwards only final answers during execution and after restart', async t => {
-  const f = await fixture(t); await f.manual();
-  const snapshot = f.snapshot(); assert.ok(snapshot.turnId);
-  const initialMessages = [...f.feishu.sent];
-  snapshot.outputs.push({ id: 'progress', threadId: snapshot.threadId, turnId: snapshot.turnId, phase: 'progress', text: 'Still investigating.' });
-  await f.loop.tick(); await f.loop.tick();
-  assert.equal(f.task().status, 'running');
-  assert.deepEqual(f.feishu.sent, initialMessages);
+test('Worker groups see each complete answer and the current turn status across restarts', async t => {
+  const f = await fixture(t);
+  const task = await f.manual();
+  const snapshot = f.snapshot();
+  assert.ok(task.chatId && snapshot.turnId);
+  const sent = () => f.feishu.sent.filter(message => message.chatId === task.chatId && !message.text.startsWith('任务对话已建立。')).map(message => message.text);
+  await f.loop.tick();
+  assert.deepEqual(sent(), ['处理中']);
+
+  const question = '❓ Q4. Display both statuses?\n❓ Q5. Group by project?';
+  const answer = 'The current dashboard groups by project.';
+  const summary = 'Two decisions are pending.';
+  const scope = { threadId: snapshot.threadId, turnId: snapshot.turnId };
+  snapshot.outputs.push({ ...scope, id: 'questions', phase: 'progress', text: question });
+  await f.loop.tick();
+  assert.deepEqual(sent(), ['处理中', question, '处理中']);
   await f.restart();
-  assert.deepEqual(f.feishu.sent, initialMessages);
-  f.codex.complete(snapshot.threadId, 'Final answer.');
-  await f.loop.tick(); await f.loop.tick(); await f.restart();
-  assert.deepEqual(f.feishu.sent.slice(initialMessages.length).map(output => output.text), ['Final answer.']);
+  snapshot.outputs.push({ ...scope, id: 'partial-answer', phase: 'progress', text: answer });
+  await f.loop.tick(); await f.loop.tick();
+  const running = ['处理中', question, '处理中', answer, '处理中'];
+  assert.deepEqual(sent(), running);
+
+  snapshot.outputs.push({ ...scope, id: 'final', phase: 'final', text: summary });
+  await f.loop.tick();
+  const awaitingTurnEnd = [...running, summary, '处理中'];
+  assert.deepEqual(sent(), awaitingTurnEnd);
+  f.codex.complete(snapshot.threadId, null);
+  await f.loop.tick(); await f.restart(); await f.loop.tick();
+  assert.deepEqual(sent(), [...awaitingTurnEnd, '本轮已结束']);
   assert.equal(f.task().status, 'idle');
+
+  await f.loop.receive(f.message('next-turn', 'I confirm both.', task.chatId, 'group'));
+  await f.loop.tick();
+  assert.deepEqual(sent(), [...awaitingTurnEnd, '本轮已结束', '处理中']);
+});
+
+test('a completed Worker message reaches its group before the next poll and survives repeated events', { timeout: 5000 }, async t => {
+  const f = await fixture(t);
+  f.config.executionPollMs = 60_000;
+  await f.loop.start();
+  const task = await f.manual();
+  await f.loop.tick();
+  const snapshot = f.snapshot();
+  assert.ok(task.chatId && snapshot.turnId && f.codex.onEvent);
+  const before = f.feishu.sent.length;
+  const scope = { threadId: snapshot.threadId, turnId: snapshot.turnId };
+  const item = { ...scope, itemId: 'questions', label: 'Agent', createdAt: Date.now() };
+  const text = 'Q4. First question\nQ5. Second question';
+  const delivered = gate();
+  const send = f.feishu.send.bind(f.feishu);
+  f.feishu.send = async input => {
+    await send(input);
+    if (input.chatId === task.chatId && input.text === text) delivered.resolve();
+  };
+  f.codex.onEvent({ ...item, kind: 'agent_delta', text: 'Q4.' });
+  snapshot.outputs.push({ ...scope, id: `${scope.threadId}:${scope.turnId}:questions`, phase: 'progress', text });
+  f.codex.onEvent({ ...item, kind: 'agent_message', text });
+  await delivered.promise;
+  f.codex.onEvent({ ...item, kind: 'agent_message', text });
+  await f.loop.tick(); await f.restart();
+  assert.deepEqual(f.feishu.sent.slice(before).filter(message => message.chatId === task.chatId).map(message => message.text), [text, '处理中']);
 });
 
 test('final answers route once per task and uncertain sends are never blindly replayed', async t => {
@@ -329,12 +376,19 @@ test('final answers route once per task and uncertain sends are never blindly re
     snapshot.outputs.push({ id: 'same-local-id', threadId: snapshot.threadId, turnId: snapshot.turnId, phase: 'progress', text: `Progress for ${task.id}` });
     f.codex.complete(snapshot.threadId, `Answer for ${task.id}`);
   }
-  f.feishu.loseSendAck = true; await f.loop.tick(); await f.restart(); await f.loop.tick();
+  const send = f.feishu.send.bind(f.feishu);
+  f.feishu.send = async input => {
+    if (input.chatId === first.chatId && input.text === `Answer for ${first.id}`) f.feishu.loseSendAck = true;
+    await send(input);
+  };
+  await f.loop.tick(); await f.restart(); await f.loop.tick();
   for (const task of [first, second]) {
-    assert.equal(f.feishu.sent.filter(output => output.text === `Progress for ${task.id}` && output.chatId === task.chatId).length, 0);
+    assert.equal(f.feishu.sent.filter(output => output.text === `Progress for ${task.id}` && output.chatId === task.chatId).length, 1);
     assert.equal(f.feishu.sent.filter(output => output.text === `Answer for ${task.id}` && output.chatId === task.chatId).length, 1);
   }
-  assert.ok(f.loop.tasks().some(task => f.loop.store.outputs(task.id).some(output => output.status === 'uncertain')));
+  assert.ok(f.loop.store.outputs(first.id).some(output => output.text === `Answer for ${first.id}` && output.status === 'uncertain'));
+  assert.equal(f.feishu.sent.filter(output => output.chatId === first.chatId && output.text === '本轮已结束').length, 0);
+  assert.equal(f.feishu.sent.filter(output => output.chatId === second.chatId && output.text === '本轮已结束').length, 1);
 });
 
 for (const status of ['interrupted', 'failed'] as const) test(`confirmed ${status} execution recovers only within configured limit`, async t => {
@@ -372,6 +426,7 @@ for (const status of ['interrupted', 'failed'] as const) test(`owner follow-up r
   const original = await f.manual();
   f.snapshot().status = status; await f.loop.tick();
   assert.equal(f.task().status, 'failed');
+  assert.equal(f.feishu.sent.filter(message => message.chatId === original.chatId && message.text === '本轮已结束').length, 1);
   const followUp = f.message('continue', 'Continue the assigned work', original.chatId!, 'group');
   await f.loop.receive(followUp);
   assert.equal(f.task().status, 'running');

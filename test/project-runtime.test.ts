@@ -67,6 +67,7 @@ test('delegated workers and secondWorkers stay group-less until the coordinator 
   assert.ok(worker.threadId);
   const snapshot = f.codex.snapshot(worker.threadId);
   assert.ok(snapshot.turnId);
+  snapshot.outputs.push({ id: 'private-progress', threadId: worker.threadId, turnId: snapshot.turnId, phase: 'progress', text: 'Draft before the group opened.' });
   snapshot.requests = [{ id: 'clarify', threadId: worker.threadId, turnId: snapshot.turnId, kind: 'question',
     prompt: 'Which behavior is intended?', method: 'item/tool/requestUserInput', payload: {}, isBlocking: true, connectionEpoch: 'live' }];
   await f.loop.tick();
@@ -85,7 +86,7 @@ test('delegated workers and secondWorkers stay group-less until the coordinator 
   assert.match(sent[0]!.text, /当前摘要：Current investigation summary/);
   assert.ok(!sent.some(output => output.text === 'Which behavior is intended?'));
   await f.openGroup(worker.id);
-  await f.openGroup(worker.id, 'another-open');
+  await f.openGroup(worker.id, 'another-open'); await f.restart(); await f.loop.tick();
   assert.equal(f.feishu.groups.size, 3);
   assert.equal(f.feishu.sent.filter(output => output.chatId === opened.chatId).length, 1);
   await assert.rejects(f.loop.projectAction(worker.id, { action: 'open_group', requestId: 'forbidden', taskId: worker.id }), /Only the coordinator/);
@@ -151,6 +152,32 @@ test('approval notices use the current group when retirement races with old-grou
   assert.equal(notices.length, 1);
   assert.ok(notices[0]?.text.includes(encodeURIComponent(replacement.chatId)));
   assert.ok(!notices[0]?.text.includes(encodeURIComponent(current.chatId)));
+});
+
+test('a replacement Worker group ignores late messages from an older finished turn', async t => {
+  const f = await fixture(t);
+  await f.initialize();
+  const worker = await f.dispatch('late-event', 'Discuss scope');
+  assert.ok(worker.threadId);
+  const group = await f.openGroup(worker.id);
+  await f.loop.tick();
+  assert.ok(group.chatId);
+  const oldTurnId = f.codex.snapshot(worker.threadId).turnId;
+  assert.ok(oldTurnId);
+  for (const next of ['second', 'third']) {
+    f.codex.complete(worker.threadId, 'Summary');
+    await f.loop.tick();
+    await f.loop.receive(f.message(next, 'Continue', group.chatId));
+    await f.loop.tick();
+  }
+  await f.feishu.dissolveGroup(group.chatId);
+  await f.restart();
+  const replacement = await f.openGroup(worker.id, 'reopen');
+  const sent = f.feishu.sent.length;
+  f.codex.onEvent?.({ threadId: worker.threadId, turnId: oldTurnId, itemId: 'late',
+    kind: 'agent_message', createdAt: Date.now(), label: 'Agent', text: 'Old discussion' });
+  await f.loop.tick();
+  assert.deepEqual(f.feishu.sent.slice(sent).filter(message => message.chatId === replacement.chatId), []);
 });
 
 test('a manually dissolved direct-worker group stays absent through recovery and can be reopened explicitly', async t => {
@@ -671,10 +698,15 @@ test('background coordinator events stay local until an idempotent typed announc
 test('a direct project-group message keeps the coordinator final reply visible', async t => {
   const f = await fixture(t); const coordinator = await f.initialize(); await f.idleCoordinator();
   const message = f.message('direct-coordinator', '请说明当前任务状态。', coordinator.chatId!);
+  const messages = () => f.feishu.sent.filter(output => output.chatId === coordinator.chatId).map(output => output.text);
+  const before = messages();
   await f.loop.receive(message);
-  const running = f.loop.store.task(coordinator.id); assert.ok(running.threadId);
+  const running = f.loop.store.task(coordinator.id); assert.ok(running.threadId && running.turnId);
+  f.codex.snapshot(running.threadId).outputs.push({ id: 'intermediate', threadId: running.threadId, turnId: running.turnId, phase: 'progress', text: '正在核实任务进度。' });
+  await f.loop.tick();
+  assert.deepEqual(messages(), before);
   f.codex.complete(running.threadId, '当前任务仍在调查。'); await f.loop.tick();
-  assert.ok(f.feishu.sent.some(output => output.chatId === coordinator.chatId && output.text === '当前任务仍在调查。'));
+  assert.deepEqual(messages(), [...before, '当前任务仍在调查。']);
 });
 
 test('Feature implementation needs owner authorization while investigation remains allowed', async t => {
