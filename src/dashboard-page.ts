@@ -177,7 +177,7 @@ async function loadDetail(id, generation) {
   entries = (detail.history?.kind === 'unavailable' ? [...new Map([...entries, ...timeline].map(entry => [entry.id, entry])).values()] : timeline).slice(-500);
   lastSeq = detail.cursor;
   if (detail.history?.kind === 'unavailable') retryDetail(); else { needsDetail = false; detailRetryDelay = 1000; }
-  showError(detail.history?.kind === 'unavailable' ? 'Codex 历史暂不可用；业务记录和实时更新仍可查看' : '');
+  showError(detail.history?.kind === 'unavailable' ? (detail.history.reason || 'Codex 历史暂不可用') + '；业务记录仍可查看' : '');
   renderTaskHeader(); renderTimeline(); renderHistory(); renderDiagnostics(); return true;
 }
 function renderHistory() { const target = $('history'); if (!detail) { target.replaceChildren(); return; } const fragment = document.createDocumentFragment(); for (const input of detail.inputs || []) fragment.append(node('article','history-message',input.text)); for (const output of detail.outputs || []) fragment.append(node('article','history-message',output.text)); if (!fragment.childNodes.length) fragment.append(node('div','sidebar-empty','还没有消息')); target.replaceChildren(fragment); }
@@ -186,7 +186,13 @@ async function selectTask(id, recovering = false) {
   const generation = ++selectionGeneration;
   if (stream) stream.close(); stream = null;
   selectedId = id; detailLoading = true;
-  if (!recovering || detail?.threadId !== currentTask()?.threadId) { detail = null; entries = []; lastSeq = 0; stageDisclosure.clear(); needsDetail = false; detailRetryDelay = 1000; }
+  if (!recovering) { detail = null; entries = []; lastSeq = 0; stageDisclosure.clear(); needsDetail = false; detailRetryDelay = 1000; }
+  else if (detail?.threadId !== currentTask()?.threadId) {
+    detail = detail ? { ...detail, threadId: currentTask()?.threadId, history: { kind: 'unavailable', reason: 'Thread 已变更，正在重新读取 Codex 历史' }, timeline: [], events: [] } : null;
+    entries = []; lastSeq = 0; stageDisclosure.clear();
+    connection(false, 'Thread 已变更，正在重新读取'); $('stream-status').textContent = 'RECONNECTING · 重新读取执行记录';
+    showError('Thread 已变更，正在重新读取 Codex 历史；业务记录仍可查看');
+  }
   renderTimeline(); renderHistory(); renderDiagnostics();
   renderWorkers(); renderTaskHeader();
   if (!recovering) $('task-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -198,7 +204,16 @@ async function selectTask(id, recovering = false) {
   stream = new EventSource('/api/events?taskId=' + encodeURIComponent(id) + '&after=' + encodeURIComponent(lastSeq) + '&threadId=' + encodeURIComponent(detail.threadId || ''));
   stream.onopen = () => { if (generation !== selectionGeneration || selectedId !== id) return; connection(true,'实时连接已建立'); $('stream-status').textContent = 'LIVE · 接收执行事件'; };
   stream.onerror = () => { if (generation !== selectionGeneration || selectedId !== id) return; connection(false,'连接中断，正在重连'); $('stream-status').textContent = 'RECONNECTING · 自动续接'; };
-  stream.addEventListener('reset', () => { if (generation !== selectionGeneration || selectedId !== id) return; if (stream) stream.close(); stream = null; detail = null; entries = []; stageDisclosure.clear(); renderTimeline(); renderHistory(); if (!needsDetail) retryDetail(); });
+  stream.addEventListener('reset', () => {
+    if (generation !== selectionGeneration || selectedId !== id) return;
+    ++selectionGeneration;
+    stream.close(); stream = null;
+    detail = { ...detail, history: { kind: 'unavailable', reason: '执行记录已重置，正在重新读取 Codex 历史' }, timeline: [], events: [] };
+    entries = []; stageDisclosure.clear(); renderTimeline(); renderHistory();
+    connection(false, '执行记录已重置，正在重新读取'); $('stream-status').textContent = 'RECONNECTING · 重新读取执行记录';
+    showError(detail.history.reason + '；业务记录仍可查看');
+    if (!needsDetail) retryDetail();
+  });
   stream.addEventListener('execution', message => { if (generation !== selectionGeneration || selectedId !== id) return; try { mergeEvent(JSON.parse(message.data)); } catch (error) { showError('事件读取失败：' + error.message); } });
 }
 async function refresh() {
@@ -206,7 +221,7 @@ async function refresh() {
   try {
     const response = await fetch('/api/snapshot'); if (!response.ok) throw new Error('读取看板失败 · HTTP ' + response.status);
     snapshot = await response.json(); snapshotStale = false; snapshotReceivedAt = Date.now();
-    showError(detail?.history?.kind === 'unavailable' ? 'Codex 历史暂不可用；业务记录和实时更新仍可查看' : ''); renderRuntime(); renderWorkers();
+    showError(detail?.history?.kind === 'unavailable' ? (detail.history.reason || 'Codex 历史暂不可用') + '；业务记录仍可查看' : ''); renderRuntime(); renderWorkers();
     if (selectedId && !allTasks().some(task => task.id === selectedId)) { if (stream) stream.close(); stream = null; selectedId = null; detail = null; entries = []; needsDetail = false; ++selectionGeneration; detailLoading = false; }
     if (selectedId && detail && allTasks().find(task => task.id === selectedId)?.threadId !== detail.threadId) await selectTask(selectedId, true);
     else if (selectedId && !detailLoading && needsDetail && Date.now() >= detailRetryAt) await selectTask(selectedId, true);

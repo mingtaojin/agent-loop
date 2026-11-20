@@ -24,8 +24,6 @@ export async function startDashboard(options: { execution?: LiveExecution; dataD
     if (!store && existsSync(join(options.dataDir, 'tasks.sqlite'))) store = new Store(options.dataDir, { readOnly: true });
     return store;
   };
-  // Open the read-only connection before listening so the first API request measures the
-  // dashboard query rather than SQLite connection and schema setup.
   readStore();
   const json = (response: ServerResponse, status: number, value: unknown) => {
     response.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });

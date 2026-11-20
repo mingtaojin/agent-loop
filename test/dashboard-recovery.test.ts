@@ -17,15 +17,18 @@ class Element {
   addEventListener() {}
   removeAttribute() {}
   scrollIntoView() {}
+  get innerText(): string { return [this.textContent, ...this.childNodes.map(child => child.innerText)].join('\n'); }
 }
 
-async function browser(options: { threadId: string | null; unavailable?: boolean; runtime?: { pid: number; lastSeenAt: number; intervalMs: number; status: 'running' | 'stopped' } }) {
+async function browser(options: { threadId: string | null; unavailable?: boolean; beforeDetail?: () => Promise<void>; runtime?: { pid: number; lastSeenAt: number; intervalMs: number; status: 'running' | 'stopped' } }) {
   const elements = new Map<string, Element>();
   const element = (id: string) => { let result = elements.get(id); if (!result) { result = new Element(); elements.set(id, result); } return result; };
   const requests: string[] = [];
   const streams: Stream[] = [];
   class Stream {
     closed = false;
+    onopen = () => {};
+    onerror = () => {};
     listeners = new Map<string, (message: { data: string }) => void>();
     constructor(readonly url: string) { streams.push(this); }
     close() { this.closed = true; }
@@ -33,7 +36,7 @@ async function browser(options: { threadId: string | null; unavailable?: boolean
     emit(name: string, value: unknown = {}) { this.listeners.get(name)?.({ data: JSON.stringify(value) }); }
   }
   let now = 0, unavailable = options.unavailable ?? false, snapshotUnavailable = false;
-  const task = { id: 'task', title: 'Task', threadId: options.threadId, status: 'running', role: 'worker', updatedAt: 0 };
+  const task = { id: 'task', title: 'Task', threadId: options.threadId, status: 'running', role: 'worker', updatedAt: 0, latestReport: { text: 'Business report', createdAt: 0 } };
   const context = createContext({
     document: { getElementById: element, createElement: () => new Element(), createDocumentFragment: () => new Element(), querySelectorAll: () => [] },
     EventSource: Stream,
@@ -42,9 +45,10 @@ async function browser(options: { threadId: string | null; unavailable?: boolean
     fetch: async (url: string) => {
       requests.push(url);
       if (url === '/api/snapshot' && snapshotUnavailable) throw new Error('Snapshot unavailable');
+      if (url !== '/api/snapshot') await options.beforeDetail?.();
       return { ok: true, status: 200, json: async () => url === '/api/snapshot'
         ? { tasks: [task], projects: [], now, runtime: options.runtime ?? null, dataDir: '/test' }
-        : { task, threadId: task.threadId, cursor: 'epoch:0', history: { kind: unavailable ? 'unavailable' : 'available' }, timeline: unavailable ? [] : [{ id: 'historical', kind: 'agent_message', text: 'Recovered answer', createdAt: 0 }], inputs: [], outputs: [], diagnostics: [] } };
+        : { task, threadId: task.threadId, cursor: 'epoch:0', history: { kind: unavailable ? 'unavailable' : 'available' }, timeline: unavailable ? [] : [{ id: 'historical', kind: 'agent_message', text: 'Recovered answer', createdAt: 0 }], inputs: [{ text: 'Business input' }], outputs: [{ text: 'Business output' }], diagnostics: [] } };
     },
   });
   runInContext(dashboardScript, context);
@@ -89,6 +93,84 @@ test('reset notifications do not create an immediate detail subscription loop fo
   assert.equal(first.closed, true);
   await page.refresh(60000);
   assert.equal(page.streams.length, 2);
+});
+
+test('reset retains business messages and shows recovery through snapshot polling before retry', async () => {
+  const page = await browser({ threadId: 'thread' });
+  await page.select();
+  const first = page.streams[0]!;
+  first.onopen();
+  assert.match(page.element('stream-status').textContent, /LIVE/);
+  assert.match(page.element('output').innerText, /Recovered answer/);
+  first.emit('reset');
+  await page.refresh(500);
+  assert.match(page.element('history').innerText, /Business input/);
+  assert.match(page.element('history').innerText, /Business output/);
+  assert.match(page.element('task-summary').innerText, /Business report/);
+  assert.equal(page.element('event-count').textContent, '0 条事件');
+  assert.doesNotMatch(page.element('output').innerText, /Recovered answer/);
+  assert.equal(page.element('page-error').hidden, false);
+  assert.match(page.element('page-error').textContent, /不可用|重新读取/);
+  assert.match(page.element('connection-text').textContent, /重连|重新读取/);
+  assert.match(page.element('stream-status').textContent, /RECONNECTING/);
+  assert.equal(first.closed, true);
+  assert.equal(page.streams.length, 1);
+  assert.equal(page.requests.filter(url => url === '/api/tasks/task').length, 1);
+
+  first.onopen();
+  assert.match(page.element('stream-status').textContent, /RECONNECTING/);
+  first.onerror();
+  first.emit('execution', { taskId: 'task', threadId: 'thread', key: 'late', turnId: 'turn', kind: 'agent_message', text: 'Closed stream answer', createdAt: 1 });
+  assert.equal(page.element('event-count').textContent, '0 条事件');
+  assert.match(page.element('stream-status').textContent, /RECONNECTING/);
+
+  await page.refresh(500);
+  assert.equal(page.streams.length, 2);
+  page.streams[1]!.onopen();
+  assert.equal(page.element('page-error').hidden, true);
+  assert.match(page.element('stream-status').textContent, /LIVE/);
+  assert.match(page.element('output').innerText, /Recovered answer/);
+  assert.doesNotMatch(page.element('output').innerText, /Closed stream answer/);
+});
+
+test('Thread rebind during reset recovery retains business facts while the new detail is loading', async () => {
+  let detailReady = Promise.resolve(), releaseDetail = () => {};
+  const page = await browser({ threadId: 'thread-a', beforeDetail: () => detailReady });
+  await page.select();
+  const first = page.streams[0]!;
+  first.onopen();
+  first.emit('reset');
+  detailReady = new Promise<void>(resolve => { releaseDetail = resolve; });
+  page.rebind('thread-b');
+  const refresh = page.refresh(500);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  try {
+    assert.match(page.element('history').innerText, /Business input/);
+    assert.match(page.element('history').innerText, /Business output/);
+    assert.match(page.element('task-summary').innerText, /Business report/);
+    assert.equal(page.element('event-count').textContent, '0 条事件');
+    assert.doesNotMatch(page.element('output').innerText, /Recovered answer/);
+    assert.equal(page.element('page-error').hidden, false);
+    assert.match(page.element('page-error').textContent, /重新读取/);
+    first.onopen();
+    first.emit('execution', { taskId: 'task', threadId: 'thread-a', key: 'late', turnId: 'turn', kind: 'agent_message', text: 'Previous Thread answer', createdAt: 1 });
+    assert.equal(page.element('event-count').textContent, '0 条事件');
+    assert.match(page.element('stream-status').textContent, /RECONNECTING/);
+  } finally {
+    releaseDetail();
+    await refresh;
+  }
+  assert.match(page.streams[1]!.url, /threadId=thread-b/);
+  assert.equal(page.element('event-count').textContent, '0 条事件');
+  assert.match(page.element('history').innerText, /Business input/);
+  page.recover();
+  await page.refresh(1000);
+  assert.equal(page.streams.length, 2);
+  await page.refresh(1000);
+  page.streams[2]!.onopen();
+  assert.equal(page.element('page-error').hidden, true);
+  assert.match(page.element('stream-status').textContent, /LIVE/);
+  assert.doesNotMatch(page.element('output').innerText, /Previous Thread answer/);
 });
 
 test('live item upserts retain at most five hundred visible timeline entries', async () => {
