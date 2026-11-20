@@ -21,3 +21,5 @@ Runtime 从 Worker 任务中收集用户消息的 `messageId`、`chatId` 和 `se
 路由先通过项目成员关系校验。Worker 不能为其他项目创建汇报。中间汇报没有有效任务群时失败关闭，不降级发送给协调者。跨群汇报使用 Worker 群明确请求汇报的所有者消息 ID 作为 `requestId`。Runtime 校验实际收到的消息及其当前群绑定。同一消息只对应一份汇报，投递记录与回执一起写入 SQLite。
 
 这项决策只改变 Worker `report` 的去向。普通用户输入仍按任务群路由，原生问题、审批和权限请求仍使用原有路径。项目协调者仍只能通过 `announce` 发送协调群公告。
+
+2026-11-20 的 [ADR 0024](0024-worker-result-delivery.md) 新增独立的 `deliver_result` 交付通知。Worker 明确登记成果后，Runtime 在匹配执行成功结束时自动写入协调者 inbox，不要求群或所有者汇报请求。本 ADR 对显式 `report` 的校验继续有效。普通 final 不构成交付声明。

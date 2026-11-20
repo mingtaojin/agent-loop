@@ -34,6 +34,341 @@ class ProjectCodexFake extends CodexFake {
   }
 }
 
+async function nativeWorkerAction(f: Awaited<ReturnType<typeof fixture>>, taskId: string, action: ProjectAction) {
+  const task = f.loop.store.task(taskId);
+  assert.ok(task.threadId && f.codex.projectHandler);
+  const snapshot = f.codex.snapshot(task.threadId);
+  assert.ok(snapshot.turnId);
+  return f.codex.projectHandler({ threadId: task.threadId, turnId: snapshot.turnId,
+    connectionEpoch: 'fake-epoch', callId: action.action === 'status' ? 'status' : action.requestId, action });
+}
+
+function deliverResult(requestId = 'delivery-attempt-1', resultId = 'result-v1'): Extract<ProjectAction, { action: 'deliver_result' }> {
+  return { action: 'deliver_result', requestId, resultId, text: 'Verified deliverable. Independent review remains pending.',
+    deliveryReferences: ['https://github.com/example/app/pull/42', 'docs/verification.md'] };
+}
+
+for (const grouped of [false, true]) for (const running of [false, true]) {
+  test(`Worker deliverable reaches its coordinator once with grouped=${grouped} running=${running} and no owner request`, async t => {
+    const f = await fixture(t); await f.initialize();
+    const worker = await f.dispatch('deliverable', 'Produce the agreed deliverable.');
+    if (grouped) await f.openGroup(worker.id);
+    if (!running) await f.idleCoordinator();
+    const coordinator = f.coordinator(), groups = f.feishu.groups.size;
+    const starts = f.codex.starts.length, steers = f.codex.steers.length;
+    const receipt = await nativeWorkerAction(f, worker.id, deliverResult());
+    assert.deepEqual(await nativeWorkerAction(f, worker.id, deliverResult()), receipt);
+    await f.loop.tick();
+    assert.equal(f.events(coordinator.id, 'worker_result').length, 0);
+    assert.equal(f.codex.starts.length, starts); assert.equal(f.codex.steers.length, steers);
+    f.codex.complete(worker.threadId!, 'Task group final with a different wording.');
+    await f.loop.tick(); await f.loop.tick();
+    const events = f.events(coordinator.id, 'worker_result');
+    assert.equal(events.length, 1); assert.equal(events[0]?.status, 'delivered');
+    assert.match(events[0]!.message.text, /Verified deliverable/);
+    assert.match(events[0]!.message.text, /result-v1/);
+    assert.match(JSON.stringify(events[0]), /docs\/verification\.md/);
+    assert.ok(events[0]?.provenance.kind === 'agent');
+    assert.equal(events[0].provenance.taskId, worker.id);
+    assert.equal(f.codex.starts.length, starts + (running ? 0 : 1));
+    assert.equal(f.codex.steers.length, steers + (running ? 1 : 0));
+    assert.equal(f.feishu.groups.size, groups);
+    assert.equal(f.loop.closeout.completed(worker.id), false);
+    assert.equal(f.loop.store.meta(`task-summary:${worker.id}`), 'Task group final with a different wording.');
+    assert.equal(f.loop.store.outputs(worker.id).filter(output => output.text.includes('Task group final')).length, 1);
+    const group = f.loop.store.task(worker.id).chatId;
+    assert.equal(group !== null, grouped);
+    if (group) assert.equal(f.feishu.sent.filter(output => output.chatId === group && output.text.includes('Task group final')).length, 1);
+    await f.restart(); await f.loop.tick(); await f.loop.tick();
+    assert.equal(f.events(coordinator.id, 'worker_result').length, 1);
+    assert.equal(f.codex.starts.length, starts + (running ? 0 : 1));
+    assert.equal(f.codex.steers.length, steers + (running ? 1 : 0));
+  });
+}
+
+test('Worker delivery survives a restart before successful completion and a lost coordinator delivery response', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('durable-delivery', 'Produce evidence.'); await f.idleCoordinator();
+  const action = deliverResult();
+  const receipt = await nativeWorkerAction(f, worker.id, action);
+  await f.restart();
+  assert.deepEqual(await nativeWorkerAction(f, worker.id, action), receipt);
+  const starts = f.codex.starts.length;
+  f.codex.complete(worker.threadId!, null);
+  f.codex.loseInputAck = true;
+  await f.loop.tick(); await f.loop.tick();
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
+  assert.equal(f.codex.starts.length, starts + 1);
+  await f.restart(); await f.loop.tick();
+  assert.equal(f.events(f.coordinator().id, 'worker_result')[0]?.status, 'delivered');
+  assert.equal(f.codex.starts.length, starts + 1);
+});
+
+test('a verified Worker result survives connection rollover while new calls from the old epoch are rejected', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('reconnected-delivery', 'Deliver evidence.');
+  assert.ok(worker.threadId && f.codex.projectHandler);
+  const snapshot = f.codex.snapshot(worker.threadId); assert.ok(snapshot.turnId);
+  let epoch = 'connection-before';
+  f.codex.isActiveTurn = identity => identity.connectionEpoch === epoch && identity.threadId === worker.threadId
+    && identity.turnId === snapshot.turnId && snapshot.status === 'running';
+  const request = { threadId: worker.threadId, turnId: snapshot.turnId, callId: 'reconnected-result',
+    connectionEpoch: epoch, action: deliverResult() };
+  const receipt = await f.codex.projectHandler(request);
+  epoch = 'connection-after';
+  await assert.rejects(f.codex.projectHandler(request), /active/i);
+  await f.restart(); assert.ok(f.codex.projectHandler);
+  assert.deepEqual(await f.codex.projectHandler({ ...request, connectionEpoch: epoch }), receipt);
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
+  f.codex.complete(worker.threadId, null); await f.loop.tick(); await f.loop.tick(); await f.restart();
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
+  assert.equal(f.events(f.coordinator().id, 'worker_result')[0]?.status, 'delivered');
+});
+
+test('Worker result identity deduplicates across turns while separate results with the same prose remain distinct', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('stable-result-id', 'Deliver once.');
+  await nativeWorkerAction(f, worker.id, deliverResult());
+  f.codex.complete(worker.threadId!, null); await f.loop.tick(); await f.loop.tick();
+  await f.loop.projectAction(f.coordinator().id, { action: 'send', requestId: 'follow-up', taskId: worker.id, text: 'Review the delivered evidence.' });
+  await f.loop.tick();
+  await nativeWorkerAction(f, worker.id, deliverResult('new-attempt-same-result'));
+  f.codex.complete(worker.threadId!, null); await f.loop.tick(); await f.loop.tick();
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
+  await f.loop.projectAction(f.coordinator().id, { action: 'send', requestId: 'second-result', taskId: worker.id, text: 'Produce the second deliverable.' });
+  await f.loop.tick();
+  await nativeWorkerAction(f, worker.id, deliverResult('new-attempt-new-result', 'result-v2'));
+  f.codex.complete(worker.threadId!, null); await f.loop.tick(); await f.loop.tick();
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 2);
+});
+
+test('Worker delivery requires active trusted ingress and rejects changed retry content', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('trusted-delivery', 'Deliver evidence.');
+  await assert.rejects(f.loop.projectAction(worker.id, deliverResult()), /active|identity|context/i);
+  await assert.rejects(nativeWorkerAction(f, f.coordinator().id, deliverResult()), /worker/i);
+  assert.ok(worker.threadId && f.codex.projectHandler);
+  const snapshot = f.codex.snapshot(worker.threadId); assert.ok(snapshot.turnId);
+  await assert.rejects(f.codex.projectHandler({ threadId: worker.threadId, turnId: snapshot.turnId, callId: 'stale',
+    connectionEpoch: 'stale-epoch', action: deliverResult() }), /active/i);
+  await nativeWorkerAction(f, worker.id, deliverResult());
+  await assert.rejects(nativeWorkerAction(f, worker.id, { ...deliverResult(), text: 'Changed operation content.' }), /different|conflict/i);
+  await assert.rejects(nativeWorkerAction(f, worker.id, { ...deliverResult('changed-result'), text: 'Changed result content.' }), /different|conflict/i);
+  f.codex.complete(worker.threadId, 'Ordinary final.'); await f.loop.tick(); await f.loop.tick();
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
+});
+
+for (const terminal of ['failed', 'interrupted'] as const) {
+  test(`Worker ${terminal} execution cannot publish or later reactivate a declared delivery`, async t => {
+    const f = await fixture(t); await f.initialize();
+    const worker = await f.dispatch(`delivery-${terminal}`, 'Deliver evidence.');
+    await nativeWorkerAction(f, worker.id, deliverResult());
+    const snapshot = f.codex.snapshot(worker.threadId!);
+    snapshot.status = terminal; snapshot.error = terminal;
+    await f.loop.tick();
+    assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
+    assert.ok(f.events(f.coordinator().id, 'execution_status').length > 0);
+    f.codex.complete(worker.threadId!, 'Later ordinary final.');
+    await f.loop.tick(); await f.restart(); await f.loop.tick();
+    assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
+  });
+}
+
+test('operator pause invalidates a pending Worker delivery even when the turn finishes before resume', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('paused-delivery', 'Deliver evidence.');
+  await nativeWorkerAction(f, worker.id, deliverResult());
+  await f.loop.control(worker.id, 'pause');
+  f.codex.complete(worker.threadId!, 'Final after pause.');
+  await f.loop.control(worker.id, 'resume'); await f.loop.tick(); await f.restart();
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
+});
+
+for (const kind of ['question', 'approval', 'permissions'] as const) {
+  test(`native ${kind} preserves its request and prevents a pending Worker delivery`, async t => {
+    const f = await fixture(t); await f.initialize();
+    const worker = await f.dispatch(`native-delivery-${kind}`, 'Deliver evidence.');
+    await nativeWorkerAction(f, worker.id, deliverResult());
+    const snapshot = f.codex.snapshot(worker.threadId!); assert.ok(snapshot.turnId);
+    const request: PendingRequest = { id: `delivery-${kind}`, kind, threadId: worker.threadId!, turnId: snapshot.turnId,
+      connectionEpoch: 'fake-epoch', prompt: `Native ${kind} still needs an answer.`, method: `native/${kind}`, payload: {}, isBlocking: true };
+    snapshot.requests = [request]; await f.loop.tick();
+    assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
+    assert.deepEqual(f.loop.store.task(worker.id).requests, [request]);
+    assert.equal(f.codex.approvals.length, 0); assert.equal(f.codex.replies.length, 0);
+    if (kind === 'question') assert.equal(f.events(f.coordinator().id, 'question').length, 1);
+    else assert.equal(f.feishu.approvals.at(-1)?.request.id, request.id);
+    f.codex.complete(worker.threadId!, 'This final does not replace the native answer.'); await f.loop.tick(); await f.restart();
+    assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
+    assert.equal(f.codex.approvals.length, 0); assert.equal(f.codex.replies.length, 0);
+  });
+}
+
+for (const origin of ['owner', 'coordinator'] as const) {
+  test(`${origin} steering invalidates the old delivery and permits a fresh declaration after handling input`, async t => {
+    const f = await fixture(t); await f.initialize();
+    const worker = await f.dispatch(`delivery-steering-${origin}`, 'Deliver evidence.');
+    const opened = origin === 'owner' ? await f.openGroup(worker.id) : worker;
+    const oldAction = deliverResult(); await nativeWorkerAction(f, worker.id, oldAction);
+    const turn = f.codex.snapshot(worker.threadId!).turnId;
+    if (origin === 'owner') await f.loop.receive(f.message('delivery-owner-steer', 'Check one more requirement.', opened.chatId!));
+    else await f.loop.projectAction(f.coordinator().id, { action: 'send', requestId: 'delivery-coordinator-steer', taskId: worker.id, text: 'Check one more requirement.' });
+    await f.loop.tick();
+    assert.equal(f.codex.snapshot(worker.threadId!).turnId, turn);
+    await nativeWorkerAction(f, worker.id, oldAction);
+    f.codex.complete(worker.threadId!, 'Stale declared result.'); await f.loop.tick(); await f.loop.tick();
+    assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
+    await f.loop.projectAction(f.coordinator().id, { action: 'send', requestId: `redo-${origin}`, taskId: worker.id, text: 'Deliver the checked result.' });
+    await f.loop.tick();
+    await nativeWorkerAction(f, worker.id, deliverResult('fresh-delivery-attempt'));
+    f.codex.complete(worker.threadId!, 'Checked result.'); await f.loop.tick(); await f.loop.tick();
+    assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
+  });
+}
+
+test('unhandled input cannot be included silently in a new delivery declaration', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('unhandled-delivery-input', 'Deliver evidence.');
+  f.loop.store.receive(worker.id, f.message('unhandled-delivery-owner', 'Still needs handling.', ''), 'source',
+    { kind: 'agent', projectId: 'app', taskId: f.coordinator().id, eventId: 'new-guidance', category: 'instruction' });
+  await assert.rejects(nativeWorkerAction(f, worker.id, deliverResult()), /input|pending|unresolved|handled/i);
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
+});
+
+for (const reportFirst of [false, true]) {
+  test(`explicit result report and Worker delivery use one coordinator result with reportFirst=${reportFirst}`, async t => {
+    const f = await fixture(t); await f.initialize();
+    const worker = await f.dispatch('report-delivery-overlap', 'Deliver evidence.');
+    const requestId = await requestReport(f, worker.id, 'owner-delivery-report');
+    const report: ProjectAction = { action: 'report', requestId, kind: 'result', routing: 'final', text: 'Owner-requested deliverable report.' };
+    if (reportFirst) await nativeWorkerAction(f, worker.id, report);
+    await nativeWorkerAction(f, worker.id, deliverResult());
+    if (!reportFirst) await nativeWorkerAction(f, worker.id, report);
+    f.codex.complete(worker.threadId!, 'Ordinary final remains in the task group.');
+    await f.loop.tick(); await f.loop.tick(); await f.restart();
+    assert.equal(f.events(f.coordinator().id, 'result').length, 1);
+    assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
+    assert.ok(f.loop.store.outputs(worker.id).some(output => output.text.includes('Ordinary final remains')));
+    const input = f.events(f.coordinator().id, 'result')[0]; assert.ok(input?.provenance.kind === 'agent');
+    assert.ok(input.provenance.sources?.some(source => source.messageId === requestId));
+  });
+}
+
+test('intermediate or rejected reports cannot consume a declared Worker result', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('intermediate-delivery', 'Deliver evidence.'); await f.openGroup(worker.id);
+  await nativeWorkerAction(f, worker.id, deliverResult());
+  await assert.rejects(nativeWorkerAction(f, worker.id, { action: 'report', requestId: 'no-owner-request', kind: 'result', text: 'Not authorized.' }), /owner/i);
+  await nativeWorkerAction(f, worker.id, { action: 'report', requestId: 'progress-only', kind: 'update', routing: 'intermediate', text: 'Local progress.' });
+  f.codex.complete(worker.threadId!, null); await f.loop.tick(); await f.loop.tick();
+  assert.equal(f.events(f.coordinator().id, 'result').length, 0);
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
+});
+
+test('Worker delivery event and publication state roll back together and recover after a partial write', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('atomic-publication', 'Deliver evidence.');
+  await nativeWorkerAction(f, worker.id, deliverResult());
+  const event = f.loop.projects.event.bind(f.loop.projects); let injected = false;
+  f.loop.projects.event = (...args) => {
+    event(...args);
+    if (args[4] === 'worker_result' && !injected) { injected = true; throw new Error('Crash after inbox insertion'); }
+  };
+  f.codex.complete(worker.threadId!, null); await f.loop.tick();
+  assert.equal(injected, true);
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
+  await f.restart(); await f.loop.tick(); await f.loop.tick();
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
+  assert.equal(f.events(f.coordinator().id, 'worker_result')[0]?.status, 'delivered');
+});
+
+test('Worker declaration and operation receipt roll back together', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('atomic-declaration', 'Deliver evidence.');
+  const saveReceipt = f.loop.projects.ledger.saveReceipt.bind(f.loop.projects.ledger); let injected = false;
+  f.loop.projects.ledger.saveReceipt = (...args) => {
+    saveReceipt(...args);
+    if (args[2] === 'delivery-attempt-1' && !injected) { injected = true; throw new Error('Crash after receipt insertion'); }
+  };
+  await assert.rejects(nativeWorkerAction(f, worker.id, deliverResult()), /Crash after receipt/);
+  await f.restart();
+  await nativeWorkerAction(f, worker.id, deliverResult());
+  f.codex.complete(worker.threadId!, null); await f.loop.tick(); await f.loop.tick();
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
+});
+
+test('Worker result reconciliation ignores saved ordinary output and ended-turn receipts', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('saved-chat-receipt', 'Deliver evidence.');
+  await nativeWorkerAction(f, worker.id, deliverResult());
+  const task = f.loop.store.task(worker.id); assert.ok(task.threadId && task.turnId);
+  task.lastHandledTurnId = task.turnId; task.executionStatus = 'completed';
+  f.loop.store.saveTask(task);
+  f.loop.store.setMeta(`worker-chat-ended:${JSON.stringify([task.id, task.threadId, task.turnId])}`, 'ended');
+  f.codex.complete(worker.threadId!, null); await f.restart(); await f.loop.tick();
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
+});
+
+test('a paused coordinator retains Worker delivery until its original task resumes', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('paused-coordinator-delivery', 'Deliver evidence.');
+  const coordinator = f.coordinator();
+  await f.loop.control(coordinator.id, 'pause');
+  const starts = f.codex.starts.length, steers = f.codex.steers.length;
+  await nativeWorkerAction(f, worker.id, deliverResult());
+  f.codex.complete(worker.threadId!, null); await f.loop.tick(); await f.loop.tick();
+  assert.equal(f.events(coordinator.id, 'worker_result').length, 1);
+  assert.notEqual(f.events(coordinator.id, 'worker_result')[0]?.status, 'delivered');
+  assert.equal(f.codex.starts.length, starts); assert.equal(f.codex.steers.length, steers);
+  await f.restart(); await f.loop.control(coordinator.id, 'resume'); await f.loop.tick();
+  assert.equal(f.events(coordinator.id, 'worker_result')[0]?.status, 'delivered');
+  assert.equal(f.coordinator().threadId, coordinator.threadId);
+  assert.equal(f.events(coordinator.id, 'worker_result').length, 1);
+});
+
+test('a retained Worker Thread can register delivery through the actual capability client', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('fallback-delivery', 'Deliver evidence.');
+  await f.restart(); f.codex.projectHandler = null;
+  const instructions = f.codex.instructionUpdates.findLast(update => update.threadId === worker.threadId)?.instructions ?? '';
+  const command = /write the action JSON to a file and run (.+?) '<absolute-action-json-file>' using your shell tool/.exec(instructions)?.[1];
+  assert.ok(command);
+  const actionFile = join(f.root, 'delivery-action.json'); await writeFile(actionFile, JSON.stringify(deliverResult()));
+  const run = () => promisify(execFile)('/bin/sh', ['-c', `${command} "$1"`, 'delivery-fallback', actionFile], { timeout: 10_000 });
+  const receipt = await run(); assert.deepEqual(JSON.parse((await run()).stdout), JSON.parse(receipt.stdout));
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
+  f.codex.complete(worker.threadId!, null);
+  await assert.rejects(run(), /active turn/i);
+  await f.loop.tick(); await f.restart(); await f.loop.tick();
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
+  assert.equal(f.events(f.coordinator().id, 'worker_result')[0]?.status, 'delivered');
+});
+
+test('an explicit result before steering cannot suppress a fresh delivery after that steering', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('report-watermark', 'Deliver evidence.');
+  const requestId = await requestReport(f, worker.id, 'early-delivery-report');
+  await nativeWorkerAction(f, worker.id, { action: 'report', requestId, kind: 'result', text: 'Earlier result.' });
+  await f.loop.projectAction(f.coordinator().id, { action: 'send', requestId: 'new-delivery-work', taskId: worker.id, text: 'Complete the additional check.' });
+  await f.loop.tick();
+  await nativeWorkerAction(f, worker.id, deliverResult());
+  f.codex.complete(worker.threadId!, null); await f.loop.tick(); await f.loop.tick();
+  assert.equal(f.events(f.coordinator().id, 'result').length, 1);
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
+});
+
+test('Worker delivery does not publish from an idle or superseded turn observation', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('superseded-delivery', 'Deliver evidence.');
+  await nativeWorkerAction(f, worker.id, deliverResult());
+  const snapshot = f.codex.snapshot(worker.threadId!);
+  snapshot.status = 'idle'; await f.loop.tick();
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
+  snapshot.turnId = 'unrelated-turn'; f.codex.complete(worker.threadId!, 'Unrelated completion.');
+  await f.loop.tick(); await f.restart();
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
+});
+
 const dispatchReceipt = z.object({ taskId: z.string().min(1) });
 const overviewSchema = z.object({
   id: z.string(), coordinatorTaskId: z.string(), version: z.number(),

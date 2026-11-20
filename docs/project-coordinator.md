@@ -70,6 +70,10 @@ Worker 在任务群里处理普通问答和阶段结论。`routing=intermediate`
 
 Worker 用该条用户消息的飞书 ID 作为 `requestId`。Runtime 校验消息、发送者、当前 Worker 群以及明确的汇报要求。每条请求对应一份汇报。用相同的 ID 和内容重试会返回原回执。摘要包含用户指定话题的结论、范围变化、待决问题和证据，并引用真实用户消息。实施、合并、部署及原生审批各自需要对应的授权。
 
+Worker 完成约定交付并验证后，使用 `deliver_result` 登记结论、稳定 `resultId` 和可选交付引用。Runtime 确认该 Thread 和 Turn 成功结束、没有未处理输入或原生请求后，自动送达协调者 inbox，不要求 Worker 群或 owner 请求。`requestId` 标识一次登记尝试，`resultId` 跨回合标识同一成果。失败、暂停、中断、新输入或原生请求使旧登记失效，旧请求重放不重新登记。处理后使用新 `requestId`；修改成果内容使用新 `resultId`。同一 Turn 和输入版本已有成功的最终结果 report 时，不生成自动副本。
+
+`worker_result` 是代理来源的交付事实，不代表独立验证、用户批准或任务结束。协调者核对实际版本和引用后安排验证，再按已有授权决定后续行动。普通 final、项目记录和群内讨论不会自动触发交付通知。详见 [Worker 交付通知](adr/0024-worker-result-delivery.md)。
+
 ## 项目工具
 
 新正式 Thread 提供 `project_action`。工具从当前 Thread 确定调用方，Runtime 检查项目与角色。不能在参数中冒充另一个 Task。
@@ -83,6 +87,7 @@ Worker 用该条用户消息的飞书 ID 作为 `requestId`。Runtime 校验消�
 | `send` | 向本项目 Worker 追加指导或回答 | 协调者 |
 | `announce` | 向项目协调群发送带类型标题的用户可见公告 | 协调者 |
 | `open_group` | 打开本项目指定 Worker 的任务群，已有有效群则复用 | 协调者 |
+| `deliver_result` | 登记可交付结论，在匹配执行成功结束后自动通知协调者 | Worker |
 | `plan_group_cleanup` | 冻结既有任务群清单，排除所有项目协调群 | 协调者 |
 | `confirm_group_cleanup` | 核对实际用户对清单的确认消息 | 协调者 |
 | `apply_group_cleanup` | 执行或继续已确认清单，逐群记录结果 | 协调者 |
