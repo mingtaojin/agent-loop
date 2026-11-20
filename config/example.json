@@ -34,13 +34,13 @@
     }
   ],
   "github": {
-    "tokenEnv": "GITHUB_TOKEN",
+    "token": "REPLACE_WITH_GITHUB_TOKEN",
     "apiUrl": "https://api.github.com",
     "requestTimeoutMs": 30000
   },
   "feishu": {
-    "appIdEnv": "FEISHU_APP_ID",
-    "appSecretEnv": "FEISHU_APP_SECRET",
+    "appId": "REPLACE_WITH_FEISHU_APP_ID",
+    "appSecret": "REPLACE_WITH_FEISHU_APP_SECRET",
     "userOpenId": "REPLACE_WITH_YOUR_OPEN_ID"
   },
   "execution": {

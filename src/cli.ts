@@ -14,9 +14,9 @@ import { discoverProjects } from './project-discovery.js';
 import { Client } from '@larksuiteoapi/node-sdk';
 import { FeishuArtifactAdapter } from './adapters/feishu-artifact.js';
 import { StoreArtifactDeliveryLedger } from './feishu-artifact-ledger.js';
+import { credentialSafeLogger, publicJson } from './credentials.js';
 
-function output(value: unknown): void { process.stdout.write(`${JSON.stringify(value, null, 2)}\n`); }
-function secret(name: string): string { const value = process.env[name]; if (!value) throw new Error(`缺少环境变量 ${name}`); return value; }
+function output(value: unknown): void { process.stdout.write(`${publicJson(value, 2)}\n`); }
 const usage = `Agent Loop
 
   npm start -- doctor --config config.json
@@ -33,7 +33,11 @@ Send new work only in the project group. Only coordinators dispatch Workers.
 `;
 
 async function doctor(config: Config): Promise<void> {
-  const credentials = [...(config.repositories.length ? [config.github.tokenEnv] : []), config.feishu.appIdEnv, config.feishu.appSecretEnv].map(name => ({ name, present: Boolean(process.env[name]) }));
+  const credentials = [
+    ...(config.repositories.length ? [{ name: 'github.token', present: config.github.token.configured }] : []),
+    { name: 'feishu.appId', present: config.feishu.appId.configured },
+    { name: 'feishu.appSecret', present: config.feishu.appSecret.configured },
+  ];
   const repositories = await Promise.all(config.repositories.map(async repository => {
     if (!('path' in repository)) return { name: repository.name, criteria: repository.criteria, sourceOnly: true, exists: true };
     const details = { name: repository.name, path: repository.path, baseBranch: repository.baseBranch,
@@ -56,7 +60,7 @@ async function doctor(config: Config): Promise<void> {
   if (!ready) process.exitCode = 1;
 }
 async function main(): Promise<void> {
-  const args = parseArgs({ options: { config: { type: 'string', default: 'config.json' }, 'env-file': { type: 'string', default: '.env' }, help: { type: 'boolean', short: 'h' },
+  const args = parseArgs({ options: { config: { type: 'string', default: 'config.json' }, help: { type: 'boolean', short: 'h' },
     'request-id': { type: 'string' } }, allowPositionals: true });
   const command = args.positionals[0];
   if (args.values.help || !command) { process.stdout.write(usage); return; }
@@ -91,24 +95,21 @@ async function main(): Promise<void> {
     finally { store.close(); }
     return;
   }
-  const envFile = resolve(args.values['env-file']);
-  try { await access(envFile); process.loadEnvFile(envFile); }
-  catch (error) { if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT' && args.values['env-file'] === '.env')) throw error; }
   if (command === 'doctor') { await doctor(config); return; }
-  const token = config.repositories.length ? secret(config.github.tokenEnv) : '';
+  const token = config.repositories.length ? config.github.token.require('github.token') : '';
   if (command === 'run' && config.feishu.userOpenId.startsWith('REPLACE_')) throw new Error('请先配置飞书用户 open_id');
-  const appId = command === 'run' ? secret(config.feishu.appIdEnv) : '';
-  const appSecret = command === 'run' ? secret(config.feishu.appSecretEnv) : '';
+  const appId = command === 'run' ? config.feishu.appId.require('feishu.appId') : '';
+  const appSecret = command === 'run' ? config.feishu.appSecret.require('feishu.appSecret') : '';
   const store = new Store(config.dataDir);
   const feishuArtifacts = new FeishuArtifactAdapter(() => {
-    const artifactClient = new Client({ appId, appSecret });
+    const artifactClient = new Client({ appId, appSecret, logger: credentialSafeLogger });
     return { image: artifactClient.im.v1.image, file: artifactClient.im.v1.file, message: artifactClient.im.v1.message };
   },
     { maxImageBytes: config.maxAttachmentBytes, maxFileBytes: config.maxAttachmentBytes }, new StoreArtifactDeliveryLedger(store));
   const loop = new AgentLoop(config, {
     github: new GitHubAdapter({ token, apiUrl: config.github.apiUrl, requestTimeoutMs: config.github.requestTimeoutMs }),
     feishu: new FeishuAdapter({ appId, appSecret, userOpenId: config.feishu.userOpenId }), feishuArtifacts,
-    codex: new CodexAppServer({ ...config.execution.backends.codex, env: Object.fromEntries(Object.entries(process.env).filter(([name]) => ![config.feishu.appIdEnv, config.feishu.appSecretEnv].includes(name))) }), workspace: new WorkspaceProvider(config.dataDir),
+    codex: new CodexAppServer(config.execution.backends.codex), workspace: new WorkspaceProvider(config.dataDir),
   }, store);
   if (command === 'collect') {
     try { await loop.collect(); output({ collectedTasks: loop.tasks().filter(task => loop.projects.ledger.membership(task.id)?.role !== 'coordinator').length, diagnostics: loop.store.diagnostics() }); if (loop.store.diagnostics().length) process.exitCode = 1; }

@@ -6,8 +6,10 @@ import { collectionRepositorySchema } from './domain.js';
 import { projectConfigInputSchema } from './project.js';
 import { daemonSettingsSchema, normalizeDaemonSettings } from './adapters/codex-daemon.js';
 import { assertSupportedExecutionBackends, executionConfigSchema } from './execution.js';
+import { ConfigCredential, redactCredentials } from './credentials.js';
 
-const environmentName = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'Use an environment variable name, not a credential');
+const credential = z.preprocess(value => value instanceof ConfigCredential ? value.rawValue : value,
+  z.string().trim().default('').transform(value => new ConfigCredential(value)));
 const positiveMilliseconds = z.number().int().positive();
 export const documentMaxLinesSchema = z.number().int().positive().max(100_000).default(3000);
 export const documentBaseUrlSchema = z.url().max(2048).refine(value => {
@@ -38,13 +40,13 @@ export const configSchema = z.strictObject({
   }),
   recovery: z.strictObject({ maxAttempts: z.number().int().nonnegative().default(3), retryDelayMs: positiveMilliseconds.default(1000) }).default({ maxAttempts: 3, retryDelayMs: 1000 }),
   github: z.strictObject({
-    tokenEnv: environmentName.default('GITHUB_TOKEN'),
+    token: credential,
     apiUrl: z.url().refine(value => ['http:', 'https:'].includes(new URL(value).protocol)).default('https://api.github.com'),
     requestTimeoutMs: positiveMilliseconds.default(30_000),
-  }).default(() => ({ tokenEnv: 'GITHUB_TOKEN', apiUrl: 'https://api.github.com', requestTimeoutMs: 30_000 })),
+  }).prefault({}),
   feishu: z.strictObject({
-    appIdEnv: environmentName.default('FEISHU_APP_ID'),
-    appSecretEnv: environmentName.default('FEISHU_APP_SECRET'),
+    appId: credential,
+    appSecret: credential,
     userOpenId: z.string().min(1),
     progress: z.strictObject({
       enabled: z.boolean().default(false),
@@ -80,32 +82,46 @@ export const configSchema = z.strictObject({
 
 export type Config = z.infer<typeof configSchema>;
 
+export async function readConfigInput(path: string): Promise<unknown> {
+  const text = await readFile(path, 'utf8');
+  let raw: unknown;
+  try { raw = JSON.parse(text); }
+  catch { throw new Error('Invalid configuration JSON'); }
+  return raw;
+}
+
 export async function loadConfig(path: string): Promise<Config> {
   const configPath = resolve(path);
   const directory = dirname(configPath);
-  const raw: unknown = JSON.parse(await readFile(configPath, 'utf8'));
-  const config = configSchema.parse(raw);
-  config.dataDir = resolve(directory, config.dataDir);
-  for (const project of config.projects) {
-    project.directory = resolve(directory, project.directory);
-    if (!(await stat(project.directory)).isDirectory()) throw new Error(`Project directory must exist: ${project.directory}`);
-  }
-  config.repositories = config.repositories.map(repository => !('path' in repository) ? repository : ({ ...repository, path: resolve(directory, repository.path),
-    ...(repository.workspace?.kind === 'project-directory'
-      ? { workspace: { ...repository.workspace, path: resolve(directory, repository.workspace.path) } } : {}),
-  }));
-  const guidance = config.engineering;
-  if (guidance) {
-    if (guidance.projectRoot) guidance.projectRoot = resolve(directory, guidance.projectRoot);
-    if (guidance.promptPath) guidance.promptPath = resolve(directory, guidance.promptPath);
-    if (guidance.skillPath) guidance.skillPath = resolve(directory, guidance.skillPath);
-    for (const file of [guidance.promptPath, guidance.skillPath]) {
-      if (!file) continue;
-      await access(file, constants.R_OK);
-      if (!(await stat(file)).isFile() || !(await readFile(file, 'utf8')).trim()) throw new Error(`Engineering guidance must be a readable, nonempty file: ${file}`);
+  const raw = await readConfigInput(configPath);
+  const result = configSchema.safeParse(raw);
+  if (!result.success) throw new Error('Invalid configuration fields or types. Credential *Env selectors are unsupported.');
+  const config = result.data;
+  try {
+    config.dataDir = resolve(directory, config.dataDir);
+    for (const project of config.projects) {
+      project.directory = resolve(directory, project.directory);
+      if (!(await stat(project.directory)).isDirectory()) throw new Error(`Project directory must exist: ${project.directory}`);
     }
+    config.repositories = config.repositories.map(repository => !('path' in repository) ? repository : ({ ...repository, path: resolve(directory, repository.path),
+      ...(repository.workspace?.kind === 'project-directory'
+        ? { workspace: { ...repository.workspace, path: resolve(directory, repository.workspace.path) } } : {}),
+    }));
+    const guidance = config.engineering;
+    if (guidance) {
+      if (guidance.projectRoot) guidance.projectRoot = resolve(directory, guidance.projectRoot);
+      if (guidance.promptPath) guidance.promptPath = resolve(directory, guidance.promptPath);
+      if (guidance.skillPath) guidance.skillPath = resolve(directory, guidance.skillPath);
+      for (const file of [guidance.promptPath, guidance.skillPath]) {
+        if (!file) continue;
+        await access(file, constants.R_OK);
+        if (!(await stat(file)).isFile() || !(await readFile(file, 'utf8')).trim()) throw new Error(`Engineering guidance must be a readable, nonempty file: ${file}`);
+      }
+    }
+    return config;
+  } catch (error) {
+    throw new Error(redactCredentials(error instanceof Error ? error.message : String(error)));
   }
-  return config;
 }
 
 export class ExecutionConfigWatcher {

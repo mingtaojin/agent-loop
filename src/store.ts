@@ -3,6 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
+import { publicJson, redactCredentials } from './credentials.js';
 import { approvalActionSchema, feishuCardRecordSchema, inputProvenanceSchema, incomingSchema, repositorySchema, sourceSchema, taskSchema, type ApprovalAction, type FeishuCardRecord, type IncomingMessage, type InputProvenance, type Source, type Task } from './domain.js';
 
 const payloadRow = z.object({ payload: z.string() });
@@ -112,7 +113,7 @@ export class Store {
     }
   }
   saveSource(source: Source, reason: string): void {
-    const payload = JSON.stringify(source);
+    const payload = publicJson(source);
     this.prepare('INSERT INTO sources VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,reason=excluded.reason').run(source.id, payload, reason);
     this.prepare('INSERT OR IGNORE INTO source_revisions VALUES(?,?,?)').run(source.id, createHash('sha256').update(payload).digest('hex'), payload);
   }
@@ -121,7 +122,7 @@ export class Store {
   }
   saveTask(task: Task): void {
     const previousThread = this.taskThreads.get(task.id);
-    this.prepare('INSERT INTO tasks VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET chat_id=excluded.chat_id,thread_id=excluded.thread_id,payload=excluded.payload').run(task.id, task.sourceId, task.chatId, task.threadId, JSON.stringify(task));
+    this.prepare('INSERT INTO tasks VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET chat_id=excluded.chat_id,thread_id=excluded.thread_id,payload=excluded.payload').run(task.id, task.sourceId, task.chatId, task.threadId, publicJson(task));
     if (previousThread && previousThread !== task.threadId) this.taskIdsByThread.delete(previousThread);
     this.taskThreads.set(task.id, task.threadId);
     if (task.threadId) this.taskIdsByThread.set(task.threadId, task.id);
@@ -169,7 +170,7 @@ export class Store {
     const facts = provenance ?? (origin === 'user' ? { kind: 'user', message } : origin === 'source'
       ? { kind: 'github_issue', sourceId: task.sourceId, revision: message.id, url: task.source.kind === 'github' ? task.source.issue.url : '' }
       : origin === 'initial' ? { kind: 'initial', sourceId: task.sourceId } : { kind: 'recovery', previousTurnId: task.turnId ?? 'legacy' });
-    return this.prepare("INSERT OR IGNORE INTO inbox(id,task_id,payload,status,origin) VALUES(?,?,?,'pending',?)").run(message.id, taskId, JSON.stringify({ message, provenance: facts, requestId: null }), origin).changes > 0;
+    return this.prepare("INSERT OR IGNORE INTO inbox(id,task_id,payload,status,origin) VALUES(?,?,?,'pending',?)").run(message.id, taskId, publicJson({ message, provenance: facts, requestId: null }), origin).changes > 0;
   }
   inputs(taskId: string, filter: InboxFilter = {}): Inbox[] {
     const clauses = ['task_id=?'];
@@ -208,12 +209,12 @@ export class Store {
   associateRequest(id: string, taskId: string, requestId: string): void {
     const input = this.inputs(taskId).find(item => item.id === id);
     if (!input) throw new Error('Unknown inbox input');
-    this.prepare('UPDATE inbox SET payload=? WHERE id=?').run(JSON.stringify({ message: input.message, provenance: input.provenance, requestId }), id);
+    this.prepare('UPDATE inbox SET payload=? WHERE id=?').run(publicJson({ message: input.message, provenance: input.provenance, requestId }), id);
   }
-  markInput(id: string, status: Inbox['status'], error: string | null = null): void { this.prepare('UPDATE inbox SET status=?,error=? WHERE id=?').run(status, error, id); }
+  markInput(id: string, status: Inbox['status'], error: string | null = null): void { this.prepare('UPDATE inbox SET status=?,error=? WHERE id=?').run(status, error === null ? null : redactCredentials(error), id); }
   enqueue(taskId: string, text: string, key: string): string {
     const id = createHash('sha256').update(`${taskId}:${key}`).digest('hex').slice(0, 32);
-    this.prepare("INSERT OR IGNORE INTO outbox VALUES(?,?,?,'pending',NULL)").run(id, taskId, text);
+    this.prepare("INSERT OR IGNORE INTO outbox VALUES(?,?,?,'pending',NULL)").run(id, taskId, redactCredentials(text));
     return id;
   }
   hasOutput(taskId: string, key: string): boolean {
@@ -229,18 +230,18 @@ export class Store {
     if (!statuses.length) return false;
     return this.prepare(`SELECT 1 FROM outbox WHERE task_id=? AND status IN (${statuses.map(() => '?').join(',')}) LIMIT 1`).get(taskId, ...statuses) !== undefined;
   }
-  markOutput(id: string, status: Outbox['status'], error: string | null = null): void { this.prepare('UPDATE outbox SET status=?,error=? WHERE id=?').run(status, error, id); }
+  markOutput(id: string, status: Outbox['status'], error: string | null = null): void { this.prepare('UPDATE outbox SET status=?,error=? WHERE id=?').run(status, error === null ? null : redactCredentials(error), id); }
   operation(id: string): Operation | null { const row = this.prepare('SELECT * FROM operations WHERE id=?').get(id); return row ? operationSchema.parse(row) : null; }
   beginOperation(id: string, taskId: string, kind: string): void { this.prepare("INSERT INTO operations VALUES(?,?,?,'attempting',NULL,NULL)").run(id, taskId, kind); }
   retryRejectedOperation(id: string): void {
     const result = this.prepare("UPDATE operations SET status='attempting',result=NULL,error=NULL WHERE id=? AND status='uncertain' AND error='rejected'").run(id);
     if (result.changes !== 1) throw new Error('Operation is not a rejected attempt');
   }
-  finishOperation(id: string, result: string): void { this.prepare("UPDATE operations SET status='confirmed',result=?,error=NULL WHERE id=?").run(result, id); }
-  uncertainOperation(id: string, error: string): void { this.prepare("UPDATE operations SET status='uncertain',error=? WHERE id=?").run(error, id); }
+  finishOperation(id: string, result: string): void { this.prepare("UPDATE operations SET status='confirmed',result=?,error=NULL WHERE id=?").run(redactCredentials(result), id); }
+  uncertainOperation(id: string, error: string): void { this.prepare("UPDATE operations SET status='uncertain',error=? WHERE id=?").run(redactCredentials(error), id); }
   queueApproval(action: ApprovalAction): boolean {
     const id = this.approvalKey(action);
-    return this.prepare("INSERT OR IGNORE INTO approval_actions VALUES(?,?,?,'pending',NULL)").run(id, action.taskId, JSON.stringify(action)).changes > 0;
+    return this.prepare("INSERT OR IGNORE INTO approval_actions VALUES(?,?,?,'pending',NULL)").run(id, action.taskId, publicJson(action)).changes > 0;
   }
   approvalKey(action: ApprovalAction): string { return `approval:${action.taskId}:${action.epoch}:${action.requestId}`; }
   approvals(taskId: string): { id: string; action: ApprovalAction; status: string; error: string | null }[] {
@@ -250,12 +251,12 @@ export class Store {
     });
   }
   markApproval(id: string, status: 'processing' | 'confirmed' | 'uncertain' | 'rejected', error: string | null = null): void {
-    this.prepare('UPDATE approval_actions SET status=?,error=? WHERE id=?').run(status, error, id);
+    this.prepare('UPDATE approval_actions SET status=?,error=? WHERE id=?').run(status, error === null ? null : redactCredentials(error), id);
   }
   saveFeishuCard(record: FeishuCardRecord): void {
     const card = feishuCardRecordSchema.parse(record);
     this.prepare('INSERT INTO feishu_cards(id,request_id,payload) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET request_id=excluded.request_id,payload=excluded.payload')
-      .run(card.id, card.requestId, JSON.stringify(card));
+      .run(card.id, card.requestId, publicJson(card));
   }
   feishuCard(id: string): FeishuCardRecord | null {
     const row = this.prepare('SELECT payload FROM feishu_cards WHERE id=?').get(id);
@@ -279,6 +280,8 @@ export class Store {
     return next;
   }
   diagnostic(scope: string, message: string): void {
+    scope = redactCredentials(scope);
+    message = redactCredentials(message);
     const createdAt = Date.now();
     const bounded = message.length <= diagnosticMessageLimit ? message : message.slice(0, diagnosticMessageLimit) + '\n…';
     const fingerprint = createHash('sha256').update(`${scope}\u0000${bounded}`).digest('hex');
@@ -317,7 +320,7 @@ export class Store {
     return sequenceRow.parse(this.prepare('SELECT COALESCE(MAX(seq),0) AS seq FROM inbox WHERE task_id=?').get(taskId)).seq;
   }
   setMeta(key: string, value: string): void {
-    const result = this.prepare('INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE meta.value IS NOT excluded.value').run(key, value);
+    const result = this.prepare('INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE meta.value IS NOT excluded.value').run(key, redactCredentials(value));
     if (result.changes > 0) this.metaRevisions.delete(key);
   }
   deleteMeta(key: string): void {
@@ -336,7 +339,7 @@ export class Store {
     return this.prepare('SELECT payload FROM feishu_progress WHERE active=1 ORDER BY rowid').all().map(row => JSON.parse(payloadRow.parse(row).payload));
   }
   saveProgressRecord(taskId: string, turnId: string, record: unknown, active: boolean): void {
-    this.prepare('INSERT INTO feishu_progress VALUES(?,?,?,?) ON CONFLICT(task_id,turn_id) DO UPDATE SET payload=excluded.payload,active=excluded.active').run(taskId, turnId, JSON.stringify(record), Number(active));
+    this.prepare('INSERT INTO feishu_progress VALUES(?,?,?,?) ON CONFLICT(task_id,turn_id) DO UPDATE SET payload=excluded.payload,active=excluded.active').run(taskId, turnId, publicJson(record), Number(active));
   }
   close(): void {
     this.db.close(); this.lock?.close();
@@ -367,7 +370,7 @@ export class Store {
     return this.prepare('SELECT payload FROM feishu_document_progress ORDER BY rowid').all().map(row => JSON.parse(payloadRow.parse(row).payload));
   }
   saveDocumentProgressRecord(taskId: string, record: unknown): void {
-    this.prepare('INSERT INTO feishu_document_progress VALUES(?,?) ON CONFLICT(task_id) DO UPDATE SET payload=excluded.payload').run(taskId, JSON.stringify(record));
+    this.prepare('INSERT INTO feishu_document_progress VALUES(?,?) ON CONFLICT(task_id) DO UPDATE SET payload=excluded.payload').run(taskId, publicJson(record));
     this.documentPayloads.delete(taskId);
   }
 }

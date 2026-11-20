@@ -117,12 +117,12 @@ test('configuration resolves paths relative to its file and requires actual prom
   assert.equal(config.dataDir, join(root, 'data'));
   assert.equal(config.engineering!.promptPath, join(root, 'prompt.md'));
   assert.equal(config.engineering!.skillPath, join(root, 'SKILL.md'));
-  assert.equal(config.github.tokenEnv, 'GITHUB_TOKEN');
+  assert.equal(config.github.token.configured, false);
   assert.equal(config.pollIntervalMs, 30_000);
   assert.equal(config.executionPollMs, 2_000);
   assert.equal(config.execution.coordinator.model, 'test-coordinator');
   assert.throws(() => configSchema.parse({ ...raw, codex: { model: 'legacy-model' } }));
-  assert.throws(() => configSchema.parse({ ...raw, github: { token: 'never-store-secrets' } }));
+  assert.equal(configSchema.parse({ ...raw, github: { token: 'synthetic-direct-token' } }).github.token.require('github.token'), 'synthetic-direct-token');
   assert.throws(() => configSchema.parse({ ...raw, github: { tokenEnv: 'github-token-value' } }));
   assert.throws(() => configSchema.parse({ ...raw, bug: raw.engineering }), /Unrecognized key/);
   await rm(join(root, 'SKILL.md'));

@@ -6,6 +6,7 @@ import { pipeline } from 'node:stream/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Client, WSClient, EventDispatcher, Domain, LoggerLevel, defaultHttpInstance, type HttpInstance, type HttpRequestOptions } from '@larksuiteoapi/node-sdk';
 import { z } from 'zod';
+import { credentialSafeLogger } from '../credentials.js';
 import { UncertainOperationError, errorMessage, projectDecisionActionSchema, type ApprovalAction, type Attachment, type IncomingMessage, type PendingRequest, type ProjectDecisionAction, type ReplyTarget } from '../domain.js';
 import { FeishuApiError, GroupCreationRejected, TaskGroupUnavailable, type FeishuCardDelivery, type FeishuDecisionCardInput, type FeishuPort, type FeishuProgressPort, type FeishuReconnectEvent, type ProgressWriteGuard } from '../ports.js';
 import { FeishuDocumentAdapter, type FeishuDocumentApi } from './feishu-document.js';
@@ -252,7 +253,7 @@ export class FeishuAdapter implements FeishuPort, FeishuProgressPort {
     this.documentProgress = new FeishuDocumentAdapter(() => {
       if (!documentApi) {
         const client = new Client({ appId: this.options.appId, appSecret: this.options.appSecret,
-          domain: Domain.Feishu, httpInstance: this.http, loggerLevel: LoggerLevel.error });
+          domain: Domain.Feishu, httpInstance: this.http, loggerLevel: LoggerLevel.error, logger: credentialSafeLogger });
         documentApi = { document: client.docx.v1.document, children: client.docx.v1.documentBlockChildren,
           block: client.docx.v1.documentBlock, members: client.drive.v1.permissionMember, tabs: client.im.v1.chatTab };
       }
@@ -261,12 +262,12 @@ export class FeishuAdapter implements FeishuPort, FeishuProgressPort {
   }
   private get api(): FeishuApi {
     this.apiInstance ??= new Client({ appId: this.options.appId, appSecret: this.options.appSecret,
-      domain: Domain.Feishu, httpInstance: this.http, loggerLevel: LoggerLevel.error }).im.v1;
+      domain: Domain.Feishu, httpInstance: this.http, loggerLevel: LoggerLevel.error, logger: credentialSafeLogger }).im.v1;
     return this.apiInstance;
   }
   private get cardkit(): NonNullable<FeishuDependencies['cardkit']> {
     this.cardkitInstance ??= new Client({ appId: this.options.appId, appSecret: this.options.appSecret,
-      domain: Domain.Feishu, httpInstance: this.http, loggerLevel: LoggerLevel.error }).cardkit.v1;
+      domain: Domain.Feishu, httpInstance: this.http, loggerLevel: LoggerLevel.error, logger: credentialSafeLogger }).cardkit.v1;
     return this.cardkitInstance;
   }
   private async paceProgressRequest(): Promise<void> {
@@ -546,7 +547,7 @@ export class FeishuAdapter implements FeishuPort, FeishuProgressPort {
     return [...messages.values()].sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
   }
   async start(onMessage: (message: IncomingMessage) => Promise<void>, onError: (error: unknown) => void, onAction?: (action: ApprovalAction) => Promise<void>, onReconnect?: (event: FeishuReconnectEvent) => void, onDecision?: (action: ProjectDecisionAction) => Promise<void>): Promise<void> {
-    const eventDispatcher = new EventDispatcher({ loggerLevel: LoggerLevel.error }).register({
+    const eventDispatcher = new EventDispatcher({ loggerLevel: LoggerLevel.error, logger: credentialSafeLogger }).register({
       'card.action.trigger': async (raw: unknown) => {
         const receivedAt = Date.now();
         let action: ApprovalAction | ProjectDecisionAction | null = null;
@@ -605,7 +606,7 @@ export class FeishuAdapter implements FeishuPort, FeishuProgressPort {
         reject(new Error('Feishu long connection did not become ready before its timeout'));
       }, this.options.requestTimeoutMs ?? 30_000);
       this.socket = new WSClient({ appId: this.options.appId, appSecret: this.options.appSecret,
-        domain: Domain.Feishu, httpInstance: this.http, loggerLevel: LoggerLevel.error,
+        domain: Domain.Feishu, httpInstance: this.http, loggerLevel: LoggerLevel.error, logger: credentialSafeLogger,
         handshakeTimeoutMs: this.options.requestTimeoutMs ?? 30_000,
         onReady: () => { clearTimeout(timer); resolve(); },
         onError: error => { clearTimeout(timer); onError(error); reject(error); },

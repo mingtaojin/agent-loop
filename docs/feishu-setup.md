@@ -4,27 +4,26 @@
 
 ## 确认当前实例与飞书应用
 
-1. 确认目标服务的工作目录、启动参数中的 `--config` 路径和 `--env-file` 路径。未指定 `--env-file` 时，程序读取工作目录的 `.env`。本机 launchd 实例的位置与检查方法见[服务操作说明](agents/operations.md)。
-2. 在该配置中找到 `feishu.appIdEnv`，读取它所指环境变量的 App ID。默认变量名为 `FEISHU_APP_ID`，`appIdEnv` 本身填写变量名。进程已有环境变量优先于 `.env`。不要用另一个终端或另一个实例的环境代替服务实际环境。
-3. 登录[飞书开放平台开发者后台](https://open.feishu.cn/app)，打开该 App ID 对应的应用，在“凭证与基础信息”中核对 App ID。后续权限操作均在这个应用中完成。另一实例的机器人能发文档，不代表当前应用也有权限。
+1. 确认目标服务的工作目录和启动参数中的 `--config` 路径。本机 launchd 实例的位置与检查方法见[服务操作说明](agents/operations.md)。
+2. 在该私有配置中找到 `feishu.appId`，在本机核对当前应用。`feishu.appSecret` 也直接保存在同一文件。不要将凭证复制到排障记录或截图中。
+3. 登录[飞书开放平台开发者后台](https://open.feishu.cn/app)，打开对应应用，在“凭证与基础信息”中核对 App ID。后续权限操作均在这个应用中完成。另一实例的机器人能发文档，不代表当前应用也有权限。
 
-在项目根目录使用以下只读命令查看磁盘配置与当前终端的 App ID。将配置路径、环境文件路径换成目标实例的路径。命令只输出 App ID 和相关配置，不输出 App Secret。
+在项目根目录运行以下只读命令，查看磁盘配置的凭证存在性和进度设置。将配置路径换成目标实例的路径。命令不输出凭证值。
 
 ```sh
 node --import tsx --input-type=module <<'NODE'
 import { loadConfig } from './src/config.ts';
-process.loadEnvFile('.env');
 const config = await loadConfig('config.json');
 console.log(JSON.stringify({
-	appIdEnv: config.feishu.appIdEnv,
-	appId: process.env[config.feishu.appIdEnv] ?? null,
+	appIdConfigured: config.feishu.appId.configured,
+	appSecretConfigured: config.feishu.appSecret.configured,
 	dataDir: config.dataDir,
 	progress: config.feishu.progress,
 }, null, 2));
 NODE
 ```
 
-此命令不读取运行中服务的内存配置。若凭证由服务管理器注入，需在服务定义中核对变量来源。不要将真实 App Secret 或访问令牌写入文档、JSON 配置或排障记录。
+此命令不读取运行中服务的内存配置。应用不再读取 `.env` 或应用凭证环境变量，不接受 `--env-file` 与旧 `*Env` 字段。真实凭证仅写入被 Git 忽略的私有 JSON，不写入示例、文档或排障记录。
 
 ## 配置文档进度模式
 
@@ -33,8 +32,8 @@ NODE
 ```json
 {
 	"feishu": {
-		"appIdEnv": "FEISHU_APP_ID",
-		"appSecretEnv": "FEISHU_APP_SECRET",
+		"appId": "REPLACE_WITH_FEISHU_APP_ID",
+		"appSecret": "REPLACE_WITH_FEISHU_APP_SECRET",
 		"userOpenId": "REPLACE_WITH_YOUR_OPEN_ID",
 		"progress": {
 			"enabled": true,
@@ -100,7 +99,7 @@ NODE
 
 ## 重载配置并确认目标实例
 
-1. 使用目标配置运行 `npm start -- doctor --config config.json`。若环境文件不同，追加 `--env-file /absolute/path/to/.env`。先修正配置解析错误或缺失凭证。
+1. 使用目标配置运行 `npm start -- doctor --config config.json`。应用凭证均来自该 JSON 文件。先修正配置解析错误或缺失凭证。
 2. 确认服务定义中的工作目录和配置路径与刚修改的文件一致，按[服务操作说明的重启步骤](agents/operations.md#修改配置后重启)重启目标实例。不要另开一个 `run` 进程共用同一数据目录。
 3. 重启后核对服务 PID、调试网页的执行服务心跳 PID 和持续更新的心跳时间。核对最新 `started` 日志的 `dataDir`、调试网页地址与目标实例一致。日志位置和状态命令见[服务操作说明](agents/operations.md)。
 4. 再次运行本指南的配置查看命令，确认磁盘中的 `enabled`、`surface` 和 `documentBaseUrl`。随后用新任务群的实际文档和 Tab 完成验收。仅看到磁盘新配置或一个旧心跳，不能证明目标服务已加载新配置。
@@ -164,7 +163,7 @@ sqlite3 -readonly '/absolute/path/to/data/tasks.sqlite' \
 | --- | --- |
 | 群消息正常，但顶部没有“执行进度”Tab | 先确认 `feishu.progress.enabled: true`、`surface: "document"` 和正确的 HTTPS `documentBaseUrl`，再核对目标服务是否重载。`card` 模式只发聊天卡片。继续查文档诊断、文档进度权限及群设置是否允许机器人管理标签页。 |
 | 文档或标签页接口返回 `99991672` | 这是权限不足的诊断。根据失败接口和响应中要求的权限，在当前 App ID 下添加应用身份权限，再回读实际授权。文档创建需 `docx:document`，标签页读取需 `im:chat.tabs:read` 或覆盖权限，不能用基础群信息读取成功作证明。 |
-| 当前应用与正常实例的 App ID 不同 | 重新确认目标服务的 `appIdEnv`、环境文件和进程环境来源。分别进入各自应用配置权限，另一应用的已授权状态不能复用。若修改了目标实例的环境或配置，按服务操作说明重启后重新验收。 |
+| 当前应用与正常实例的 App ID 不同 | 重新确认目标服务实际使用的 JSON 文件及其中的 `feishu.appId`。分别进入各自应用配置权限，另一应用的已授权状态不能复用。若修改了目标实例的凭证或其他非 execution 配置，按服务操作说明重启后重新验收。 |
 | 权限已添加，但接口仍拒权 | 检查是否误选用户身份权限，以及是否尚需发布版本或管理员审批。用当前应用的应用身份回读实际授权；没有出现在已授权范围内时，返回权限管理处理，不能仅凭已添加列表判定生效。 |
 | “向管理员申请授权”接口返回 `212002` | 此接口表示可申请的未授权范围为空，不能据此证明所需能力已授权。先检查所需权限是否已加入当前应用配置，再查授权状态。本次接入在尚未添加权限时遇到此码，回到权限管理添加并按后台提示开通后才恢复。接口说明见[向管理员申请授权](https://open.feishu.cn/document/application-v6/scope/apply)。 |
 | 文档或 Tab 已创建，但群成员不能阅读 | 检查 `docs:permission.member:create` 与 `docs:permission.member:retrieve`，并回读文档协作者列表，确认当前 `chatId` 作为 `openchat` 成员具有 `view` 阅读权限。核对 Tab 绑定的文档 URL，使用普通群成员账号实际打开。Tab 创建成功不能证明协作者授权成功。 |

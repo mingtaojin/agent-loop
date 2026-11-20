@@ -14,7 +14,7 @@ Agent Loop 保存项目和任务的持续上下文。用户在项目协调群交
 cp config/example.json config.json
 ```
 
-按下面的说明修改本机路径，并通过环境变量提供凭证。然后检查配置。
+按下面的说明修改本机路径，并在私有 `config.json` 中填写凭证。然后检查配置。
 
 ```sh
 npm start -- doctor --config config.json
@@ -29,7 +29,9 @@ npm install
 cp config/example.json config.json
 ```
 
-编辑 `config.json`，将 `feishu.userOpenId` 改为应用下的所有者 Open ID。相对路径均以配置文件所在目录为基准。
+编辑私有 `config.json`，填写 `feishu.appId`、`feishu.appSecret` 和应用下的所有者 `feishu.userOpenId`。配置了采集仓库时，还需填写 `github.token`。相对路径均以配置文件所在目录为基准。
+
+仓库只提交带占位值的 `config/example.json`。`config.json` 与 `config.json.*` 已被 Git 忽略。将私人副本保存在这些路径，或自行为其他文件名设置忽略规则，并限制文件读取权限，例如 `chmod 600 config.json`。不要把私人配置复制进日志、报告、prompt 或版本库。
 
 正式任务共用本机 Codex daemon。Agent Loop 通过官方 `daemon version` 发现服务，只在服务未运行时调用 `daemon start`。连接失败会报告错误，断线后重新连接并核对原 Thread。Agent Loop 不停止、重启或更新 daemon，也不回退私有 App Server。
 
@@ -69,7 +71,24 @@ Agent Loop 不再使用模型选择目录。任务必须先归属到已配置项
 
 新 Task 先保存原始任务与附件。项目协调者负责确认工程归属并通过 `claim_intake` 或 `dispatch` 派发 Worker；未归属 intake 和历史任务保持等待，不创建执行 Thread。确认归属后，协调者和 Worker 直接使用项目配置的目录，所有项目共用实例级角色执行配置。后续讨论、澄清、工程工作和恢复沿用正式 Thread。
 
-凭证通过环境变量提供。默认名称为 `GITHUB_TOKEN`、`FEISHU_APP_ID`、`FEISHU_APP_SECRET`。配置仅保存变量名。程序加载当前目录的 `.env`，已有进程变量优先。可用 `--env-file` 指定其他文件。不要将真实凭证写入 JSON、prompt 或全局说明。
+应用只从 `--config` 指定的 JSON 文件读取凭证。凭证字段直接填写值，例如：
+
+```json
+{
+	"github": { "token": "REPLACE_WITH_GITHUB_TOKEN" },
+	"feishu": {
+		"appId": "REPLACE_WITH_FEISHU_APP_ID",
+		"appSecret": "REPLACE_WITH_FEISHU_APP_SECRET",
+		"userOpenId": "REPLACE_WITH_YOUR_OPEN_ID"
+	}
+}
+```
+
+这些占位值不会被视为已配置凭证。`doctor` 仅报告字段是否已填写。`collect` 只在配置采集仓库时要求 GitHub token，不要求飞书凭证；`run` 还要求飞书凭证和已绑定所有者。`status` 可在未填写凭证时读取本地状态。
+
+应用不读取 `.env`，不接受 `--env-file`，也不支持 `tokenEnv`、`appIdEnv` 或 `appSecretEnv`。升级已有配置时，在私有 JSON 中填写直接凭证字段并移除旧字段，从服务启动参数中移除 `--env-file`。完成迁移和验收后，可由配置所有者另行处理旧环境文件。程序不会迁移或删除它。普通系统环境和 Codex provider 的环境与登录机制继续保留，JSON 凭证不会注入子进程环境。
+
+只有 `execution` 配置会热更新。修改凭证或其他设置后，按[服务操作说明](docs/agents/operations.md)重启服务。无效编辑会保留上一次有效 execution 配置。解析后的凭证在配置导出、诊断和看板输出中被遮蔽，私有 JSON 文件本身仍保存原值。
 
 ## 飞书接入
 

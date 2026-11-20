@@ -2,7 +2,7 @@
 
 本机常驻执行服务和调试网页由同一个 `run` 进程提供，统一由 launchd 管理。后续启动、停止和重启均使用本文命令，避免另起独立后台进程争用同一数据目录。前台调试前先停止 launchd 服务。
 
-服务定义位于 `~/Library/LaunchAgents/com.local.agent-loop.run.plist`，标签为 `com.local.agent-loop.run`。工作目录和入口以定义中的 `WorkingDirectory`、`ProgramArguments` 为准；独立 worktree 部署可以使用该 worktree 的 `dist/src/cli.js`。应用配置继续使用绝对路径 `/Users/developer/IdeaProjects/agent-loop/config.json`，凭证文件通过 `--env-file` 指定，避免因工作目录变化而读取错误位置。运行参数和环境变量保留在服务定义与应用配置中。
+服务定义位于 `~/Library/LaunchAgents/com.local.agent-loop.run.plist`，标签为 `com.local.agent-loop.run`。工作目录和入口以定义中的 `WorkingDirectory`、`ProgramArguments` 为准；独立 worktree 部署可以使用该 worktree 的 `dist/src/cli.js`。应用配置继续使用绝对路径 `/Users/developer/IdeaProjects/agent-loop/config.json`，凭证直接保存在该私有 JSON 的 `github.token`、`feishu.appId` 和 `feishu.appSecret` 中。程序不读取环境凭证文件。升级服务定义时移除旧 `--env-file` 参数，并按 [README 配置说明](../../README.md#项目归属与正式任务)迁移旧字段。运行参数和普通系统或 provider 环境变量保留在服务定义中。
 
 服务随当前用户登录加载。断开 SSH 不影响运行，进程退出后由 launchd 自动拉起。机器重启后，服务在该用户登录时启动。
 
@@ -16,7 +16,7 @@ launchctl print "gui/$(id -u)/com.local.agent-loop.run" | rg 'state =|pid =|last
 
 ## 修改配置后重启
 
-修改 `config.json` 或应用代码后，执行：
+只有 `execution` 配置支持热更新。修改凭证、其他配置或应用代码后，在获得对应服务操作授权后执行：
 
 ```sh
 launchctl kickstart -k "gui/$(id -u)/com.local.agent-loop.run"

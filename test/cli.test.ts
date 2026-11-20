@@ -18,16 +18,15 @@ test('doctor reports discovered projects and source-only collection without requ
   const root = await mkdtemp(join(tmpdir(), 'agent-loop-doctor-discovery-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   await mkdir(join(root, 'projects', 'multi-repo', 'nested'), { recursive: true });
-  await mkdir(join(root, 'projects', '.metadata')); await writeFile(join(root, 'fixture.env'), '');
+  await mkdir(join(root, 'projects', '.metadata'));
   const configPath = join(root, 'config.json');
   await writeFile(configPath, JSON.stringify({
     execution,
     engineering: { projectRoot: './projects' }, repositories: [{ name: 'explicit/issues', criteria: {} }],
-    github: { tokenEnv: 'FIXTURE_DOCTOR_TOKEN' },
-    feishu: { userOpenId: 'owner', appIdEnv: 'FIXTURE_DOCTOR_APP', appSecretEnv: 'FIXTURE_DOCTOR_SECRET' },
+    github: { token: 'synthetic-doctor-github' },
+    feishu: { userOpenId: 'owner', appId: 'synthetic-doctor-app', appSecret: 'synthetic-doctor-secret' },
   }));
-  const env = { ...process.env, FIXTURE_DOCTOR_TOKEN: 'fixture', FIXTURE_DOCTOR_APP: 'fixture', FIXTURE_DOCTOR_SECRET: 'fixture' };
-  const run = () => execute(process.execPath, [cli, entry, 'doctor', '--config', configPath, '--env-file', join(root, 'fixture.env')], { cwd: root, env });
+  const run = () => execute(process.execPath, [cli, entry, 'doctor', '--config', configPath], { cwd: root });
   const output = JSON.parse((await run()).stdout);
   assert.equal(output.ready, true); assert.equal(output.discovery.readable, true);
   assert.deepEqual(output.execution, { coordinator: execution.coordinator, worker: execution.worker });
@@ -78,10 +77,10 @@ for (const scenario of [
     execution,
     dataDir: './data', repositories: [{ name: 'example/project', path: './repository', baseBranch: 'main', criteria: { assigneesAny: ['owner'], taskTypes: scenario.taskTypes, nativeTypes: { [scenario.classification]: scenario.classification }, typeLabels: { [scenario.classification]: scenario.classification } } }],
     engineering: { promptPath: './prompt.md', skillPath: './SKILL.md' },
-    github: { tokenEnv: 'TEST_GITHUB_TOKEN', apiUrl },
-    feishu: { appIdEnv: 'UNSET_FEISHU_APP_ID', appSecretEnv: 'UNSET_FEISHU_SECRET', userOpenId: 'REPLACE_WITH_YOUR_OPEN_ID' },
+    github: { token: 'test-token', apiUrl },
+    feishu: { userOpenId: 'REPLACE_WITH_YOUR_OPEN_ID' },
   }));
-  const options = { cwd: root, env: { ...process.env, TEST_GITHUB_TOKEN: 'test-token' }, timeout: 15_000 };
+  const options = { cwd: root, env: { ...process.env, GITHUB_TOKEN: 'conflicting-env-token' }, timeout: 15_000 };
   const collect = await execute(process.execPath, [cli, entry, 'collect', '--config', 'config.json'], options);
   assert.deepEqual(JSON.parse(collect.stdout), { collectedTasks: scenario.expectedNumbers.length, diagnostics: [] });
   assert.equal(requests.filter(url => !/issues\/\d+/.test(url)).length, 2);
@@ -129,9 +128,9 @@ async function runFixture(t: TestContext, options: {
   }
   await writeFile(join(root, 'config.json'), JSON.stringify({
     execution,
-    dataDir: './data', repositories: [], github: { tokenEnv: 'UNSET_MANUAL_ONLY_GITHUB' },
+    dataDir: './data', repositories: [], github: {},
     dashboard: { port: options.port }, executionPollMs: 50,
-    feishu: { appIdEnv: 'FIXTURE_FEISHU_APP', appSecretEnv: 'FIXTURE_FEISHU_SECRET', userOpenId: 'ou_fixture' },
+    feishu: { appId: 'fixture-app', appSecret: 'fixture-secret', userOpenId: 'ou_fixture' },
   }));
   const sdk = `
     import { existsSync, writeFileSync } from 'node:fs';
@@ -141,7 +140,11 @@ async function runFixture(t: TestContext, options: {
     export class Client { constructor() { throw new Error('No task should call Feishu HTTP'); } }
     export class EventDispatcher { register(handlers) { if (!handlers['im.message.receive_v1']) throw new Error('No receiver'); return this; } }
     export class WSClient {
-      constructor(options) { this.options = options; }
+      constructor(options) {
+        if (options.appId !== 'fixture-app' || options.appSecret !== 'fixture-secret') throw new Error('JSON credentials were not used');
+        if (process.env.PROVIDER_FIXTURE !== 'inherited-provider') throw new Error('Provider environment was lost');
+        this.options = options;
+      }
       async start() {
         writeFileSync('feishu-started', 'yes');
         ${options.startup === 'fail' ? "throw new Error('Fixture Feishu startup failed');" : ''}
@@ -169,8 +172,7 @@ async function runFixture(t: TestContext, options: {
       if (specifier === '@larksuiteoapi/node-sdk') return { url: ${JSON.stringify(`data:text/javascript,${encodeURIComponent(sdk)}`)}, shortCircuit: true };
       return nextResolve(specifier, context);
     } });`);
-  const env: NodeJS.ProcessEnv = { ...process.env, FIXTURE_FEISHU_APP: 'fixture-app', FIXTURE_FEISHU_SECRET: 'fixture-secret' };
-  delete env.UNSET_MANUAL_ONLY_GITHUB;
+  const env: NodeJS.ProcessEnv = { ...process.env, FEISHU_APP_ID: 'conflicting-env-app', FEISHU_APP_SECRET: 'conflicting-env-secret', PROVIDER_FIXTURE: 'inherited-provider' };
   const child = spawn(process.execPath, ['--import', resolve('node_modules/tsx/dist/loader.mjs'), '--import', hook, entry, options.command ?? 'run', '--config', 'config.json'], { cwd: root, env, timeout: 20_000, killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'pipe'] });
   let stdout = ''; let stderr = '';
   child.stdout.setEncoding('utf8').on('data', chunk => { stdout += chunk; });
@@ -193,6 +195,7 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) test(`actual CLI run serves
     return fixture.stdout().trimEnd().endsWith('}');
   });
   const started = JSON.parse(fixture.stdout());
+  assert.doesNotMatch(fixture.stdout() + fixture.stderr(), /fixture-app|fixture-secret/);
   assert.equal(started.event, 'started'); assert.equal(started.dataDir, join(await realpath(fixture.root), 'data')); assert.equal(started.tasks, 0);
   assert.equal(started.dashboard.url, fixture.url); assert.equal(started.dashboard.listenAddress, `0.0.0.0:${fixture.port}`);
   assert.ok(Array.isArray(started.dashboard.networkUrls));

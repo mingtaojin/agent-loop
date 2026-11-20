@@ -23,18 +23,20 @@ test('execution watcher applies valid changes and keeps the last valid config af
   const root = await mkdtemp(join(tmpdir(), 'agent-loop-execution-config-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const path = join(root, 'config.json');
-  const configFile = (profile: typeof execution = execution) => JSON.stringify({ execution: profile, feishu: { userOpenId: 'owner' } });
+  const configFile = (profile: typeof execution = execution, appSecret = 'synthetic-reload-original') => JSON.stringify({ execution: profile, feishu: { appId: 'synthetic-reload-app', appSecret, userOpenId: 'owner' } });
   await writeFile(path, configFile());
   const target = await loadConfig(path);
   const diagnostics: unknown[] = [];
   const watcher = new ExecutionConfigWatcher(path, target, error => diagnostics.push(error));
   watcher.start(); t.after(() => watcher.close());
 
-  await writeFile(path, configFile({ ...execution, coordinator: { ...execution.coordinator, model: 'coordinator-b' } }));
+  await writeFile(path, configFile({ ...execution, coordinator: { ...execution.coordinator, model: 'coordinator-b' } }, 'synthetic-reload-edited'));
   await waitFor(() => target.execution.coordinator.model === 'coordinator-b');
-  await writeFile(path, '{ invalid json');
+  assert.equal(target.feishu.appSecret.require('feishu.appSecret'), 'synthetic-reload-original');
+  await writeFile(path, '{ invalid json synthetic-reload-new-secret');
   await waitFor(() => diagnostics.length === 1);
   assert.equal(target.execution.coordinator.model, 'coordinator-b');
+  assert.doesNotMatch(String(diagnostics[0]), /synthetic-reload-new-secret/);
 
   const invalid = configSchema.safeParse({ execution: { ...execution, worker: { ...execution.worker, backend: 'dsh' } }, feishu: { userOpenId: 'owner' } });
   assert.equal(invalid.success, false);

@@ -4,6 +4,7 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { hostname, networkInterfaces } from 'node:os';
 import { z } from 'zod';
+import { publicJson } from './credentials.js';
 import { Store } from './store.js';
 import { boundedDashboardText, dashboardResources, ProjectDashboardReader } from './dashboard-reader.js';
 import { errorMessage, presentTaskSource } from './domain.js';
@@ -29,7 +30,7 @@ export async function startDashboard(options: { execution?: LiveExecution; dataD
   readStore();
   const json = (response: ServerResponse, status: number, value: unknown) => {
     response.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
-    response.end(JSON.stringify(value));
+    response.end(publicJson(value));
   };
   const readModel = () => {
     const now = Date.now();
@@ -147,14 +148,14 @@ export async function startDashboard(options: { execution?: LiveExecution; dataD
           for (const change of changes) {
             cursor = change.cursor;
             if (change.event.taskId !== taskId || change.event.threadId !== threadId) continue;
-            if (!response.write('id: ' + cursor + '\nevent: execution\ndata: ' + JSON.stringify(change.event) + '\n\n')) { blocked = true; break; }
+            if (!response.write('id: ' + cursor + '\nevent: execution\ndata: ' + publicJson(change.event) + '\n\n')) { blocked = true; break; }
           }
           if (Date.now() - lastKeepAlive > 10_000 && !blocked) {
             lastKeepAlive = Date.now();
             blocked = !response.write(': heartbeat\n\n');
           }
         } catch (error) {
-          end('event: stream-error\ndata: ' + JSON.stringify({ error: errorMessage(error) }) + '\n\n');
+          end('event: stream-error\ndata: ' + publicJson({ error: errorMessage(error) }) + '\n\n');
         }
       };
       const unsubscribe = execution.subscribe(() => send());
