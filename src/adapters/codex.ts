@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { RejectedInputError, TurnChangedError, UncertainOperationError, workspaceTargetSchema, type AgentInput, type AgentOutput, type ExecutionSnapshot, type PendingRequest, type WorkspaceRequest } from '../domain.js';
 import { CodexProviderMismatchError, type Activity, type CodexPort, type TurnIdentity } from '../ports.js';
 import { executionEvent, executionKey, type ExecutionHistory, type ExecutionEvent } from '../execution-events.js';
-import { projectActionSchema } from '../project.js';
+import { projectToolCallSchema } from '../project.js';
 import type { ReasoningEffort } from '../execution.js';
 import { normalizeDaemonSettings, sharedDaemonConnector, type CodexConnection, type CodexConnector, type DaemonSettings } from './codex-daemon.js';
 import { taskTitleInput, taskTitleInstructions, taskTitleOutputSchema } from '../task-title.js';
@@ -88,12 +88,16 @@ const workspaceTool = {
   description: 'Get an additional engineering workspace using an exact Runtime-supplied projectId, or a configured or saved legacy repository name. Use the returned absolute path and read its project instructions. This does not grant additional filesystem permissions.',
   inputSchema: z.toJSONSchema(workspaceTargetSchema),
 };
-const { $schema: _projectSchema, ...projectInputSchema } = z.toJSONSchema(projectActionSchema, { io: 'input' });
-const projectTool = {
-  type: 'function', name: 'project_action',
-  description: 'Query project status, dispatch or message a task, report progress or questions, record durable project information, rotate the coordinator session, or release an owned workspace. Use nonblank identifiers and text. Project membership and caller role determine allowed actions. Reuse requestId only to retry the same action. This tool grants no additional engineering permissions.',
-  inputSchema: projectInputSchema,
+const projectToolDescriptions = {
+  project_action: 'Query project status, dispatch a Worker, manage groups and resources, record project facts or rotate the coordinator session. Membership and role determine allowed actions. Keep requestId stable for identical retries. This tool grants no additional engineering permissions.',
+  send_agent_message: 'Send text and optional factual references to your own coordinator or one of your Workers. taskId is the recipient. Delivery is durable and starts promptly, without waiting for your turn to end. Returns the original input ID and its current delivery state. Keep requestId stable for identical retries.',
+  send_group_message: 'Send text for people to your currently bound group. This does not deliver an Agent input. Coordinator replies to users require this tool. Worker ordinary replies already appear in its group. Returns the original output ID and its current delivery state. Keep requestId stable for identical retries.',
 };
+const projectTools = projectToolCallSchema.options.map(schema => {
+  const name = schema.shape.tool.value;
+  const { $schema: _schema, ...inputSchema } = z.toJSONSchema(schema.shape.arguments, { io: 'input' });
+  return { type: 'function', name, description: projectToolDescriptions[name], inputSchema };
+});
 type RpcId = z.infer<typeof rpcIdSchema>;
 type LiveRequest = {
   rpcId: RpcId;
@@ -181,7 +185,6 @@ export class CodexAppServer implements CodexPort {
   private sequence = 0;
   private observationReset: (() => void) | undefined;
   private eventHandler: ((event: ExecutionEvent) => void) | undefined;
-  private completionPolicy: { isCompleted(threadId: string): boolean } | undefined;
 
   async readHistory(threadId: string): Promise<ExecutionHistory> {
     await this.ready();
@@ -212,13 +215,9 @@ export class CodexAppServer implements CodexPort {
   }
   setObservationResetHandler(handler: () => void): void { this.observationReset = handler; }
   setEventHandler(handler: (event: ExecutionEvent) => void): void { this.eventHandler = handler; }
-  setThreadCompletionPolicy(policy: { isCompleted(threadId: string): boolean }): void { this.completionPolicy = policy; }
   assertThreadCompletionAllowed(threadId: string): void {
     if (this.closed || this.failure || !this.initialized || !this.connection || this.threads.get(threadId)?.load.kind !== 'ready') throw new Error('Native request state is unavailable');
     if ([...this.requests.values()].some(live => live.request.threadId === threadId)) throw new Error('Reconcile unresolved native requests before completion');
-  }
-  private assertThreadOpen(threadId: string): void {
-    if (this.completionPolicy?.isCompleted(threadId)) throw new RejectedInputError('Task completed; Thread is sealed');
   }
 
   constructor(private readonly options: CodexOptions, connector?: CodexConnector) {
@@ -369,12 +368,10 @@ export class CodexAppServer implements CodexPort {
     const id = this.requestId(rpcId);
     if (this.seenRequestIds.has(id)) return;
     this.seenRequestIds.add(id);
-    const scope = threadScopeSchema.safeParse(payload);
-    const completed = scope.success && this.completionPolicy?.isCompleted(scope.data.threadId);
-    if (method === 'item/tool/call' && !completed) {
+    if (method === 'item/tool/call') {
       const epoch = this.epoch;
       const { tool } = z.object({ tool: z.string() }).parse(payload);
-      const operation = tool === 'project_action' ? this.projectCall(rpcId, payload, epoch) : this.workspaceCall(rpcId, payload, epoch);
+      const operation = projectTools.some(definition => definition.name === tool) ? this.projectCall(rpcId, payload, epoch) : this.workspaceCall(rpcId, payload, epoch);
       void operation.catch(error => {
         if (epoch === this.epoch) this.fail(error instanceof Error ? error : new Error(String(error)));
       });
@@ -406,14 +403,6 @@ export class CodexAppServer implements CodexPort {
     const request: PendingRequest = { id: this.requestId(rpcId), isBlocking, connectionEpoch: this.epoch, threadId: base.data.threadId, turnId: base.data.turnId ?? '', kind, method, payload, prompt };
     const live: LiveRequest = { rpcId, request, response, responseSent: false, waiters: new Set() };
     this.requests.set(request.id, live);
-    if (completed) {
-      let denial: NativeResponse;
-      if (response.kind === 'approval') denial = { kind: 'result', value: { decision: 'decline' } };
-      else if (response.kind === 'permissions') denial = { kind: 'result', value: { permissions: {}, scope: 'turn' } };
-      else if (method === 'item/tool/call') denial = { kind: 'result', value: { success: false, contentItems: [{ type: 'inputText', text: 'Task completed' }] } };
-      else denial = { kind: 'error', value: { code: -32000, message: 'Task completed; native input unavailable' } };
-      void this.respond(live, denial, 'retain-request').catch(() => undefined);
-    }
   }
 
   private config() {
@@ -461,19 +450,16 @@ export class CodexAppServer implements CodexPort {
     await this.ready();
     const { thread } = threadResponseSchema.parse(await this.rpc('thread/start', { ...this.config(), ...(input.model ? { model: input.model } : {}),
       ...(input.reasoningEffort ? { config: { model_reasoning_effort: input.reasoningEffort } } : {}),
-      allowProviderModelFallback: false, cwd: input.cwd, developerInstructions: input.instructions, dynamicTools: this.projectHandler ? [workspaceTool, projectTool] : [workspaceTool], ephemeral: false }));
+      allowProviderModelFallback: false, cwd: input.cwd, developerInstructions: input.instructions, dynamicTools: this.projectHandler ? [workspaceTool, ...projectTools] : [workspaceTool], ephemeral: false }));
     if (thread.status.type !== 'idle' || thread.turns.length) throw new UncertainOperationError('New Codex thread was not empty and idle');
     this.threads.set(thread.id, { load: { kind: 'ready' }, untouched: true, instructions: input.instructions, model: input.model, reasoningEffort: input.reasoningEffort });
     return thread.id;
   }
 
   private async resume(threadId: string, instructions?: string, model?: string, reasoningEffort?: ReasoningEffort): Promise<void> {
-    this.assertThreadOpen(threadId);
     await this.ready();
-    this.assertThreadOpen(threadId);
     const entry = this.threads.get(threadId);
     if (entry?.load.kind === 'pending') await entry.load.request;
-    this.assertThreadOpen(threadId);
     if (entry?.load.kind === 'uncertain') throw entry.load.error;
     if (entry?.load.kind === 'ready' && (instructions === undefined || instructions === entry.instructions)
       && (model === undefined || model === entry.model) && (reasoningEffort === undefined || reasoningEffort === entry.reasoningEffort)) return;
@@ -508,7 +494,6 @@ export class CodexAppServer implements CodexPort {
     }).finally(() => { this.historyObservations.delete(threadId); });
     current.load = { kind: 'pending', request };
     await request;
-    this.assertThreadOpen(threadId);
   }
 
   isActiveTurn(identity: TurnIdentity): boolean {
@@ -666,7 +651,6 @@ export class CodexAppServer implements CodexPort {
   async startTurn(input: Parameters<CodexPort['startTurn']>[0]): Promise<string> {
     this.historyObservations.delete(input.threadId);
     await this.resume(input.threadId);
-    this.assertThreadOpen(input.threadId);
     const entry = this.threads.get(input.threadId);
     if (entry) entry.untouched = false;
     this.historyObservations.delete(input.threadId);
@@ -694,7 +678,6 @@ export class CodexAppServer implements CodexPort {
   async steer(input: Parameters<CodexPort['steer']>[0]): Promise<void> {
     this.historyObservations.delete(input.threadId);
     await this.resume(input.threadId);
-    this.assertThreadOpen(input.threadId);
     try {
       this.historyObservations.delete(input.threadId);
       const response = z.object({ turnId: z.string() }).parse(await this.rpc('turn/steer', {
@@ -710,7 +693,6 @@ export class CodexAppServer implements CodexPort {
   async reply(input: { request: PendingRequest; text: string }): Promise<void> {
     this.historyObservations.delete(input.request.threadId);
     await this.ready();
-    this.assertThreadOpen(input.request.threadId);
     const live = this.liveRequest(input.request);
     if (live.response.kind !== 'question') throw new RejectedInputError('Only native questions can receive ordinary replies');
     let result: unknown;
@@ -730,7 +712,6 @@ export class CodexAppServer implements CodexPort {
   async respondApproval(input: Parameters<CodexPort['respondApproval']>[0]): Promise<'confirmed' | 'uncertain'> {
     this.historyObservations.delete(input.request.threadId);
     await this.ready();
-    this.assertThreadOpen(input.request.threadId);
     const live = this.liveRequest(input.request);
     let result: unknown;
     switch (live.response.kind) {
@@ -833,13 +814,13 @@ export class CodexAppServer implements CodexPort {
     const call = z.object({ threadId: z.string(), turnId: z.string(), callId: z.string(), tool: z.string(), namespace: z.string().nullish(), arguments: z.unknown() }).parse(payload);
     let result: { success: boolean; contentItems: { type: 'inputText'; text: string }[] };
     try {
-      if (call.tool !== 'project_action' || call.namespace) throw new Error(`Unsupported dynamic tool ${call.tool}`);
+      if (call.namespace) throw new Error(`Unsupported dynamic tool ${call.tool}`);
       if (!this.threads.has(call.threadId)) throw new Error('Project request belongs to an unknown thread');
       if (!this.projectHandler) throw new Error('Project coordination is unavailable');
-      const action = projectActionSchema.parse(call.arguments);
+      const command = projectToolCallSchema.parse({ tool: call.tool, arguments: call.arguments });
       const activity = await this.activity(call.threadId);
       if (epoch !== this.epoch || activity.kind !== 'running' || activity.turnId !== call.turnId || !this.isActiveTurn(activity)) throw new Error('Project request belongs to an inactive turn');
-      const value = await this.projectHandler({ threadId: call.threadId, turnId: call.turnId, callId: call.callId, action, connectionEpoch: epoch });
+      const value = await this.projectHandler({ threadId: call.threadId, turnId: call.turnId, callId: call.callId, call: command, connectionEpoch: epoch });
       result = { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify(value) }] };
     } catch (error) {
       result = { success: false, contentItems: [{ type: 'inputText', text: error instanceof Error ? error.message : String(error) }] };
@@ -904,7 +885,7 @@ export class CodexAppServer implements CodexPort {
       for (const threadId of [...this.threads.keys()]) {
         try {
           if (this.failure) await this.recover();
-          if (!this.completionPolicy?.isCompleted(threadId) && (this.needsCleanup.has(threadId) || this.activeTurns.has(threadId))) await this.stopOwnedThread(threadId);
+          if (this.needsCleanup.has(threadId) || this.activeTurns.has(threadId)) await this.stopOwnedThread(threadId);
           await this.rpc('thread/unsubscribe', { threadId });
         } catch (error) { failures.push(error); }
       }

@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { isDeepStrictEqual } from 'node:util';
 import { workerExecutionIdentitySchema } from './execution.js';
-import { approvalActionSchema, feishuCardRecordSchema, inputProvenanceSchema, incomingSchema, repositorySchema, sourceSchema, taskSchema, type ApprovalAction, type FeishuCardRecord, type IncomingMessage, type InputProvenance, type Source, type Task } from './domain.js';
+import { approvalActionSchema, feishuCardRecordSchema, inputProvenanceSchema, incomingSchema, reminderSchema, repositorySchema, sourceSchema, taskSchema, type ApprovalAction, type FeishuCardRecord, type IncomingMessage, type InputProvenance, type Reminder, type Source, type Task } from './domain.js';
 
 const payloadRow = z.object({ payload: z.string() });
 const taskPayloadRow = payloadRow.extend({ id: z.string() });
@@ -30,6 +30,8 @@ const inboxRow = z.object({ seq: z.number(), id: z.string(), task_id: z.string()
 export type Inbox = Omit<z.infer<typeof inboxRow>, 'payload'> & { message: IncomingMessage; provenance: InputProvenance; requestId: string | null };
 export type InboxFilter = { statuses?: readonly Inbox['status'][]; origin?: Inbox['origin'] };
 const outboxSchema = z.object({ id: z.string(), task_id: z.string(), text: z.string(), status: z.enum(['pending', 'sending', 'sent', 'uncertain', 'dropped']), error: z.string().nullable() });
+const groupDeliverySchema = z.object({ project_id: z.string(), request_id: z.string(), chat_id: z.string(), generation: z.number(), message_id: z.string().nullable() });
+export type GroupDelivery = z.infer<typeof groupDeliverySchema>;
 export type Outbox = z.infer<typeof outboxSchema>;
 const workerDeliverySchema = z.object({ chat_id: z.string().nullable(), turn_key: z.string(), kind: z.enum(['body', 'working', 'ended']) });
 type WorkerDelivery = z.infer<typeof workerDeliverySchema>;
@@ -64,8 +66,12 @@ export class Store {
         CREATE TABLE IF NOT EXISTS inbox(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,task_id TEXT NOT NULL REFERENCES tasks(id),payload TEXT NOT NULL,status TEXT NOT NULL,origin TEXT NOT NULL DEFAULT 'user',error TEXT);
         CREATE INDEX IF NOT EXISTS inbox_task ON inbox(task_id,seq);
         CREATE INDEX IF NOT EXISTS inbox_task_status ON inbox(task_id,status,seq);
+        CREATE TABLE IF NOT EXISTS reminders(id TEXT PRIMARY KEY,project_id TEXT NOT NULL,task_id TEXT NOT NULL REFERENCES tasks(id),request_id TEXT NOT NULL,fingerprint TEXT NOT NULL,due_at INTEGER NOT NULL,status TEXT NOT NULL CHECK(status IN ('scheduled','fired','cancelled')),payload TEXT NOT NULL,UNIQUE(project_id,task_id,request_id));
+        CREATE INDEX IF NOT EXISTS reminders_due ON reminders(status,due_at,id);
+        CREATE INDEX IF NOT EXISTS reminders_owner ON reminders(project_id,task_id,due_at,id);
         CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id),text TEXT NOT NULL,status TEXT NOT NULL,error TEXT);
         CREATE INDEX IF NOT EXISTS outbox_task_status ON outbox(task_id,status);
+        CREATE TABLE IF NOT EXISTS group_message_deliveries(output_id TEXT PRIMARY KEY REFERENCES outbox(id) ON DELETE CASCADE,project_id TEXT NOT NULL,request_id TEXT NOT NULL,chat_id TEXT NOT NULL,generation INTEGER NOT NULL,message_id TEXT);
         CREATE TABLE IF NOT EXISTS worker_chat_deliveries(output_id TEXT PRIMARY KEY REFERENCES outbox(id) ON DELETE CASCADE,chat_id TEXT,turn_key TEXT NOT NULL,kind TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS worker_chat_turn ON worker_chat_deliveries(turn_key,chat_id,kind);
         CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id),kind TEXT NOT NULL,status TEXT NOT NULL,result TEXT,error TEXT);
@@ -223,10 +229,73 @@ export class Store {
     this.prepare('UPDATE inbox SET payload=? WHERE id=?').run(JSON.stringify({ message: input.message, provenance: input.provenance, requestId }), id);
   }
   markInput(id: string, status: Inbox['status'], error: string | null = null): void { this.prepare('UPDATE inbox SET status=?,error=? WHERE id=?').run(status, error, id); }
+  scheduleReminder(reminder: Extract<Reminder, { status: 'scheduled' }>): Reminder {
+    this.prepare('INSERT OR IGNORE INTO reminders VALUES(?,?,?,?,?,?,?,?)').run(reminder.id, reminder.projectId, reminder.taskId,
+      reminder.requestId, reminder.fingerprint, reminder.dueAt, reminder.status, JSON.stringify(reminder));
+    const row = this.prepare('SELECT payload FROM reminders WHERE project_id=? AND task_id=? AND request_id=?')
+      .get(reminder.projectId, reminder.taskId, reminder.requestId);
+    if (!row) throw new Error('Reminder identity conflicts with an existing reminder');
+    const current = reminderSchema.parse(JSON.parse(payloadRow.parse(row).payload));
+    if (current.fingerprint !== reminder.fingerprint) throw new Error('Reminder request ID already has different content');
+    return current;
+  }
+  reminder(owner: { projectId: string; taskId: string; reminderId: string }): Reminder | null {
+    const row = this.prepare('SELECT payload FROM reminders WHERE project_id=? AND task_id=? AND id=?')
+      .get(owner.projectId, owner.taskId, owner.reminderId);
+    return row ? reminderSchema.parse(JSON.parse(payloadRow.parse(row).payload)) : null;
+  }
+  reminders(owner: { projectId: string; taskId: string; offset: number; limit: number }) {
+    const total = countRow.parse(this.prepare('SELECT COUNT(*) AS count FROM reminders WHERE project_id=? AND task_id=?')
+      .get(owner.projectId, owner.taskId)).count;
+    const reminders = this.prepare('SELECT payload FROM reminders WHERE project_id=? AND task_id=? ORDER BY due_at,id LIMIT ? OFFSET ?')
+      .all(owner.projectId, owner.taskId, owner.limit, owner.offset).map(row => reminderSchema.parse(JSON.parse(payloadRow.parse(row).payload)));
+    return { reminders, total, offset: owner.offset, limit: owner.limit,
+      nextOffset: owner.offset + reminders.length < total ? owner.offset + reminders.length : null };
+  }
+  cancelReminder(owner: { projectId: string; taskId: string; reminderId: string }, cancelledAt: number): Reminder {
+    const current = this.reminder(owner);
+    if (!current) throw new Error('Unknown reminder for this task');
+    if (current.status !== 'scheduled') return current;
+    const cancelled: Reminder = { ...current, status: 'cancelled', cancelledAt };
+    this.prepare("UPDATE reminders SET status='cancelled',payload=? WHERE id=? AND project_id=? AND task_id=? AND status='scheduled'")
+      .run(JSON.stringify(cancelled), current.id, owner.projectId, owner.taskId);
+    const result = this.reminder(owner);
+    if (!result) throw new Error('Unknown reminder for this task');
+    return result;
+  }
+  fireDueReminders(now: number, limit = 100): Reminder[] {
+    return this.transaction(() => {
+      const due = this.prepare("SELECT payload FROM reminders WHERE status='scheduled' AND due_at<=? ORDER BY due_at,id LIMIT ?")
+        .all(now, limit).map(row => reminderSchema.parse(JSON.parse(payloadRow.parse(row).payload)));
+      return due.map(reminder => {
+        if (reminder.status !== 'scheduled') throw new Error('Due reminder is not scheduled');
+        const task = this.task(reminder.taskId);
+        const received = this.receive(task.id, { id: `reminder-input:${reminder.id}`, chatId: task.chatId ?? '', senderId: 'runtime:reminder',
+          chatType: 'group', text: `Self-reminder.\n${reminder.text}`, attachments: [], createdAt: now }, 'source',
+        { kind: 'reminder', projectId: reminder.projectId, taskId: reminder.taskId, reminderId: reminder.id, dueAt: reminder.dueAt });
+        if (!received) throw new Error('Reminder input already exists without its fired state');
+        const fired: Reminder = { ...reminder, status: 'fired', firedAt: now };
+        this.prepare("UPDATE reminders SET status='fired',payload=? WHERE id=? AND status='scheduled'").run(JSON.stringify(fired), reminder.id);
+        return fired;
+      });
+    });
+  }
   enqueue(taskId: string, text: string, key: string): string {
     const id = createHash('sha256').update(`${taskId}:${key}`).digest('hex').slice(0, 32);
     this.prepare("INSERT OR IGNORE INTO outbox VALUES(?,?,?,'pending',NULL)").run(id, taskId, text);
     return id;
+  }
+  enqueueGroupMessage(taskId: string, text: string, delivery: Omit<GroupDelivery, 'message_id'>): string {
+    const id = this.enqueue(taskId, text, `group-message:${delivery.request_id}`);
+    this.prepare('INSERT OR IGNORE INTO group_message_deliveries VALUES(?,?,?,?,?,NULL)').run(id, delivery.project_id, delivery.request_id, delivery.chat_id, delivery.generation);
+    return id;
+  }
+  groupMessage(id: string): GroupDelivery | null {
+    const row = this.prepare('SELECT project_id,request_id,chat_id,generation,message_id FROM group_message_deliveries WHERE output_id=?').get(id);
+    return row ? groupDeliverySchema.parse(row) : null;
+  }
+  confirmGroupMessage(id: string, messageId: string): void {
+    this.prepare('UPDATE group_message_deliveries SET message_id=? WHERE output_id=?').run(messageId, id);
   }
   enqueueWorkerOutput(taskId: string, text: string, key: string, delivery: WorkerDelivery): void {
     const id = this.enqueue(taskId, text, key);
@@ -323,6 +392,10 @@ export class Store {
       if (seen.has(identity)) return false;
       seen.add(identity); return true;
     }).slice(0, diagnosticReadLimit);
+  }
+  metadata(prefix: string): { key: string; value: string }[] {
+    return this.prepare('SELECT key,value FROM meta WHERE substr(key,1,?)=? ORDER BY key').all(prefix.length, prefix)
+      .map(row => z.object({ key: z.string(), value: z.string() }).parse(row));
   }
   meta(key: string): string | null { const row = this.prepare('SELECT value FROM meta WHERE key=?').get(key); return row ? metaRow.parse(row).value : null; }
   metaRevision(key: string): symbol {

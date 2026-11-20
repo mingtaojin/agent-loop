@@ -1,3 +1,4 @@
+import { taskCloseoutSchema } from './task-closeout.js';
 import { LiveExecution, type ExecutionObservation } from './live-execution.js';
 import { intakeRouteSchema, presentTaskSource, type InputProvenance, type ReportEscalation, type ReportRouting, type ReportSource, type Task, type TaskResource } from './domain.js';
 import { ProjectLedger, type ProjectState } from './project.js';
@@ -93,6 +94,9 @@ export interface ProjectTaskCard {
   createdAt: number;
   updatedAt: number;
   latestReport: DashboardReport | null;
+  completion: z.infer<typeof taskCloseoutSchema>['lifecycle'];
+  completionHistory: z.infer<typeof taskCloseoutSchema>['completionHistory'];
+  cleanup: { operationId: string; kind: string; scopeId: string; state: string; reason: string | null; directoryRemoved: boolean; branchRemoved: boolean }[];
 }
 
 export interface ProjectDashboard {
@@ -232,7 +236,11 @@ export class ProjectDashboardReader {
     const waiting = task.requests.map(request => `${request.kind}: ${boundedDashboardText(request.prompt)}`);
     const source = presentTaskSource(task.source, 200);
     const repository = task.source.kind === 'github' ? task.source.issue.repository : task.resources.find(resource => resource.kind !== 'project')?.repository.name ?? null;
+    const rawCloseout = this.store.meta(`task-closeout:${task.id}`);
+    const closeout = rawCloseout ? taskCloseoutSchema.parse(JSON.parse(rawCloseout)) : null;
     return {
+      completion: closeout?.lifecycle ?? { kind: 'open' }, completionHistory: closeout?.completionHistory ?? [],
+      cleanup: closeout?.operations.flatMap(operation => operation.targets.map(target => ({ operationId: operation.id, kind: operation.kind, scopeId: target.scope.id, state: target.state, reason: target.reason, directoryRemoved: target.directoryRemoved, branchRemoved: target.branchRemoved }))) ?? [],
       id: task.id, projectId, role, title: source.title, sourceLabel: source.label, sourceKind: task.source.kind, sourceUrl: source.url, repository,
       issueId: issueId ?? (task.source.kind === 'github' ? task.source.issue.id : null),
       status: task.status, executionStatus: task.executionStatus, currentTurn: task.turnId ?? visibleActivity?.turnId ?? null,

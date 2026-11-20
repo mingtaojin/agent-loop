@@ -573,11 +573,13 @@ test('legacy shell bridge acquires task-bound resources through the live Runtime
   await assert.rejects(execute(process.execPath, [client, capability, 'example/project']), /active/);
 });
 
-test('legacy pause waits across restart and fresh human input resumes the same conversation', async t => {
+test('legacy pause holds fresh human input until explicit resume of the same conversation', async t => {
   const f = await fixture(t); await f.manual();
   const task = f.task(); task.status = 'paused'; task.reason = '来源不再符合条件'; task.legacy = { status: 'paused', prUrl: null }; f.loop.store.saveTask(task);
   f.snapshot().status = 'interrupted'; await f.restart(); assert.equal(f.task().status, 'paused'); assert.equal(f.starts().length, 1);
   await f.loop.receive(f.message('fresh', 'Continue with this correction', task.chatId!, 'group'));
+  assert.equal(f.task().status, 'paused'); assert.equal(f.starts().length, 1);
+  await f.loop.control(task.id, 'resume');
   assert.equal(f.task().status, 'running'); assert.equal(f.starts().length, 2); assert.equal(f.task().threadId, task.threadId);
   await f.loop.control(task.id, 'pause');
   await f.loop.receive(f.message('held', 'Operator pause remains explicit', task.chatId!, 'group'));

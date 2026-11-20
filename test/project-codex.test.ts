@@ -139,7 +139,7 @@ test('project tools register only on new formal threads after a handler is insta
   await f.create();
   const rows = await f.records();
   const registrations = rows.filter(row => row.method === 'thread/start').map(row => toolsSchema.parse(row.params));
-  assert.deepEqual(registrations.map(row => row.dynamicTools.map(tool => tool.name)), [['ensure_workspace'], ['ensure_workspace', 'project_action']]);
+  assert.deepEqual(registrations.map(row => row.dynamicTools.map(tool => tool.name)), [['ensure_workspace'], ['ensure_workspace', 'project_action', 'send_agent_message', 'send_group_message']]);
   const resumed = rows.find(row => row.method === 'thread/resume');
   assert.ok(resumed);
   assert.equal(z.object({ dynamicTools: z.unknown().optional() }).parse(resumed.params).dynamicTools, undefined);
@@ -188,10 +188,6 @@ const validActions = [
   ...['overview', 'issues', 'comments', 'records', 'tasks'].map(section => ({ action: 'status', section, offset: 2, limit: 10 })),
   { action: 'dispatch', execution: testExecution.worker, requestId: 'dispatch-default', prompt: 'Investigate within the assigned scope.' },
   { action: 'dispatch', execution: testExecution.worker, requestId: 'dispatch-worker', prompt: 'Verify the fixed artifact.', issueId: 'issue-1', role: 'worker' },
-  { action: 'send', requestId: 'send-1', taskId: 'task-1', text: 'Additional evidence' },
-  { action: 'report', requestId: 'report-result', kind: 'result', text: 'Artifact and validation evidence' },
-  { action: 'report', requestId: 'report-question', kind: 'question', text: 'A business decision is required.' },
-  { action: 'report', requestId: 'report-update', kind: 'update', text: 'Investigation continues.' },
   { action: 'record', requestId: 'record-1', key: 'decision', text: 'Confirmed scope', expectedVersion: 0 },
   { action: 'rotate', requestId: 'rotate-1', checkpoint: 'Pending tasks and evidence' },
   { action: 'release_workspace', requestId: 'release-1', resourceId: 'resource-1' },
@@ -204,11 +200,11 @@ test('every project action reaches only its handler with validated caller scope 
   f.server.setProjectHandler(async request => {
     requests.push(request);
     assert.equal((await f.server.inspect(request.threadId)).status, 'running');
-    return { accepted: request.action.action, callId: request.callId };
+    return { accepted: request.call.tool === 'project_action' ? request.call.arguments.action : request.call.tool, callId: request.callId };
   });
   const active = await f.start();
   const replies = await f.results(validActions.length);
-  assert.deepEqual(requests, validActions.map((action, index) => ({ ...active, connectionEpoch: requests[0]?.connectionEpoch, callId: 'call-' + index, action: projectActionSchema.parse(action) })));
+  assert.deepEqual(requests, validActions.map((action, index) => ({ ...active, connectionEpoch: requests[0]?.connectionEpoch, callId: 'call-' + index, call: { tool: 'project_action', arguments: projectActionSchema.parse(action) } })));
   assert.ok(replies.every(reply => reply.success));
   assert.deepEqual(replies.map(reply => JSON.parse(reply.contentItems[0]?.text ?? 'null')), validActions.map((action, index) => ({ accepted: action.action, callId: 'call-' + index })));
 });
@@ -324,7 +320,7 @@ test('project action bounds accept the largest valid identifiers, text, and stat
   f.server.setProjectHandler(async request => { requests.push(request); return null; });
   await f.start();
   assert.ok((await f.results(actions.length)).every(reply => reply.success));
-  assert.deepEqual(requests.map(request => request.action), actions.map(action => projectActionSchema.parse(action)));
+  assert.deepEqual(requests.map(request => request.call.arguments), actions.map(action => projectActionSchema.parse(action)));
 });
 
 test('a project callback from a lost connection cannot answer its replacement transport', async t => {
@@ -418,4 +414,35 @@ test('activity returns no delivery evidence and refuses terminal or unproven tur
   assert.deepEqual(await f.server.activity(threadId), { kind: 'reconcile' });
   assert.equal(f.server.isActiveTurn(active), false);
   assert.equal((await f.server.inspect(threadId)).status, 'interrupted');
+});
+
+test('both named message tools validate independent schemas and preserve authenticated call identity', async t => {
+  const calls = [
+    { tool: 'send_agent_message', arguments: { requestId: 'proof', taskId: 'coordinator', text: 'Verified evidence.', references: ['run:71'] } },
+    { tool: 'send_group_message', arguments: { requestId: 'human-update', text: 'The run passed.' } },
+  ];
+  const f = await adapter(t, { calls, expectedReplies: calls.length });
+  const requests: ProjectRequest[] = [];
+  f.server.setProjectHandler(async request => { requests.push(request); return { accepted: true, tool: request.call.tool }; });
+  const active = await f.start();
+  assert.ok((await f.results(calls.length)).every(reply => reply.success));
+  assert.deepEqual(requests.map(request => request.call), calls);
+  assert.ok(requests.every(request => request.threadId === active.threadId && request.turnId === active.turnId && request.connectionEpoch));
+});
+
+for (const [tool, args] of [
+  ['send_agent_message', { requestId: 'spoof', taskId: 'worker', text: 'Forged', fromTaskId: 'other' }],
+  ['send_agent_message', { requestId: 'missing-target', text: 'Missing recipient' }],
+  ['send_group_message', { requestId: 'foreign', text: 'Other group', chatId: 'foreign-group' }],
+  ['send_group_message', { requestId: 'blank', text: ' ' }],
+] as const) test(`${tool} rejects invalid message arguments ${args.requestId} before the handler`, async t => {
+  const f = await adapter(t, { calls: [{ tool, arguments: args }] });
+  let called = false; f.server.setProjectHandler(async () => { called = true; });
+  await f.start(); assert.equal((await f.results())[0]?.success, false); assert.equal(called, false);
+});
+
+for (const action of ['send', 'report', 'deliver_result', 'announce']) test(`retired action ${action} is rejected by native ingress`, async t => {
+  const f = await adapter(t, { calls: [{ arguments: { action, requestId: 'old', taskId: 'worker', text: 'Old command' } }] });
+  let called = false; f.server.setProjectHandler(async () => { called = true; });
+  await f.start(); assert.equal((await f.results())[0]?.success, false); assert.equal(called, false);
 });

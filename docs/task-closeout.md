@@ -10,41 +10,47 @@ New Tasks receive a separate `artifacts-*` directory under their task data direc
 
 ## Completion action
 
-Only the project coordinator can complete a Worker or Worker. A final answer, result report, idle state, pause or failure does not complete a Task. The coordinator verifies delivery or explicit abandonment before submitting the action.
+Only the project coordinator can record completion of its Worker. A final answer, idle state, pause or failure does not complete a Task.
 
 ```json
-{"action":"complete_task","requestId":"closeout-123","taskId":"worker-task-id","outcome":"delivered","summary":"The agreed result was delivered; temporary work can be released","deliveryReferences":["https://example.test/result"]}
+{"action":"complete_task","requestId":"complete-123","taskId":"worker-task-id","outcome":"delivered","summary":"The agreed result was delivered","deliveryReferences":["https://example.test/result"]}
 ```
 
-Outcome is `delivered` or `terminated`. Completion and the frozen cleanup intent share one SQLite transaction. Completion is owned by the closeout ledger, separately from mutable Task execution snapshots. The immutable action receipt is `{operationId, taskId}`. Repeating the same action continues that operation; changing content under the same request ID fails.
+Outcome is `delivered` or `terminated`. Completion stores the conclusion, immutable history and the current inbox sequence in one SQLite transaction. It does not seal scopes, create cleanup operations, delete files or interrupt execution. Native questions and approvals keep their existing delivery and authorization rules. The receipt is `{operationId, taskId}`. Repeating the same request returns the original receipt without recording another completion or closing later work. Reusing its request ID with different content fails.
 
-`{"action":"status","section":"closeout"}` returns live ledgers with `lifecycle`, `scopes` and `operations`, using normal project pagination and caller visibility. Workers and Workers see only their own ledger; coordinators can query project Tasks. Every frozen target reports `pending`, `protected` or `removed`, its reason, and directory and branch results. A receipt alone does not mean deletion succeeded. Summary and delivery references survive deletion.
+`{"action":"status","section":"closeout"}` returns `lifecycle`, `completionHistory`, `scopes` and cleanup `operations`, with project pagination and caller visibility. Workers see their own ledger; coordinators can query project Tasks. The dashboard displays current work, completion history and resource cleanup independently.
 
-An in-flight allocation or execution admission rejects completion until the same request can be retried. Uncertain input delivery and pending approvals must be reconciled before completion. A running turn can finish after completion is recorded. Runtime never interrupts it to reclaim files. Cleanup progresses after explicit actions, during polling and on restart without waking a model.
+## Explicit cleanup
 
-## Native request boundary
+Only the coordinator can request cleanup of its own scopes or a Worker in the same project, including a completed Worker. The request names each owned artifact or worktree scope:
 
-The final completion transaction checks the adapter's authoritative unresolved-request state. This includes requests that have not been clicked and responses awaiting native acknowledgement. A provider without this protection cannot complete a threaded Task.
+```json
+{"action":"cleanup_artifacts","requestId":"cleanup-123","taskId":"worker-task-id","scopeIds":["owned-scope-id"]}
+```
 
-After completion, late native requests receive only denial or protocol error responses. Runtime does not grant permissions or manufacture user answers. An uncertain denial leaves execution use busy and cleanup pending. Completed Threads are excluded from adapter resumption and recovery. Already permitted execution can still finish; cleanup waits for actual idleness and process-use checks. Protocol fixtures verify response frames and acknowledgement handling. Real-provider progress after a question error remains unverified.
+The response includes `{operationId, taskId, cleanup}`. Each target reports `pending`, `protected` or `removed`, its reason, and directory and branch results. A receipt alone does not mean deletion succeeded. Scope identities and local branch identity are frozen when cleanup is accepted. New scopes cannot enter that operation.
+
+Cleanup and execution admission are mutually exclusive. New input is saved while cleanup owns admission, then delivered when its result is known. Running execution, unresolved delivery, native requests and process use keep cleanup pending. An undelivered artifact keeps its scope protected. These blocked results do not prevent later inputs from continuing the Worker. Explicit cleanup progresses during polling and restart without creating model input or interrupting execution.
 
 ## Deletion boundaries
 
 Deletion checks physical directory and ancestor identities, registered artifact identities, Git identity, the frozen local branch head and branch incarnation, other Task references and process use. A replacement file or recreated branch cannot inherit an earlier delivery or cleanup decision. Local lsof checks cwd and open files. An unavailable or incomplete probe stays pending. Artifact deletion uses a persisted disposal path so interrupted removal can resume without adopting replacement contents. A containing resource waits until every nested scope has been removed, then rechecks absence at its original and disposal locations, including locations inside a relocated parent.
 
-New worktree enrollment binds branch ownership to the physical reflog creation identity and first entry. Normal commits can append to that reflog. A missing, rewritten or replaced anchor, a filesystem without a usable creation timestamp, or an older ledger without an enrollment anchor leaves worktree and branch removal pending. Completion additionally freezes the current branch identity and head.
+New worktree enrollment binds branch ownership to the physical reflog creation identity and first entry. Normal commits can append to that reflog. A missing, rewritten or replaced anchor, a filesystem without a usable creation timestamp, or an older ledger without an enrollment anchor leaves worktree and branch removal pending. Explicit cleanup additionally freezes the current branch identity and head.
 
 If a Worker already removed its owned worktree and local branch, Runtime reconciles verified absence of the worktree and nested scopes without recreating resources. All surviving ancestors must retain their recorded identities. A missing branch with a remaining worktree or Git registration blocks destructive cleanup, including nested scopes. An extant replacement or conflicting Git registration remains protected.
 
-Explicit completion can discard dirty, untracked, ignored and unmerged work in newly owned worktrees and deletes their local task branches. Ordinary `release_workspace` retains its existing conservative checks and does not delete branches. Shared project roots, original inputs, project records, other Tasks and unknown or active use stay protected. Cleanup never stops deployed services, dissolves groups, deletes remote branches or scans historical resources.
+Explicit cleanup can discard dirty, untracked, ignored and unmerged work in newly owned worktrees and deletes their local task branches. Ordinary `release_workspace` retains its existing conservative checks and does not delete branches. Shared project roots, original inputs, project records, other Tasks and unknown or active use stay protected. Cleanup never stops deployed services, dissolves groups, deletes remote branches or scans historical resources.
 
 ## Follow-up work
 
-Completed Tasks cannot resume Threads, restore worktrees, start execution or approve old native requests. Read-only execution-use checks do not call `thread/resume`. Live and offline follow-ups retain original provenance and route once to the coordinator. Forwarded messages cannot answer an unrelated coordinator native question, and attachment downloads use the original message identity. The coordinator answers historical questions from records. New work uses `dispatch` with `predecessorTaskId`; the new Task receives the old summary and delivery references and allocates independent resources.
+New user input or an Agent message continues the same Worker and Thread. The task, execution profile, group and prior completion history stay intact. Only an accepted input after the completion inbox sequence reopens current work; retries and historical pending rows do not. Pause still requires explicit resume.
 
-## Coordinator housekeeping
+After cleanup, additional input reports removed scopes and the current resources. `ensure_workspace` can acquire another worktree for the same repository using a persisted new resource generation, path and branch. Old tombstones and cleanup retries cannot remove the replacement. `allocate_artifacts` creates a new artifact scope when needed. The coordinator may choose a new task with `predecessorTaskId` when the work calls for it.
 
-Coordinators allocate a separate scope for each dispatch or inspection. `cleanup_artifacts` takes `requestId` and `scopeIds`, freezes those scopes and leaves the coordinator Task open. The coordinator finishes its current turn so mechanical cleanup can proceed. Subsequent work allocates a fresh scope. New scopes and durable project records are outside old operations.
+## Upgrade behavior
+
+Before recovery, the Runtime turns each old completion into a historical record and records the existing inbox sequence. Explicit old cleanup remains recoverable. An old implicit completion cleanup is retained as evidence and stops deleting. Untouched scopes are unsealed when their physical identity matches. Interrupted disposal paths and partial worktree removal keep their frozen identities and results. A new explicit request can select a retained scope and continue from that exact disposal identity. Migration neither starts a new turn nor replays historical follow-ups.
 
 ## Verification
 

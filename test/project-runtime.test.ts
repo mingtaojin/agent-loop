@@ -15,7 +15,7 @@ import { AgentLoop } from '../src/loop.js';
 import { CodexProviderMismatchError, FeishuApiError, GroupCreationRejected, type CodexPort, type WorkspacePort } from '../src/ports.js';
 import { GroupCleanup } from '../src/group-cleanup.js';
 import { groupGeneration, retireTaskGroup, TaskGroups } from '../src/task-groups.js';
-import { ProjectLedger, projectStateSchema, type ProjectAction } from '../src/project.js';
+import { ProjectLedger, projectStateSchema, type ProjectAction, type ProjectToolCall } from '../src/project.js';
 import { ProjectRuntime } from '../src/project-runtime.js';
 import type { ReasoningEffort } from '../src/project.js';
 import { Store } from '../src/store.js';
@@ -40,334 +40,8 @@ async function nativeWorkerAction(f: Awaited<ReturnType<typeof fixture>>, taskId
   const snapshot = f.codex.snapshot(task.threadId);
   assert.ok(snapshot.turnId);
   return f.codex.projectHandler({ threadId: task.threadId, turnId: snapshot.turnId,
-    connectionEpoch: 'fake-epoch', callId: action.action === 'status' ? 'status' : action.requestId, action });
+    connectionEpoch: 'fake-epoch', callId: 'requestId' in action ? action.requestId : action.action, call: { tool: 'project_action', arguments: action } });
 }
-
-function deliverResult(requestId = 'delivery-attempt-1', resultId = 'result-v1'): Extract<ProjectAction, { action: 'deliver_result' }> {
-  return { action: 'deliver_result', requestId, resultId, text: 'Verified deliverable. Independent review remains pending.',
-    deliveryReferences: ['https://github.com/example/app/pull/42', 'docs/verification.md'] };
-}
-
-for (const grouped of [false, true]) for (const running of [false, true]) {
-  test(`Worker deliverable reaches its coordinator once with grouped=${grouped} running=${running} and no owner request`, async t => {
-    const f = await fixture(t); await f.initialize();
-    const worker = await f.dispatch('deliverable', 'Produce the agreed deliverable.');
-    if (grouped) await f.openGroup(worker.id);
-    if (!running) await f.idleCoordinator();
-    const coordinator = f.coordinator(), groups = f.feishu.groups.size;
-    const starts = f.codex.starts.length, steers = f.codex.steers.length;
-    const receipt = await nativeWorkerAction(f, worker.id, deliverResult());
-    assert.deepEqual(await nativeWorkerAction(f, worker.id, deliverResult()), receipt);
-    await f.loop.tick();
-    assert.equal(f.events(coordinator.id, 'worker_result').length, 0);
-    assert.equal(f.codex.starts.length, starts); assert.equal(f.codex.steers.length, steers);
-    f.codex.complete(worker.threadId!, 'Task group final with a different wording.');
-    await f.loop.tick(); await f.loop.tick();
-    const events = f.events(coordinator.id, 'worker_result');
-    assert.equal(events.length, 1); assert.equal(events[0]?.status, 'delivered');
-    assert.match(events[0]!.message.text, /Verified deliverable/);
-    assert.match(events[0]!.message.text, /result-v1/);
-    assert.match(JSON.stringify(events[0]), /docs\/verification\.md/);
-    assert.ok(events[0]?.provenance.kind === 'agent');
-    assert.equal(events[0].provenance.taskId, worker.id);
-    assert.equal(f.codex.starts.length, starts + (running ? 0 : 1));
-    assert.equal(f.codex.steers.length, steers + (running ? 1 : 0));
-    assert.equal(f.feishu.groups.size, groups);
-    assert.equal(f.loop.closeout.completed(worker.id), false);
-    assert.equal(f.loop.store.meta(`task-summary:${worker.id}`), 'Task group final with a different wording.');
-    assert.equal(f.loop.store.outputs(worker.id).filter(output => output.text.includes('Task group final')).length, 1);
-    const group = f.loop.store.task(worker.id).chatId;
-    assert.equal(group !== null, grouped);
-    if (group) assert.equal(f.feishu.sent.filter(output => output.chatId === group && output.text.includes('Task group final')).length, 1);
-    await f.restart(); await f.loop.tick(); await f.loop.tick();
-    assert.equal(f.events(coordinator.id, 'worker_result').length, 1);
-    assert.equal(f.codex.starts.length, starts + (running ? 0 : 1));
-    assert.equal(f.codex.steers.length, steers + (running ? 1 : 0));
-  });
-}
-
-test('Worker delivery survives a restart before successful completion and a lost coordinator delivery response', async t => {
-  const f = await fixture(t); await f.initialize();
-  const worker = await f.dispatch('durable-delivery', 'Produce evidence.'); await f.idleCoordinator();
-  const action = deliverResult();
-  const receipt = await nativeWorkerAction(f, worker.id, action);
-  await f.restart();
-  assert.deepEqual(await nativeWorkerAction(f, worker.id, action), receipt);
-  const starts = f.codex.starts.length;
-  f.codex.complete(worker.threadId!, null);
-  f.codex.loseInputAck = true;
-  await f.loop.tick(); await f.loop.tick();
-  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
-  assert.equal(f.codex.starts.length, starts + 1);
-  await f.restart(); await f.loop.tick();
-  assert.equal(f.events(f.coordinator().id, 'worker_result')[0]?.status, 'delivered');
-  assert.equal(f.codex.starts.length, starts + 1);
-});
-
-test('a verified Worker result survives connection rollover while new calls from the old epoch are rejected', async t => {
-  const f = await fixture(t); await f.initialize();
-  const worker = await f.dispatch('reconnected-delivery', 'Deliver evidence.');
-  assert.ok(worker.threadId && f.codex.projectHandler);
-  const snapshot = f.codex.snapshot(worker.threadId); assert.ok(snapshot.turnId);
-  let epoch = 'connection-before';
-  f.codex.isActiveTurn = identity => identity.connectionEpoch === epoch && identity.threadId === worker.threadId
-    && identity.turnId === snapshot.turnId && snapshot.status === 'running';
-  const request = { threadId: worker.threadId, turnId: snapshot.turnId, callId: 'reconnected-result',
-    connectionEpoch: epoch, action: deliverResult() };
-  const receipt = await f.codex.projectHandler(request);
-  epoch = 'connection-after';
-  await assert.rejects(f.codex.projectHandler(request), /active/i);
-  await f.restart(); assert.ok(f.codex.projectHandler);
-  assert.deepEqual(await f.codex.projectHandler({ ...request, connectionEpoch: epoch }), receipt);
-  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
-  f.codex.complete(worker.threadId, null); await f.loop.tick(); await f.loop.tick(); await f.restart();
-  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
-  assert.equal(f.events(f.coordinator().id, 'worker_result')[0]?.status, 'delivered');
-});
-
-test('Worker result identity deduplicates across turns while separate results with the same prose remain distinct', async t => {
-  const f = await fixture(t); await f.initialize();
-  const worker = await f.dispatch('stable-result-id', 'Deliver once.');
-  await nativeWorkerAction(f, worker.id, deliverResult());
-  f.codex.complete(worker.threadId!, null); await f.loop.tick(); await f.loop.tick();
-  await f.loop.projectAction(f.coordinator().id, { action: 'send', requestId: 'follow-up', taskId: worker.id, text: 'Review the delivered evidence.' });
-  await f.loop.tick();
-  await nativeWorkerAction(f, worker.id, deliverResult('new-attempt-same-result'));
-  f.codex.complete(worker.threadId!, null); await f.loop.tick(); await f.loop.tick();
-  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
-  await f.loop.projectAction(f.coordinator().id, { action: 'send', requestId: 'second-result', taskId: worker.id, text: 'Produce the second deliverable.' });
-  await f.loop.tick();
-  await nativeWorkerAction(f, worker.id, deliverResult('new-attempt-new-result', 'result-v2'));
-  f.codex.complete(worker.threadId!, null); await f.loop.tick(); await f.loop.tick();
-  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 2);
-});
-
-test('Worker delivery requires active trusted ingress and rejects changed retry content', async t => {
-  const f = await fixture(t); await f.initialize();
-  const worker = await f.dispatch('trusted-delivery', 'Deliver evidence.');
-  await assert.rejects(f.loop.projectAction(worker.id, deliverResult()), /active|identity|context/i);
-  await assert.rejects(nativeWorkerAction(f, f.coordinator().id, deliverResult()), /worker/i);
-  assert.ok(worker.threadId && f.codex.projectHandler);
-  const snapshot = f.codex.snapshot(worker.threadId); assert.ok(snapshot.turnId);
-  await assert.rejects(f.codex.projectHandler({ threadId: worker.threadId, turnId: snapshot.turnId, callId: 'stale',
-    connectionEpoch: 'stale-epoch', action: deliverResult() }), /active/i);
-  await nativeWorkerAction(f, worker.id, deliverResult());
-  await assert.rejects(nativeWorkerAction(f, worker.id, { ...deliverResult(), text: 'Changed operation content.' }), /different|conflict/i);
-  await assert.rejects(nativeWorkerAction(f, worker.id, { ...deliverResult('changed-result'), text: 'Changed result content.' }), /different|conflict/i);
-  f.codex.complete(worker.threadId, 'Ordinary final.'); await f.loop.tick(); await f.loop.tick();
-  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
-});
-
-for (const terminal of ['failed', 'interrupted'] as const) {
-  test(`Worker ${terminal} execution cannot publish or later reactivate a declared delivery`, async t => {
-    const f = await fixture(t); await f.initialize();
-    const worker = await f.dispatch(`delivery-${terminal}`, 'Deliver evidence.');
-    await nativeWorkerAction(f, worker.id, deliverResult());
-    const snapshot = f.codex.snapshot(worker.threadId!);
-    snapshot.status = terminal; snapshot.error = terminal;
-    await f.loop.tick();
-    assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
-    assert.ok(f.events(f.coordinator().id, 'execution_status').length > 0);
-    f.codex.complete(worker.threadId!, 'Later ordinary final.');
-    await f.loop.tick(); await f.restart(); await f.loop.tick();
-    assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
-  });
-}
-
-test('operator pause invalidates a pending Worker delivery even when the turn finishes before resume', async t => {
-  const f = await fixture(t); await f.initialize();
-  const worker = await f.dispatch('paused-delivery', 'Deliver evidence.');
-  await nativeWorkerAction(f, worker.id, deliverResult());
-  await f.loop.control(worker.id, 'pause');
-  f.codex.complete(worker.threadId!, 'Final after pause.');
-  await f.loop.control(worker.id, 'resume'); await f.loop.tick(); await f.restart();
-  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
-});
-
-for (const kind of ['question', 'approval', 'permissions'] as const) {
-  test(`native ${kind} preserves its request and prevents a pending Worker delivery`, async t => {
-    const f = await fixture(t); await f.initialize();
-    const worker = await f.dispatch(`native-delivery-${kind}`, 'Deliver evidence.');
-    await nativeWorkerAction(f, worker.id, deliverResult());
-    const snapshot = f.codex.snapshot(worker.threadId!); assert.ok(snapshot.turnId);
-    const request: PendingRequest = { id: `delivery-${kind}`, kind, threadId: worker.threadId!, turnId: snapshot.turnId,
-      connectionEpoch: 'fake-epoch', prompt: `Native ${kind} still needs an answer.`, method: `native/${kind}`, payload: {}, isBlocking: true };
-    snapshot.requests = [request]; await f.loop.tick();
-    assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
-    assert.deepEqual(f.loop.store.task(worker.id).requests, [request]);
-    assert.equal(f.codex.approvals.length, 0); assert.equal(f.codex.replies.length, 0);
-    if (kind === 'question') assert.equal(f.events(f.coordinator().id, 'question').length, 1);
-    else assert.equal(f.feishu.approvals.at(-1)?.request.id, request.id);
-    f.codex.complete(worker.threadId!, 'This final does not replace the native answer.'); await f.loop.tick(); await f.restart();
-    assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
-    assert.equal(f.codex.approvals.length, 0); assert.equal(f.codex.replies.length, 0);
-  });
-}
-
-for (const origin of ['owner', 'coordinator'] as const) {
-  test(`${origin} steering invalidates the old delivery and permits a fresh declaration after handling input`, async t => {
-    const f = await fixture(t); await f.initialize();
-    const worker = await f.dispatch(`delivery-steering-${origin}`, 'Deliver evidence.');
-    const opened = origin === 'owner' ? await f.openGroup(worker.id) : worker;
-    const oldAction = deliverResult(); await nativeWorkerAction(f, worker.id, oldAction);
-    const turn = f.codex.snapshot(worker.threadId!).turnId;
-    if (origin === 'owner') await f.loop.receive(f.message('delivery-owner-steer', 'Check one more requirement.', opened.chatId!));
-    else await f.loop.projectAction(f.coordinator().id, { action: 'send', requestId: 'delivery-coordinator-steer', taskId: worker.id, text: 'Check one more requirement.' });
-    await f.loop.tick();
-    assert.equal(f.codex.snapshot(worker.threadId!).turnId, turn);
-    await nativeWorkerAction(f, worker.id, oldAction);
-    f.codex.complete(worker.threadId!, 'Stale declared result.'); await f.loop.tick(); await f.loop.tick();
-    assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
-    await f.loop.projectAction(f.coordinator().id, { action: 'send', requestId: `redo-${origin}`, taskId: worker.id, text: 'Deliver the checked result.' });
-    await f.loop.tick();
-    await nativeWorkerAction(f, worker.id, deliverResult('fresh-delivery-attempt'));
-    f.codex.complete(worker.threadId!, 'Checked result.'); await f.loop.tick(); await f.loop.tick();
-    assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
-  });
-}
-
-test('unhandled input cannot be included silently in a new delivery declaration', async t => {
-  const f = await fixture(t); await f.initialize();
-  const worker = await f.dispatch('unhandled-delivery-input', 'Deliver evidence.');
-  f.loop.store.receive(worker.id, f.message('unhandled-delivery-owner', 'Still needs handling.', ''), 'source',
-    { kind: 'agent', projectId: 'app', taskId: f.coordinator().id, eventId: 'new-guidance', category: 'instruction' });
-  await assert.rejects(nativeWorkerAction(f, worker.id, deliverResult()), /input|pending|unresolved|handled/i);
-  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
-});
-
-for (const reportFirst of [false, true]) {
-  test(`explicit result report and Worker delivery use one coordinator result with reportFirst=${reportFirst}`, async t => {
-    const f = await fixture(t); await f.initialize();
-    const worker = await f.dispatch('report-delivery-overlap', 'Deliver evidence.');
-    const requestId = await requestReport(f, worker.id, 'owner-delivery-report');
-    const report: ProjectAction = { action: 'report', requestId, kind: 'result', routing: 'final', text: 'Owner-requested deliverable report.' };
-    if (reportFirst) await nativeWorkerAction(f, worker.id, report);
-    await nativeWorkerAction(f, worker.id, deliverResult());
-    if (!reportFirst) await nativeWorkerAction(f, worker.id, report);
-    f.codex.complete(worker.threadId!, 'Ordinary final remains in the task group.');
-    await f.loop.tick(); await f.loop.tick(); await f.restart();
-    assert.equal(f.events(f.coordinator().id, 'result').length, 1);
-    assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
-    assert.ok(f.loop.store.outputs(worker.id).some(output => output.text.includes('Ordinary final remains')));
-    const input = f.events(f.coordinator().id, 'result')[0]; assert.ok(input?.provenance.kind === 'agent');
-    assert.ok(input.provenance.sources?.some(source => source.messageId === requestId));
-  });
-}
-
-test('intermediate or rejected reports cannot consume a declared Worker result', async t => {
-  const f = await fixture(t); await f.initialize();
-  const worker = await f.dispatch('intermediate-delivery', 'Deliver evidence.'); await f.openGroup(worker.id);
-  await nativeWorkerAction(f, worker.id, deliverResult());
-  await assert.rejects(nativeWorkerAction(f, worker.id, { action: 'report', requestId: 'no-owner-request', kind: 'result', text: 'Not authorized.' }), /owner/i);
-  await nativeWorkerAction(f, worker.id, { action: 'report', requestId: 'progress-only', kind: 'update', routing: 'intermediate', text: 'Local progress.' });
-  f.codex.complete(worker.threadId!, null); await f.loop.tick(); await f.loop.tick();
-  assert.equal(f.events(f.coordinator().id, 'result').length, 0);
-  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
-});
-
-test('Worker delivery event and publication state roll back together and recover after a partial write', async t => {
-  const f = await fixture(t); await f.initialize();
-  const worker = await f.dispatch('atomic-publication', 'Deliver evidence.');
-  await nativeWorkerAction(f, worker.id, deliverResult());
-  const event = f.loop.projects.event.bind(f.loop.projects); let injected = false;
-  f.loop.projects.event = (...args) => {
-    event(...args);
-    if (args[4] === 'worker_result' && !injected) { injected = true; throw new Error('Crash after inbox insertion'); }
-  };
-  f.codex.complete(worker.threadId!, null); await f.loop.tick();
-  assert.equal(injected, true);
-  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
-  await f.restart(); await f.loop.tick(); await f.loop.tick();
-  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
-  assert.equal(f.events(f.coordinator().id, 'worker_result')[0]?.status, 'delivered');
-});
-
-test('Worker declaration and operation receipt roll back together', async t => {
-  const f = await fixture(t); await f.initialize();
-  const worker = await f.dispatch('atomic-declaration', 'Deliver evidence.');
-  const saveReceipt = f.loop.projects.ledger.saveReceipt.bind(f.loop.projects.ledger); let injected = false;
-  f.loop.projects.ledger.saveReceipt = (...args) => {
-    saveReceipt(...args);
-    if (args[2] === 'delivery-attempt-1' && !injected) { injected = true; throw new Error('Crash after receipt insertion'); }
-  };
-  await assert.rejects(nativeWorkerAction(f, worker.id, deliverResult()), /Crash after receipt/);
-  await f.restart();
-  await nativeWorkerAction(f, worker.id, deliverResult());
-  f.codex.complete(worker.threadId!, null); await f.loop.tick(); await f.loop.tick();
-  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
-});
-
-test('Worker result reconciliation ignores saved ordinary output and ended-turn receipts', async t => {
-  const f = await fixture(t); await f.initialize();
-  const worker = await f.dispatch('saved-chat-receipt', 'Deliver evidence.');
-  await nativeWorkerAction(f, worker.id, deliverResult());
-  const task = f.loop.store.task(worker.id); assert.ok(task.threadId && task.turnId);
-  task.lastHandledTurnId = task.turnId; task.executionStatus = 'completed';
-  f.loop.store.saveTask(task);
-  f.loop.store.setMeta(`worker-chat-ended:${JSON.stringify([task.id, task.threadId, task.turnId])}`, 'ended');
-  f.codex.complete(worker.threadId!, null); await f.restart(); await f.loop.tick();
-  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
-});
-
-test('a paused coordinator retains Worker delivery until its original task resumes', async t => {
-  const f = await fixture(t); await f.initialize();
-  const worker = await f.dispatch('paused-coordinator-delivery', 'Deliver evidence.');
-  const coordinator = f.coordinator();
-  await f.loop.control(coordinator.id, 'pause');
-  const starts = f.codex.starts.length, steers = f.codex.steers.length;
-  await nativeWorkerAction(f, worker.id, deliverResult());
-  f.codex.complete(worker.threadId!, null); await f.loop.tick(); await f.loop.tick();
-  assert.equal(f.events(coordinator.id, 'worker_result').length, 1);
-  assert.notEqual(f.events(coordinator.id, 'worker_result')[0]?.status, 'delivered');
-  assert.equal(f.codex.starts.length, starts); assert.equal(f.codex.steers.length, steers);
-  await f.restart(); await f.loop.control(coordinator.id, 'resume'); await f.loop.tick();
-  assert.equal(f.events(coordinator.id, 'worker_result')[0]?.status, 'delivered');
-  assert.equal(f.coordinator().threadId, coordinator.threadId);
-  assert.equal(f.events(coordinator.id, 'worker_result').length, 1);
-});
-
-test('a retained Worker Thread can register delivery through the actual capability client', async t => {
-  const f = await fixture(t); await f.initialize();
-  const worker = await f.dispatch('fallback-delivery', 'Deliver evidence.');
-  await f.restart(); f.codex.projectHandler = null;
-  const instructions = f.codex.instructionUpdates.findLast(update => update.threadId === worker.threadId)?.instructions ?? '';
-  const command = /write the action JSON to a file and run (.+?) '<absolute-action-json-file>' using your shell tool/.exec(instructions)?.[1];
-  assert.ok(command);
-  const actionFile = join(f.root, 'delivery-action.json'); await writeFile(actionFile, JSON.stringify(deliverResult()));
-  const run = () => promisify(execFile)('/bin/sh', ['-c', `${command} "$1"`, 'delivery-fallback', actionFile], { timeout: 10_000 });
-  const receipt = await run(); assert.deepEqual(JSON.parse((await run()).stdout), JSON.parse(receipt.stdout));
-  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
-  f.codex.complete(worker.threadId!, null);
-  await assert.rejects(run(), /active turn/i);
-  await f.loop.tick(); await f.restart(); await f.loop.tick();
-  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
-  assert.equal(f.events(f.coordinator().id, 'worker_result')[0]?.status, 'delivered');
-});
-
-test('an explicit result before steering cannot suppress a fresh delivery after that steering', async t => {
-  const f = await fixture(t); await f.initialize();
-  const worker = await f.dispatch('report-watermark', 'Deliver evidence.');
-  const requestId = await requestReport(f, worker.id, 'early-delivery-report');
-  await nativeWorkerAction(f, worker.id, { action: 'report', requestId, kind: 'result', text: 'Earlier result.' });
-  await f.loop.projectAction(f.coordinator().id, { action: 'send', requestId: 'new-delivery-work', taskId: worker.id, text: 'Complete the additional check.' });
-  await f.loop.tick();
-  await nativeWorkerAction(f, worker.id, deliverResult());
-  f.codex.complete(worker.threadId!, null); await f.loop.tick(); await f.loop.tick();
-  assert.equal(f.events(f.coordinator().id, 'result').length, 1);
-  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
-});
-
-test('Worker delivery does not publish from an idle or superseded turn observation', async t => {
-  const f = await fixture(t); await f.initialize();
-  const worker = await f.dispatch('superseded-delivery', 'Deliver evidence.');
-  await nativeWorkerAction(f, worker.id, deliverResult());
-  const snapshot = f.codex.snapshot(worker.threadId!);
-  snapshot.status = 'idle'; await f.loop.tick();
-  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
-  snapshot.turnId = 'unrelated-turn'; f.codex.complete(worker.threadId!, 'Unrelated completion.');
-  await f.loop.tick(); await f.restart();
-  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
-});
 
 const dispatchReceipt = z.object({ taskId: z.string().min(1) });
 const overviewSchema = z.object({
@@ -424,7 +98,7 @@ test('delegated workers and secondWorkers stay group-less until the coordinator 
   await f.openGroup(worker.id, 'another-open'); await f.restart(); await f.loop.tick();
   assert.equal(f.feishu.groups.size, 3);
   assert.equal(f.feishu.sent.filter(output => output.chatId === opened.chatId).length, 1);
-  await assert.rejects(f.loop.projectAction(worker.id, { action: 'open_group', requestId: 'forbidden', taskId: worker.id }), /Only the coordinator/);
+  await f.loop.projectAction(worker.id, { action: 'open_group', requestId: 'self-reuse', taskId: worker.id });
   await assert.rejects(f.loop.projectAction(f.coordinator('docs').id, { action: 'open_group', requestId: 'foreign', taskId: worker.id }), /not a worker/);
   await assert.rejects(f.loop.projectAction(f.coordinator().id, { action: 'open_group', requestId: 'self', taskId: f.coordinator().id }), /not a worker/);
 });
@@ -716,7 +390,7 @@ test('bulk cleanup freezes its list, requires owner confirmation, protects both 
   assert.deepEqual(cleanup.plan(f.coordinator().id, 'cleanup'), plan);
   await assert.rejects(cleanup.apply(f.coordinator().id, plan.id), /not been confirmed/);
   const newer = await f.dispatch('cleanup-new', 'A later task.'); await f.openGroup(newer.id);
-  await f.loop.projectAction(f.coordinator().id, { action: 'send', requestId: 'fake-confirm', taskId: worker.id, text: plan.confirmationText });
+  await f.loop.projectCall(f.coordinator().id, { tool: 'send_agent_message', arguments: { requestId: 'fake-confirm', taskId: worker.id, text: plan.confirmationText } });
   assert.throws(() => cleanup.confirm(f.coordinator().id, plan.id, 'fake-confirm'), /actual owner/);
   const confirmation = f.message('cleanup-confirm', plan.confirmationText, f.coordinator().chatId!);
   confirmation.createdAt = Math.max(Date.now(), plan.createdAt);
@@ -800,6 +474,7 @@ async function fixture(t: TestContext, options: { secondProject?: boolean } = {}
   });
   return { root, directory, config, projectConfigs, github, feishu, codex, workspaces, state, coordinator, events, message,
     get loop() { return loop; },
+    messages: (taskId: string) => loop.store.inputs(taskId).filter(input => input.provenance.kind === 'agent_message'),
     async seedLegacy(source: Source) {
       const repository = configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner' }, repositories: [{ name: source.repository, path: directory, baseBranch: 'main', workspace: { kind: 'project-directory', path: directory } }] }).repositories[0];
       assert.ok(repository && 'path' in repository && repository.workspace?.kind === 'project-directory');
@@ -822,11 +497,9 @@ async function fixture(t: TestContext, options: { secondProject?: boolean } = {}
     },
     async initialize() { await loop.collect(); await loop.tick(); return coordinator(); },
     async status(callerId = coordinator().id) { return overviewSchema.parse(await loop.projectAction(callerId, { action: 'status' })); },
-    async dispatch(requestId: string, prompt: string, extra: { issueId?: string; role?: 'worker'; callerId?: string; mode?: 'investigation' | 'implementation'; authorization?: Extract<ProjectAction, { action: 'dispatch' }>['authorization'] } = {}) {
+    async dispatch(requestId: string, prompt: string, extra: { issueId?: string; role?: 'worker'; callerId?: string } = {}) {
       const result = dispatchReceipt.parse(await loop.projectAction(extra.callerId ?? coordinator().id, {
         action: 'dispatch', execution: testExecution.worker, requestId, prompt, role: extra.role ?? 'worker', ...(extra.issueId ? { issueId: extra.issueId } : {}),
-        ...(extra.mode ? { mode: extra.mode } : extra.issueId ? { mode: 'investigation' as const } : {}),
-        ...(extra.authorization ? { authorization: extra.authorization } : {}),
       }));
       await loop.tick();
       const task = loop.store.task(result.taskId);
@@ -945,7 +618,7 @@ test('dispatch is idempotent under concurrent requests and restart, rejects conf
   const f = await fixture(t); f.github.sources = [projectIssue(12)];
   const coordinator = await f.initialize();
   const action: ProjectAction = { action: 'dispatch', execution: testExecution.worker, requestId: 'investigate-12', issueId: f.github.sources[0]!.id,
-    role: 'worker', mode: 'investigation', prompt: 'Investigate batch export. Deliver findings and acceptance criteria only. Do not edit business code or deploy.' };
+    role: 'worker', prompt: 'Investigate batch export. Deliver findings and acceptance criteria only. Do not edit business code or deploy.' };
   const [first, duplicate] = await Promise.all([f.loop.projectAction(coordinator.id, action), f.loop.projectAction(coordinator.id, action)]);
   assert.deepEqual(first, duplicate);
   const { taskId } = dispatchReceipt.parse(first);
@@ -953,7 +626,7 @@ test('dispatch is idempotent under concurrent requests and restart, rejects conf
   const worker = f.loop.store.task(taskId); assert.ok(worker.threadId);
   assert.deepEqual(f.state().members.find(member => member.taskId === taskId), { taskId, role: 'worker', issueId: f.github.sources[0]!.id });
   const delegation = f.loop.store.meta(`project-delegation:${taskId}`) ?? '';
-  assert.ok(delegation.startsWith(action.prompt)); assert.match(delegation, /Investigation-only contract:/);
+  assert.equal(delegation, action.prompt);
   const creation = f.codex.created.find(input => input.instructions.includes(action.prompt)); assert.ok(creation);
   assert.match(creation.instructions, /poteto-mode/);
   assert.ok(creation.instructions.includes(action.prompt));
@@ -1004,36 +677,36 @@ test('new Issue comments reach only the coordinator until explicitly sent to the
   assert.equal(f.loop.store.inputs(worker.id).length, workerInputs);
   const page = z.object({ items: z.array(sourceCommentSchema) }).parse(await f.loop.projectAction(f.coordinator().id, { action: 'status', section: 'comments' }));
   assert.deepEqual(page.items, [comment]);
-  const action: ProjectAction = { action: 'send', requestId: 'forward-13', taskId: worker.id,
-    text: `Source ${comment.url}, author ${comment.author}. Check this new evidence within the existing scope. ${comment.body}` };
-  await f.loop.projectAction(f.coordinator().id, action); await f.loop.projectAction(f.coordinator().id, action); await f.loop.tick();
-  const forwarded = f.events(worker.id, 'instruction'); assert.equal(forwarded.length, 1);
-  assert.equal(forwarded[0]?.message.text, action.text);
+  const action: ProjectToolCall = { tool: 'send_agent_message', arguments: { requestId: 'forward-13', taskId: worker.id, text: `Source ${comment.url}, author ${comment.author}. Check this new evidence within the existing scope. ${comment.body}` } };
+  await f.loop.projectCall(f.coordinator().id, action); await f.loop.projectCall(f.coordinator().id, action); await f.loop.tick();
+  await eventually(() => assert.equal(f.messages(worker.id)[0]?.status, 'delivered'));
+  const forwarded = f.messages(worker.id); assert.equal(forwarded.length, 1);
+  assert.equal(forwarded[0]?.message.text, action.arguments.text);
   assert.equal(forwarded[0]?.status, 'delivered');
-  assert.equal(forwarded[0]?.provenance.kind, 'agent');
+  assert.equal(forwarded[0]?.provenance.kind, 'agent_message');
   assert.equal(f.codex.steers.filter(input => input.threadId === worker.threadId && JSON.stringify(input.input).includes(comment.url)).length, 1);
   assert.equal(f.codex.approvals.length, 0);
   assert.equal(f.loop.tasks().length, 2);
 });
 
-test('background coordinator events stay local until an idempotent typed announcement is sent', async t => {
+test('background coordinator events stay local until an idempotent explicit group message is sent', async t => {
   const f = await fixture(t); const coordinator = await f.initialize(); await f.idleCoordinator();
   const before = f.feishu.sent.filter(output => output.chatId === coordinator.chatId).length;
   f.loop.projects.event('app', 'github-background', 'GitHub Issue facts', coordinator.id, 'github_issue');
   await f.loop.tick();
   const running = f.loop.store.task(coordinator.id); assert.equal(running.status, 'running'); assert.ok(running.threadId);
-  const announcement: ProjectAction = { action: 'announce', requestId: 'announce-background', kind: 'blocker', text: '需要补充测试环境证据。' };
-  await f.loop.projectAction(coordinator.id, announcement);
+  const announcement: ProjectToolCall = { tool: 'send_group_message', arguments: { requestId: 'announce-background', text: '需要补充测试环境证据。' } };
+  await f.loop.projectCall(coordinator.id, announcement);
   f.codex.complete(running.threadId, 'Internal background assessment.');
   await f.loop.tick();
   const sent = f.feishu.sent.filter(output => output.chatId === coordinator.chatId);
   assert.equal(sent.length, before + 1);
-  assert.equal(sent.at(-1)?.text, '【任务阻塞】\n需要补充测试环境证据。');
-  await f.loop.projectAction(coordinator.id, announcement); await f.loop.tick();
+  assert.equal(sent.at(-1)?.text, '需要补充测试环境证据。');
+  await f.loop.projectCall(coordinator.id, announcement); await f.loop.tick();
   assert.equal(f.feishu.sent.filter(output => output.chatId === coordinator.chatId).length, before + 1);
 });
 
-test('a direct project-group message keeps the coordinator final reply visible', async t => {
+test('a direct project-group reply is visible only after an explicit group message', async t => {
   const f = await fixture(t); const coordinator = await f.initialize(); await f.idleCoordinator();
   const message = f.message('direct-coordinator', '请说明当前任务状态。', coordinator.chatId!);
   const messages = () => f.feishu.sent.filter(output => output.chatId === coordinator.chatId).map(output => output.text);
@@ -1044,162 +717,19 @@ test('a direct project-group message keeps the coordinator final reply visible',
   await f.loop.tick();
   assert.deepEqual(messages(), before);
   f.codex.complete(running.threadId, '当前任务仍在调查。'); await f.loop.tick();
+  assert.deepEqual(messages(), before);
+  await f.loop.projectCall(coordinator.id, { tool: 'send_group_message', arguments: { requestId: 'direct-reply', text: '当前任务仍在调查。' } });
+  await f.loop.tick();
   assert.deepEqual(messages(), [...before, '当前任务仍在调查。']);
 });
 
-test('Feature implementation needs owner authorization while investigation remains allowed', async t => {
-  const f = await fixture(t); const source = projectIssue(14); f.github.sources = [source]; const coordinator = await f.initialize(); await f.idleCoordinator();
-  const intake = f.loop.store.taskForSource(source.id); assert.ok(intake);
-  const missing: ProjectAction = { action: 'dispatch', execution: testExecution.worker, requestId: 'feature-implementation-missing', issueId: source.id, intakeTaskId: intake.id,
-    role: 'worker', mode: 'implementation', prompt: 'Implement the requested feature.' };
-  await assert.rejects(f.loop.projectAction(coordinator.id, missing), /authorization/);
-  assert.equal(f.loop.projects.ledger.membership(intake.id), null);
-  const owner = f.message('feature-owner-decision', '确认开发这个 Feature，范围是导出筛选结果。', coordinator.chatId!);
-  await f.loop.receive(owner);
-  const sourceRevision = createHash('sha256').update(JSON.stringify({ ...source, assignees: [...source.assignees].sort(), labels: [...source.labels].sort(), updatedAt: undefined })).digest('hex');
-  const action: ProjectAction = { ...missing, requestId: 'feature-implementation-authorized', authorization: {
-    messageId: owner.id, scope: '导出当前筛选结果', acceptance: '结果与当前筛选条件一致', sourceRevision,
-  } };
-  const first = dispatchReceipt.parse(await f.loop.projectAction(coordinator.id, action));
-  const second = dispatchReceipt.parse(await f.loop.projectAction(coordinator.id, action));
-  assert.deepEqual(second, first);
-  await f.loop.tick();
-  const worker = f.loop.store.task(first.taskId);
-  assert.equal(f.loop.projects.ledger.membership(worker.id)?.role, 'worker');
-  assert.match(f.loop.store.meta(`project-delegation:${worker.id}`) ?? '', /Implement the requested feature/);
+test('Feature dispatch uses the supplied scope without business authorization fields', async t => {
+  const f = await fixture(t); f.github.sources = [projectIssue(29)]; await f.initialize();
+  const prompt = 'Implement the requested feature. Do not deploy.';
+  const worker = await f.dispatch('feature-implementation', prompt, { issueId: projectIssue(29).id });
+  assert.equal(worker.source.kind === 'cli' ? worker.source.prompt : f.loop.store.meta(`project-delegation:${worker.id}`), prompt);
+  assert.doesNotMatch(worker.prompt, /Investigation-only contract/);
 });
-
-for (const kind of ['result', 'question', 'update'] as const) test(`worker ${kind} report wakes the coordinator once and survives redelivery after restart`, async t => {
-  const f = await fixture(t); await f.initialize();
-  const worker = await f.dispatch('investigate', 'Investigate the existing export behavior.');
-  await f.idleCoordinator();
-  const requestId = await requestReport(f, worker.id, `report-${kind}`);
-  const starts = f.codex.starts.filter(input => input.threadId === f.coordinator().threadId).length;
-  const action: ProjectAction = { action: 'report', requestId, kind, routing: 'final',
-    text: kind === 'question' ? 'Batch size is undefined. Choose a fixed size or all rows; recommend a fixed size.' : 'Investigation report is ready at docs/export.md. Implementation is still pending.' };
-  await f.loop.projectAction(worker.id, action); await f.loop.projectAction(worker.id, action); await f.loop.tick();
-  const events = f.events(f.coordinator().id, kind); assert.equal(events.length, 1);
-  assert.ok(events[0]?.message.text.includes(action.text)); assert.equal(events[0]?.status, 'delivered');
-  assert.equal(events[0]?.provenance.kind, 'agent');
-  assert.equal(f.codex.starts.filter(input => input.threadId === f.coordinator().threadId).length, starts + 1);
-  assert.equal(f.coordinator().status, 'running');
-  await f.restart(); await f.loop.projectAction(worker.id, action); await f.loop.tick();
-  assert.equal(f.events(f.coordinator().id, kind).length, 1);
-  await assert.rejects(f.loop.projectAction(worker.id, { ...action, text: 'Changed report under the same ID' }), /different|conflict|already/i);
-});
-
-test('Worker discussion cannot report to the coordinator without an explicit owner request', async t => {
-  const f = await fixture(t); await f.initialize();
-  const worker = await f.dispatch('unsolicited-report', 'Clarify the scope in the Worker group.');
-  const group = await f.openGroup(worker.id); assert.ok(group.chatId);
-  await f.idleCoordinator();
-  const discussion = f.message('ordinary-discussion', '需求还没聊完，继续讨论。', group.chatId);
-  await f.loop.receive(discussion);
-  await assert.rejects(f.loop.projectAction(worker.id, {
-    action: 'report', kind: 'result', requestId: discussion.id, text: 'Current findings.',
-  }), /explicit.*report/i);
-  await f.loop.tick();
-  assert.equal(f.events(f.coordinator().id, 'result').length, 0);
-  assert.equal(f.coordinator().status, 'idle');
-});
-
-test('coordinator reports require an affirmative request from the current Worker group owner', async t => {
-  const f = await fixture(t); const coordinator = await f.initialize();
-  const worker = await f.dispatch('report-source', 'Discuss scope.');
-  const group = await f.openGroup(worker.id); assert.ok(group.chatId && coordinator.chatId);
-  await f.idleCoordinator();
-  const requests = [
-    f.message('negated', '先不要汇报给协调者。', group.chatId),
-    f.message('scoped-negation', '把这个结论暂时不汇报给协调者。', group.chatId),
-    f.message('scoped-deferral', '把这个结论晚点汇报给协调者。', group.chatId),
-    f.message('question', '现在需要汇报给协调者吗？', group.chatId),
-    f.message('deferred', '等需求确认后再汇报给协调者。', group.chatId),
-    f.message('quoted', '“同步给协调者”', group.chatId),
-    f.message('project-group', '请汇报给协调者。', coordinator.chatId),
-    { ...f.message('other-sender', '请汇报给协调者。', group.chatId), senderId: 'stranger' },
-  ];
-  for (const message of requests) {
-    await f.loop.receive(message);
-    await assert.rejects(f.loop.projectAction(worker.id, {
-      action: 'report', requestId: message.id, kind: 'update', routing: 'final', text: 'A scope summary.',
-    }), /explicit.*report/i);
-  }
-  const oldRequest = f.message('retired-group-request', '请汇报给协调者。', group.chatId);
-  await f.loop.receive(oldRequest);
-  retireTaskGroup(f.loop.store, worker.id, group.chatId);
-  const replacement = await f.openGroup(worker.id, 'open-replacement');
-  assert.ok(replacement.chatId && replacement.chatId !== group.chatId);
-  await assert.rejects(f.loop.projectAction(worker.id, {
-    action: 'report', requestId: oldRequest.id, kind: 'update', routing: 'final', text: 'An old group summary.',
-  }), /explicit.*report/i);
-  assert.equal(f.events(coordinator.id, 'update').length, 0);
-});
-
-test('intermediate Worker reports stay in the Worker group, survive restart and never wake the coordinator', async t => {
-  const f = await fixture(t); await f.initialize();
-  const worker = await f.dispatch('intermediate-report', 'Discuss the assigned contract.');
-  const group = await f.openGroup(worker.id); assert.ok(group.chatId);
-  await f.idleCoordinator();
-  const action: ProjectAction = { action: 'report', requestId: 'intermediate-discussion', kind: 'question',
-    text: '中间问题留在任务群。', routing: 'intermediate' };
-  const first = await f.loop.projectAction(worker.id, action);
-  assert.deepEqual(first, { accepted: true, destination: 'worker_group', taskId: worker.id, routing: 'intermediate' });
-  assert.deepEqual(await f.loop.projectAction(worker.id, action), first);
-  await f.loop.tick();
-  assert.equal(f.events(f.coordinator().id, 'question').length, 0);
-  assert.equal(f.feishu.sent.filter(message => message.chatId === group.chatId && message.text === action.text).length, 1);
-  const audit = JSON.parse(f.loop.store.meta(`project-report:${JSON.stringify(['app', worker.id, action.requestId])}`) ?? '{}');
-  assert.equal(audit.routing, 'intermediate');
-  await f.restart(); await f.loop.projectAction(worker.id, action); await f.loop.tick();
-  assert.equal(f.events(f.coordinator().id, 'question').length, 0);
-  assert.equal(f.feishu.sent.filter(message => message.chatId === group.chatId && message.text === action.text).length, 1);
-});
-
-test('final Worker reports retain task-group sources and reach only the coordinator once', async t => {
-  const f = await fixture(t); await f.initialize();
-  const worker = await f.dispatch('final-report', 'Resolve the assigned discussion.');
-  const group = await f.openGroup(worker.id); assert.ok(group.chatId);
-  const owner = f.message('final-source', '确认采用当前范围。', group.chatId);
-  await f.loop.receive(owner); await f.loop.tick();
-  const requestId = await requestReport(f, worker.id, 'final-conclusion');
-  const action: ProjectAction = { action: 'report', requestId, kind: 'result', text: '结论已确认。' };
-  const first = await f.loop.projectAction(worker.id, action);
-  assert.deepEqual(first, { accepted: true, destination: 'coordinator', taskId: worker.id, routing: 'final' });
-  assert.deepEqual(await f.loop.projectAction(worker.id, action), first);
-  await f.loop.tick();
-  const event = f.events(f.coordinator().id, 'result'); assert.equal(event.length, 1);
-  assert.equal(event[0]?.provenance.kind, 'agent');
-  if (event[0]?.provenance.kind === 'agent') {
-    assert.equal(event[0].provenance.routing, 'final');
-    assert.deepEqual(event[0].provenance.sources, [
-      { messageId: owner.id, chatId: owner.chatId, senderId: owner.senderId },
-      { messageId: requestId, chatId: owner.chatId, senderId: owner.senderId },
-    ]);
-  }
-  await f.restart(); await f.loop.projectAction(worker.id, action); await f.loop.tick();
-  assert.equal(f.events(f.coordinator().id, 'result').length, 1);
-});
-
-test('escalation reports require an explicit Worker group request and a reason', async t => {
-  const f = await fixture(t); await f.initialize();
-  const worker = await f.dispatch('escalate-report', 'Escalate only coordination matters.');
-  const action: ProjectAction = { action: 'report', requestId: 'authorization-escalation', kind: 'question',
-    text: '需要确认授权范围。', routing: 'escalation', escalation: 'authorization' };
-  await assert.rejects(f.loop.projectAction(worker.id, { ...action, routing: 'intermediate' }), /explicit.*report/i);
-  assert.equal(f.events(f.coordinator().id, 'question').length, 0);
-  await requestReport(f, worker.id, action.requestId);
-  const first = await f.loop.projectAction(worker.id, action);
-  assert.deepEqual(first, { accepted: true, destination: 'coordinator', taskId: worker.id, routing: 'escalation' });
-  await f.loop.projectAction(worker.id, action); await f.loop.tick();
-  const event = f.events(f.coordinator().id, 'question'); assert.equal(event.length, 1);
-  assert.equal(event[0]?.provenance.kind, 'agent');
-  if (event[0]?.provenance.kind === 'agent') {
-    assert.equal(event[0].provenance.routing, 'escalation');
-    assert.equal(event[0].provenance.escalation, 'authorization');
-  }
-  await assert.rejects(f.loop.projectAction(worker.id, { ...action, requestId: 'missing-escalation', escalation: undefined }), /Escalation reports require/);
-});
-
 
 test('native Worker questions wake the coordinator and its answer resumes that Worker without blocking others', async t => {
   const f = await fixture(t); await f.initialize();
@@ -1214,65 +744,19 @@ test('native Worker questions wake the coordinator and its answer resumes that W
   await f.loop.tick(); await f.loop.tick();
   const received = f.events(f.coordinator().id, 'question'); assert.equal(received.length, 1);
   assert.ok(received[0]?.message.text.includes(request.prompt));
-  assert.equal(f.coordinator().status, 'running');
+  await eventually(() => assert.equal(f.coordinator().status, 'running'));
   assert.equal(f.loop.store.task(other.id).status, 'running');
   const decision = f.message('decision-in-project', 'Export only selected rows. This decision applies to this requirement.', f.coordinator().chatId!);
   await f.loop.receive(decision);
   assert.equal(f.codex.replies.length, 0);
-  await f.loop.projectAction(f.coordinator().id, { action: 'send', requestId: 'answer-batch-size', taskId: worker.id,
-    text: `Owner decision ${decision.id}: ${decision.text}` });
+  await f.loop.projectCall(f.coordinator().id, { tool: 'send_agent_message', arguments: { requestId: 'answer-batch-size', taskId: worker.id, text: `Owner decision ${decision.id}: ${decision.text}` } });
   await f.loop.tick();
-  assert.equal(f.codex.replies.length, 1);
+  await eventually(() => assert.equal(f.codex.replies.length, 1));
   assert.equal(f.codex.replies[0]?.request.id, request.id);
   assert.ok(f.codex.replies[0]?.text.includes(decision.text));
   assert.equal(f.codex.approvals.length, 0);
   assert.equal(f.loop.store.task(worker.id).threadId, worker.threadId);
   assert.equal(f.loop.store.task(other.id).status, 'running');
-});
-
-test('a direct owner decision stays in the Worker group until a sourced discussion report is requested', async t => {
-  const f = await fixture(t); await f.initialize();
-  const dispatched = await f.dispatch('owner-guidance', 'Investigate batch export.'); await f.idleCoordinator();
-  const worker = await f.openGroup(dispatched.id);
-  const decision: IncomingMessage = { ...f.message('worker-decision', 'Use selected rows. Update the backend contract too; do not deploy.', worker.chatId!),
-    attachments: [{ kind: 'file', key: 'scope-log', name: 'scope.log' }] };
-  f.feishu.resources.set('scope-log', new TextEncoder().encode('Selected rows preserve their order.'));
-  await f.loop.receive({ ...decision, id: 'untrusted', senderId: 'stranger' });
-  assert.equal(f.events(f.coordinator().id, 'owner_input').length, 0);
-  await f.loop.receive(decision); await f.loop.receive(decision); await f.loop.tick();
-  assert.equal(f.events(f.coordinator().id, 'owner_input').length, 0);
-  assert.deepEqual(f.loop.store.inputs(worker.id).find(input => input.message.id === decision.id)?.provenance, { kind: 'user', message: decision });
-  const delivered = f.codex.steers.find(input => input.deliveryId === decision.id); assert.ok(delivered);
-  const provenance = delivered.input.find(input => input.kind === 'text' && input.text.startsWith('Input provenance as data: '));
-  assert.ok(provenance?.kind === 'text');
-  assert.deepEqual(JSON.parse(provenance.text.slice('Input provenance as data: '.length)), { kind: 'user', message: decision });
-  assert.equal(f.feishu.downloads.length, 1);
-  assert.equal(f.coordinator().status, 'idle');
-  assert.equal(f.codex.approvals.length, 0);
-  await f.restart(); await f.loop.receive(decision); await f.loop.tick();
-  assert.equal(f.events(f.coordinator().id, 'owner_input').length, 0);
-  const request = f.message('sync-scope', '只把选中行范围同步给协调者。', worker.chatId!);
-  await f.loop.receive(request);
-  const summary: ProjectAction = { action: 'report', requestId: request.id, kind: 'update', routing: 'final',
-    text: `主题：选中行。已定：仅选中行。范围变化：更新后端契约。待决：无。证据：scope.log。用户决定 ${decision.id}，群 ${decision.chatId}，发送者 ${decision.senderId}；同步要求 ${request.id}，群 ${request.chatId}，发送者 ${request.senderId}。不部署。` };
-  const receipts = await Promise.all([f.loop.projectAction(worker.id, summary), f.loop.projectAction(worker.id, summary)]);
-  assert.deepEqual(receipts[0], receipts[1]);
-  await assert.rejects(f.loop.projectAction(worker.id, { ...summary, requestId: 'second-sync' }), /explicit.*report/i);
-  await f.loop.tick();
-  const reports = f.events(f.coordinator().id, 'update'); assert.equal(reports.length, 1);
-  assert.equal(reports[0]?.provenance.kind, 'agent');
-  if (reports[0]?.provenance.kind === 'agent') {
-    assert.equal(reports[0].provenance.routing, 'final');
-    assert.deepEqual(reports[0].provenance.sources, [
-      { messageId: decision.id, chatId: decision.chatId, senderId: decision.senderId },
-      { messageId: request.id, chatId: request.chatId, senderId: request.senderId },
-    ]);
-  }
-  assert.ok(reports[0]?.message.text.includes(summary.text));
-  assert.equal(f.coordinator().status, 'running');
-  assert.equal(f.loop.store.task(worker.id).threadId, worker.threadId);
-  assert.deepEqual(f.loop.store.inputs(worker.id).find(input => input.id === decision.id)?.message, decision);
-  assert.equal(f.codex.approvals.length, 0);
 });
 
 test('CAS records reject stale writers and preserve immutable decisions, authors and versions across restart', async t => {
@@ -1416,12 +900,9 @@ test('project and role permissions reject cross-project messages, foreign Issues
   const foreign = await f.dispatch('docs-worker', 'Investigate documentation.', { callerId: docs.id, issueId: docsIssue.id });
   const before = f.loop.store.inputs(foreign.id).length;
   const forbidden: { caller: string; action: ProjectAction }[] = [
-    { caller: app.id, action: { action: 'send', requestId: 'foreign-send', taskId: foreign.id, text: 'Change another project.' } },
     { caller: app.id, action: { action: 'dispatch', execution: testExecution.worker, requestId: 'foreign-issue', issueId: docsIssue.id, role: 'worker', prompt: 'Take over another project.' } },
     { caller: worker.id, action: { action: 'dispatch', execution: testExecution.worker, requestId: 'worker-dispatch', role: 'worker', prompt: 'Spawn a peer.' } },
-    { caller: worker.id, action: { action: 'send', requestId: 'worker-send', taskId: foreign.id, text: 'Direct another Worker.' } },
     { caller: worker.id, action: { action: 'rotate', requestId: 'worker-rotate', checkpoint: 'Rotate the coordinator.' } },
-    { caller: app.id, action: { action: 'report', requestId: 'coordinator-report', kind: 'question', text: 'Pretend to be a Worker.' } },
   ];
   for (const attempt of forbidden) await assert.rejects(f.loop.projectAction(attempt.caller, attempt.action));
   const appStatus = await f.status(worker.id);
@@ -1465,9 +946,9 @@ test('only the coordinator can pause and resume its project Worker while other t
   assert.equal(f.codex.interrupts.length, 1);
   assert.equal(f.codex.interrupts[0]?.threadId, worker.threadId);
   const text = 'Continue investigating the original contract when resumed. Do not expand the scope.';
-  await f.loop.projectAction(app.id, { action: 'send', requestId: 'held-instruction', taskId: worker.id, text });
+  await f.loop.projectCall(app.id, { tool: 'send_agent_message', arguments: { requestId: 'held-instruction', taskId: worker.id, text } });
   await f.loop.tick();
-  assert.equal(f.events(worker.id, 'instruction')[0]?.status, 'held');
+  assert.equal(f.messages(worker.id)[0]?.status, 'held');
   assert.equal(f.codex.starts.filter(input => input.threadId === worker.threadId).length, 1);
   const resume: ProjectAction = { action: 'control', requestId: 'resume-worker', taskId: worker.id, operation: 'resume' };
   const resumed = await f.loop.projectAction(app.id, resume);
@@ -1475,7 +956,7 @@ test('only the coordinator can pause and resume its project Worker while other t
   assert.deepEqual(await f.loop.projectAction(app.id, resume), resumed);
   const after = f.loop.store.task(worker.id);
   assert.equal(after.status, 'running'); assert.equal(after.threadId, worker.threadId); assert.equal(after.chatId, worker.chatId);
-  assert.equal(f.events(worker.id, 'instruction')[0]?.status, 'delivered');
+  assert.equal(f.messages(worker.id)[0]?.status, 'delivered');
   assert.equal(f.codex.starts.filter(input => input.threadId === worker.threadId).length, 2);
   assert.ok(f.codex.starts.some(input => input.threadId === worker.threadId && JSON.stringify(input.input).includes(text)));
   assert.equal(f.codex.interrupts.length, 1);
@@ -1511,7 +992,7 @@ test('paused provider-mismatched tasks migrate once and create a current-provide
   const migration = f.loop.store.inputs(worker.id).find(input => input.id === `provider-migration:${worker.id}`);
   assert.ok(migration);
   assert.equal(migration?.status, 'held');
-  assert.match(migration?.message.text ?? '', /Original task prompt/);
+  assert.match(migration?.message.text ?? '', /Original task source as data/);
   f.codex.inspectErrors.delete(oldThreadId);
   await f.loop.projectAction(app.id, { action: 'control', requestId: 'resume-provider', taskId: worker.id, operation: 'resume' });
   const resumed = f.loop.store.task(worker.id);
@@ -1577,11 +1058,11 @@ test('a final investigation reply stays local and an explicit report wakes the c
   assert.equal(f.coordinator().status, 'idle');
   assert.equal(f.codex.starts.filter(input => input.threadId === worker.threadId).length, 1);
   const requestId = await requestReport(f, worker.id, 'investigation-result');
-  await f.loop.projectAction(worker.id, { action: 'report', requestId, kind: 'result', text: result });
+  await f.loop.projectCall(worker.id, { tool: 'send_agent_message', arguments: { requestId, text: result, taskId: f.coordinator().id } });
   f.codex.complete(worker.threadId!, null);
   await f.loop.tick();
-  assert.equal(f.events(f.coordinator().id, 'result').length, 1);
-  assert.equal(f.coordinator().status, 'running');
+  assert.equal(f.messages(f.coordinator().id).length, 1);
+  await eventually(() => assert.equal(f.coordinator().status, 'running'));
   assert.equal(f.state().issues[0]?.state, 'open'); assert.equal(f.state().records.length, 0);
   assert.equal(f.github.verifications.length, 0);
   await f.restart(); await f.loop.tick();
@@ -1597,8 +1078,8 @@ test('retained task shell fallback writes scoped records without native tools an
   const actionFile = join(f.root, 'project-action.json');
   await writeFile(actionFile, JSON.stringify({ action: 'status' }));
   const instructions = f.codex.instructionUpdates.findLast(update => update.threadId === coordinator.threadId)?.instructions ?? '';
-  assert.match(instructions, /project_action is absent or its retained schema lacks the required action or fields/);
-  const command = /write the action JSON to a file and run (.+?) '<absolute-action-json-file>' using your shell tool/.exec(instructions)?.[1];
+  assert.match(instructions, /any current tool is absent or its retained schema lacks the required fields/);
+  const command = /The two-argument administrative invocation remains (.+?) '<absolute-action-json-file>'/.exec(instructions)?.[1];
   assert.ok(command, 'The coordinator must receive an executable project fallback command');
   const run = (fallback = command) => promisify(execFile)('/bin/sh', ['-c', `${fallback} "$1"`, 'project-fallback', actionFile], { timeout: 10_000 });
   const active = await run();
@@ -1618,7 +1099,7 @@ test('retained task shell fallback writes scoped records without native tools an
     assert.deepEqual(records[0]?.scope, action.scope);
   } finally { saved.close(); }
   const workerInstructions = f.codex.instructionUpdates.findLast(update => update.threadId === worker.threadId)?.instructions ?? '';
-  const workerCommand = /write the action JSON to a file and run (.+?) '<absolute-action-json-file>' using your shell tool/.exec(workerInstructions)?.[1];
+  const workerCommand = /The two-argument administrative invocation remains (.+?) '<absolute-action-json-file>'/.exec(workerInstructions)?.[1];
   assert.ok(workerCommand);
   await writeFile(actionFile, JSON.stringify({ ...action, requestId: 'forbidden-fallback', expectedVersion: f.state().version,
     scope: { kind: 'task', taskId: coordinator.id } }));
@@ -1941,10 +1422,7 @@ for (const role of ['worker', 'worker'] as const) for (const grouped of [false, 
     const outgoing = f.loop.store.outputs(worker.id).filter(output => output.text === result);
     assert.equal(outgoing.length, 1); assert.equal(outgoing[0]?.status, grouped ? 'sent' : 'dropped');
     assert.equal(f.feishu.sent.filter(output => output.chatId === worker.chatId && output.text === result).length, grouped ? 1 : 0);
-    await assert.rejects(f.loop.projectAction(worker.id, {
-      action: 'report', requestId: 'formal-result', kind: 'result', text: result,
-    }), /explicit.*report/i);
-    assert.equal(f.events(coordinator.id, 'result').length, 0);
+    assert.equal(f.messages(coordinator.id).length, 0);
   });
 }
 
@@ -1964,19 +1442,19 @@ for (const running of [false, true]) test(`Worker group messages stay local with
 });
 
 for (const kind of ['result', 'question', 'update'] as const) for (const running of [false, true]) {
-  test(`Worker ${kind} report requested by the owner arrives once with coordinator running=${running}`, async t => {
+  test(`Worker ${kind} Agent message arrives once with coordinator running=${running}`, async t => {
     const f = await fixture(t); await f.initialize();
     const worker = await f.dispatch('formal-report', 'Perform the assigned work.');
     if (!running) await f.idleCoordinator();
     const requestId = await requestReport(f, worker.id, `formal-${kind}`);
     const coordinator = f.coordinator(), starts = f.codex.starts.length, steers = f.codex.steers.length;
-    const action: ProjectAction = { action: 'report', kind, routing: 'final', requestId, text: `Formal ${kind} with evidence docs/findings.md.` };
-    await f.loop.projectAction(worker.id, action); await f.loop.projectAction(worker.id, action); await f.loop.tick();
-    assert.equal(f.events(coordinator.id, kind).length, 1);
-    assert.equal(f.events(coordinator.id, kind)[0]?.status, 'delivered');
+    const action: ProjectToolCall = { tool: 'send_agent_message', arguments: { requestId, text: `Formal ${kind} with evidence docs/findings.md.`, taskId: f.coordinator().id } };
+    await f.loop.projectCall(worker.id, action); await f.loop.projectCall(worker.id, action); await f.loop.tick();
+    assert.equal(f.messages(coordinator.id).length, 1);
+    await eventually(() => assert.equal(f.messages(coordinator.id)[0]?.status, 'delivered'));
     assert.equal(f.codex.starts.length, starts + (running ? 0 : 1)); assert.equal(f.codex.steers.length, steers + (running ? 1 : 0));
     if (running) assert.equal(f.codex.steers.at(-1)?.turnId, coordinator.turnId);
-    await f.restart(); await f.loop.projectAction(worker.id, action); await f.loop.tick();
+    await f.restart(); await f.loop.projectCall(worker.id, action); await f.loop.tick();
     assert.equal(f.codex.starts.length, starts + (running ? 0 : 1)); assert.equal(f.codex.steers.length, steers + (running ? 1 : 0));
     assert.equal(f.coordinator().threadId, coordinator.threadId);
   });
@@ -1999,25 +1477,25 @@ test('elapsed time and restarts leave idle project members waiting until an expl
   assert.deepEqual(f.loop.store.inputs(f.coordinator().id), inputs);
   assert.equal(f.events(f.coordinator().id, 'supervision').length, 0);
   const requestId = await requestReport(f, secondWorker.id, 'new-evidence');
-  await f.loop.projectAction(secondWorker.id, { action: 'report', requestId, kind: 'update', routing: 'final', text: 'New evidence arrived.' });
+  await f.loop.projectCall(secondWorker.id, { tool: 'send_agent_message', arguments: { requestId, text: 'New evidence arrived.', taskId: f.coordinator().id } });
   await f.loop.tick();
-  assert.equal(coordinatorStarts(), initialCoordinatorStarts + 1);
-  assert.equal(f.events(f.coordinator().id, 'update')[0]?.status, 'delivered');
+  await eventually(() => assert.equal(coordinatorStarts(), initialCoordinatorStarts + 1));
+  await eventually(() => assert.equal(f.messages(f.coordinator().id)[0]?.status, 'delivered'));
 });
 
 test('an acknowledged report with a lost delivery response reconciles once after restart', async t => {
   const f = await fixture(t); await f.initialize();
   const worker = await f.dispatch('lost-report-ack', 'Investigate.'); await f.idleCoordinator();
   const requestId = await requestReport(f, worker.id, 'stable-report');
-  const action: ProjectAction = { action: 'report', requestId, kind: 'result', text: 'Evidence is in docs/result.md.' };
-  await f.loop.projectAction(worker.id, action);
+  const action: ProjectToolCall = { tool: 'send_agent_message', arguments: { requestId, text: 'Evidence is in docs/result.md.', taskId: f.coordinator().id } };
   const starts = f.codex.starts.length;
-  f.codex.loseInputAck = true; await f.loop.tick();
-  assert.equal(f.events(f.coordinator().id, 'result')[0]?.status, 'uncertain');
+  f.codex.loseInputAck = true;
+  await f.loop.projectCall(worker.id, action); await f.loop.tick();
+  await eventually(() => assert.equal(f.messages(f.coordinator().id)[0]?.status, 'uncertain'));
   assert.equal(f.codex.starts.length, starts + 1);
-  await f.restart(); await f.loop.projectAction(worker.id, action); await f.loop.tick();
-  assert.equal(f.events(f.coordinator().id, 'result').length, 1);
-  assert.equal(f.events(f.coordinator().id, 'result')[0]?.status, 'delivered');
+  await f.restart(); await f.loop.projectCall(worker.id, action); await f.loop.tick();
+  assert.equal(f.messages(f.coordinator().id).length, 1);
+  await eventually(() => assert.equal(f.messages(f.coordinator().id)[0]?.status, 'delivered'));
   assert.equal(f.codex.starts.length, starts + 1);
 });
 
@@ -2066,13 +1544,13 @@ for (const status of ['pending', 'held', 'failed'] as const) test(`obsolete auto
   }
   assert.equal(f.codex.starts.length, starts); assert.equal(f.codex.steers.length, steers);
   const requestId = await requestReport(f, worker.id, 'paused-report');
-  await f.loop.projectAction(worker.id, { action: 'report', requestId, kind: 'update', routing: 'final', text: 'Explicit new evidence while paused.' });
+  await f.loop.projectCall(worker.id, { tool: 'send_agent_message', arguments: { requestId, text: 'Explicit new evidence while paused.', taskId: f.coordinator().id } });
   await f.loop.tick();
   assert.equal(f.coordinator().status, 'paused');
-  assert.equal(f.events(coordinator.id, 'update')[0]?.status, 'held');
+  assert.equal(f.messages(coordinator.id)[0]?.status, 'held');
   assert.equal(f.codex.starts.length, starts);
   await f.loop.control(coordinator.id, 'resume'); await f.loop.tick();
-  assert.equal(f.events(coordinator.id, 'update')[0]?.status, 'delivered');
+  await eventually(() => assert.equal(f.messages(coordinator.id)[0]?.status, 'delivered'));
   assert.equal(f.codex.starts.length, starts + 1);
   for (const input of original) assert.equal(f.loop.store.inputs(coordinator.id).find(candidate => candidate.id === input.id)?.status, 'dropped');
   await f.restart();
@@ -2102,11 +1580,11 @@ test('historical attempted automatic inputs retain uncertainty and reconcile see
   assert.equal(f.loop.store.inputs(coordinator.id).find(input => input.id === ids[2])?.status, 'uncertain');
   assert.equal(f.codex.starts.length, starts); assert.equal(f.codex.steers.length, steers);
   const requestId = await requestReport(f, worker.id, 'after-uncertain');
-  await f.loop.projectAction(worker.id, { action: 'report', requestId, kind: 'result', text: 'Preserve this explicit report.' });
-  await f.loop.tick(); assert.equal(f.events(coordinator.id, 'result')[0]?.status, 'pending');
+  await f.loop.projectCall(worker.id, { tool: 'send_agent_message', arguments: { requestId, text: 'Preserve this explicit report.', taskId: f.coordinator().id } });
+  await f.loop.tick(); assert.equal(f.messages(coordinator.id)[0]?.status, 'pending');
   f.codex.snapshot(coordinator.threadId).seenInputIds.push(ids[2]!);
   await f.loop.tick();
-  assert.equal(f.events(coordinator.id, 'result')[0]?.status, 'delivered');
+  await eventually(() => assert.equal(f.messages(coordinator.id)[0]?.status, 'delivered'));
   assert.equal(f.codex.starts.length, starts + 1);
 });
 
@@ -2167,7 +1645,7 @@ for (const status of ['failed', 'interrupted'] as const) test(`Worker ${status} 
   await f.loop.tick(); await f.loop.tick();
   assert.equal(f.events(f.coordinator().id, 'execution_status').length, 1);
   assert.equal(f.events(f.coordinator().id, 'execution_status')[0]?.status, 'delivered');
-  assert.equal(f.coordinator().status, 'running');
+  await eventually(() => assert.equal(f.coordinator().status, 'running'));
   const other = await f.dispatch('operator-pause', 'Preserve this task.');
   await f.loop.control(other.id, 'pause'); await f.loop.tick();
   assert.equal(f.events(f.coordinator().id, 'execution_status').length, 1);
@@ -2178,23 +1656,21 @@ test('current reporting and event guidance reaches new and resumed Worker, secon
   const worker = await f.dispatch('guidance-worker', 'Discuss scope.');
   const secondWorker = await f.dispatch('guidance-secondWorker', 'Verify the result.', { role: 'worker' });
   const assertWorkerGuidance = (instructions: string) => {
-    for (const requirement of ['只有所有者在当前 Worker 群明确要求汇报给协调者时', '把 requestId 设置为该用户消息的确切 ID',
-      '每条消息最多发送一份汇报', '无需先展示预览', '按用户指定范围汇报', '真实消息 ID、群 ID 和发送者']) {
+    for (const requirement of ['send_agent_message', 'send_group_message', 'Coordinator taskId:', 'open_group', 'requestId'])
       assert.ok(instructions.includes(requirement), requirement);
-    }
-    assert.ok(!instructions.includes('完成后必须主动 report result'));
+    assert.ok(!instructions.includes('Worker reports to the coordinator require an explicit request'));
   };
   for (const role of ['worker', 'worker']) {
     const created = f.codex.created.find(input => input.instructions.includes(`Project role: ${role}.`)); assert.ok(created);
     assertWorkerGuidance(created.instructions);
   }
-  assert.ok(f.codex.created[0]?.instructions.includes('没有新事件时持续等待'));
+  assert.ok(f.codex.created[0]?.instructions.includes('send_group_message'));
   await f.restart();
   for (const task of [worker, secondWorker]) {
     const update = f.codex.instructionUpdates.filter(input => input.threadId === task.threadId).at(-1); assert.ok(update);
     assertWorkerGuidance(update.instructions);
   }
-  assert.ok(f.codex.instructionUpdates.filter(input => input.threadId === f.coordinator().threadId).at(-1)?.instructions.includes('只有所有者在当前 Worker 群明确要求向你汇报时'));
+  assert.ok(f.codex.instructionUpdates.filter(input => input.threadId === f.coordinator().threadId).at(-1)?.instructions.includes('send_group_message'));
 });
 
 test('a constructed initial-batch fixture excludes dropped copies while delivering its valid source inputs', async t => {
@@ -2205,15 +1681,16 @@ test('a constructed initial-batch fixture excludes dropped copies while deliveri
   f.loop.projects.event('app', eventId, 'Obsolete initial copy.', receipt.taskId, 'owner_input');
   f.loop.store.setMeta(`project-intake-promotion:${coordinator.id}`, 'constructed initial-batch fixture');
   const requestId = await requestReport(f, receipt.taskId, 'early-report');
-  await f.loop.projectAction(receipt.taskId, { action: 'report', requestId, kind: 'update', routing: 'final', text: 'Valid early report.' });
+  await f.loop.projectCall(receipt.taskId, { tool: 'send_agent_message', arguments: { requestId, text: 'Valid early report.', taskId: f.coordinator().id } });
   await f.loop.tick();
+  await eventually(() => assert.ok(f.codex.starts.some(input => input.threadId === f.coordinator().threadId)));
   const started = f.codex.starts.find(input => input.threadId === f.coordinator().threadId); assert.ok(started);
   const retiredId = `project:${coordinator.id}:${eventId}`;
   assert.equal(f.loop.store.inputs(coordinator.id).find(input => input.id === retiredId)?.status, 'dropped');
   assert.ok(!started.input.some(input => input.kind === 'text' && input.text.includes('Obsolete initial copy')));
   assert.ok(started.input.some(input => input.kind === 'text' && input.text.includes('Valid early report')));
   assert.ok(!started.additionalDeliveryIds?.includes(retiredId));
-  assert.equal(f.events(coordinator.id, 'update')[0]?.status, 'delivered');
+  await eventually(() => assert.equal(f.messages(coordinator.id)[0]?.status, 'delivered'));
 });
 
 test('project polling and task instructions retain routing without reading full project history', async t => {
@@ -2238,4 +1715,212 @@ test('project polling and task instructions retain routing without reading full 
   assert.equal(provenance.taskId, coordinator.id);
   assert.equal(provenance.category, 'github_comment');
   assert.equal(f.events(worker.id, 'github_comment').length, 0);
+});
+
+async function nativeMessage(f: Awaited<ReturnType<typeof fixture>>, taskId: string, call: ProjectToolCall) {
+  const task = f.loop.store.task(taskId); assert.ok(task.threadId && f.codex.projectHandler);
+  const active = await f.codex.activity(task.threadId); assert.equal(active.kind, 'running');
+  if (active.kind !== 'running') throw new Error('Expected an active sender');
+  return f.codex.projectHandler({ ...active, callId: 'message-call', call });
+}
+async function eventually(assertion: () => void) {
+  for (let attempt = 0; ; attempt++) {
+    try { assertion(); return; } catch (error) {
+      if (attempt === 100) throw error;
+      await new Promise<void>(resolve => setTimeout(resolve, 5));
+    }
+  }
+}
+const agentReceipt = z.object({ accepted: z.literal(true), kind: z.literal('agent'), inputId: z.string(),
+  fromTaskId: z.string(), toTaskId: z.string(), status: z.string() });
+const groupReceipt = z.object({ accepted: z.literal(true), kind: z.literal('group'), outputId: z.string(), chatId: z.string(), status: z.string(), messageId: z.string().nullable() });
+
+for (const running of [false, true]) test(`native Agent messages start or steer the recipient promptly while sender continues, running=${running}`, async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('active-messenger', 'Read the evidence and tell the coordinator.');
+  if (!running) await f.idleCoordinator();
+  const coordinator = f.coordinator(), originalTurn = f.codex.snapshot(worker.threadId!).turnId;
+  const command: ProjectToolCall = { tool: 'send_agent_message', arguments: { requestId: 'proof', taskId: coordinator.id, text: 'Proof is ready.', references: ['run:71'] } };
+  const receipt = agentReceipt.parse(await nativeMessage(f, worker.id, command));
+  await eventually(() => assert.equal(f.loop.store.input(coordinator.id, receipt.inputId)?.status, 'delivered'));
+  assert.equal(f.codex.snapshot(worker.threadId!).turnId, originalTurn);
+  assert.equal(f.codex.snapshot(worker.threadId!).status, 'running');
+  assert.ok((running ? f.codex.steers : f.codex.starts).some(call => call.threadId === coordinator.threadId && call.deliveryId === receipt.inputId));
+  const reply = agentReceipt.parse(await nativeMessage(f, coordinator.id, { tool: 'send_agent_message', arguments: { requestId: 'reply', taskId: worker.id, text: 'Verify the Linux run too.' } }));
+  await eventually(() => assert.equal(f.loop.store.input(worker.id, reply.inputId)?.status, 'delivered'));
+  assert.ok(f.codex.steers.some(call => call.deliveryId === reply.inputId && call.turnId === originalTurn));
+  f.codex.snapshot(worker.threadId!).status = 'failed';
+  f.codex.snapshot(worker.threadId!).error = 'Sender failed after delivery';
+  await f.loop.tick();
+  const replay = agentReceipt.parse(await f.loop.projectCall(worker.id, command));
+  assert.equal(replay.inputId, receipt.inputId); assert.equal(replay.status, 'delivered');
+  assert.equal(f.messages(coordinator.id).filter(input => input.id === receipt.inputId).length, 1);
+  await assert.rejects(f.loop.projectCall(worker.id, { tool: 'send_agent_message', arguments: { ...command.arguments, text: 'Changed proof' } }), /different content/);
+});
+
+test('Agent acceptance and operation receipt roll back together, then recover a committed input without sender completion', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('transactional-message', 'Send a durable proof.'); await f.idleCoordinator();
+  const command: ProjectToolCall = { tool: 'send_agent_message', arguments: { requestId: 'durable-proof', taskId: f.coordinator().id, text: 'Accepted evidence.' } };
+  const receiptWrite = f.loop.projects.ledger.saveReceipt.bind(f.loop.projects.ledger);
+  f.loop.projects.ledger.saveReceipt = () => { throw new Error('Crash before receipt commit'); };
+  await assert.rejects(nativeMessage(f, worker.id, command), /Crash before receipt commit/);
+  assert.equal(f.messages(f.coordinator().id).length, 0);
+  f.loop.projects.ledger.saveReceipt = receiptWrite;
+  const serial = f.loop['serial'];
+  f.loop['serial'] = async () => {};
+  const accepted = agentReceipt.parse(await nativeMessage(f, worker.id, command));
+  assert.equal(f.loop.store.input(f.coordinator().id, accepted.inputId)?.status, 'pending');
+  f.loop['serial'] = serial;
+  const threadId = f.coordinator().threadId, starts = f.codex.starts.length;
+  await f.restart();
+  assert.equal(f.coordinator().threadId, threadId);
+  assert.equal(f.loop.store.input(f.coordinator().id, accepted.inputId)?.status, 'delivered');
+  assert.equal(f.codex.starts.length, starts + 1);
+  await f.restart();
+  assert.equal(f.codex.starts.length, starts + 1);
+  assert.equal(agentReceipt.parse(await f.loop.projectCall(worker.id, command)).inputId, accepted.inputId);
+});
+
+test('message references preserve actual owner provenance and reject forged sources and routing', async t => {
+  const f = await fixture(t, { secondProject: true }); await f.initialize();
+  const worker = await f.dispatch('source-worker', 'Discuss scope.');
+  const sibling = await f.dispatch('source-sibling', 'Independent work.');
+  const foreign = await f.dispatch('source-foreign', 'Another project.', { callerId: f.coordinator('docs').id });
+  const grouped = await f.openGroup(worker.id);
+  const owner = f.message('actual-owner-decision', 'Only investigate, do not implement.', grouped.chatId!);
+  await f.loop.receive(owner);
+  const reference = { messageId: owner.id, chatId: owner.chatId, senderId: owner.senderId };
+  const references = [reference];
+  const command: ProjectToolCall = { tool: 'send_agent_message', arguments: { requestId: 'source-proof', taskId: f.coordinator().id, text: 'User restricted this to investigation.', references } };
+  const receipt = agentReceipt.parse(await nativeMessage(f, worker.id, command));
+  const input = f.loop.store.input(f.coordinator().id, receipt.inputId); assert.ok(input);
+  assert.deepEqual(input.provenance, { kind: 'agent_message', projectId: 'app', fromTaskId: worker.id, toTaskId: f.coordinator().id, requestId: 'source-proof', references: [], sources: [owner] });
+  for (const invalid of [{ ...reference, senderId: 'forged' }, { ...reference, chatId: 'other-group' }, { ...reference, messageId: 'missing' }])
+    await assert.rejects(nativeMessage(f, worker.id, { tool: 'send_agent_message', arguments: { ...command.arguments, requestId: JSON.stringify(invalid), references: [invalid] } }), /actual saved input/);
+  for (const target of [worker.id, sibling.id, foreign.id, f.coordinator('docs').id])
+    await assert.rejects(nativeMessage(f, worker.id, { tool: 'send_agent_message', arguments: { requestId: `forbidden:${target}`, taskId: target, text: 'Cannot route here.' } }), /coordinator.*Workers/);
+  await assert.rejects(f.loop.projects.call(worker.id, { tool: 'send_agent_message', arguments: { requestId: 'spoof', taskId: f.coordinator().id, text: 'Spoof', fromTaskId: sibling.id } }));
+  const page = z.object({ items: z.array(z.unknown()) }).parse(await f.loop.projectAction(worker.id, { action: 'status', section: 'messages' }));
+  assert.ok(JSON.stringify(page).includes('actual-owner-decision'));
+  assert.ok(!JSON.stringify(page).includes(foreign.id));
+});
+
+test('Worker and coordinator concurrently open the same Worker group and replay against the current binding', async t => {
+  const f = await fixture(t); await f.initialize(); const worker = await f.dispatch('self-group', 'Discuss with owner.');
+  const own: ProjectAction = { action: 'open_group', requestId: 'self-open', taskId: worker.id };
+  const [a, b] = await Promise.all([nativeWorkerAction(f, worker.id, own), f.loop.projectAction(f.coordinator().id, { ...own, requestId: 'coordinator-open' })]);
+  assert.deepEqual(a, b); const old = f.loop.store.task(worker.id).chatId; assert.ok(old);
+  assert.equal([...f.feishu.groups.values()].filter(chat => chat === old).length, 1);
+  retireTaskGroup(f.loop.store, worker.id, old);
+  const replacement = z.object({ chatId: z.string() }).parse(await nativeWorkerAction(f, worker.id, own));
+  assert.notEqual(replacement.chatId, old);
+  assert.equal(replacement.chatId, f.loop.store.task(worker.id).chatId);
+  await assert.rejects(nativeWorkerAction(f, worker.id, { ...own, requestId: 'coordinator-group', taskId: f.coordinator().id }), /own group/);
+});
+
+test('explicit group receipts track actual sends, preserve uncertainty and pin accepted destinations', async t => {
+  const f = await fixture(t); const coordinator = await f.initialize();
+  const command: ProjectToolCall = { tool: 'send_group_message', arguments: { requestId: 'group-proof', text: 'Visible evidence.' } };
+  const original = f.feishu.send.bind(f.feishu);
+  f.feishu.send = async args => { await original(args); return { messageId: `feishu:${args.id}` }; };
+  const accepted = groupReceipt.parse(await nativeMessage(f, coordinator.id, command));
+  await eventually(() => assert.equal(f.loop.store.outputs(coordinator.id).find(output => output.id === accepted.outputId)?.status, 'sent'));
+  const replay = groupReceipt.parse(await nativeMessage(f, coordinator.id, command));
+  assert.equal(replay.status, 'sent'); assert.equal(replay.messageId, `feishu:${accepted.outputId}`);
+  assert.equal(f.feishu.sent.filter(output => output.id === accepted.outputId).length, 1);
+  f.feishu.send = async args => { await original(args); throw new Error('Provider accepted, response lost'); };
+  const uncertain: ProjectToolCall = { tool: 'send_group_message', arguments: { requestId: 'lost-group-ack', text: 'Uncertain delivery.' } };
+  const lost = groupReceipt.parse(await nativeMessage(f, coordinator.id, uncertain));
+  await eventually(() => assert.equal(f.loop.store.outputs(coordinator.id).find(output => output.id === lost.outputId)?.status, 'uncertain'));
+  await f.restart();
+  assert.equal(groupReceipt.parse(await f.loop.projectCall(coordinator.id, uncertain)).status, 'uncertain');
+  assert.equal(f.feishu.sent.filter(output => output.id === lost.outputId).length, 1);
+  f.feishu.send = original;
+  const pinned = groupReceipt.parse(await f.loop.projects.call(coordinator.id, { tool: 'send_group_message', arguments: { requestId: 'old-group', text: 'Pinned old destination.' } }));
+  retireTaskGroup(f.loop.store, coordinator.id, coordinator.chatId!);
+  await f.loop.tick();
+  assert.equal(f.feishu.sent.filter(output => output.id === pinned.outputId).length, 0);
+  assert.equal(f.loop.store.outputs(coordinator.id).find(output => output.id === pinned.outputId)?.status, 'dropped');
+});
+
+test('slow group verification leaves Agent messages available and detects a binding changed before acceptance', async t => {
+  const f = await fixture(t); await f.initialize(); const worker = await f.dispatch('unblocked-agent', 'Send progress.');
+  let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; }); t.after(release);
+  const verify = f.feishu.verifyGroup.bind(f.feishu);
+  f.feishu.verifyGroup = async chatId => { await gate; await verify(chatId); };
+  const sending = nativeMessage(f, f.coordinator().id, { tool: 'send_group_message', arguments: { requestId: 'slow-check', text: 'Group result.' } });
+  const message = agentReceipt.parse(await nativeMessage(f, worker.id, { tool: 'send_agent_message', arguments: { requestId: 'fast-input', taskId: f.coordinator().id, text: 'Still running.' } }));
+  assert.ok(f.loop.store.input(f.coordinator().id, message.inputId));
+  const coordinator = f.coordinator(); retireTaskGroup(f.loop.store, coordinator.id, coordinator.chatId!);
+  release(); await assert.rejects(sending, /binding/);
+  assert.ok(!f.loop.store.outputs(coordinator.id).some(output => output.text === 'Group result.'));
+});
+
+test('retained Thread named message client preserves task capability and refreshed invocation after restart', async t => {
+  const f = await fixture(t); await f.initialize(); const worker = await f.dispatch('named-fallback', 'Send through retained tools.');
+  const client = new URL('../src/project-client.ts', import.meta.url).pathname;
+  const capability = join(f.root, 'workspace-capabilities', `${worker.id}.json`), file = join(f.root, 'message.json');
+  await writeFile(file, JSON.stringify({ requestId: 'fallback-message', taskId: f.coordinator().id, text: 'Retained Thread proof.' }));
+  const run = () => promisify(execFile)(process.execPath, ['--import', 'tsx', client, capability, 'send_agent_message', file]);
+  const first = agentReceipt.parse(JSON.parse((await run()).stdout));
+  await f.restart();
+  const second = agentReceipt.parse(JSON.parse((await run()).stdout));
+  assert.equal(second.inputId, first.inputId); assert.equal(f.messages(f.coordinator().id).length, 1);
+  const supplied = f.codex.instructionUpdates.findLast(update => update.threadId === worker.threadId)?.instructions ?? '';
+  assert.match(supplied, /send_agent_message.*send_group_message/);
+  f.codex.complete(worker.threadId!, null);
+  await assert.rejects(run(), /active turn/);
+});
+
+test('legacy result declarations archive without new delivery while accepted old inputs keep their IDs and live status', async t => {
+  const f = await fixture(t); await f.initialize(); const worker = await f.dispatch('legacy-results', 'Preserve old evidence.');
+  const coordinator = f.coordinator(); await f.loop.control(coordinator.id, 'pause');
+  for (const [resultId, state] of [['pending', 'pending'], ['published', 'published'], ['missing', 'published'], ['suppressed', 'suppressed'], ['invalidated', 'invalidated']] as const) {
+    const result = { projectId: 'app', taskId: worker.id, resultId, requestId: `old:${resultId}`, threadId: worker.threadId, turnId: worker.turnId,
+      inputSequence: f.loop.store.inputSequence(worker.id), text: `Legacy ${resultId}`, deliveryReferences: ['legacy-proof'], state };
+    const key = `project-worker-result:${JSON.stringify(['app', worker.id, resultId])}`;
+    f.loop.store.setMeta(key, JSON.stringify(result));
+    if (resultId === 'pending') f.loop.store.setMeta(`project-worker-result-pending:${worker.id}`, key);
+    if (resultId === 'published') f.loop.projects.event('app', `worker-result:${JSON.stringify(['app', worker.id, resultId])}`, result.text, worker.id, 'worker_result');
+  }
+  const before = f.loop.store.inputs(coordinator.id).map(input => input.id), starts = f.codex.starts.length;
+  await f.restart(); await f.restart();
+  assert.deepEqual(f.loop.store.inputs(coordinator.id).map(input => input.id), before);
+  assert.equal(f.codex.starts.length, starts); assert.equal(f.loop.store.meta(`project-worker-result-pending:${worker.id}`), null);
+  const page = z.object({ items: z.array(z.object({ kind: z.string() }).passthrough()) }).parse(await f.loop.projectAction(worker.id, { action: 'status', section: 'messages', limit: 100 }));
+  const results = page.items.filter(item => item.kind === 'legacy_result');
+  assert.deepEqual(results.map(item => [item.resultId, item.disposition]).sort(), [['invalidated', 'invalidated'], ['missing', 'unresolved_missing_delivery'], ['pending', 'archived_not_submitted'], ['published', 'accepted'], ['suppressed', 'suppressed']]);
+  assert.equal(results.find(item => item.resultId === 'published')?.status, 'held');
+});
+
+test('only migrated dispatch receipts accept removed business fields without changing preserved dispatch semantics', async t => {
+  const f = await fixture(t); const coordinator = await f.initialize();
+  const action: ProjectAction = { action: 'dispatch', execution: testExecution.worker, requestId: 'old-dispatch', role: 'worker', prompt: 'Investigate only. Do not implement.' };
+  const accepted = await f.loop.projectAction(coordinator.id, action);
+  const { taskId } = dispatchReceipt.parse(accepted);
+  const oldFingerprint = createHash('sha256').update(JSON.stringify({ ...action, mode: 'investigation', authorization: { scope: 'Old scope', acceptance: 'Old criteria', sourceRevision: 'Old version' } })).digest('hex');
+  f.loop.store.setMeta(`project:${JSON.stringify(['receipt', 'app', coordinator.id, action.requestId])}`, JSON.stringify({ fingerprint: oldFingerprint, value: accepted }));
+  f.loop.store.setMeta(`project-action-intent:${JSON.stringify(['app', coordinator.id, action.requestId])}`, oldFingerprint);
+  f.loop.store.deleteMeta('project-collaboration-migration');
+  await f.restart();
+  assert.deepEqual(await f.loop.projectAction(coordinator.id, action), accepted);
+  await assert.rejects(f.loop.projectAction(coordinator.id, { ...action, prompt: 'Implement instead.' }), /different content/);
+  assert.equal(f.loop.store.task(taskId).workerExecution?.source.kind, 'dispatch');
+  assert.equal(f.state().members.length, 2);
+});
+
+test('immediate dispatch then message starts the original Worker with its assignment and current tools', async t => {
+  const f = await fixture(t); const coordinator = await f.initialize();
+  const prompt = 'Inspect only. Preserve the original restriction.';
+  const { taskId } = dispatchReceipt.parse(await f.loop.projectAction(coordinator.id,
+    { action: 'dispatch', execution: testExecution.worker, requestId: 'immediate-dispatch', role: 'worker', prompt }));
+  const receipt = agentReceipt.parse(await nativeMessage(f, coordinator.id,
+    { tool: 'send_agent_message', arguments: { requestId: 'immediate-message', taskId, text: 'Check the second file too.' } }));
+  await eventually(() => assert.equal(f.loop.store.input(taskId, receipt.inputId)?.status, 'delivered'));
+  const worker = f.loop.store.task(taskId); assert.ok(worker.threadId);
+  const creation = f.codex.created.find(entry => entry.instructions.includes(`Your taskId: ${taskId}.`)); assert.ok(creation);
+  assert.ok(creation.instructions.includes(prompt));
+  assert.match(creation.instructions, /send_agent_message.*send_group_message/);
+  assert.equal(f.codex.starts.filter(entry => entry.threadId === worker.threadId).length, 1);
 });

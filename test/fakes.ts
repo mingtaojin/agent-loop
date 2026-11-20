@@ -74,7 +74,7 @@ export class FeishuFake implements FeishuPort {
   async dissolveGroup(chatId: string): Promise<void> {
     for (const [key, group] of this.groups) if (group === chatId) this.groups.delete(key);
   }
-  async send(input: Parameters<FeishuPort['send']>[0]): Promise<void> {
+  async send(input: Parameters<FeishuPort['send']>[0]): ReturnType<FeishuPort['send']> {
     this.sent.push(input);
     if (this.loseSendAck) { this.loseSendAck = false; throw new UncertainOperationError('Message sent; acknowledgement lost'); }
   }
@@ -105,10 +105,8 @@ export class CodexFake implements CodexPort {
       return { ...event, key: executionKey(event) };
     });
   }
-  private completionPolicy: { isCompleted(threadId: string): boolean } | undefined;
   readonly nativeDenials: PendingRequest[] = [];
   uncertainNativeDenial = false;
-  setThreadCompletionPolicy(policy: { isCompleted(threadId: string): boolean }): void { this.completionPolicy = policy; }
   assertThreadCompletionAllowed(threadId: string): void {
     if (this.inspectError) throw new Error('Native request state is unavailable');
     if (this.snapshot(threadId).requests.length) throw new Error('Reconcile unresolved native requests before completion');
@@ -158,10 +156,7 @@ export class CodexFake implements CodexPort {
   async executionUse(threadId: string): Promise<'idle' | 'busy' | 'unknown'> {
     if (this.inspectError) return 'unknown';
     const snapshot = this.snapshot(threadId);
-    if (this.completionPolicy?.isCompleted(threadId)) {
-      for (const request of snapshot.requests) if (!this.nativeDenials.some(denied => denied.id === request.id)) this.nativeDenials.push(structuredClone(request));
-      if (!this.uncertainNativeDenial) snapshot.requests = [];
-    }
+
     if (snapshot.requests.length || snapshot.status === 'running') return 'busy';
     return ['idle', 'completed', 'interrupted', 'failed'].includes(snapshot.status) ? 'idle' : 'unknown';
   }
