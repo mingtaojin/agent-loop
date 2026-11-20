@@ -6,7 +6,7 @@ Agent Loop 保存项目和任务的持续上下文。用户在项目协调群交
 
 ## 下载自动构建包
 
-每个合入 `main` 的 PR 都会生成一个运行包。在对应运行记录的 **Artifacts** 下载 `agent-loop-pr-<PR 编号>-<提交 SHA>.tar.gz`。 [查看打包记录](https://github.com/mingtaojin/agent-loop/actions/workflows/package.yml)
+每个合入 `main` 的 PR 都会生成一个运行包。运行包通过验证后会发布为预发行版。在 **Releases** 中打开对应 PR 的预发行版，从 **Assets** 下载 `agent-loop-pr-<PR 编号>-<提交 SHA>.tar.gz`。也可以从对应 Actions 运行的 **Artifacts** 下载。 [查看 Releases](https://github.com/mingtaojin/agent-loop/releases) · [查看打包记录](https://github.com/mingtaojin/agent-loop/actions/workflows/package.yml)
 
 将包解压到新目录。运行包自带生产依赖。安装 Node.js 24、Git 和 Codex CLI 后，在解压出的 `agent-loop` 目录中复制示例配置。
 
