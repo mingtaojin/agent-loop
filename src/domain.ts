@@ -98,6 +98,17 @@ export const incomingSchema = z.object({
   replyTo: replyTargetSchema.optional(),
 });
 export type IncomingMessage = z.infer<typeof incomingSchema>;
+export const epochMillisecondsSchema = z.number().int().min(-8_640_000_000_000_000).max(8_640_000_000_000_000);
+const reminderFields = {
+  id: z.string().min(1), projectId: z.string().min(1), taskId: z.string().min(1), requestId: z.string().min(1),
+  fingerprint: z.string().min(1), dueAt: epochMillisecondsSchema, text: z.string().min(1).max(131_072), createdAt: epochMillisecondsSchema,
+};
+export const reminderSchema = z.discriminatedUnion('status', [
+  z.strictObject({ ...reminderFields, status: z.literal('scheduled') }),
+  z.strictObject({ ...reminderFields, status: z.literal('fired'), firedAt: epochMillisecondsSchema }),
+  z.strictObject({ ...reminderFields, status: z.literal('cancelled'), cancelledAt: epochMillisecondsSchema }),
+]);
+export type Reminder = z.infer<typeof reminderSchema>;
 export function normalizeManualTaskText(text: IncomingMessage['text']): string {
   return text.trim().replace(/^\/new(?:\s|$)/, '').trim();
 }
@@ -218,6 +229,7 @@ export const inputProvenanceSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('github_comment'), sourceId: z.string(), commentId: z.string(), revision: z.string(), url: z.string(), author: z.string() }),
   z.object({ kind: z.literal('initial'), sourceId: z.string() }),
   z.strictObject({ kind: z.literal('cli'), requestId: submissionRequestIdSchema }),
+  z.strictObject({ kind: z.literal('reminder'), projectId: z.string(), taskId: z.string(), reminderId: z.string(), dueAt: epochMillisecondsSchema }),
   z.object({ kind: z.literal('recovery'), previousTurnId: z.string() }),
 ]);
 export type InputProvenance = z.infer<typeof inputProvenanceSchema>;

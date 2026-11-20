@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
-import { criteriaSchema, matchSource, sourceSchema, sourceCommentSchema, type Source, type SourceComment } from './domain.js';
+import { criteriaSchema, epochMillisecondsSchema, matchSource, sourceSchema, sourceCommentSchema, type Source, type SourceComment } from './domain.js';
 import { executionProfileSchema } from './execution.js';
 import type { Store } from './store.js';
 export { reasoningEffortSchema } from './execution.js';
@@ -42,6 +42,9 @@ const recordRequestSchema = z.strictObject({ requestId: idSchema, key: idSchema,
 export const projectActionSchema = z.discriminatedUnion('action', [
   z.strictObject({ action: z.literal('status'), section: z.enum(['overview', 'issues', 'comments', 'records', 'tasks', 'intakes', 'unassigned_intakes', 'closeout', 'messages']).optional(),
     offset: versionSchema.optional(), limit: z.number().int().min(1).max(100).optional() }),
+  z.strictObject({ action: z.literal('schedule_reminder'), requestId: idSchema, dueAt: epochMillisecondsSchema, text: textSchema }),
+  z.strictObject({ action: z.literal('list_reminders'), offset: versionSchema.optional(), limit: z.number().int().min(1).max(100).optional() }),
+  z.strictObject({ action: z.literal('cancel_reminder'), requestId: idSchema, reminderId: idSchema }),
   z.strictObject({ action: z.literal('dispatch'), requestId: idSchema, prompt: textSchema,
     predecessorTaskId: idSchema.optional(), issueId: idSchema.optional(), intakeTaskId: idSchema.optional(), role: z.literal('worker').default('worker'),
     execution: executionProfileSchema }),

@@ -17,6 +17,7 @@ const stableId = (text: string) => {
   const h = hash(text);
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-a${h.slice(17, 20)}-${h.slice(20, 32)}`;
 };
+const reminderId = (projectId: string, taskId: string, requestId: string) => stableId(JSON.stringify(['reminder', projectId, taskId, requestId]));
 const workerResultSchema = z.strictObject({
   projectId: z.string(), taskId: z.string(), resultId: z.string(), requestId: z.string(),
   threadId: z.string(), turnId: z.string(), inputSequence: z.number().int().nonnegative(),
@@ -402,13 +403,15 @@ Project policy: ${config.instructions}`;
     if (this.closing) throw new Error('Project runtime is stopping');
     assertActive?.();
     const action = projectActionSchema.parse(raw);
-    if (action.action !== 'status' && action.action !== 'register_artifact') this.host.closeout.assertOpen(callerId);
+    if (action.action !== 'status' && action.action !== 'list_reminders' && action.action !== 'cancel_reminder' && action.action !== 'register_artifact') this.host.closeout.assertOpen(callerId);
     const member = this.ledger.membership(callerId);
     if (!member || !this.config(callerId)) throw new Error('Task is not bound to an enabled project');
     if (action.action === 'status') {
       if (action.section === 'unassigned_intakes' && member.role !== 'coordinator') throw new Error('Only coordinators can discover unassigned intake identifiers');
       return this.status(member.projectId, callerId, action);
     }
+    if (action.action === 'list_reminders') return this.store.reminders({ projectId: member.projectId, taskId: callerId,
+      offset: action.offset ?? 0, limit: action.limit ?? 20 });
     const perform = async () => {
       assertActive?.();
       const fingerprint = hash(JSON.stringify(action));
@@ -421,10 +424,27 @@ Project policy: ${config.instructions}`;
           throw new Error('Project request ID already has different content');
       }
       if (old) {
+        if (action.action === 'schedule_reminder' || action.action === 'cancel_reminder') {
+          const current = this.store.reminder({ projectId: member.projectId, taskId: callerId,
+            reminderId: action.action === 'schedule_reminder' ? reminderId(member.projectId, callerId, action.requestId) : action.reminderId });
+          if (!current) throw new Error('Reminder receipt has no matching reminder');
+          return { accepted: true, reminder: current };
+        }
         if (action.action === 'record') return this.recordAcknowledgement(member.projectId, callerId, action.requestId);
         if (action.action === 'open_group') return this.perform(callerId, member, action);
         return old.value;
       }
+      if (action.action === 'schedule_reminder' || action.action === 'cancel_reminder') return this.store.transaction(() => {
+        this.store.setMeta(intentKey, fingerprint);
+        const owner = { projectId: member.projectId, taskId: callerId };
+        const reminder = action.action === 'schedule_reminder'
+          ? this.store.scheduleReminder({ ...owner, id: reminderId(member.projectId, callerId, action.requestId), requestId: action.requestId,
+            fingerprint, dueAt: action.dueAt, text: action.text, createdAt: Date.now(), status: 'scheduled' })
+          : this.store.cancelReminder({ ...owner, reminderId: action.reminderId }, Date.now());
+        const result = { accepted: true, reminder };
+        this.ledger.saveReceipt(member.projectId, callerId, action.requestId, fingerprint, result);
+        return result;
+      });
       if (action.action === 'claim_intake') return this.claimIntake(callerId, member, action, intentKey, fingerprint);
       this.store.setMeta(intentKey, fingerprint);
       const result = await this.perform(callerId, member, action);
@@ -599,7 +619,7 @@ Project policy: ${config.instructions}`;
     }
     return messages;
   }
-  private async perform(callerId: string, member: NonNullable<ReturnType<ProjectLedger['membership']>>, action: Exclude<ProjectAction, { action: 'status' | 'claim_intake' }>): Promise<unknown> {
+  private async perform(callerId: string, member: NonNullable<ReturnType<ProjectLedger['membership']>>, action: Exclude<ProjectAction, { action: 'status' | 'list_reminders' | 'schedule_reminder' | 'cancel_reminder' | 'claim_intake' }>): Promise<unknown> {
     const state = this.ledger.project(member.projectId);
     if (!state) throw new Error('Project unavailable');
     switch (action.action) {

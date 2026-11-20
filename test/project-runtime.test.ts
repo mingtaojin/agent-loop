@@ -40,7 +40,7 @@ async function nativeWorkerAction(f: Awaited<ReturnType<typeof fixture>>, taskId
   const snapshot = f.codex.snapshot(task.threadId);
   assert.ok(snapshot.turnId);
   return f.codex.projectHandler({ threadId: task.threadId, turnId: snapshot.turnId,
-    connectionEpoch: 'fake-epoch', callId: action.action === 'status' ? 'status' : action.requestId, call: { tool: 'project_action', arguments: action } });
+    connectionEpoch: 'fake-epoch', callId: 'requestId' in action ? action.requestId : action.action, call: { tool: 'project_action', arguments: action } });
 }
 
 const dispatchReceipt = z.object({ taskId: z.string().min(1) });

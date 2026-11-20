@@ -579,6 +579,7 @@ export class AgentLoop {
   async tick(): Promise<void> {
     if (this.stopping) return;
     if (this.running) this.heartbeat('running');
+    this.store.fireDueReminders(Date.now());
     const tasks = this.sweepBatch(this.store.tasks());
     let next = 0;
     const worker = async () => {
@@ -1362,6 +1363,7 @@ export class AgentLoop {
   }
   async recover(): Promise<void> {
     await this.projects.ensure();
+    this.store.fireDueReminders(Date.now());
     await Promise.all(this.store.tasks().map(task => this.closeout.progress(task.id)));
     const priority = (task: Task) => {
       if (task.status === 'paused' || task.status === 'failed') return 3;
