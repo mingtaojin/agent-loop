@@ -147,6 +147,32 @@ test('approval notices use the current group when retirement races with old-grou
   assert.ok(!notices[0]?.text.includes(encodeURIComponent(current.chatId)));
 });
 
+test('a replacement Worker group ignores late messages from an older finished turn', async t => {
+  const f = await fixture(t);
+  await f.initialize();
+  const worker = await f.dispatch('late-event', 'Discuss scope');
+  assert.ok(worker.threadId);
+  const group = await f.openGroup(worker.id);
+  await f.loop.tick();
+  assert.ok(group.chatId);
+  const oldTurnId = f.codex.snapshot(worker.threadId).turnId;
+  assert.ok(oldTurnId);
+  for (const next of ['second', 'third']) {
+    f.codex.complete(worker.threadId, 'Summary');
+    await f.loop.tick();
+    await f.loop.receive(f.message(next, 'Continue', group.chatId));
+    await f.loop.tick();
+  }
+  await f.feishu.dissolveGroup(group.chatId);
+  await f.restart();
+  const replacement = await f.openGroup(worker.id, 'reopen');
+  const sent = f.feishu.sent.length;
+  f.codex.onEvent?.({ threadId: worker.threadId, turnId: oldTurnId, itemId: 'late',
+    kind: 'agent_message', createdAt: Date.now(), label: 'Agent', text: 'Old discussion' });
+  await f.loop.tick();
+  assert.deepEqual(f.feishu.sent.slice(sent).filter(message => message.chatId === replacement.chatId), []);
+});
+
 test('a manually dissolved direct-worker group stays absent through recovery and can be reopened explicitly', async t => {
   const f = await fixture(t); await f.initialize();
   const worker = await f.dispatch('manual-dissolve', 'Continue the same task.');

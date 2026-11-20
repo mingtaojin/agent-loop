@@ -19,7 +19,7 @@ export class WorkerChatTurn {
   }
 
   get ended(): boolean {
-    return this.store.hasOutput(this.task.id, `${this.statusKey}:ended:`);
+    return this.store.meta(`worker-chat-ended:${this.turnKey}`) !== null;
   }
 
   start(): void { this.status('working'); }
@@ -32,5 +32,8 @@ export class WorkerChatTurn {
     if (running) this.status('working', output.id);
   }
 
-  end(): void { this.status('ended'); }
+  end(): void {
+    this.status('ended');
+    this.store.setMeta(`worker-chat-ended:${this.turnKey}`, 'ended');
+  }
 }
