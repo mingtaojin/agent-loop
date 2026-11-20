@@ -16,9 +16,10 @@ createInterface({ input: process.stdin }).on('line', line => {
       threads.set(thread.id, thread); result = { thread: view(thread), cwd: p.cwd, approvalPolicy: p.approvalPolicy, sandbox: { type: 'readOnly', networkAccess: false } }; break;
     }
     case 'thread/resume': case 'thread/read': result = { thread: view(threads.get(p.threadId)) }; break;
+    case 'thread/turns/list': result = { data: threads.get(p.threadId).turns.map(turn => ({ ...turn, itemsView: 'full', startedAt: null, completedAt: null })), nextCursor: null }; break;
     case 'turn/start': {
       const thread = threads.get(p.threadId);
-      const turn = { id: 'turn-' + (thread.turns.length + 1), status: 'inProgress', items: [{ id: 'user', type: 'userMessage', clientId: p.clientUserMessageId, content: p.input }] };
+      const turn = { startedAt: null, completedAt: null, itemsView: 'full', id: 'turn-' + (thread.turns.length + 1), status: 'inProgress', items: [{ id: 'user', type: 'userMessage', clientId: p.clientUserMessageId, content: p.input }] };
       thread.turns.push(turn);
       send({ id, result: { turn } });
       const scope = { threadId: thread.id, turnId: turn.id };
@@ -35,6 +36,7 @@ createInterface({ input: process.stdin }).on('line', line => {
         return;
       }
       notify('turn/started', { threadId: thread.id, turn });
+      notify('item/started', { ...scope, item: { id: 'agent', type: 'agentMessage', text: '', phase: 'commentary' } });
       notify('item/agentMessage/delta', { ...scope, itemId: 'agent', delta: '正在检查运行状态，' });
       notify('item/started', { ...scope, item: { id: 'command', type: 'commandExecution', command: 'npm run check', status: 'inProgress' } });
       notify('item/commandExecution/outputDelta', { ...scope, itemId: 'command', delta: 'TypeScript checking…\n' });

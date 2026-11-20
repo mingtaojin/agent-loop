@@ -159,7 +159,7 @@ function newLoop(): AgentLoop {
 function snapshot(current: AgentLoop): unknown {
   return { project: current.projects.ledger.project(projectId), tasks: current.tasks().map(task => ({ task,
     inputs: current.store.inputs(task.id), outputs: current.store.outputs(task.id),
-    approvals: current.store.approvals(task.id), events: current.store.executionEvents(task.id, 0, 100_000) })),
+    approvals: current.store.approvals(task.id), events: current.execution.current(task.id) })),
   diagnostics: current.store.diagnostics(), fakeFeishu: { groups: [...feishu.groups], sent: feishu.sent,
     approvals: feishu.approvals }, fakeGithub: { sources: github.sources, verifications: github.verifications } };
 }
@@ -183,7 +183,6 @@ function readDatabase(): unknown {
       inbox: 'SELECT * FROM inbox ORDER BY seq', outbox: 'SELECT * FROM outbox ORDER BY rowid',
       operations: 'SELECT * FROM operations ORDER BY rowid',
       projectMetadata: "SELECT * FROM meta WHERE key LIKE 'project:%' OR key LIKE 'project-generation:%' OR key LIKE 'project-archived-thread:%' ORDER BY key",
-      executionEvents: 'SELECT * FROM execution_events ORDER BY seq',
       diagnostics: 'SELECT * FROM diagnostics ORDER BY id',
     };
     return Object.fromEntries(Object.entries(queries).map(([name, sql]) => [name, { sql, rows: db.prepare(sql).all() }]));
@@ -286,9 +285,9 @@ async function verify(): Promise<void> {
       assert.ok(reportInput);
       assert.equal(reportInput.provenance.kind, 'agent');
       assert.equal(reportInput.status, 'delivered');
-      const receiptTurnStart = loop.store.executionEvents(coordinatorId, 0, 100_000).find(event => event.kind === 'turn_start' && event.turnId === recorded.request.turnId);
-      assert.ok(receiptTurnStart && receiptTurnStart.createdAt >= reportArrival.at, 'Receipt turn must start after the actual worker report');
-      const workerEvents = loop.store.executionEvents(worker.taskId, 0, 100_000);
+      const receiptTurnStart = loop.execution.current(coordinatorId).find(event => event.kind === 'turn_start' && event.turnId === recorded.request.turnId);
+      assert.ok(receiptTurnStart && (receiptTurnStart.createdAt ?? 0) >= reportArrival.at, 'Receipt turn must start after the actual worker report');
+      const workerEvents = loop.execution.current(worker.taskId);
       assert.ok(workerEvents.some(event => ['tool_output', 'tool_end'].includes(event.kind)
         && event.text.includes(marker)), 'Marker must be observed in actual worker tool output');
       const workerOutputs = loop.store.outputs(worker.taskId).map(output => output.text).join('\n');
@@ -296,7 +295,7 @@ async function verify(): Promise<void> {
       const coordinatorOutputs = loop.store.outputs(coordinatorId).map(output => output.text).join('\n');
       assert.match(coordinatorOutputs, /COORDINATOR_RECEIPT_RECORDED/);
       assert.ok(coordinatorOutputs.includes(marker));
-      for (const task of tasks) for (const event of loop.store.executionEvents(task.id, 0, 100_000)) {
+      for (const task of tasks) for (const event of loop.execution.current(task.id)) {
         if (event.kind === 'tool_start') assert.ok(event.label.startsWith('project_action') || event.text.startsWith('$ '), 'No external tool or nested agent may be used');
       }
       assert.deepEqual({ files: (await readdir(directory)).sort(),

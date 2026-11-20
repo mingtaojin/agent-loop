@@ -1,3 +1,4 @@
+import { ExecutionFixture } from './execution-fixture.js';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -20,7 +21,7 @@ function task(id: string, title: string, purpose: 'execution' | 'intake' = 'exec
 
 test('dashboard resource DTO keeps project card repositories usable by the client', async t => {
   const root = await mkdtemp(join(tmpdir(), 'agent-dashboard-resource-dto-'));
-  const store = new Store(root);
+  const store = new Store(root); const source = new ExecutionFixture();
   const worker = task('worker', 'Implement dashboard', 'execution', [{
     id: 'worker-repository', kind: 'git-worktree',
     repository: repositorySchema.parse({ name: 'example/project', path: '/tmp/source', baseBranch: 'main' }),
@@ -33,7 +34,7 @@ test('dashboard resource DTO keeps project card repositories usable by the clien
     ledger.create({ id: 'project-a', name: 'Project A', directory: root, repositories: [], instructions: '' }, coordinator.id);
     ledger.addMember('project-a', worker.id, 'worker');
   });
-  const dashboard = await startDashboard({ dataDir: root, port: 0 });
+  const dashboard = await startDashboard({ execution: source.execution, dataDir: root, port: 0 });
   t.after(async () => { await dashboard.close(); store.close(); await rm(root, { recursive: true, force: true }); });
 
   const projects = await (await fetch(dashboard.url + '/api/projects')).json();
@@ -54,7 +55,7 @@ test('dashboard resource DTO keeps project card repositories usable by the clien
 
 test('project dashboard uses ledger membership, reports, and redacted task events', async t => {
   const root = await mkdtemp(join(tmpdir(), 'agent-dashboard-coordinator-'));
-  const store = new Store(root);
+  const store = new Store(root); const source = new ExecutionFixture();
   const coordinator = task('coordinator', 'Coordinate release');
   const worker = task('worker', 'Implement dashboard');
   const secondWorker = task('second-worker', 'Verify dashboard');
@@ -69,15 +70,15 @@ test('project dashboard uses ledger membership, reports, and redacted task event
     store.setMeta('project-intake-route:' + intake.id, JSON.stringify({ projectId: 'project-a', coordinatorTaskId: coordinator.id }));
     const report = { id: 'report', chatId: 'chat:' + coordinator.id, senderId: 'runtime:project', text: 'Worker worker update. Added the reader.', attachments: [], createdAt: Date.now(), chatType: 'group' as const };
     store.receive(coordinator.id, report, 'source', { kind: 'agent', projectId: 'project-a', taskId: worker.id, eventId: 'report:worker:update', category: 'update', routing: 'final', escalation: undefined, sources: [{ messageId: 'owner-message', chatId: worker.chatId!, senderId: 'owner' }], currentStep: 'Reader', nextStep: 'Run tests', blockers: [], evidence: ['test/dashboard-coordinator.test.ts'] });
-    store.recordExecutionEvent(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'agent', kind: 'agent_message', label: 'Agent', text: 'Visible progress', createdAt: Date.now() });
-    store.recordExecutionEvent(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'tool', kind: 'tool_end', label: '命令 · completed · exit 0', text: '$ npm test', createdAt: Date.now() });
-    store.recordExecutionEvent(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'legacy-tool', kind: 'tool_end', label: '命令 · completed · exit 0', text: '$ npm test\nSECRET_OUTPUT', createdAt: Date.now() });
-    store.recordExecutionEvent(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'tool', kind: 'tool_output', label: '工具输出', text: 'SECRET_OUTPUT', createdAt: Date.now() });
-    for (let index = 0; index < 501; index++) store.recordExecutionEvent(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'legacy-tool-' + index, kind: 'tool_output', label: '工具输出', text: 'OLD_OUTPUT_' + index, createdAt: Date.now() });
-    store.recordExecutionEvent(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'after-gap', kind: 'agent_message', label: '最终回答', text: 'VISIBLE_AFTER_GAP', createdAt: Date.now() });
+    source.publish(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'agent', kind: 'agent_message', label: 'Agent', text: 'Visible progress', createdAt: Date.now() });
+    source.publish(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'tool', kind: 'tool_end', label: '命令 · completed · exit 0', text: '$ npm test', createdAt: Date.now() });
+    source.publish(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'legacy-tool', kind: 'tool_end', label: '命令 · completed · exit 0', text: '$ npm test\nSECRET_OUTPUT', createdAt: Date.now() });
+    source.publish(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'tool', kind: 'tool_output', label: '工具输出', text: 'SECRET_OUTPUT', createdAt: Date.now() });
+    for (let index = 0; index < 501; index++) source.publish(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'legacy-tool-' + index, kind: 'tool_output', label: '工具输出', text: 'OLD_OUTPUT_' + index, createdAt: Date.now() });
+    source.publish(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'after-gap', kind: 'agent_message', label: '最终回答', text: 'VISIBLE_AFTER_GAP', createdAt: Date.now() });
     store.receive(worker.id, { id: 'long-input', chatId: worker.chatId!, senderId: 'owner', text: 'x'.repeat(40_000), attachments: [], createdAt: Date.now(), chatType: 'group' }, 'user');
   });
-  const dashboard = await startDashboard({ dataDir: root, port: 0 });
+  const dashboard = await startDashboard({ execution: source.execution, dataDir: root, port: 0 });
   t.after(async () => { await dashboard.close(); store.close(); await rm(root, { recursive: true, force: true }); });
 
   const projects = await (await fetch(dashboard.url + '/api/projects')).json();
@@ -98,7 +99,7 @@ test('project dashboard uses ledger membership, reports, and redacted task event
   assert.equal(detail.reports[0].routing, 'final');
   assert.deepEqual(detail.reports[0].sources, [{ messageId: 'owner-message', chatId: worker.chatId, senderId: 'owner' }]);
   assert.equal(detail.inputs.find((input: { id: string }) => input.id === 'long-input').text.length, 32_770);
-  assert.equal(detail.events.some((event: { kind: string }) => event.kind === 'tool_output'), false);
+  assert.equal(detail.timeline.some((event: { kind: string }) => event.kind === 'tool_output'), false);
   assert.equal(detail.timeline.some((event: { type: string }) => event.type === 'INPUT'), true);
   assert.equal(detail.timeline.some((event: { type: string }) => event.type === 'NARRATIVE'), true);
   assert.equal(detail.timeline.some((event: { type: string }) => event.type === 'TOOL_CALL'), true);
@@ -109,14 +110,10 @@ test('project dashboard uses ledger membership, reports, and redacted task event
   assert.doesNotMatch(JSON.stringify(detail), /SECRET_OUTPUT/);
   assert.match(JSON.stringify(detail), /VISIBLE_AFTER_GAP/);
 
-  const reader = new ProjectDashboardReader(store);
-  const hiddenStart = store.executionEvents(worker.id).find(event => event.itemId === 'legacy-tool-0')?.seq;
-  assert.ok(hiddenStart);
-  const firstPage = reader.events(worker.id, hiddenStart - 1);
-  assert.equal(firstPage.events.some(event => event.text === 'VISIBLE_AFTER_GAP'), true);
-
   const controller = new AbortController();
-  const stream = await fetch(dashboard.url + '/api/events?taskId=' + worker.id, { signal: controller.signal });
+  const cursor = source.execution.cursor;
+  source.publish(worker.id, { threadId: worker.threadId!, turnId: worker.turnId, itemId: 'new', kind: 'agent_message', label: 'Agent', text: 'VISIBLE_AFTER_GAP', createdAt: Date.now() });
+  const stream = await fetch(dashboard.url + '/api/events?taskId=' + worker.id + '&after=' + encodeURIComponent(cursor), { signal: controller.signal });
   const streamReader = stream.body!.getReader(); let streamText = '';
   for (let attempt = 0; attempt < 5 && !streamText.includes('VISIBLE_AFTER_GAP'); attempt++) {
     const chunk = await streamReader.read(); streamText += new TextDecoder().decode(chunk.value);

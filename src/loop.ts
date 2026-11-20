@@ -1,3 +1,4 @@
+import { LiveExecution } from './live-execution.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { access, mkdir, readFile, stat, rename, rm, writeFile } from 'node:fs/promises';
@@ -17,7 +18,6 @@ import { GroupCleanup } from './group-cleanup.js';
 import { Store, type Inbox } from './store.js';
 import { FeishuProgressPublisher } from './feishu-progress.js';
 import { FeishuDocumentProgressPublisher } from './feishu-document-progress.js';
-import { taskProgressStatus } from './feishu-progress-view.js';
 import { IntakeOwnershipChanged, intakeMaterialVersion, ProjectRuntime } from './project-runtime.js';
 import type { ProjectAction, ProjectConfig } from './project.js';
 import { matchesProjectIssue } from './project.js';
@@ -56,6 +56,7 @@ function sourceRevision(source: Source): string {
 }
 export class AgentLoop {
   readonly store: Store;
+  readonly execution: LiveExecution;
   readonly feishuArtifacts: FeishuArtifactPort | undefined;
   private readonly workspaceBridge: WorkspaceBridge;
   private readonly progress: FeishuProgressPublisher | FeishuDocumentProgressPublisher | null;
@@ -80,6 +81,7 @@ export class AgentLoop {
   private readonly groups: TaskGroups;
   constructor(readonly config: Config, readonly ports: { github: GitHubPort; feishu: FeishuPort; feishuArtifacts?: FeishuArtifactPort; codex: CodexPort; workspace: WorkspacePort }, store?: Store) {
     this.store = store ?? new Store(config.dataDir);
+    this.execution = new LiveExecution(ports.codex);
     this.feishuArtifacts = ports.feishuArtifacts;
     this.closeout = new TaskCloseout(this.store, {
       assertCompletionAllowed: task => {
@@ -120,18 +122,15 @@ export class AgentLoop {
     const progress = config.feishu.progress;
     this.progress = !progress.enabled ? null : progress.surface === 'document'
       ? ports.feishu.documentProgress && progress.documentBaseUrl
-        ? new FeishuDocumentProgressPublisher({ store: this.store, transport: ports.feishu.documentProgress,
+        ? new FeishuDocumentProgressPublisher({ store: this.store, execution: this.execution, transport: ports.feishu.documentProgress,
           documentBaseUrl: progress.documentBaseUrl, intervalMs: progress.intervalMs, maxLines: progress.maxLines }) : null
-      : ports.feishu.progress ? new FeishuProgressPublisher({ store: this.store, transport: ports.feishu.progress,
+      : ports.feishu.progress ? new FeishuProgressPublisher({ store: this.store, execution: this.execution, transport: ports.feishu.progress,
         intervalMs: progress.intervalMs, dashboardUrl: progress.dashboardUrl }) : null;
+    ports.codex.setObservationResetHandler?.(() => this.execution.reset());
     ports.codex.setEventHandler?.(event => {
       try {
         const taskId = this.store.taskIdForThread(event.threadId);
-        if (taskId) this.store.recordExecutionEvent(taskId, event);
-        else {
-          const archived = this.store.meta(`project-archived-thread:${event.threadId}`);
-          if (archived) this.store.recordExecutionEvent(archived, event);
-        }
+        if (taskId) this.execution.publish(taskId, event);
       } catch (error) { this.problem('debug:' + event.threadId, error); }
     });
     this.workspaceBridge = new WorkspaceBridge(config.dataDir, async (taskId, repository) => {
@@ -232,7 +231,6 @@ export class AgentLoop {
   private persist(task: Task): void {
     const latest = this.store.task(task.id);
     task.chatId = latest.chatId;
-    this.recordProgressStatus(task);
     task.resources = [...new Map([...task.resources, ...latest.resources].map(resource => [resource.id, resource])).values()]
       .filter(resource => this.store.meta(`released-resource:${task.id}:${resource.id}`) !== 'released');
     const current = this.store.task(task.id);
@@ -365,7 +363,6 @@ export class AgentLoop {
     this.closeout.assertOpen(task.id);
     const profile = this.projects.executionProfile(task.id);
     const snapshot = await this.admitted(task.id, () => this.ports.codex.inspect(threadId, instructions, profile?.model, profile?.reasoningEffort));
-    this.recordProgressStatus({ ...task, turnId: snapshot.turnId, executionStatus: snapshot.status, requests: snapshot.requests });
     return snapshot;
   }
   private async observation(task: Task, reconcile = false): Promise<ExecutionSnapshot | RunningActivity> {
@@ -375,22 +372,10 @@ export class AgentLoop {
       const profile = this.projects.executionProfile(task.id);
       const activity = await this.ports.codex.activity(task.threadId, await this.instructions(task), profile?.model, profile?.reasoningEffort);
       if (activity.kind === 'running') {
-        this.recordProgressStatus({ ...task, turnId: activity.turnId, executionStatus: 'running', requests: activity.requests });
         return activity;
       }
     }
     return this.inspect(task.threadId);
-  }
-  private recordProgressStatus(task: Task): void {
-    if (!this.config.feishu.progress.enabled || !task.threadId || !task.turnId) return;
-    try {
-      const key = `feishu-progress:status:${JSON.stringify([task.id, task.turnId])}`;
-      const status = taskProgressStatus(task);
-      if (this.store.meta(key) === status) return;
-      this.store.recordExecutionEvent(task.id, { threadId: task.threadId, turnId: task.turnId, itemId: null,
-        kind: 'turn_status', label: '执行状态', text: status, createdAt: Date.now() });
-      this.store.setMeta(key, status);
-    } catch (error) { this.problem('feishu-progress', error); }
   }
   private async allocateTask(sourceId: string, source: TaskSource, purpose: 'intake' | 'execution'): Promise<Task> {
     const id = randomUUID();

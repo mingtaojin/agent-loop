@@ -1,59 +1,51 @@
+import { progressDiagnostic } from './feishu-progress-errors.js';
+import { LiveExecution } from './live-execution.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { documentBaseUrlSchema, documentMaxLinesSchema } from './config.js';
-import { errorMessage, type Task } from './domain.js';
-import { finished, progressViewSchema, taskProgressStatus } from './feishu-progress-view.js';
+import { type Task } from './domain.js';
+import { coversSource, sourceFrontier, sourceFrontierSchema, HistoryRetries, finished, progressViewSchema, taskProgressStatus } from './feishu-progress-view.js';
 import { documentConversationText, projectDocumentConversation } from './feishu-document-conversation.js';
 import { documentChunks } from './feishu-document-text.js';
 import { DocumentRequestRejected, TaskGroupBindingChanged, TaskGroupUnavailable, type FeishuDocumentProgressPort } from './ports.js';
 import { assertGroupBinding, retireTaskGroup } from './task-groups.js';
-import { documentSourcePositionSchema, type DocumentSourcePosition, type Store } from './store.js';
+import type { Store } from './store.js';
 
 const id = z.string().min(1);
-const writeSchema = z.strictObject({ clientToken: id, text: z.string(), sent: z.boolean(), chunks: z.array(z.string()).min(1).optional() });
-const partSchema = z.strictObject({ blockId: id, text: z.string() });
+const writeSchema = z.strictObject({ clientToken: id, text: z.string(), sent: z.boolean() });
+const partSchema = z.strictObject({ blockId: id, digest: z.string() });
+const hash = (text: string) => createHash('sha256').update(text).digest('hex');
 const operationSchema = z.discriminatedUnion('kind', [
-  z.strictObject({ kind: z.literal('replace'), ...partSchema.shape, clientToken: id, sent: z.boolean() }),
+  z.strictObject({ kind: z.literal('replace'), blockId: id, text: z.string(), clientToken: id, sent: z.boolean() }),
   z.strictObject({ kind: z.literal('append'), index: z.number().int().nonnegative(), text: z.string(), clientToken: id, sent: z.boolean() }),
   z.strictObject({ kind: z.literal('remove'), blockIds: z.array(id).min(1), clientToken: id, sent: z.boolean() }),
 ]);
 const documentFields = { documentId: id, documentUrl: z.url() };
 const blockFields = { ...documentFields, blockId: id };
 const deliverySchema = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('disabled'), documentId: id.nullable(), documentUrl: z.url().nullable(),
+    reason: z.literal('Task group is unavailable or its binding changed'), apiCode: z.number().nullable() }),
   z.strictObject({ kind: z.literal('document'), title: id, pending: z.boolean() }),
   z.strictObject({ kind: z.literal('block'), ...documentFields, write: writeSchema }),
   z.strictObject({ kind: z.literal('access'), ...blockFields, pending: z.boolean() }),
   z.strictObject({ kind: z.literal('tab'), ...blockFields, pending: z.boolean() }),
-  z.strictObject({ kind: z.literal('ready'), ...blockFields, tabId: id, content: z.string(), write: writeSchema.nullable(),
+  z.strictObject({ kind: z.literal('ready'), ...blockFields, tabId: id, contentHash: z.string(),
     parts: z.array(partSchema).default([]), operation: operationSchema.nullable().default(null) }),
 ]);
-const projectionRevisionSchema = documentSourcePositionSchema.extend({
-  taskKey: z.string(), rendererVersion: z.number().int().nonnegative(), maxLines: documentMaxLinesSchema,
-});
-type DocumentProjectionRevision = z.infer<typeof projectionRevisionSchema>;
-export const documentPublicationSchema = z.strictObject({
-  version: z.literal(1), taskId: id, chatId: id, turnId: id,
+const runtimePublicationSchema = z.strictObject({
+  version: z.literal(2), taskId: id, chatId: id, threadId: id, turnId: id,
   view: progressViewSchema, text: z.string().default(''), delivery: deliverySchema,
   lastAttemptAt: z.number(), nextAttemptAt: z.number(), failures: z.number().int().nonnegative(),
-  projectionRevision: projectionRevisionSchema.nullable().default(null),
+  sourceFrontier: sourceFrontierSchema.default({}),
+  projectionRevision: z.string().nullable().default(null),
 });
-export type DocumentPublication = z.infer<typeof documentPublicationSchema>;
-const discoverySchema = z.strictObject({ cursor: z.number().int().nonnegative(), excludedTurns: z.array(z.string()) });
-const discoveryKey = 'feishu-document-progress:discovery:v1';
+export const documentPublicationSchema = runtimePublicationSchema.omit({ view: true, text: true });
+type DocumentPublication = z.infer<typeof runtimePublicationSchema>;
+const discoverySchema = z.strictObject({ excludedTurns: z.array(z.string()) });
+const discoveryKey = 'feishu-document-progress:discovery:v2';
 const turnKey = (taskId: string, turnId: string) => JSON.stringify([taskId, turnId]);
 const emptyView = () => progressViewSchema.parse({ status: 'running', cursor: 0, lastExecutionEventAt: null, assistant: [], tool: null });
 const content = (record: DocumentPublication) => record.text;
-function projectionRevision(task: Task, position: DocumentSourcePosition, maxLines: number): DocumentProjectionRevision {
-  const taskKey = createHash('sha256').update(JSON.stringify([
-    task.threadId, task.turnId, taskProgressStatus(task), task.source.kind === 'manual' ? task.source.message : null,
-  ])).digest('hex');
-  return { ...position, taskKey, rendererVersion: 1, maxLines };
-}
-function sameRevision(previous: DocumentProjectionRevision | null, current: DocumentProjectionRevision): boolean {
-  return previous !== null && previous.eventSeq === current.eventSeq && previous.inputSeq === current.inputSeq
-    && previous.taskKey === current.taskKey && previous.rendererVersion === current.rendererVersion && previous.maxLines === current.maxLines;
-}
-
 export class FeishuDocumentProgressPublisher {
   private readonly inFlight = new Map<string, Promise<void>>();
   private readonly publications = new Map<string, { payload: string; record: DocumentPublication }>();
@@ -63,7 +55,12 @@ export class FeishuDocumentProgressPublisher {
   private readonly maxLines: number;
   private timer: ReturnType<typeof setInterval> | undefined;
   private stopped = false;
-  constructor(private readonly options: { store: Store; transport: FeishuDocumentProgressPort; documentBaseUrl: string; intervalMs?: number; maxLines?: number; now?: () => number }) {
+  private discoveryWork: Promise<boolean> | null = null;
+  private readonly unsubscribe: () => void;
+  private readonly observed = new Map<string, string>();
+  private readonly historyRetries = new HistoryRetries();
+  constructor(private readonly options: { store: Store; execution: LiveExecution; transport: FeishuDocumentProgressPort; documentBaseUrl: string; intervalMs?: number; maxLines?: number; now?: () => number }) {
+    this.unsubscribe = options.execution.subscribe(({ event }) => { if (!event) { this.observed.clear(); this.publications.clear(); } });
     this.now = options.now ?? Date.now;
     this.intervalMs = Math.max(3000, options.intervalMs ?? 3000);
     this.baseUrl = documentBaseUrlSchema.parse(options.documentBaseUrl);
@@ -71,99 +68,171 @@ export class FeishuDocumentProgressPublisher {
   }
   start(): void {
     if (this.timer || this.stopped) return;
-    this.discoverSafely();
+    void this.discoverSafely();
     this.timer = setInterval(() => { void this.poll().catch(error => this.report(error)); }, this.intervalMs);
     this.timer.unref();
   }
   async poll(): Promise<void> {
-    if (this.stopped || !this.discoverSafely()) return;
+    if (this.stopped) return;
     const work: Promise<void>[] = [];
+    for (const taskId of this.options.store.documentProgressTaskIds()) {
+      const record = this.load(taskId);
+      if (!record) continue;
+      const task = this.options.store.task(taskId);
+      if (task.chatId !== record.chatId || task.threadId === null) {
+        if (record.delivery.kind === 'block' || (record.delivery.kind === 'ready' && record.delivery.operation)) this.disable(record);
+        this.publications.delete(taskId); this.observed.delete(taskId); continue;
+      }
+      if (task.threadId !== record.threadId) {
+        if (record.delivery.kind === 'ready' && record.delivery.operation) { record.delivery.operation = null; this.save(record); }
+        else if (record.delivery.kind === 'block') this.disable(record);
+        continue;
+      }
+      if (this.inFlight.has(taskId) || record.nextAttemptAt > this.now()) continue;
+      if (this.inFlight.size >= 2) break;
+      if ((record.delivery.kind === 'block' && record.delivery.write.sent) || (record.delivery.kind === 'ready' && record.delivery.operation?.sent)) work.push(this.dispatch(record));
+    }
+    await Promise.all(work);
+    if (this.stopped) return;
+    const discovered = await this.discoverSafely();
+    if (!discovered || this.stopped) { await Promise.all(work); return; }
     const taskIds = new Set(this.options.store.documentProgressTaskIds());
     for (const taskId of this.publications.keys()) if (!taskIds.has(taskId)) this.publications.delete(taskId);
     const records = [...taskIds].flatMap(taskId => { const record = this.load(taskId); return record ? [record] : []; });
     for (const record of records.sort((a, b) => a.lastAttemptAt - b.lastAttemptAt)) {
-      if (this.options.store.task(record.taskId).chatId !== record.chatId) continue;
+      if (this.options.store.task(record.taskId).chatId !== record.chatId) {
+        if (record.delivery.kind === 'block' || (record.delivery.kind === 'ready' && record.delivery.operation)) this.disable(record);
+        this.publications.delete(record.taskId); continue;
+      }
+      if (record.delivery.kind === 'disabled') continue;
+      const pending = record.delivery.kind === 'block' || (record.delivery.kind === 'ready' && record.delivery.operation !== null);
+      if (!pending && (!this.publications.has(record.taskId) || !this.observed.has(record.taskId))) continue;
       if (this.inFlight.size >= 2) break;
       if (this.inFlight.has(record.taskId) || record.nextAttemptAt > this.now()) continue;
       const delivery = record.delivery;
       if (delivery.kind === 'document' && delivery.pending) continue;
-      if (delivery.kind === 'ready' && !delivery.write && delivery.content === content(record)) continue;
-      const request = this.deliver(structuredClone(record)).catch(error => this.report(error)).finally(() => this.inFlight.delete(record.taskId));
-      this.inFlight.set(record.taskId, request);
-      work.push(request);
+      if (delivery.kind === 'ready' && !delivery.operation && delivery.contentHash === record.projectionRevision) continue;
+      work.push(this.dispatch(record));
     }
     await Promise.all(work);
+    let bytes = 0;
+    for (const [taskId, cached] of this.publications) {
+      const record = cached.record;
+      bytes += Buffer.byteLength(record.text);
+      if ((record.delivery.kind === 'ready' && !record.delivery.operation && record.delivery.contentHash === record.projectionRevision)
+        || bytes > 2_000_000 || this.publications.size > 64) this.publications.delete(taskId);
+    }
+  }
+  private dispatch(record: DocumentPublication): Promise<void> {
+    const request = this.deliver(structuredClone(record)).catch(error => this.report(error, record.taskId, record.delivery.kind))
+      .finally(() => this.inFlight.delete(record.taskId));
+    this.inFlight.set(record.taskId, request);
+    return request;
   }
   async close(): Promise<void> {
     this.stopped = true;
+    this.unsubscribe();
     if (this.timer) clearInterval(this.timer);
+    await this.discoveryWork;
     await Promise.allSettled(this.inFlight.values());
     this.publications.clear();
   }
-  private report(error: unknown): void { this.options.store.diagnostic('feishu-document-progress', errorMessage(error)); }
+  private report(error: unknown, taskId?: string, operation = 'discovery', retry: 'pending' | 'disabled' = 'pending'): void {
+    this.options.store.diagnostic(taskId ?? 'feishu-document-progress', progressDiagnostic(error, `document.${operation}`, retry));
+  }
   private load(taskId: string): DocumentPublication | null {
     const payload = this.options.store.documentProgressPayload(taskId);
     if (payload === null) { this.publications.delete(taskId); return null; }
     let cached = this.publications.get(taskId);
     if (cached?.payload !== payload) {
-      cached = { payload, record: documentPublicationSchema.parse(JSON.parse(payload)) };
-      this.publications.set(taskId, cached);
+      cached = { payload, record: { ...documentPublicationSchema.parse(JSON.parse(payload)), view: emptyView(), text: cached?.record.text ?? '' } };
+      if (cached.record.text) this.publications.set(taskId, cached);
     }
     return cached.record;
   }
-  private save(record: DocumentPublication): void { this.options.store.saveDocumentProgressRecord(record.taskId, record); }
+  private save(record: DocumentPublication): void {
+    const { view: _view, text: _text, ...receipt } = record;
+    this.options.store.saveDocumentProgressRecord(record.taskId, receipt);
+    this.publications.set(record.taskId, { payload: JSON.stringify(receipt), record });
+  }
   private saveDelivery(record: DocumentPublication): void {
     const latest = this.load(record.taskId);
     if (!latest) throw new Error('Document publication disappeared');
-    if (latest.chatId !== record.chatId) throw new TaskGroupBindingChanged();
+    if (latest.chatId !== record.chatId || this.options.store.task(record.taskId).threadId !== record.threadId) throw new TaskGroupBindingChanged();
     assertGroupBinding(this.options.store, record.taskId, record.chatId);
     this.save({ ...latest, delivery: record.delivery, lastAttemptAt: record.lastAttemptAt,
       nextAttemptAt: record.nextAttemptAt, failures: record.failures });
   }
-  private discoverSafely(): boolean {
-    try { this.discover(); return true; }
-    catch (error) { this.report(error); return false; }
+  private discoverSafely(): Promise<boolean> {
+    return this.discoveryWork ??= this.discover().then(() => true, error => { this.report(error); return false; })
+      .finally(() => { this.discoveryWork = null; });
   }
-  private discover(): void {
+  private async discover(): Promise<void> {
     const store = this.options.store;
-    store.transaction(() => {
-      const tasks = store.tasks();
-      const raw = store.meta(discoveryKey);
-      const discovery = raw === null ? { cursor: store.latestExecutionSequence(), excludedTurns: tasks.flatMap(task =>
-        task.turnId && finished(taskProgressStatus(task)) && !this.load(task.id) ? [turnKey(task.id, task.turnId)] : []) }
-        : discoverySchema.parse(JSON.parse(raw));
-      const excluded = new Set(discovery.excludedTurns);
-      for (const task of tasks) {
-        if (!task.chatId || !task.turnId || excluded.has(turnKey(task.id, task.turnId))) continue;
-        let record = this.load(task.id);
-        if (record && record.chatId !== task.chatId) {
-          store.setMeta(`retired-document-progress:${task.id}:${record.chatId}`, JSON.stringify(record));
-          record = null;
-        }
-        if (!record) {
-          record = { version: 1, taskId: task.id, chatId: task.chatId, turnId: task.turnId,
-            view: emptyView(), text: '', projectionRevision: null, delivery: { kind: 'document', title: '执行进度', pending: false },
-            lastAttemptAt: 0, nextAttemptAt: 0, failures: 0 };
-        }
-        const revision = projectionRevision(task, store.documentConversationPosition(task.id), this.maxLines);
-        if (sameRevision(record.projectionRevision, revision)) continue;
-        record = structuredClone(record);
-        record.turnId = task.turnId;
-        const conversation = projectDocumentConversation(task, store.inputs(task.id), store.documentConversationEvents(task.id));
-        record.view = { status: conversation.status, cursor: conversation.cursor,
-          lastExecutionEventAt: conversation.lastExecutionEventAt, assistant: [], tool: null, notice: null };
-        record.text = documentConversationText(conversation, this.maxLines);
-        record.projectionRevision = revision;
-        this.save(record);
+    const tasks = store.tasks();
+    const raw = store.meta(discoveryKey);
+    const discovery = raw === null ? { excludedTurns: tasks.flatMap(task =>
+      task.turnId && finished(taskProgressStatus(task)) && !this.load(task.id) ? [turnKey(task.id, task.turnId)] : []) }
+      : discoverySchema.parse(JSON.parse(raw));
+    if (raw === null) store.setMeta(discoveryKey, JSON.stringify(discovery));
+    let reads = 0;
+    for (const task of tasks.sort((a, b) => (this.load(a.id)?.lastAttemptAt ?? 0) - (this.load(b.id)?.lastAttemptAt ?? 0))) {
+      if (!task.chatId || !task.threadId || !task.turnId || discovery.excludedTurns.includes(turnKey(task.id, task.turnId))) continue;
+      const inputSequence = store.inputSequence(task.id);
+      const signature = JSON.stringify([task.threadId, task.turnId, task.chatId, taskProgressStatus(task), task.source.kind === 'manual' ? task.source.message : null, inputSequence, this.options.execution.revision(task.id, task.threadId)]);
+      const existing = this.load(task.id);
+      if (existing?.delivery.kind === 'disabled' && existing.chatId === task.chatId && existing.threadId === task.threadId) continue;
+      const settled = existing?.delivery.kind === 'ready' && !existing.delivery.operation && existing.delivery.contentHash === existing.projectionRevision;
+      if (this.observed.get(task.id) === signature && (this.publications.get(task.id)?.record.text || settled)) continue;
+      if (!this.historyRetries.ready(task.id, signature, this.now())) continue;
+      if (reads >= 2 || (this.inFlight.size >= 2 && !this.inFlight.has(task.id))) continue;
+      reads++;
+      const observation = await this.options.execution.read(task.id, task.threadId);
+      if (this.stopped) return;
+      const current = store.task(task.id);
+      if (current.threadId !== task.threadId || current.turnId !== task.turnId || current.chatId !== task.chatId || taskProgressStatus(current) !== taskProgressStatus(task)
+        || JSON.stringify(current.source) !== JSON.stringify(task.source) || store.inputSequence(task.id) !== inputSequence) continue;
+      if (observation.history.kind === 'unavailable') {
+        this.historyRetries.failed(task.id, signature, this.now()); this.observed.delete(task.id); this.publications.delete(task.id); continue;
       }
-      discovery.cursor = store.latestExecutionSequence();
-      store.setMeta(discoveryKey, JSON.stringify(discovery));
-    });
+      let record = this.load(task.id);
+      if (record && record.chatId !== task.chatId) {
+        const { view: _view, text: _text, ...receipt } = record;
+        const delivery = receipt.delivery;
+        if (delivery.kind === 'ready') { delivery.operation = null; }
+        if (delivery.kind !== 'block') store.setMeta(`retired-document-progress:${task.id}:${record.chatId}`, JSON.stringify(receipt));
+        record = null;
+      }
+      if (record && record.threadId !== task.threadId && record.delivery.kind !== 'ready') record = null;
+      if (record && record.chatId === task.chatId && record.threadId === task.threadId && !coversSource(observation.entries, record.sourceFrontier)) {
+        this.historyRetries.failed(task.id, signature, this.now()); this.observed.delete(task.id); this.publications.delete(task.id); continue;
+      }
+      record = record ? structuredClone(record) : { version: 2, taskId: task.id, chatId: task.chatId, threadId: task.threadId, turnId: task.turnId,
+        view: emptyView(), text: '', sourceFrontier: {}, projectionRevision: null, delivery: { kind: 'document', title: '执行进度', pending: false },
+        lastAttemptAt: 0, nextAttemptAt: 0, failures: 0 };
+      record.threadId = task.threadId; record.turnId = task.turnId; record.sourceFrontier = sourceFrontier(observation.entries);
+      const conversation = projectDocumentConversation(task, store.inputs(task.id), observation.entries);
+      record.view = { status: conversation.status, cursor: conversation.cursor, lastExecutionEventAt: conversation.lastExecutionEventAt, assistant: [], tool: null, notice: null };
+      record.text = documentConversationText(conversation, this.maxLines);
+      record.projectionRevision = hash(record.text);
+      this.save(record);
+      this.observed.set(task.id, signature); this.historyRetries.succeeded(task.id);
+    }
+  }
+  private disable(record: DocumentPublication, apiCode: number | null = null): void {
+    const latest = this.load(record.taskId);
+    if (!latest || latest.chatId !== record.chatId || latest.threadId !== record.threadId) return;
+    const delivery = latest.delivery;
+    this.save({ ...latest, text: '', view: emptyView(), delivery: { kind: 'disabled',
+      documentId: 'documentId' in delivery ? delivery.documentId : null,
+      documentUrl: 'documentUrl' in delivery ? delivery.documentUrl : null,
+      reason: 'Task group is unavailable or its binding changed', apiCode } });
+    this.publications.delete(record.taskId); this.observed.delete(record.taskId);
   }
   private async deliver(record: DocumentPublication): Promise<void> {
     if (this.options.store.task(record.taskId).chatId !== record.chatId) return;
     const transport = this.options.transport;
-    const guard = () => assertGroupBinding(this.options.store, record.taskId, record.chatId);
+    const guard = () => { assertGroupBinding(this.options.store, record.taskId, record.chatId); if (this.options.store.task(record.taskId).threadId !== record.threadId) throw new TaskGroupBindingChanged(); };
     let rollback: DocumentPublication['delivery'] | undefined;
     record.lastAttemptAt = this.now();
     record.nextAttemptAt = this.now() + this.intervalMs;
@@ -171,6 +240,7 @@ export class FeishuDocumentProgressPublisher {
     try {
       const delivery = record.delivery;
       switch (delivery.kind) {
+        case 'disabled': return;
         case 'document': {
           if (delivery.pending) return;
           rollback = structuredClone(delivery);
@@ -219,34 +289,23 @@ export class FeishuDocumentProgressPublisher {
           }
           if (!tabId) throw new Error('Document tab creation remains unknown');
           record.delivery = { kind: 'ready', documentId: delivery.documentId, documentUrl: delivery.documentUrl,
-            blockId: delivery.blockId, tabId, content: '', write: null, parts: [], operation: null };
+            blockId: delivery.blockId, tabId, contentHash: '', parts: [], operation: null };
           break;
         }
         case 'ready': {
-          delivery.write ??= { clientToken: randomUUID(), text: content(record), chunks: documentChunks(content(record)), sent: false };
-          const write = delivery.write;
-          if (!write.chunks) {
-            const input = { documentId: delivery.documentId, blockId: delivery.blockId };
-            if (!write.sent || await transport.readBlock(input) !== write.text) {
-              rollback = structuredClone(delivery); write.sent = true; this.saveDelivery(record);
-              await transport.replaceContent({ ...input, ...write }, guard);
-            }
-            delivery.parts = [{ blockId: delivery.blockId, text: write.text }];
-            delivery.content = write.text; delivery.write = null; break;
-          }
-          const chunks = write.chunks;
-          if (!delivery.parts.length) delivery.parts.push({ blockId: delivery.blockId, text: delivery.content });
+          const chunks = this.observed.has(record.taskId) && record.text ? documentChunks(content(record)) : [];
+          if (!delivery.parts.length) delivery.parts.push({ blockId: delivery.blockId, digest: delivery.contentHash });
           if (!delivery.operation) {
-            const changed = delivery.parts.findIndex((part, index) => index < chunks.length && part.text !== chunks[index]);
+            const changed = delivery.parts.findIndex((part, index) => index < chunks.length && part.digest !== hash(chunks[index]!));
             const part = delivery.parts[changed], text = chunks[changed];
             if (part && text !== undefined) delivery.operation = { kind: 'replace', blockId: part.blockId, text, clientToken: randomUUID(), sent: false };
-            else if (delivery.parts.length < write.chunks.length) {
-              const next = write.chunks[delivery.parts.length];
+            else if (delivery.parts.length < chunks.length) {
+              const next = chunks[delivery.parts.length];
               if (next === undefined) throw new Error('Missing document chunk');
               delivery.operation = { kind: 'append', index: delivery.parts.length - 1, text: next, clientToken: randomUUID(), sent: false };
-            } else if (delivery.parts.length > write.chunks.length) {
-              delivery.operation = { kind: 'remove', blockIds: delivery.parts.slice(write.chunks.length).map(part => part.blockId), clientToken: randomUUID(), sent: false };
-            } else { delivery.content = write.text; delivery.write = null; break; }
+            } else if (delivery.parts.length > chunks.length) {
+              delivery.operation = { kind: 'remove', blockIds: delivery.parts.slice(chunks.length).map(part => part.blockId), clientToken: randomUUID(), sent: false };
+            } else { delivery.contentHash = hash(content(record)); break; }
           }
           const operation = delivery.operation;
           rollback = structuredClone(delivery);
@@ -259,7 +318,7 @@ export class FeishuDocumentProgressPublisher {
               }
               const part = delivery.parts.find(part => part.blockId === operation.blockId);
               if (!part) throw new Error('Document block ownership disappeared');
-              part.text = operation.text;
+              part.digest = hash(operation.text);
               break;
             }
             case 'append': {
@@ -271,7 +330,7 @@ export class FeishuDocumentProgressPublisher {
                 blockId = await transport.createBlock({ ...input, clientToken: operation.clientToken }, guard);
               }
               if (!blockId) throw new Error('Overflow block creation remains unknown');
-              delivery.parts.push({ blockId, text: operation.text });
+              delivery.parts.push({ blockId, digest: hash(operation.text) });
               break;
             }
             case 'remove': {
@@ -284,8 +343,8 @@ export class FeishuDocumentProgressPublisher {
             default: { const exhaustive: never = operation; return exhaustive; }
           }
           delivery.operation = null;
-          if (delivery.parts.length === chunks.length && delivery.parts.every((part, index) => part.text === chunks[index])) {
-            delivery.content = write.text; delivery.write = null;
+          if (delivery.parts.length === chunks.length && delivery.parts.every((part, index) => part.digest === hash(chunks[index]!))) {
+            delivery.contentHash = hash(content(record));
           }
           break;
         }
@@ -295,16 +354,17 @@ export class FeishuDocumentProgressPublisher {
       record.nextAttemptAt = this.now() + this.intervalMs;
       this.saveDelivery(record);
     } catch (error) {
-      if (error instanceof TaskGroupBindingChanged) return;
+      if (error instanceof TaskGroupBindingChanged) { this.disable(record); return; }
       if (error instanceof TaskGroupUnavailable) {
         retireTaskGroup(this.options.store, record.taskId, record.chatId);
-        this.report(`${record.taskId}: ${error.message}`); return;
+        this.disable(record, error.code);
+        this.report(error, record.taskId, record.delivery.kind, 'disabled'); return;
       }
       if (error instanceof DocumentRequestRejected && rollback) record.delivery = rollback;
       record.failures++;
       record.nextAttemptAt = this.now() + Math.max(this.intervalMs, Math.min(60_000, 3000 * 2 ** Math.min(record.failures - 1, 5)));
       this.saveDelivery(record);
-      this.report(`${record.taskId}: ${errorMessage(error)}`);
+      this.report(error, record.taskId, record.delivery.kind);
     }
   }
 }

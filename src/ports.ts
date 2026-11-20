@@ -1,5 +1,5 @@
 import type { AgentOutput, AgentInput, ApprovalAction, Attachment, CollectionRepository, ExecutionSnapshot, IncomingMessage, PendingRequest, ProjectDecisionAction, Repository, Source, SourceComment, TaskResource, WorkspaceRequest } from './domain.js';
-import type { ExecutionEvent } from './execution-events.js';
+import type { ExecutionEvent, ExecutionHistory } from './execution-events.js';
 import type { ProjectAction } from './project.js';
 import type { ReasoningEffort } from './execution.js';
 
@@ -96,9 +96,11 @@ export interface FeishuProgressPort {
   updateProgressContent(input: { cardId: string; content: string; sequence: number; uuid: string }, guard?: ProgressWriteGuard): Promise<void>;
   setProgressStreaming(input: { cardId: string; enabled: boolean; sequence: number; uuid: string }, guard?: ProgressWriteGuard): Promise<void>;
 }
-export interface CodexPort {
+export interface ExecutionHistoryPort { readHistory(threadId: string): Promise<ExecutionHistory>; }
+export interface CodexPort extends ExecutionHistoryPort {
   // Returns raw model output. Callers normalize it and fall back when it is unusable.
   summarizeTitle?(input: { taskId: string; cwd: string; text: string; signal?: AbortSignal }): Promise<string>;
+  setObservationResetHandler?(handler: () => void): void;
   setEventHandler?(handler: (event: ExecutionEvent) => void): void;
   createThread(input: { cwd: string; instructions: string; model?: string; reasoningEffort?: ReasoningEffort }): Promise<string>;
   inspect(threadId: string, instructions?: string, model?: string, reasoningEffort?: ReasoningEffort): Promise<ExecutionSnapshot>;
