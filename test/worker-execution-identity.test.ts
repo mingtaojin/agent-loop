@@ -5,7 +5,7 @@ import { z } from 'zod';
 import { projectActionSchema } from '../src/project.js';
 import { taskSchema, type Task } from '../src/domain.js';
 import { CodexProviderMismatchError } from '../src/ports.js';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { test, type TestContext } from 'node:test';
@@ -35,7 +35,7 @@ class IdentityCodex extends CodexFake {
 }
 
 async function fixture(t: TestContext, profiles = [workerA, workerB]) {
-  const root = await mkdtemp(join(tmpdir(), 'agent-worker-identity-'));
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'agent-worker-identity-')));
   const config = configSchema.parse({
     dataDir: root,
     execution: { coordinator, worker: profiles },

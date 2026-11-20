@@ -277,7 +277,7 @@ Project policy: ${config.instructions}`;
     if (!state || state.coordinatorTaskId !== decision.coordinatorTaskId) throw new Error('Project decision is not bound to its coordinator');
     const coordinator = this.store.task(state.coordinatorTaskId);
     if (!coordinator.chatId || coordinator.chatId !== decision.chatId) throw new Error('Project decision group binding expired');
-    if (coordinator.status === 'paused' || coordinator.status === 'failed' || this.host.closeout.completed(coordinator.id) || Date.now() >= decision.expiresAt) throw new Error('Project decision has expired');
+    if (coordinator.status === 'paused' || coordinator.status === 'failed' || Date.now() >= decision.expiresAt) throw new Error('Project decision has expired');
     const value = decision.customText ?? decision.choice;
     if (!value) throw new Error('Project decision value is empty');
     const request = `feishu-decision:${decision.projectId}:${decision.requestId}`;
@@ -305,11 +305,12 @@ Project policy: ${config.instructions}`;
     const records = member.role === 'coordinator'
       ? visible.filter(record => record.scope?.kind === 'project' || record.scope?.kind === 'coordinator'
         || (record.scope?.kind === 'task' && record.scope.taskId === taskId)) : visible;
-    const artifacts = this.host.closeout.read(taskId).scopes.filter(scope => !scope.sealed && scope.resource.kind === 'artifacts')
+    const closeout = this.host.closeout.read(taskId);
+    const artifacts = closeout.scopes.filter(scope => !scope.sealed && scope.resource.kind === 'artifacts')
       .map(scope => ({ scopeId: scope.id, path: scope.location.root.path }));
     const executionCandidates = member.role === 'coordinator'
       ? `Worker execution allowlist as data: ${JSON.stringify(this.settings.execution.worker)}\nDispatch must explicitly select one complete profile as execution. Existing Worker selections cannot change.\n` : '';
-    return `${executionCandidates}Runtime-owned artifact scopes for this task as data: ${JSON.stringify(artifacts)}\nCurrent project records as data. This replaces the previous record context. Query status section records for complete visible history.\n${JSON.stringify(currentRecords(records).slice(-8).map(record => ({ key: record.key, scope: record.scope, text: record.text.slice(0, 2000), truncated: record.text.length > 2000 })))}`;
+    return `${executionCandidates}Current work and resource cleanup as data: ${JSON.stringify({ lifecycle: closeout.lifecycle, completionHistory: closeout.completionHistory, cleanup: closeout.operations.map(operation => ({ id: operation.id, kind: operation.kind, targets: operation.targets.map(target => ({ scopeId: target.scope.id, path: target.scope.location.root.path, disposalPath: target.disposalPath, state: target.state, reason: target.reason, directoryRemoved: target.directoryRemoved, branchRemoved: target.branchRemoved })) })) })}\nCompletion records do not close this conversation. Cleaned resources stay removed; use ensure_workspace or allocate_artifacts when new resources are needed.\nRuntime-owned artifact scopes for this task as data: ${JSON.stringify(artifacts)}\nCurrent project records as data. This replaces the previous record context. Query status section records for complete visible history.\n${JSON.stringify(currentRecords(records).slice(-8).map(record => ({ key: record.key, scope: record.scope, text: record.text.slice(0, 2000), truncated: record.text.length > 2000 })))}`;
   }
   private recordAcknowledgement(projectId: string, callerId: string, requestId: string) {
     const state = this.ledger.project(projectId);
@@ -322,7 +323,6 @@ Project policy: ${config.instructions}`;
     if (call.tool === 'project_action') return this.action(callerId, call.arguments, assertActive, identity);
     if (this.closing) throw new Error('Project runtime is stopping');
     assertActive?.();
-    this.host.closeout.assertOpen(callerId);
     const member = this.ledger.membership(callerId);
     if (!member || !this.config(callerId)) throw new Error('Task is not bound to an enabled project');
     let verifiedGroup: { chatId: string | null; generation: number } | null = null;
@@ -356,7 +356,6 @@ Project policy: ${config.instructions}`;
     if (!state || !target || target.projectId !== member.projectId || target.role === member.role
       || (member.role === 'coordinator' ? state.coordinatorTaskId !== callerId : state.coordinatorTaskId !== args.taskId))
       throw new Error('Agent messages require this project coordinator and one of its Workers');
-    this.host.closeout.assertOpen(args.taskId);
     const references: string[] = [];
     const sources: Inbox['message'][] = [];
     for (const reference of args.references ?? []) {
@@ -403,7 +402,6 @@ Project policy: ${config.instructions}`;
     if (this.closing) throw new Error('Project runtime is stopping');
     assertActive?.();
     const action = projectActionSchema.parse(raw);
-    if (action.action !== 'status' && action.action !== 'list_reminders' && action.action !== 'cancel_reminder' && action.action !== 'register_artifact') this.host.closeout.assertOpen(callerId);
     const member = this.ledger.membership(callerId);
     if (!member || !this.config(callerId)) throw new Error('Task is not bound to an enabled project');
     if (action.action === 'status') {
@@ -634,11 +632,13 @@ Project policy: ${config.instructions}`;
         if (member.role !== 'coordinator') throw new Error('Only the coordinator can complete tasks');
         const target = this.ledger.membership(action.taskId);
         if (!target || target.projectId !== state.id || target.role === 'coordinator') throw new Error('Target is not a worker in this project');
-        return this.host.closeout.accept({ ...action, callerId, projectId: state.id, fingerprint: hash(JSON.stringify(action)), completion: { outcome: action.outcome, summary: action.summary, deliveryReferences: action.deliveryReferences } });
+        return this.host.closeout.complete({ ...action, callerId, projectId: state.id, fingerprint: hash(JSON.stringify(action)) });
       }
       case 'cleanup_artifacts': {
-        if (member.role !== 'coordinator') throw new Error('Only the coordinator can clean its own scopes');
-        return this.host.closeout.accept({ ...action, taskId: callerId, callerId, projectId: state.id, fingerprint: hash(JSON.stringify(action)) });
+        if (member.role !== 'coordinator') throw new Error('Only the coordinator can clean task resources');
+        const target = this.ledger.membership(action.taskId);
+        if (!target || target.projectId !== state.id || (action.taskId !== callerId && target.role !== 'worker')) throw new Error('Cleanup target is not owned by this coordinator');
+        return this.host.closeout.requestCleanup({ ...action, callerId, projectId: state.id, fingerprint: hash(JSON.stringify(action)) });
       }
       case 'dispatch': {
         if (member.role !== 'coordinator') throw new Error('Only the coordinator can dispatch workers');

@@ -1,11 +1,12 @@
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { lstatSync } from 'node:fs';
 import { lstat, mkdir, mkdtemp, readFile, realpath, rename, rm } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 import { taskResourceSchema, type Task, type TaskResource } from './domain.js';
-import type { Store } from './store.js';
+import type { Inbox, Store } from './store.js';
 
 const execute = promisify(execFile);
 const identitySchema = z.strictObject({ path: z.string(), dev: z.number(), ino: z.number() });
@@ -20,12 +21,13 @@ const scopeSchema = z.strictObject({
   ]),
   artifacts: z.array(z.strictObject({ path: z.string(), dev: z.number(), ino: z.number(), disposition: z.enum(['temporary', 'undelivered', 'delivered', 'superseded', 'abandoned']), reference: z.string().nullable() })),
 });
-const completionSchema = z.strictObject({ kind: z.literal('completed'), outcome: z.enum(['delivered', 'terminated']), summary: z.string(), deliveryReferences: z.array(z.string()), at: z.number(), operationId: z.string() });
+const completionSchema = z.strictObject({ kind: z.literal('completed'), outcome: z.enum(['delivered', 'terminated']), summary: z.string(), deliveryReferences: z.array(z.string()), at: z.number(), operationId: z.string(), inboxSequence: z.number().int().nonnegative().default(0) });
+const completionRecordSchema = completionSchema.extend({ requestId: z.string(), callerId: z.string(), fingerprint: z.string() });
 const targetSchema = z.strictObject({ scope: scopeSchema, branchHead: z.string().nullable(), branchIdentity: branchIdentitySchema.nullable().default(null), disposalPath: z.string(),
-  state: z.enum(['pending', 'removed', 'protected']), reason: z.string().nullable(), directoryRemoved: z.boolean(), branchRemoved: z.boolean() });
+  state: z.enum(['pending', 'removed', 'protected', 'retained']), reason: z.string().nullable(), directoryRemoved: z.boolean(), branchRemoved: z.boolean() });
 const operationSchema = z.strictObject({ id: z.string(), requestId: z.string(), callerId: z.string(), projectId: z.string(), fingerprint: z.string(),
   kind: z.enum(['completion', 'scopes']), createdAt: z.number(), targets: z.array(targetSchema) });
-export const taskCloseoutSchema = z.strictObject({ taskId: z.string(), projectId: z.string().nullable(),
+export const taskCloseoutSchema = z.strictObject({ version: z.number().default(1), completionHistory: z.array(completionRecordSchema).default([]), taskId: z.string(), projectId: z.string().nullable(),
   lifecycle: z.discriminatedUnion('kind', [z.strictObject({ kind: z.literal('open') }), completionSchema]),
   scopes: z.array(scopeSchema), operations: z.array(operationSchema), predecessorTaskId: z.string().nullable() });
 type Ledger = z.infer<typeof taskCloseoutSchema>;
@@ -110,6 +112,11 @@ async function processUse(path: string): Promise<string | null> {
   }
 }
 
+export function isContinuationInput(input: Inbox): boolean {
+  return input.provenance.kind === 'user' || input.provenance.kind === 'agent_message' || input.provenance.kind === 'reminder'
+    || (input.provenance.kind === 'agent' && input.provenance.category === 'instruction');
+}
+
 export class CleanupAdmissionBusy extends Error {}
 
 export class TaskCloseout {
@@ -119,12 +126,11 @@ export class TaskCloseout {
   private readonly progressing = new Map<string, Promise<void>>();
   constructor(private readonly store: Store, private readonly host: {
     usage(task: Task): Promise<string | null>;
-    assertCompletionAllowed?(task: Task): void;
     protectedPaths(): string[];
-  }) {}
+  }) { this.migrate(); }
   read(taskId: string): Ledger {
     const value = this.store.meta(`task-closeout:${taskId}`);
-    return value ? taskCloseoutSchema.parse(JSON.parse(value)) : { taskId, projectId: null, lifecycle: { kind: 'open' }, scopes: [], operations: [], predecessorTaskId: null };
+    return value ? taskCloseoutSchema.parse(JSON.parse(value)) : { version: 2, completionHistory: [], taskId, projectId: null, lifecycle: { kind: 'open' }, scopes: [], operations: [], predecessorTaskId: null };
   }
   private save(value: Ledger) { this.store.setMeta(`task-closeout:${value.taskId}`, JSON.stringify(taskCloseoutSchema.parse(value))); }
   private status(taskId: string) {
@@ -133,16 +139,72 @@ export class TaskCloseout {
     if (cached?.revision === revision) return cached;
     const value = this.read(taskId);
     const status = { revision, completed: value.lifecycle.kind === 'completed',
-      pendingCleanup: value.operations.some(operation => operation.targets.some(target => target.state !== 'removed')) };
+      pendingCleanup: value.operations.some(operation => operation.kind === 'scopes' && operation.targets.some(target => target.state === 'pending' || target.state === 'protected')) };
     if (this.statuses.size >= 256) this.statuses.clear();
     this.statuses.set(taskId, status);
     return status;
   }
   completed(taskId: string) { return this.status(taskId).completed; }
   hasPendingCleanup(taskId: string): boolean { return this.status(taskId).pendingCleanup; }
-  assertOpen(taskId: string) { if (this.completed(taskId)) throw new Error('Task is completed; dispatch a new linked task'); }
+  isCleaning(taskId: string) { return this.destructing.has(taskId); }
+  reopenOnInput(taskId: string): boolean {
+    const state = this.read(taskId);
+    if (state.lifecycle.kind !== 'completed' || this.isCleaning(taskId) || this.store.task(taskId).status === 'paused') return false;
+    const { inboxSequence: sequence, at } = state.lifecycle;
+    const fresh = this.store.inputs(taskId, { statuses: ['pending', 'held'] }).some(input => input.seq > sequence
+      && input.message.createdAt >= at && isContinuationInput(input));
+    if (!fresh) return false;
+    state.lifecycle = { kind: 'open' }; this.save(state); return true;
+  }
+  private migrate(): void {
+    for (const task of this.store.tasks()) {
+      const state = this.read(task.id);
+      if (state.version >= 2) continue;
+      const sequence = this.store.inputs(task.id).at(-1)?.seq ?? 0;
+      if (state.lifecycle.kind === 'completed') {
+        state.lifecycle.inboxSequence = sequence;
+        const operationId = state.lifecycle.operationId;
+        const operation = state.operations.find(item => item.id === operationId);
+        state.completionHistory.push({ ...state.lifecycle, requestId: operation?.requestId ?? state.lifecycle.operationId,
+          callerId: operation?.callerId ?? task.id, fingerprint: operation?.fingerprint ?? '' });
+      }
+      for (const operation of state.operations.filter(item => item.kind === 'completion')) for (const target of operation.targets) {
+        if (target.state === 'removed') continue;
+        target.state = 'retained'; target.reason = 'Legacy implicit cleanup stopped; a new explicit cleanup request is required';
+        const scope = state.scopes.find(item => item.id === target.scope.id);
+        try {
+          const info = lstatSync(target.scope.location.root.path);
+          const unchanged = [target.scope.location.root, ...target.scope.location.ancestors].every(expected => {
+            const actual = lstatSync(expected.path);
+            return actual.isDirectory() && !actual.isSymbolicLink() && actual.dev === expected.dev && actual.ino === expected.ino;
+          });
+          if (scope && unchanged && info.isDirectory()) scope.sealed = false;
+        } catch (error) {
+          if (!missing(error)) throw error;
+          if (target.scope.resource.kind === 'artifacts') {
+            try {
+              const disposal = lstatSync(target.disposalPath);
+              if (disposal.isDirectory() && !disposal.isSymbolicLink() && disposal.dev === target.scope.location.root.dev && disposal.ino === target.scope.location.root.ino)
+                target.reason = `Legacy implicit cleanup stopped after rename; bytes retained at ${target.disposalPath}`;
+              else target.reason = 'Legacy disposal identity changed; retained for inspection';
+            } catch (disposalError) {
+              if (!missing(disposalError)) throw disposalError;
+              target.directoryRemoved = true;
+            }
+          } else {
+            target.directoryRemoved = true;
+            this.retireResource(task.id, target.scope.resource.association.id);
+          }
+        }
+      }
+      state.version = 2; this.save(state);
+    }
+  }
+  private retireResource(taskId: string, resourceId: string) {
+    this.store.setMeta(`released-resource:${taskId}:${resourceId}`, 'released');
+    const task = this.store.task(taskId); task.resources = task.resources.filter(item => item.id !== resourceId); this.store.saveTask(task);
+  }
   reserve(taskId: string): () => void {
-    this.assertOpen(taskId);
     if (this.destructing.has(taskId)) throw new CleanupAdmissionBusy('Task cleanup is in flight; retry admission');
     this.reservations.set(taskId, (this.reservations.get(taskId) ?? 0) + 1);
     return () => { const count = (this.reservations.get(taskId) ?? 1) - 1; if (count) this.reservations.set(taskId, count); else this.reservations.delete(taskId); };
@@ -162,7 +224,6 @@ export class TaskCloseout {
     } finally { release(); }
   }
   async allocateExternal(taskId: string, parent: string | undefined, projectId: string, projectDirectory: string, label: string, requestId: string) {
-    this.assertOpen(taskId);
     this.bind(taskId, projectId);
     const state = this.read(taskId);
     const existing = state.scopes.find(scope => scope.allocationRequestId === requestId);
@@ -182,13 +243,11 @@ export class TaskCloseout {
   link(taskId: string, predecessorTaskId: string) { const value = this.read(taskId); value.predecessorTaskId = predecessorTaskId; this.save(value); }
   async enrollWorktree(taskId: string, association: TaskResource): Promise<void> {
     if (association.kind !== 'git-worktree') return;
-    this.assertOpen(taskId);
     const common = await realpath(await git(association.workspace, 'rev-parse', '--path-format=absolute', '--git-common-dir'));
     const gitDirectory = await realpath(await git(association.workspace, 'rev-parse', '--absolute-git-dir'));
     if (common === gitDirectory) throw new Error('Original repository cannot be enrolled');
     const scope: Scope = { id: randomUUID(), allocationRequestId: null, location: await location(association.workspace), createdAt: Date.now(), sealed: false,
       resource: { kind: 'worktree', association, common: await location(common), gitDirectory: await location(gitDirectory), branchGeneration: await branchGeneration(common, `refs/heads/${association.branch}`) }, artifacts: [] };
-    this.assertOpen(taskId);
     const state = this.read(taskId); state.scopes.push(scope); this.save(state);
   }
   async register(taskId: string, scopeId: string, path: string, disposition: Scope['artifacts'][number]['disposition'], reference?: string) {
@@ -208,22 +267,44 @@ export class TaskCloseout {
     latest.artifacts = [...latest.artifacts.filter(item => item.path !== canonical), { path: canonical, dev: info.dev, ino: info.ino, disposition, reference: reference ?? null }];
     this.save(current); return { scopeId, path: canonical, disposition };
   }
-  async accept(input: { taskId: string; callerId: string; projectId: string; requestId: string; fingerprint: string; scopeIds?: string[];
-    completion?: { outcome: 'delivered' | 'terminated'; summary: string; deliveryReferences: string[] } }): Promise<{ operationId: string; taskId: string }> {
+  complete(input: { taskId: string; callerId: string; projectId: string; requestId: string; fingerprint: string;
+    outcome: 'delivered' | 'terminated'; summary: string; deliveryReferences: string[] }): { operationId: string; taskId: string } {
+    return this.store.transaction(() => {
+      const state = this.read(input.taskId);
+      if (state.projectId && state.projectId !== input.projectId) throw new Error('Resource project identity changed');
+      const old = state.completionHistory.find(item => item.callerId === input.callerId && item.requestId === input.requestId);
+      if (old) {
+        if (old.fingerprint !== input.fingerprint) throw new Error('Completion request has different content');
+        return { operationId: old.operationId, taskId: input.taskId };
+      }
+      const completion = { kind: 'completed' as const, outcome: input.outcome, summary: input.summary,
+        deliveryReferences: input.deliveryReferences, at: Date.now(), operationId: randomUUID(),
+        inboxSequence: this.store.inputs(input.taskId).at(-1)?.seq ?? 0 };
+      state.projectId = input.projectId; state.lifecycle = completion;
+      state.completionHistory.push({ ...completion, requestId: input.requestId, callerId: input.callerId, fingerprint: input.fingerprint });
+      this.save(state);
+      return { operationId: completion.operationId, taskId: input.taskId };
+    });
+  }
+  async requestCleanup(input: { taskId: string; callerId: string; projectId: string; requestId: string; fingerprint: string; scopeIds: string[] }): Promise<{ operationId: string; taskId: string }> {
     const old = this.read(input.taskId).operations.find(op => op.callerId === input.callerId && op.requestId === input.requestId);
-    if (old) { if (old.fingerprint !== input.fingerprint) throw new Error('Closeout request has different content'); return { operationId: old.id, taskId: input.taskId }; }
-    this.assertOpen(input.taskId);
-    if (input.completion && (this.store.inputs(input.taskId).some(item => ['delivering', 'uncertain'].includes(item.status))
-      || this.store.approvals(input.taskId).some(item => ['processing', 'uncertain', 'pending'].includes(item.status)))) throw new Error('Reconcile unresolved input and approvals before completion');
-    if (this.reservations.has(input.taskId)) throw new Error('Resource allocation or execution admission is in flight; retry closeout');
+    if (old) { if (old.fingerprint !== input.fingerprint) throw new Error('Cleanup request has different content'); return { operationId: old.id, taskId: input.taskId }; }
+    if (this.reservations.has(input.taskId) || this.isCleaning(input.taskId)) throw new CleanupAdmissionBusy('Resource allocation or execution admission is in flight; retry cleanup');
     this.bind(input.taskId, input.projectId);
     const initial = this.read(input.taskId);
-    const scopes = input.scopeIds ? input.scopeIds.map(id => { const scope = initial.scopes.find(item => item.id === id); if (!scope || scope.sealed || scope.resource.kind !== 'artifacts') throw new Error('Unknown, sealed or non-artifact scope'); return scope; }) : initial.scopes.filter(scope => !scope.sealed);
-    if (new Set(scopes.map(scope => scope.id)).size !== scopes.length) throw new Error('Duplicate artifact scope');
-    scopes.sort((a, b) => b.location.root.path.length - a.location.root.path.length);
-    const id = randomUUID();
-    const targets: Target[] = [];
+    if (!input.scopeIds.length || new Set(input.scopeIds).size !== input.scopeIds.length) throw new Error('Supply distinct owned scope IDs');
+    const scopes = input.scopeIds.map(id => {
+      const scope = initial.scopes.find(item => item.id === id);
+      if (!scope || initial.operations.some(operation => operation.kind === 'scopes' && operation.targets.some(target => target.scope.id === id))) throw new Error('Unknown scope or cleanup already requested');
+      return scope;
+    }).sort((a, b) => b.location.root.path.length - a.location.root.path.length);
+    const id = randomUUID(), targets: Target[] = [];
     for (const scope of scopes) {
+      const retained = initial.operations.filter(operation => operation.kind === 'completion').flatMap(operation => operation.targets)
+        .find(target => target.scope.id === scope.id && target.state === 'retained');
+      if (retained && (scope.sealed || retained.directoryRemoved)) {
+        targets.push({ ...structuredClone(retained), state: 'pending', reason: null }); continue;
+      }
       let branchHead: string | null = null;
       let frozenBranch: Target['branchIdentity'] = null;
       if (scope.resource.kind === 'worktree') {
@@ -235,33 +316,24 @@ export class TaskCloseout {
       targets.push({ scope: structuredClone(scope), branchHead, branchIdentity: frozenBranch, disposalPath: join(dirname(scope.location.root.path), `.closeout-${id}-${scope.id}`), state: 'pending', reason: null, directoryRemoved: false, branchRemoved: scope.resource.kind !== 'worktree' });
     }
     return this.store.transaction(() => {
-      this.assertOpen(input.taskId);
-      if (input.completion && (this.store.inputs(input.taskId).some(item => ['delivering', 'uncertain'].includes(item.status))
-        || this.store.approvals(input.taskId).some(item => ['processing', 'uncertain', 'pending'].includes(item.status)))) throw new Error('Reconcile unresolved input and approvals before completion');
-      if (this.reservations.has(input.taskId)) throw new Error('Resource allocation or execution admission is in flight; retry closeout');
+      if (this.reservations.has(input.taskId) || this.isCleaning(input.taskId)) throw new CleanupAdmissionBusy('Resource allocation or execution admission is in flight; retry cleanup');
       const state = this.read(input.taskId);
-      if (JSON.stringify(state.scopes) !== JSON.stringify(initial.scopes)) throw new Error('Owned resources changed; retry closeout');
-      if (input.completion) {
-        const task = this.store.task(input.taskId);
-        if (task.threadId && !this.host.assertCompletionAllowed) throw new Error('Native request completion protection is unavailable');
-        this.host.assertCompletionAllowed?.(task);
-      }
-      state.operations.push({ id, requestId: input.requestId, callerId: input.callerId, projectId: input.projectId, fingerprint: input.fingerprint,
-        kind: input.completion ? 'completion' : 'scopes', createdAt: Date.now(), targets });
-      for (const scope of state.scopes) if (scopes.some(item => item.id === scope.id)) scope.sealed = true;
-      if (input.completion) state.lifecycle = { kind: 'completed', ...input.completion, at: Date.now(), operationId: id };
+      if (JSON.stringify(state.scopes) !== JSON.stringify(initial.scopes) || JSON.stringify(state.operations) !== JSON.stringify(initial.operations)) throw new Error('Owned resources changed; retry cleanup');
+      state.operations.push({ id, requestId: input.requestId, callerId: input.callerId, projectId: input.projectId, fingerprint: input.fingerprint, kind: 'scopes', createdAt: Date.now(), targets });
+      for (const scope of state.scopes) if (input.scopeIds.includes(scope.id)) scope.sealed = true;
       this.save(state);
       return { operationId: id, taskId: input.taskId };
     });
   }
+  async settle(): Promise<void> { await Promise.allSettled([...this.progressing.values()]); }
   async progress(taskId: string): Promise<void> {
     const old = this.progressing.get(taskId); if (old) return old;
     const work = this.progressTask(taskId); this.progressing.set(taskId, work);
     try { await work; } finally { this.progressing.delete(taskId); }
   }
   private async progressTask(taskId: string) {
-    for (const operation of this.read(taskId).operations) for (const frozen of operation.targets) {
-      if (frozen.state === 'removed') continue;
+    for (const operation of this.read(taskId).operations.filter(item => item.kind === 'scopes')) for (const frozen of operation.targets) {
+      if (frozen.state === 'removed' || frozen.state === 'retained') continue;
       const target = structuredClone(frozen);
       try {
         const scope = this.read(taskId).scopes.find(scope => scope.id === target.scope.id);
@@ -294,7 +366,7 @@ export class TaskCloseout {
     const ledger = this.read(taskId);
     const map = (expected: z.infer<typeof identitySchema>) => ({ ...expected, path: within(path, expected.path) ? join(actualRoot, relative(path, expected.path)) : expected.path });
     for (const child of ledger.scopes.filter(scope => scope.id !== target.scope.id && roots.some(root => within(root, scope.location.root.path)))) {
-      const childTarget = ledger.operations.flatMap(operation => operation.targets).find(item => item.scope.id === child.id);
+      const childTarget = ledger.operations.flatMap(operation => operation.targets).reverse().find(item => item.scope.id === child.id);
       if (!childTarget || childTarget.state !== 'removed') throw new Error(`Nested resource cleanup is unresolved: ${child.id}`);
       for (const childPath of [child.location.root.path, childTarget.disposalPath]) {
         const childLocation = { root: map({ ...child.location.root, path: childPath }), ancestors: child.location.ancestors.map(map) };
@@ -381,6 +453,7 @@ export class TaskCloseout {
       if ((await git(repository, 'worktree', 'list', '--porcelain', '-z')).split('\0').includes(`worktree ${path}`)) throw new Error('Worktree remains registered');
     }
     target.directoryRemoved = true;
+    this.retireResource(taskId, association.id);
     const registrations = (await git(repository, 'worktree', 'list', '--porcelain', '-z')).split('\0');
     if (registrations.includes(`branch ${ref}`)) throw new Error('Task branch is checked out elsewhere');
     if (branchHead && target.branchHead !== null) {

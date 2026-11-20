@@ -916,7 +916,6 @@ async function nativePolicyAdapter(t: TestContext) {
   const root = await mkdtemp('/tmp/agent-loop-native-policy-');
   const server = new CodexAppServer({ command: [process.execPath, '-e', nativePolicyFixture, root], approvalPolicy: 'on-request', sandbox: 'read-only', requestTimeoutMs: 1500 });
   t.after(async () => { await server.close(); await rm(root, { recursive: true, force: true }); });
-  const completed = new Set<string>(); server.setThreadCompletionPolicy({ isCompleted: threadId => completed.has(threadId) });
   const active = await start(server), observer = await server.createThread({ cwd: '/tmp', instructions: 'Observe protocol only' });
   const wire = async () => (await readFile(`${root}/wire.jsonl`, 'utf8')).trim().split('\n').map(line => policyWireSchema.parse(JSON.parse(line)));
   const inject = async (frames: { id?: string; method: string; params: unknown }[]) => {
@@ -931,7 +930,7 @@ async function nativePolicyAdapter(t: TestContext) {
     }
     throw new Error(`Expected ${count} native responses`);
   };
-  return { root, server, completed, active, observer, wire, inject, responses };
+  return { root, server, active, observer, wire, inject, responses };
 }
 
 test('native completion admission sees authoritative nonblocking and unacknowledged requests', async t => {
@@ -949,64 +948,54 @@ test('native completion admission sees authoritative nonblocking and unacknowled
   assert.doesNotThrow(() => f.server.assertThreadCompletionAllowed(f.active.threadId));
 });
 
-test('completed native policy denies late requests without permissions, answers, tool handlers or new turns', async t => {
-  const f = await nativePolicyAdapter(t); f.completed.add(f.active.threadId);
-  let toolCalls = 0; f.server.setWorkspaceHandler(async () => { toolCalls++; throw new Error('Sealed handler reached'); });
+test('late native requests remain available to the original Thread and tool handlers', async t => {
+  const f = await nativePolicyAdapter(t);
+  let toolCalls = 0; f.server.setWorkspaceHandler(async () => { toolCalls++; return { id: 'workspace', kind: 'project-directory', workspace: '/tmp', repository: { name: 'example/app', path: '/tmp', baseBranch: 'main', criteria: { states: ['open'], assigneesAny: [], taskTypes: ['bug'], labelsAll: [], labelsAny: [], labelsNone: [], nativeTypes: {}, typeLabels: {} }, workspace: { kind: 'project-directory', path: '/tmp' } } }; });
   const params = { ...f.active, itemId: 'late', startedAtMs: 1, cwd: '/tmp', command: 'effect' };
-  const before = (await f.wire()).length;
   await f.inject([
     { id: 'command', method: 'item/commandExecution/requestApproval', params },
-    { id: 'file', method: 'item/fileChange/requestApproval', params },
-    { id: 'permissions', method: 'item/permissions/requestApproval', params: { ...params, permissions: { network: { enabled: true } } } },
     { id: 'question', method: 'item/tool/requestUserInput', params: { ...params, isBlocking: false, questions: [{ id: 'q', header: 'Q', question: 'Continue?', options: null }] } },
-    { id: 'unsupported', method: 'mcpServer/elicitation/request', params },
     { id: 'dynamic', method: 'item/tool/call', params: { ...params, callId: 'call', tool: 'ensure_workspace', arguments: { repository: 'example/app' } } },
   ]);
-  const responses = await f.responses(6), byId = new Map(responses.map(frame => [frame.id, frame]));
-  assert.deepEqual(byId.get('command')?.result, { decision: 'decline' }); assert.deepEqual(byId.get('file')?.result, { decision: 'decline' });
-  assert.deepEqual(byId.get('permissions')?.result, { permissions: {}, scope: 'turn' });
-  for (const id of ['question', 'unsupported']) { assert.equal(byId.get(id)?.error?.code, -32000); assert.equal(byId.get(id)?.result, undefined); }
-  assert.deepEqual(byId.get('dynamic')?.result, { success: false, contentItems: [{ type: 'inputText', text: 'Task completed' }] });
-  assert.equal(toolCalls, 0); assert.equal(await f.server.executionUse(f.active.threadId), 'busy');
-  await assert.rejects(f.server.inspect(f.active.threadId), /sealed/);
-  await assert.rejects(f.server.startTurn({ threadId: f.active.threadId, input: [], deliveryId: 'forbidden' }), /sealed/);
-  await assert.rejects(f.server.steer({ ...f.active, input: [], deliveryId: 'forbidden' }), /sealed/);
-  const after = (await f.wire()).slice(before);
-  assert.equal(after.filter(frame => ['thread/resume', 'thread/start', 'turn/start', 'turn/steer', 'turn/interrupt'].includes(frame.method ?? '')).length, 0);
-  assert.equal(await f.server.executionUse(f.observer), 'idle');
-});
-
-test('unacknowledged late native denial stays busy and is never replayed before terminal evidence', async t => {
-  const f = await nativePolicyAdapter(t); await writeFile(`${f.root}/unconfirmed`, 'lose denial acknowledgement');
-  f.completed.add(f.active.threadId);
-  const request = { id: 'late-question', method: 'item/tool/requestUserInput', params: { ...f.active, itemId: 'late', isBlocking: true, questions: [{ id: 'q', header: 'Q', question: 'Continue?', options: null }] } };
-  await f.inject([request]); await f.responses(1); await delay(1550);
+  const responses = await f.responses(1);
+  assert.equal(responses[0]?.id, 'dynamic'); assert.equal(toolCalls, 1);
+  const snapshot = await f.server.inspect(f.active.threadId);
+  assert.deepEqual(snapshot.requests.map(request => request.kind).sort(), ['approval', 'question']);
   assert.equal(await f.server.executionUse(f.active.threadId), 'busy');
-  assert.throws(() => f.server.assertThreadCompletionAllowed(f.active.threadId), /native requests/);
-  await f.inject([request]); assert.equal((await f.responses(1)).length, 1);
-  await f.inject([{ method: 'turn/completed', params: { threadId: f.active.threadId, turn: { id: f.active.turnId } } }]);
-  assert.equal(await f.server.executionUse(f.active.threadId), 'idle');
-  assert.equal((await f.responses(1)).length, 1);
+  await f.server.steer({ ...f.active, input: [{kind:'text',text:'Continue the same conversation'}], deliveryId: 'continue' });
+  assert.ok((await f.wire()).some(frame => frame.method === 'turn/steer'));
 });
 
-test('native completion policy excludes sealed threads from transport recovery and preserves unknown use', async t => {
+test('unacknowledged native answer stays busy and is never replayed before terminal evidence', async t => {
+  const f = await nativePolicyAdapter(t); await writeFile(`${f.root}/unconfirmed`, 'lose answer acknowledgement');
+  const frame = { id: 'late-question', method: 'item/tool/requestUserInput', params: { ...f.active, itemId: 'late', isBlocking: true, questions: [{ id: 'q', header: 'Q', question: 'Continue?', options: null }] } };
+  await f.inject([frame]);
+  const request = (await f.server.inspect(f.active.threadId)).requests[0]; assert.ok(request);
+  await assert.rejects(f.server.reply({ request, text: 'Continue' }), /acknowledgement/);
+  assert.equal(await f.server.executionUse(f.active.threadId), 'busy');
+  await f.inject([frame]); assert.equal((await f.responses(1)).length, 1);
+  await f.inject([{ method: 'turn/completed', params: { threadId: f.active.threadId, turn: { id: f.active.turnId } } }]);
+  assert.equal(await f.server.executionUse(f.active.threadId), 'idle'); assert.equal((await f.responses(1)).length, 1);
+});
+
+test('transport recovery preserves unknown use and resumes the original Threads', async t => {
   const f = await nativePolicyAdapter(t);
   const openTurn = await f.server.startTurn({ threadId: f.observer, input: [], deliveryId: 'open-task' });
-  f.completed.add(f.active.threadId);
+
   await assert.rejects(f.server.steer({ threadId: f.observer, turnId: openTurn, input: [], deliveryId: 'crash' }), UncertainOperationError);
   await f.server.recover();
   assert.equal((await f.wire()).filter(frame => frame.method === 'thread/resume').length, 0);
   assert.throws(() => f.server.assertThreadCompletionAllowed(f.observer), /state is unavailable/);
   assert.equal(await f.server.executionUse(f.active.threadId), 'unknown');
-  await assert.rejects(f.server.inspect(f.active.threadId), /sealed/);
+  await f.server.inspect(f.active.threadId);
   assert.equal((await f.server.inspect(f.observer)).status, 'interrupted');
   const resumed = (await f.wire()).filter(frame => frame.method === 'thread/resume').map(frame => z.object({ threadId: z.string() }).parse(frame.params).threadId);
-  assert.deepEqual(resumed, [f.observer]);
+  assert.deepEqual(resumed, [f.active.threadId, f.observer]);
 });
 
 
-test('late denial transport failure retains uncertainty without killing the shared app server', async t => {
-  const f = await nativePolicyAdapter(t); f.completed.add(f.active.threadId);
+test('late native request stays pending without unsolicited response or killing the shared app server', async t => {
+  const f = await nativePolicyAdapter(t);
   await writeFile(`${f.root}/deny-with-closed-stdin.json`, JSON.stringify({ id: 'late-broken-transport', method: 'item/commandExecution/requestApproval', params: { ...f.active, itemId: 'late', startedAtMs: 1, cwd: '/tmp', command: 'effect' } }));
   let pid: number | undefined;
   for (let attempt = 0; attempt < 100; attempt++) {
@@ -1021,4 +1010,5 @@ test('late denial transport failure retains uncertainty without killing the shar
   const wire = await f.wire();
   assert.equal(wire.filter(frame => frame.method === 'initialize').length, 1);
   assert.equal(wire.filter(frame => frame.id === 'late-broken-transport').length, 0);
+  await assert.rejects(f.server.close(), /shutdown cleanup could not be confirmed/);
 });

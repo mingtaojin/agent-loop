@@ -15,7 +15,7 @@ import { errorMessage, projectDecisionActionSchema, presentTaskSource, matchSour
 import { fitsTaskTitle, parseTaskTitle } from './task-title.js';
 import { CodexProviderMismatchError, FeishuApiError, TaskGroupUnavailable, type FeishuReconnectEvent, type RunningActivity, type TurnIdentity, type CodexPort, type FeishuPort, type GitHubPort, type WorkspacePort } from './ports.js';
 import { TaskGroups, assertGroupBinding, groupGeneration, retireTaskGroup } from './task-groups.js';
-import { CleanupAdmissionBusy, TaskCloseout } from './task-closeout.js';
+import { CleanupAdmissionBusy, isContinuationInput, TaskCloseout } from './task-closeout.js';
 import { GroupCleanup } from './group-cleanup.js';
 import { Store, type Inbox } from './store.js';
 import { FeishuProgressPublisher } from './feishu-progress.js';
@@ -87,11 +87,6 @@ export class AgentLoop {
     this.execution = new LiveExecution(ports.codex);
     this.feishuArtifacts = ports.feishuArtifacts;
     this.closeout = new TaskCloseout(this.store, {
-      assertCompletionAllowed: task => {
-        if (!task.threadId) return;
-        if (!ports.codex.setThreadCompletionPolicy || !ports.codex.assertThreadCompletionAllowed) throw new Error('Native request completion protection is unavailable');
-        ports.codex.assertThreadCompletionAllowed(task.threadId);
-      },
       usage: async task => {
         if (this.hasUnknownInput(task) || this.store.approvals(task.id).some(item => ['processing', 'uncertain', 'pending'].includes(item.status))) return 'Input or approval delivery is unresolved';
         if (!task.threadId) return null;
@@ -101,10 +96,6 @@ export class AgentLoop {
       protectedPaths: () => [config.dataDir, join(config.dataDir, 'attachments'), ...this.store.tasks().map(task => task.contextDirectory),
         ...config.projects.map(project => project.directory), ...config.repositories.flatMap(repository => 'path' in repository ? [repository.path] : [])],
     });
-    ports.codex.setThreadCompletionPolicy?.({ isCompleted: threadId => {
-      const task = this.store.taskForThread(threadId);
-      return task ? this.closeout.completed(task.id) : false;
-    } });
     this.groups = new TaskGroups(this.store, ports.feishu, task => this.groupTitle(task));
     this.projects = new ProjectRuntime(config, this.store, {
       closeout: this.closeout,
@@ -170,13 +161,13 @@ export class AgentLoop {
   private assertActiveTask(taskId: string, identity: TurnIdentity): void {
     const task = this.store.task(taskId);
     this.requireMember(task);
-    if (this.closeout.completed(taskId) || this.stopping || ['paused', 'failed'].includes(task.status) || task.threadId !== identity.threadId
+    if (this.stopping || ['paused', 'failed'].includes(task.status) || task.threadId !== identity.threadId
       || !this.ports.codex.isActiveTurn(identity)) throw new Error('Capability requires the original active task turn');
   }
   private async capabilityActivity(taskId: string): Promise<RunningActivity> {
     const task = this.store.task(taskId);
     this.requireMember(task);
-    if (this.closeout.completed(taskId) || this.stopping || ['paused', 'failed'].includes(task.status) || !task.threadId) throw new Error('Capability requires an active conversation');
+    if (this.stopping || ['paused', 'failed'].includes(task.status) || !task.threadId) throw new Error('Capability requires an active conversation');
     if (!this.projects.restoreWorkerExecution(task)) throw new HistoricalExecutionIdentityError(task.id);
     const profile = this.executionProfile(task);
     const activity = await this.ports.codex.activity(task.threadId, undefined, profile.model, profile.reasoningEffort);
@@ -193,10 +184,10 @@ export class AgentLoop {
       void this.serial(call.arguments.taskId, () => this.advance(call.arguments.taskId)).catch(error => this.problem(call.arguments.taskId, error));
     } else if (call.tool === 'send_group_message') {
       void this.serial(taskId, () => this.flush(this.store.task(taskId))).catch(error => this.problem(taskId, error));
-    } else {
+    } else if (call.arguments.action === 'cleanup_artifacts') {
       const action = call.arguments;
-      if (action.action === 'complete_task') { this.forwardCompletedInputs(this.store.task(action.taskId)); await this.closeout.progress(action.taskId); }
-      if (action.action === 'cleanup_artifacts') await this.closeout.progress(taskId);
+      await this.closeout.progress(action.taskId);
+      return { ...z.object({ operationId: z.string(), taskId: z.string() }).parse(result), cleanup: this.closeout.read(action.taskId).operations.find(operation => operation.requestId === action.requestId && operation.callerId === taskId) };
     }
     return result;
   }
@@ -213,7 +204,7 @@ export class AgentLoop {
     const existing = this.sweeps.get(taskId);
     if (existing) return existing;
     const work = Promise.resolve().then(async () => {
-      if (this.closeout.completed(taskId)) {
+      if (this.closeout.completed(taskId) && this.store.task(taskId).executionStatus !== 'running') {
         const now = Date.now();
         const hasInput = this.store.hasInputs(taskId, { statuses: ['pending', 'delivering', 'uncertain', 'failed', 'held'] });
         const hasOutput = this.store.hasOutputs(taskId, ['pending', 'sending', 'uncertain']);
@@ -225,8 +216,8 @@ export class AgentLoop {
       if (this.stopping || this.lanes.has(taskId)) return;
       const task = this.store.task(taskId);
       if (task.status === 'failed'
-        && !this.store.inputs(taskId, { statuses: ['pending'] }).some(input =>
-          (input.origin === 'user' || input.provenance.kind === 'agent_message') && (task.recovery.lastUserInputSeq === null ? input.message.createdAt > task.updatedAt : input.seq > task.recovery.lastUserInputSeq))
+        && !this.store.inputs(taskId, { statuses: ['pending'] }).some(input => isContinuationInput(input) && (
+          task.recovery.lastUserInputSeq === null ? input.message.createdAt > task.updatedAt : input.seq > task.recovery.lastUserInputSeq))
         && !this.store.hasOutputs(taskId, ['pending', 'sending', 'uncertain'])) return;
       if (task.status === 'idle' && task.executionStatus === 'completed'
         && !this.store.hasInputs(taskId, { statuses: ['pending', 'delivering', 'uncertain', 'held'] })
@@ -240,7 +231,7 @@ export class AgentLoop {
     return work;
   }
   private sweepBatch(tasks: Task[]): Task[] {
-    const running = tasks.filter(task => task.status === 'running' && task.threadId && !this.closeout.completed(task.id));
+    const running = tasks.filter(task => task.status === 'running' && task.threadId);
     if (running.length <= this.sweepConcurrency) return tasks;
     const urgent = running.filter(task => {
       const member = this.projects.ledger.membership(task.id);
@@ -252,7 +243,7 @@ export class AgentLoop {
     const selected = [...selectedUrgent, ...Array.from({ length: Math.min(slots, workers.length) }, (_, offset) => workers[(this.sweepCursor + offset) % workers.length]!)];
     this.sweepCursor = workers.length ? (this.sweepCursor + Math.max(1, slots)) % workers.length : 0;
     const selectedIds = new Set(selected.map(task => task.id));
-    return tasks.filter(task => task.status !== 'running' || !task.threadId || this.closeout.completed(task.id) || selectedIds.has(task.id));
+    return tasks.filter(task => task.status !== 'running' || !task.threadId || selectedIds.has(task.id));
   }
   private persist(task: Task): void {
     const latest = this.store.task(task.id);
@@ -271,11 +262,11 @@ export class AgentLoop {
   private onWorkerEvent(taskId: string, event: ExecutionEvent): void {
     if (this.stopping || !event.turnId || !['turn_start', 'agent_message', 'turn_end'].includes(event.kind)) return;
     const task = this.store.task(taskId);
-    if (this.closeout.completed(taskId) || this.projects.ledger.membership(taskId)?.role !== 'worker') return;
+    if (this.projects.ledger.membership(taskId)?.role !== 'worker') return;
     if (event.kind === 'turn_end') {
       void this.serial(taskId, async () => {
         const latest = this.store.task(taskId);
-        if (this.stopping || latest.threadId !== event.threadId || latest.turnId !== event.turnId || this.closeout.completed(taskId)) return;
+        if (this.stopping || latest.threadId !== event.threadId || latest.turnId !== event.turnId) return;
         this.publishWorkerSnapshot(latest, await this.inspect(event.threadId));
         await this.flush(this.store.task(taskId));
       }).catch(error => this.problem(taskId, error));
@@ -445,7 +436,7 @@ export class AgentLoop {
     const task = this.store.taskForThread(threadId);
     if (!task) throw new Error('Unbound Thread');
     const instructions = await this.instructions(task);
-    this.closeout.assertOpen(task.id);
+
     const profile = this.executionProfile(task);
     const snapshot = await this.admitted(task.id, () => this.ports.codex.inspect(threadId, instructions, profile.model, profile.reasoningEffort));
     return snapshot;
@@ -671,7 +662,6 @@ export class AgentLoop {
     return this.projects.ledger.membership(task.id) !== null;
   }
   private async setup(task: Task): Promise<boolean> {
-    this.closeout.assertOpen(task.id);
     const member = this.requireMember(task);
     await mkdir(task.contextDirectory, { recursive: true, mode: 0o700 });
     if (!task.chatId && member.role === 'coordinator' && groupGeneration(this.store, task.id) === 0) {
@@ -685,7 +675,7 @@ export class AgentLoop {
       const instructions = await this.instructions(task);
       task = this.store.task(task.id);
       const generation = this.store.meta(`project-generation:${task.id}`);
-      this.closeout.assertOpen(task.id);
+
       const profile = this.executionProfile(task);
       const releaseAdmission = this.closeout.reserve(task.id);
       try { task.threadId = await this.effect(task, generation ? `thread:${generation}` : 'thread', false, () => this.ports.codex.createThread({ cwd: this.executionDirectory(task), instructions,
@@ -703,7 +693,6 @@ export class AgentLoop {
     catch (error) { this.store.uncertainOperation(id, errorMessage(error)); throw error; }
   }
   async ensureWorkspace(taskId: string, target: string | WorkspaceTarget): Promise<TaskResource> {
-    this.closeout.assertOpen(taskId);
     this.requireMember(this.store.task(taskId));
     return this.acquireWorkspace(taskId, workspaceTargetSchema.parse(typeof target === 'string' ? { repository: target } : target));
   }
@@ -733,13 +722,15 @@ export class AgentLoop {
     const releaseAdmission = this.closeout.reserve(taskId);
     const work = (async () => {
       const task = this.store.task(taskId);
-      const existing = task.resources.find(resource => 'projectId' in target
+      let existing = task.resources.filter(resource => this.store.meta(`released-resource:${taskId}:${resource.id}`) !== 'released').find(resource => 'projectId' in target
         ? resource.kind === 'project' && resource.project.id === target.projectId
         : resource.kind !== 'project' && resource.repository.name.toLowerCase() === target.repository.toLowerCase());
-      let resource: TaskResource;
       if (existing) {
         await this.restoreWorkspace(taskId, existing);
-        if (this.store.meta(`released-resource:${taskId}:${existing.id}`) === 'released') throw new Error('Workspace was released; use a new task for new development');
+        if (this.store.meta(`released-resource:${taskId}:${existing.id}`) === 'released') existing = undefined;
+      }
+      let resource: TaskResource;
+      if (existing) {
         resource = existing;
       } else {
         if ('projectId' in target) {
@@ -754,7 +745,14 @@ export class AgentLoop {
           const repository = snapshot && !('kind' in snapshot) ? snapshot
             : this.config.repositories.find((item): item is Repository => 'path' in item && item.name.toLowerCase() === target.repository.toLowerCase());
           if (!repository || repository.name.toLowerCase() !== target.repository.toLowerCase()) throw new Error('Repository is not configured');
-          const id = digest(repository.name.toLowerCase()).slice(0, 16);
+          const baseId = digest(repository.name.toLowerCase()).slice(0, 16);
+          const generationKey = `workspace-generation:${taskId}:${baseId}`;
+          let generation = Number(this.store.meta(generationKey) ?? '0');
+          let id = generation === 0 ? baseId : `${baseId}-${generation}`;
+          while (this.store.meta(`released-resource:${taskId}:${id}`) === 'released') {
+            generation++; id = `${baseId}-${generation}`;
+          }
+          this.store.setMeta(generationKey, String(generation));
           if (repository.workspace?.kind === 'project-directory') {
             const workspace = await this.ports.workspace.ensure({ taskId, resourceId: id,
               kind: 'project-directory', directory: repository.workspace.path });
@@ -775,7 +773,6 @@ export class AgentLoop {
     try { return await work; } finally { this.resourceLanes.delete(key); releaseAdmission(); }
   }
   private async restoreWorkspace(taskId: string, resource: TaskResource): Promise<void> {
-    this.closeout.assertOpen(taskId);
     const releaseState = this.store.meta(`released-resource:${taskId}:${resource.id}`);
     if (releaseState === 'released') return;
     if (releaseState === 'releasing') { await this.releaseWorkspace(taskId, resource.id); return; }
@@ -795,7 +792,7 @@ export class AgentLoop {
     task.recovery.lastError = message; task.recovery.interruptedTurnId = turnId;
     if (task.recovery.attempts >= this.config.recovery.maxAttempts || !task.threadId) {
       task.status = 'failed'; task.recovery.nextAttemptAt = null;
-      task.recovery.lastUserInputSeq = this.store.inputs(task.id).filter(input => input.origin === 'user' || input.provenance.kind === 'agent_message').at(-1)?.seq ?? 0;
+      task.recovery.lastUserInputSeq = this.store.inputs(task.id).filter(isContinuationInput).at(-1)?.seq ?? 0;
       this.notify(task, `任务恢复已停止，保留现场。\n${message}`, `recovery-exhausted:${digest(message)}`);
     } else task.recovery.nextAttemptAt = Date.now() + this.config.recovery.retryDelayMs;
     this.persist(task); this.problem(task.id, error);
@@ -861,7 +858,10 @@ export class AgentLoop {
     }
   }
   private async advance(id: string, reconcile = false): Promise<void> {
-    if (this.closeout.completed(id)) { this.forwardCompletedInputs(this.store.task(id)); await this.closeout.progress(id); await this.flush(this.store.task(id)); return; }
+    if (this.closeout.isCleaning(id)) return;
+    this.closeout.reopenOnInput(id);
+    const completed = this.closeout.completed(id);
+    if (completed && this.store.task(id).executionStatus !== 'running') { await this.flush(this.store.task(id)); return; }
     let task = this.store.task(id);
     try {
       this.projects.retireObsoleteInputs(task);
@@ -883,14 +883,9 @@ export class AgentLoop {
       this.requireMember(task);
       if (!this.projects.restoreWorkerExecution(task)) return;
       if (task.purpose !== 'execution') { task.purpose = 'execution'; this.persist(task); }
-      if (task.status === 'failed' && this.store.inputs(task.id, { statuses: ['pending'] }).some(input =>
-        (input.origin === 'user' || input.provenance.kind === 'agent_message') &&
+      if (task.status === 'failed' && this.store.inputs(task.id, { statuses: ['pending'] }).some(input => isContinuationInput(input) &&
         (task.recovery.lastUserInputSeq === null ? input.message.createdAt > task.updatedAt : input.seq > task.recovery.lastUserInputSeq))) {
         for (const resource of task.resources) await this.restoreWorkspace(task.id, resource);
-        task.status = task.threadId ? 'idle' : 'pending'; task.reason = null; task.recovery = recoveryState(); this.persist(task);
-        for (const input of this.store.inputs(task.id)) if (input.status === 'held') this.store.markInput(input.id, 'pending');
-      }
-      if (task.status === 'paused' && task.legacy?.status === 'paused' && task.reason !== 'Operator paused' && this.store.inputs(task.id, { statuses: ['pending'], origin: 'user' }).some(input => input.origin === 'user' && input.status === 'pending')) {
         task.status = task.threadId ? 'idle' : 'pending'; task.reason = null; task.recovery = recoveryState(); this.persist(task);
         for (const input of this.store.inputs(task.id)) if (input.status === 'held') this.store.markInput(input.id, 'pending');
       }
@@ -917,7 +912,7 @@ export class AgentLoop {
         await this.processApprovals(task, snapshot);
         await this.observe(task, snapshot); task = this.store.task(id);
         if (this.projects.rotateIfReady(task)) return;
-        if (['interrupted', 'failed'].includes(status) && task.status === 'running' && snapshot.turnId && !this.hasUnknownInput(task)
+        if (!completed && ['interrupted', 'failed'].includes(status) && task.status === 'running' && snapshot.turnId && !this.hasUnknownInput(task)
           && !this.store.inputs(task.id, { statuses: ['pending'], origin: 'user' }).some(input => input.origin === 'user' && input.status === 'pending')) {
           if (task.recovery.interruptedTurnId !== snapshot.turnId) this.fault(task, new Error('已确认原执行中断，等待有限恢复'), snapshot.turnId);
           else this.store.receive(task.id, { id: `recovery:${snapshot.turnId}:${task.recovery.attempts}`, chatId: task.chatId ?? '', senderId: 'runtime:recovery', chatType: 'group',
@@ -925,9 +920,9 @@ export class AgentLoop {
         }
       }
       task = this.store.task(id);
-      if (task.recovery.nextAttemptAt === null) await this.drain(task);
+      if (!completed && task.recovery.nextAttemptAt === null) await this.drain(task);
     } catch (error) {
-      if (this.stopping || this.closeout.completed(id) || error instanceof CleanupAdmissionBusy) return;
+      if (this.stopping || error instanceof CleanupAdmissionBusy) return;
       task = this.store.task(id);
       if (task.status !== 'paused') this.fault(task, error);
       else this.problem(id, error);
@@ -1005,25 +1000,8 @@ export class AgentLoop {
     if (!task || !this.receiveOwner(task, message)) return;
     if (this.running || !this.started) await this.serial(task.id, () => this.advance(task.id));
   }
-  private forwardCompletedInputs(task: Task): void {
-    if (!this.closeout.completed(task.id)) return;
-    this.store.transaction(() => {
-      const member = this.projects.ledger.membership(task.id), state = member && this.projects.ledger.routing(member.projectId);
-      if (!state) throw new Error('Completed task coordinator is unavailable');
-      const completion = this.closeout.read(task.id).lifecycle;
-      for (const input of this.store.inputs(task.id, { statuses: ['pending', 'delivering', 'uncertain', 'failed', 'held'] })) {
-        if (input.origin !== 'user' || ['delivered', 'dropped'].includes(input.status)) continue;
-        const message = input.message;
-        this.store.receive(state.coordinatorTaskId, { ...message, id: `completed-followup:${task.id}:${message.id}`,
-          text: `Follow-up to completed task ${task.id}. Assess whether this is a historical question or new work. Only new work requires dispatch with predecessorTaskId.\nRetained result: ${JSON.stringify(completion)}\nOriginal message:\n${message.text}` }, 'user', input.provenance);
-        this.store.markInput(message.id, 'delivered');
-      }
-    });
-  }
   private receiveOwner(task: Task, message: IncomingMessage): boolean {
-    const received = this.store.receive(task.id, message, 'user');
-    this.forwardCompletedInputs(task);
-    return received;
+    return this.store.receive(task.id, message, 'user');
   }
   async approve(action: ApprovalAction | ProjectDecisionAction): Promise<void> {
     if ('kind' in action) {
@@ -1058,7 +1036,7 @@ export class AgentLoop {
     if (this.stopping) throw new Error('Agent Loop is closing');
     if (action.senderId !== this.config.feishu.userOpenId) throw new Error('Approval actor is not authorized');
     const task = this.store.task(action.taskId);
-    this.closeout.assertOpen(task.id);
+
     this.requireMember(task);
     const card = this.store.feishuCardForRequest(action.requestId);
     if (card?.kind === 'native_approval' && card.messageId && action.messageId && card.messageId !== action.messageId) throw new Error('Approval card identity expired');
@@ -1068,7 +1046,6 @@ export class AgentLoop {
     if (this.running || !this.started) void this.serial(task.id, () => this.advance(task.id)).catch(error => this.problem(task.id, error));
   }
   private async processApprovals(task: Task, snapshot: Pick<ExecutionSnapshot, 'requests'>): Promise<void> {
-    this.closeout.assertOpen(task.id);
     for (const queued of this.store.approvals(task.id)) {
       if (queued.status === 'processing') {
         this.store.markApproval(queued.id, 'uncertain', 'Approval acknowledgement was lost across restart');
@@ -1091,7 +1068,6 @@ export class AgentLoop {
       const card = this.store.feishuCardForRequest(action.requestId);
       if (card && card.kind === 'native_approval') this.store.updateFeishuCard(card.id, { status: 'processing', sequence: card.sequence + 1, uuid: `${card.uuid}:processing` });
       try {
-        this.closeout.assertOpen(task.id);
         const result = await this.ports.codex.respondApproval({ request, decision: action.decision });
         this.store.markApproval(queued.id, result, result === 'uncertain' ? 'Native approval resolution is unconfirmed' : null);
         if (card && card.kind === 'native_approval') {
@@ -1111,7 +1087,6 @@ export class AgentLoop {
     }
   }
   async retryAttachment(taskId: string, inputId: string): Promise<void> {
-    this.closeout.assertOpen(taskId);
     await this.serial(taskId, async () => {
       this.projects.retireObsoleteInputs(this.store.task(taskId));
       const input = this.store.inputs(taskId).find(item => item.id === inputId);
@@ -1122,10 +1097,11 @@ export class AgentLoop {
     });
   }
   private async drain(task: Task): Promise<void> {
-    this.closeout.assertOpen(task.id);
     this.requireMember(task);
     const threadId = task.threadId;
+    const completedThrough = this.closeout.read(task.id).completionHistory.at(-1)?.inboxSequence ?? 0;
     const inputs = this.store.inputs(task.id, { statuses: ['pending', 'delivering', 'uncertain', 'held'] })
+      .filter(input => input.seq > completedThrough || input.status === 'delivering' || input.status === 'uncertain')
       .sort((a, b) => Number(b.origin === 'initial') - Number(a.origin === 'initial') || a.seq - b.seq);
     if (threadId && !this.stopping && task.status !== 'paused' && task.status !== 'failed'
       && this.store.meta(`project-intake-promotion:${task.id}`) !== null
@@ -1144,7 +1120,7 @@ export class AgentLoop {
             return;
           }
         }
-        if (this.stopping || this.closeout.completed(task.id)) return;
+        if (this.stopping) return;
         const releaseAdmission = this.closeout.reserve(task.id);
         this.store.transaction(() => { for (const input of initial) this.store.markInput(input.id, 'delivering'); });
         try {
@@ -1165,7 +1141,7 @@ export class AgentLoop {
       }
     }
     for (const input of inputs) {
-      if (this.stopping || this.closeout.completed(task.id)) break;
+      if (this.stopping) break;
       if (input.status === 'delivered' || input.status === 'dropped') continue;
       if (input.status === 'failed') continue;
       if (input.provenance.kind === 'github_issue' || input.provenance.kind === 'github_comment') {
@@ -1191,7 +1167,7 @@ export class AgentLoop {
       const userQuestion = input.provenance.kind === 'user' && input.provenance.message.chatId === task.chatId;
       const questions = userQuestion || agentQuestion ? snapshot.requests.filter(request => request.kind === 'question') : [];
       if (questions.length > 1) { this.store.markInput(input.id, 'failed', '存在多个原生问题，无法唯一关联'); this.notify(task, '存在多个原生问题，回复已保存，需要明确关联后再投递。', `question-ambiguous:${input.id}`); break; }
-      if (this.stopping || this.closeout.completed(task.id)) break;
+      if (this.stopping) break;
       const releaseAdmission = this.closeout.reserve(task.id);
       this.store.markInput(input.id, 'delivering');
       try {
@@ -1208,7 +1184,7 @@ export class AgentLoop {
               if (!(error instanceof TurnChangedError)) throw error;
               current = await this.inspect(threadId);
               this.publishWorkerSnapshot(task, current);
-              this.closeout.assertOpen(task.id);
+
               if (current.seenInputIds.includes(input.id)) { this.store.markInput(input.id, 'delivered'); continue; }
               if (current.status === 'running' && current.turnId) await this.ports.codex.steer({ threadId: threadId, turnId: current.turnId, input: prepared, deliveryId: input.id, additionalContext: this.projects.context(task.id) });
               else task.turnId = await this.ports.codex.startTurn({ threadId: threadId, input: prepared, deliveryId: input.id, additionalContext: this.projects.context(task.id) });
@@ -1270,7 +1246,6 @@ export class AgentLoop {
     }
   }
   async control(taskId: string, action: 'pause' | 'resume' | 'status'): Promise<void> {
-    if (action !== 'status') this.closeout.assertOpen(taskId);
     await this.serial(taskId, async () => {
       const task = this.store.task(taskId);
       this.projects.retireObsoleteInputs(task);
@@ -1373,7 +1348,8 @@ export class AgentLoop {
     const tasks = this.store.tasks().sort((a, b) => priority(a) - priority(b));
     await Promise.all(tasks.map(task => this.serial(task.id, async () => {
       try {
-        if (this.closeout.completed(task.id)) { this.forwardCompletedInputs(task); await this.flush(task); return; }
+        this.closeout.reopenOnInput(task.id);
+        if (this.closeout.completed(task.id) && task.executionStatus !== 'running') { await this.flush(task); return; }
         if (!this.projects.restoreWorkerExecution(task)) return;
         if (!this.projects.ledger.membership(task.id)) {
           const project = await this.projects.resolveTask(task);
@@ -1382,6 +1358,7 @@ export class AgentLoop {
             task = this.store.task(task.id);
           }
         }
+        if (!this.projects.ledger.membership(task.id)) { await this.advance(task.id, true); return; }
         if (!this.projects.restoreWorkerExecution(task)) return;
         for (const resource of task.resources) await this.restoreWorkspace(task.id, resource);
         if (task.source.kind === 'github' && !this.projects.ledger.membership(task.id)) {
@@ -1400,7 +1377,7 @@ export class AgentLoop {
         const failed = this.store.task(task.id);
         if (failed.status !== 'paused' || failed.reason !== 'Operator paused') { failed.status = 'failed'; failed.reason = errorMessage(error); }
         failed.recovery.nextAttemptAt = null; failed.recovery.lastError = errorMessage(error);
-        failed.recovery.lastUserInputSeq = this.store.inputs(task.id).filter(input => input.origin === 'user' || input.provenance.kind === 'agent_message').at(-1)?.seq ?? 0; this.persist(failed);
+        failed.recovery.lastUserInputSeq = this.store.inputs(task.id).filter(isContinuationInput).at(-1)?.seq ?? 0; this.persist(failed);
         this.problem(task.id, error); this.notify(failed, `任务关联核对失败，保留现场。\n${errorMessage(error)}`, `association:${digest(errorMessage(error))}`);
         await this.flush(failed);
       }
@@ -1491,6 +1468,7 @@ export class AgentLoop {
     await Promise.allSettled([...this.lanes.values(), ...this.resourceLanes.values()]);
     await this.workspaceBridge.close();
     await this.projects.close();
+    await this.closeout.settle();
     await this.ports.codex.close();
     if (this.started) this.heartbeat('stopped');
     this.store.close();

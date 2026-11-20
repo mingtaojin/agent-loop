@@ -18,9 +18,8 @@ async function fixture(t: TestContext) {
     chatId: 'chat', threadId: 'thread', turnId: null, executionStatus: 'idle', lastHandledTurnId: null, requests: [], createdAt: 1, updatedAt: 1 });
   store.saveTask(task);
   const db = new DatabaseSync(join(root, 'tasks.sqlite'));
-  const closeout = new TaskCloseout(store, { usage: async () => null, protectedPaths: () => [] });
   t.after(async () => { db.close(); store.close(); await rm(root, { recursive: true, force: true }); });
-  return { root, store, task, db, closeout };
+  return { root, store, task, db, get closeout() { return new TaskCloseout(store, { usage: async () => null, protectedPaths: () => [] }); } };
 }
 
 test('repeated task snapshots reuse validation and isolate caller mutations', async t => {

@@ -16,6 +16,7 @@ import { z } from 'zod';
 import { configSchema } from '../src/config.js';
 import { AgentLoop } from '../src/loop.js';
 import { taskCloseoutSchema } from '../src/task-closeout.js';
+import { ProjectDashboardReader } from '../src/dashboard-reader.js';
 import { WorkspaceProvider } from '../src/workspace.js';
 import { CodexFake, FeishuFake, GitHubFake } from './fakes.js';
 import { repositorySchema } from '../src/domain.js';
@@ -57,6 +58,13 @@ async function fixture(t: TestContext) {
     async worker() { const result = z.object({ taskId: z.string() }).parse(await action({ action: 'dispatch', execution: testExecution.worker, requestId: `dispatch-${++request}`, prompt: 'Do fixture work', role: 'worker' })); await loop.tick(); return loop.store.task(result.taskId); },
     async scope(taskId: string) { const value = (await state(taskId)).scopes.find(scope => scope.resource.kind === 'artifacts'); assert.ok(value); return value; },
     async complete(taskId: string) { return receipt.parse(await action(completeAction(taskId))); },
+    async cleanup(taskId: string, scopeIds?: string[], requestId = `cleanup-${taskId}`) {
+      return receipt.parse(await action({ action: 'cleanup_artifacts', taskId, scopeIds: scopeIds ?? (await state(taskId)).scopes.map(scope => scope.id), requestId }));
+    },
+    async close(taskId: string) {
+      await action(completeAction(taskId));
+      return receipt.parse(await action({ action: 'cleanup_artifacts', taskId, scopeIds: (await state(taskId)).scopes.map(scope => scope.id), requestId: `cleanup-${taskId}` }));
+    },
     async restart() { await loop.close(); loop = new AgentLoop(config, ports); await loop.recover(); },
   };
 }
@@ -67,7 +75,7 @@ test('closeout removes actual default artifacts, retains records and originals, 
   const attachment = join(f.data, 'attachments', worker.id, 'original.txt'); await mkdir(join(f.data, 'attachments', worker.id), { recursive: true }); await writeFile(attachment, 'user original');
   await f.finish(worker.id);
   assert.equal((await f.state(worker.id)).lifecycle.kind, 'open'); assert.equal(await exists(scope.location.root.path), true);
-  const first = await f.complete(worker.id); assert.deepEqual(await f.complete(worker.id), first);
+  const first = await f.close(worker.id); assert.deepEqual(await f.close(worker.id), first);
   assert.equal(await exists(scope.location.root.path), false);
   const state = await f.state(worker.id); assert.equal(state.lifecycle.kind, 'completed'); assert.equal(state.operations[0]?.targets[0]?.state, 'removed');
   assert.equal(await readFile(attachment, 'utf8'), 'user original'); assert.equal(await readFile(join(f.project, 'source.txt'), 'utf8'), 'original source');
@@ -79,7 +87,7 @@ test('closeout removes actual default artifacts, retains records and originals, 
 test('active execution, unknown use and child processes keep cleanup pending without stopping users', async t => {
   const f = await fixture(t), worker = await f.worker(), scope = await f.scope(worker.id), path = scope.location.root.path;
   await writeFile(join(path, 'in-use.txt'), 'open file');
-  await f.complete(worker.id); assert.equal((await f.state(worker.id)).operations[0]?.targets[0]?.state, 'pending');
+  await f.close(worker.id); assert.equal((await f.state(worker.id)).operations[0]?.targets[0]?.state, 'pending');
   assert.equal(await exists(path), true); assert.equal(f.codex.interrupts.length, 0);
   const threadId = worker.threadId; assert.ok(threadId); f.codex.complete(threadId, null);
   f.codex.inspectError = new Error('usage unavailable'); await f.loop.tick(); assert.equal(await exists(path), true); f.codex.inspectError = null;
@@ -90,62 +98,25 @@ test('active execution, unknown use and child processes keep cleanup pending wit
   child.kill(); await once(child, 'exit'); await f.loop.tick(); assert.equal(await exists(path), false);
 });
 
-test('completion rejects authoritative native requests even before stale Task snapshots observe them', async t => {
+test('completion records the conclusion without consuming or denying native requests', async t => {
   for (const kind of ['approval', 'question', 'permissions', 'unsupported'] as const) {
     const f = await fixture(t), worker = await f.worker(), scope = await f.scope(worker.id); assert.ok(worker.threadId);
     const snapshot = f.codex.snapshot(worker.threadId); assert.ok(snapshot.turnId);
     snapshot.requests = [{ id: `outstanding-${kind}`, threadId: worker.threadId, turnId: snapshot.turnId, kind,
       prompt: 'Unresolved request', method: kind, payload: {}, isBlocking: false, connectionEpoch: 'fixture' }];
-    assert.equal(f.loop.store.task(worker.id).requests.length, 0);
-    await assert.rejects(f.complete(worker.id), /native request/);
-    const state = await f.state(worker.id); assert.equal(state.lifecycle.kind, 'open'); assert.equal(state.operations.length, 0);
-    assert.equal(await exists(scope.location.root.path), true); assert.equal(snapshot.requests.length, 1);
+    await f.complete(worker.id); await f.loop.tick();
+    const state = await f.state(worker.id);
+    assert.equal(state.lifecycle.kind, 'completed'); assert.equal(state.operations.length, 0);
+    assert.equal(state.completionHistory.length, 1); assert.equal(await exists(scope.location.root.path), true);
+    assert.equal(snapshot.requests.length, 1); assert.equal(f.codex.nativeDenials.length, 0);
   }
-});
-
-test('native requests arriving during resource discovery reject the final completion transaction', async t => {
-  const f = await fixture(t), worker = await f.worker(), tree = await f.loop.ensureWorkspace(worker.id, 'example/app'); assert.ok(worker.threadId);
-  const snapshot = f.codex.snapshot(worker.threadId); assert.ok(snapshot.turnId);
-  const request = { id: 'discovery-race', threadId: worker.threadId, turnId: snapshot.turnId, kind: 'approval' as const,
-    prompt: 'Late approval', method: 'approval', payload: {}, isBlocking: true, connectionEpoch: 'fixture' };
-  const completion = f.complete(worker.id); queueMicrotask(() => { snapshot.requests = [request]; });
-  await assert.rejects(completion, /native request/);
-  assert.equal((await f.state(worker.id)).lifecycle.kind, 'open'); assert.equal((await f.state(worker.id)).operations.length, 0);
-  assert.equal(await exists(tree.workspace), true);
-});
-
-test('threaded completion fails closed when the provider lacks native request protection', async t => {
-  const f = await fixture(t), worker = await f.worker(), scope = await f.scope(worker.id);
-  Object.defineProperty(f.codex, 'assertThreadCompletionAllowed', { value: undefined });
-  await assert.rejects(f.complete(worker.id), /protection is unavailable/);
-  assert.equal((await f.state(worker.id)).lifecycle.kind, 'open'); assert.equal(await exists(scope.location.root.path), true);
-});
-
-test('completed tasks deny late native requests without execution and retain uncertain cleanup until resolution', async t => {
-  const f = await fixture(t), worker = await f.worker(), scope = await f.scope(worker.id); assert.ok(worker.threadId);
-  const starts = f.codex.starts.length, steers = f.codex.steers.length;
-  await f.complete(worker.id);
-  const snapshot = f.codex.snapshot(worker.threadId); assert.ok(snapshot.turnId);
-  for (const kind of ['approval', 'question'] as const) {
-    snapshot.requests = [{ id: `late-${kind}`, threadId: worker.threadId, turnId: snapshot.turnId, kind,
-      prompt: 'Late request', method: kind, payload: {}, isBlocking: true, connectionEpoch: 'fixture' }];
-    f.codex.uncertainNativeDenial = true;
-    await f.loop.tick();
-    assert.equal(await exists(scope.location.root.path), true); assert.equal(snapshot.requests.length, 1);
-    assert.equal((await f.state(worker.id)).operations[0]?.targets[0]?.state, 'pending');
-    f.codex.uncertainNativeDenial = false; await f.loop.tick(); assert.equal(snapshot.requests.length, 0);
-  }
-  assert.deepEqual(f.codex.nativeDenials.map(request => request.kind), ['approval', 'question']);
-  assert.equal(f.codex.approvals.length, 0); assert.equal(f.codex.replies.length, 0); assert.equal(f.codex.interrupts.length, 0);
-  assert.equal(f.codex.starts.length, starts); assert.equal(f.codex.steers.length, steers);
-  f.codex.complete(worker.threadId, null); await f.restart(); assert.equal(await exists(scope.location.root.path), false);
 });
 
 test('unique delivery holds survive completion and only matching authorized delivery releases them', async t => {
   const f = await fixture(t), worker = await f.worker(), scope = await f.scope(worker.id), file = join(scope.location.root.path, 'only.zip');
   await writeFile(file, 'only deliverable');
   await f.action({ action: 'register_artifact', requestId: 'hold', scopeId: scope.id, path: file, disposition: 'undelivered' }, worker.id);
-  await f.finish(worker.id); await f.complete(worker.id);
+  await f.finish(worker.id); await f.close(worker.id);
   assert.equal((await f.state(worker.id)).operations[0]?.targets[0]?.state, 'protected'); assert.equal(await exists(file), true);
   await f.action({ action: 'register_artifact', requestId: 'delivered', taskId: worker.id, scopeId: scope.id, path: file, disposition: 'delivered', reference: 'https://example.test/download' });
   await f.loop.tick(); assert.equal(await exists(file), false);
@@ -186,7 +157,7 @@ test('concurrent worktree enrollment preserves a successful delivery hold and it
     finally { reader.mock.restore(); syncBuiltinESMExports(); }
   }
   const afterEnrollment = (await f.scope(worker.id)).artifacts;
-  await f.finish(worker.id); await f.complete(worker.id);
+  await f.finish(worker.id); await f.close(worker.id);
   const target = (await f.state(worker.id)).operations[0]?.targets.find(target => target.scope.id === scope.id);
   assert.deepEqual({ disposition: afterEnrollment[0]?.disposition, cleanup: target?.state, retained: await exists(file) },
     { disposition: 'undelivered', cleanup: 'protected', retained: true });
@@ -202,7 +173,7 @@ test('delivery status cannot release a replacement file and arbitrary external p
   await assert.rejects(f.action({ action: 'register_artifact', requestId: 'replacement', scopeId: scope.id, path: file, disposition: 'delivered', reference: 'https://example.test/new' }, worker.id), /identity changed/);
   await assert.rejects(f.action({ action: 'register_artifact', requestId: 'claim-source', scopeId: scope.id, path: join(f.project, 'source.txt'), disposition: 'temporary' }, worker.id), /outside/);
   await assert.rejects(f.action({ action: 'allocate_artifacts', requestId: 'bad-parent', parent: f.root, label: 'claim external' }, worker.id), /parent/);
-  await f.finish(worker.id); await f.complete(worker.id); assert.equal(await readFile(file, 'utf8'), 'replacement');
+  await f.finish(worker.id); await f.close(worker.id); assert.equal(await readFile(file, 'utf8'), 'replacement');
 });
 
 test('root replacement, symlink retargeting and ancestor replacement never inherit deletion authority', async t => {
@@ -211,7 +182,7 @@ test('root replacement, symlink retargeting and ancestor replacement never inher
     await f.finish(worker.id);
     if (mode === 'ancestor') { await rename(worker.contextDirectory, `${worker.contextDirectory}.old`); await mkdir(path, { recursive: true }); }
     else { await rename(path, `${path}.old`); if (mode === 'symlink') await symlink(f.project, path); else await mkdir(path); }
-    await f.complete(worker.id);
+    await f.close(worker.id);
     const target = (await f.state(worker.id)).operations[0]?.targets[0]; assert.equal(target?.state, 'pending'); assert.match(target?.reason ?? '', /identity|physical directory/);
     assert.equal(await exists(path), true); assert.equal(await readFile(join(f.project, 'source.txt'), 'utf8'), 'original source');
   }
@@ -223,7 +194,7 @@ test('formal closeout discards dirty unmerged worktree and branch while ordinary
   await writeFile(join(tree.workspace, 'unique.txt'), 'unmerged'); await git(tree.workspace, 'add', '.'); await git(tree.workspace, 'commit', '-m', 'unique');
   await writeFile(join(tree.workspace, '.gitignore'), 'ignored.bin'); await writeFile(join(tree.workspace, 'ignored.bin'), 'build'); await writeFile(join(tree.workspace, 'untracked.txt'), 'dirty');
   await assert.rejects(f.action({ action: 'release_workspace', requestId: 'ordinary', resourceId: tree.id }, worker.id), /uncommitted|untracked|ignored/);
-  await f.finish(worker.id); await f.complete(worker.id);
+  await f.finish(worker.id); await f.close(worker.id);
   assert.equal(await exists(tree.workspace), false); assert.equal(await git(f.project, 'for-each-ref', '--format=%(refname)', `refs/heads/${tree.branch}`), '');
   assert.equal((await f.state(worker.id)).operations[0]?.targets.find(target => target.scope.resource.kind === 'worktree')?.branchRemoved, true);
   assert.equal(await readFile(join(f.project, 'source.txt'), 'utf8'), 'original source');
@@ -234,7 +205,7 @@ test('completion reconciles a previously removed owned worktree and branch with 
   if (tree.kind !== 'git-worktree') throw new Error('Expected real worktree');
   await f.finish(worker.id);
   await git(f.project, 'worktree', 'remove', '--force', tree.workspace); await git(f.project, 'branch', '-D', tree.branch);
-  const completed = await f.complete(worker.id), state = await f.state(worker.id);
+  const completed = await f.close(worker.id), state = await f.state(worker.id);
   assert.equal(state.lifecycle.kind, 'completed'); assert.equal(state.operations.length, 1);
   assert.ok(state.operations[0]?.targets.every(target => target.state === 'removed'));
   const target = state.operations[0]?.targets.find(target => target.scope.resource.kind === 'worktree'); assert.ok(target);
@@ -243,7 +214,7 @@ test('completion reconciles a previously removed owned worktree and branch with 
   assert.equal(await git(f.project, 'for-each-ref', '--format=%(refname)', `refs/heads/${tree.branch}`), '');
   assert.equal((await git(f.project, 'worktree', 'list', '--porcelain', '-z')).split('\0').includes(`worktree ${tree.workspace}`), false);
   assert.equal(f.loop.store.task(worker.id).resources.some(resource => resource.id === tree.id), false);
-  await f.restart(); assert.deepEqual(await f.complete(worker.id), completed);
+  await f.restart(); assert.deepEqual(await f.close(worker.id), completed);
   assert.deepEqual(await f.state(worker.id), state);
   assert.equal(await readFile(join(f.project, 'source.txt'), 'utf8'), 'original source');
 });
@@ -267,7 +238,7 @@ test('a missing branch does not authorize removal of remaining or replaced workt
     if (mode !== 'registration') await writeFile(join(retainedPath, 'retained.txt'), mode);
     await git(f.project, 'update-ref', '-d', `refs/heads/${tree.branch}`);
     if (mode === 'descendant-branch') await git(f.project, 'branch', `${tree.branch}/replacement`, 'main');
-    await f.complete(worker.id);
+    await f.close(worker.id);
     const state = await f.state(worker.id), target = state.operations[0]?.targets.find(target => target.scope.resource.kind === 'worktree');
     assert.equal(state.lifecycle.kind, 'completed'); assert.equal(target?.state, 'pending');
     assert.match(target?.reason ?? '', /identity|branch|registration/);
@@ -284,7 +255,7 @@ test('a recreated branch at the frozen commit cannot inherit cleanup authority',
   const f = await fixture(t), worker = await f.worker(), tree = await f.loop.ensureWorkspace(worker.id, 'example/app');
   if (tree.kind !== 'git-worktree') throw new Error('Expected real worktree');
   const head = await git(f.project, 'rev-parse', `refs/heads/${tree.branch}`);
-  await f.complete(worker.id);
+  await f.close(worker.id);
   await git(f.project, 'worktree', 'remove', '--force', tree.workspace); await git(f.project, 'branch', '-D', tree.branch);
   await git(f.project, 'branch', tree.branch, head);
   await f.finish(worker.id); await f.restart();
@@ -300,7 +271,7 @@ test('registered delivery identity is rechecked before deleting artifact scopes 
     const scope = (await f.state(worker.id)).scopes.find(scope => scope.resource.kind === kind); assert.ok(scope);
     const file = join(scope.location.root.path, 'delivered.log'); await writeFile(file, 'delivered original');
     await f.action({ action: 'register_artifact', requestId: 'delivered', scopeId: scope.id, path: file, disposition: 'delivered', reference: 'fixture://delivery' }, worker.id);
-    await f.complete(worker.id);
+    await f.close(worker.id);
     await rename(file, `${file}.old`); await writeFile(file, 'replacement not delivered');
     await f.finish(worker.id); await f.restart();
     assert.equal(await readFile(file, 'utf8'), 'replacement not delivered');
@@ -313,7 +284,7 @@ test('registered delivery identity is rechecked before deleting artifact scopes 
 test('branch deletion resumes after worktree removal fails to update its locked local ref', async t => {
   const f = await fixture(t), worker = await f.worker(), tree = await f.loop.ensureWorkspace(worker.id, 'example/app'); if (tree.kind !== 'git-worktree') throw new Error('Expected real worktree');
   const lock = join(f.project, '.git', `${`refs/heads/${tree.branch}`}.lock`); await writeFile(lock, 'controlled ref lock');
-  await f.finish(worker.id); await f.complete(worker.id); assert.equal(await exists(tree.workspace), false);
+  await f.finish(worker.id); await f.close(worker.id); assert.equal(await exists(tree.workspace), false);
   assert.notEqual(await git(f.project, 'for-each-ref', '--format=%(refname)', `refs/heads/${tree.branch}`), '');
   await rm(lock); await f.restart(); assert.equal(await git(f.project, 'for-each-ref', '--format=%(refname)', `refs/heads/${tree.branch}`), '');
   assert.ok((await f.state(worker.id)).operations[0]?.targets.every(target => target.state === 'removed'));
@@ -322,35 +293,33 @@ test('branch deletion resumes after worktree removal fails to update its locked 
 test('shared associations and another task scope protect their actual contents', async t => {
   const f = await fixture(t), first = await f.worker(), second = await f.worker(), tree = await f.loop.ensureWorkspace(first.id, 'example/app');
   const saved = f.loop.store.task(second.id); saved.resources.push(tree); f.loop.store.saveTask(saved);
-  await writeFile(join(tree.workspace, 'shared.txt'), 'still used'); await f.finish(first.id); await f.complete(first.id);
+  await writeFile(join(tree.workspace, 'shared.txt'), 'still used'); await f.finish(first.id); await f.close(first.id);
   assert.equal(await readFile(join(tree.workspace, 'shared.txt'), 'utf8'), 'still used');
   assert.match((await f.state(first.id)).operations[0]?.targets.find(target => target.scope.resource.kind === 'worktree')?.reason ?? '', /another task/);
   assert.equal((await f.state(second.id)).lifecycle.kind, 'open');
 });
 
-test('completed followups retain original provenance and create no automatic execution; explicit dispatch links fresh task', async t => {
+test('completed followups continue the original Worker and Thread, retaining completion history', async t => {
   const f = await fixture(t), worker = await f.worker();
-  await f.action({ action: 'open_group', requestId: 'group', taskId: worker.id }); const chatId = f.loop.store.task(worker.id).chatId; assert.ok(chatId);
-  await f.finish(worker.id); await f.complete(worker.id); const starts = f.codex.starts.filter(start => start.threadId === worker.threadId).length;
-  const message = { id: 'follow-up', chatId, senderId: 'owner', chatType: 'group' as const, text: 'What was delivered?', attachments: [], createdAt: Date.now() };
+  await f.action({ action: 'open_group', requestId: 'group', taskId: worker.id });
+  const before = f.loop.store.task(worker.id); assert.ok(before.chatId);
+  await f.finish(worker.id); await f.complete(worker.id);
+  const message = { id: 'follow-up', chatId: before.chatId, senderId: 'owner', chatType: 'group' as const, text: 'What was delivered?', attachments: [], createdAt: Date.now() };
   await f.loop.receive(message); await f.loop.receive(message);
-  f.feishu.offline = [{ ...message, id: 'offline-follow-up', text: 'Please add another output' }];
-  await f.restart(); await f.loop.tick();
-  const forwarded = f.loop.store.inputs(f.coordinatorId).filter(input => input.id.startsWith(`completed-followup:${worker.id}:`));
-  assert.equal(forwarded.length, 2); assert.deepEqual(forwarded[0]?.provenance, { kind: 'user', message });
-  assert.equal(f.loop.tasks().length, 2); assert.equal(f.codex.starts.filter(start => start.threadId === worker.threadId).length, starts);
-  await assert.rejects(f.loop.control(worker.id, 'resume'), /completed/); await assert.rejects(f.loop.ensureWorkspace(worker.id, 'example/app'), /completed/);
-  await assert.rejects(f.loop.projectCall(f.coordinatorId, { tool: 'send_agent_message', arguments: { requestId: 'old-send', taskId: worker.id, text: 'continue' } }), /completed/);
-  const newTask = z.object({ taskId: z.string() }).parse(await f.action({ action: 'dispatch', execution: testExecution.worker, requestId: 'follow-new', predecessorTaskId: worker.id, prompt: 'New output', role: 'worker' }));
-  assert.equal((await f.state(newTask.taskId)).predecessorTaskId, worker.id); assert.notEqual((await f.scope(newTask.taskId)).location.root.path, (await f.scope(worker.id)).location.root.path);
-  assert.match(f.loop.store.inputs(newTask.taskId)[0]?.message.text ?? '', /Delivered result/);
+  const after = f.loop.store.task(worker.id);
+  assert.equal(after.threadId, before.threadId); assert.equal(after.chatId, before.chatId);
+  assert.deepEqual(after.workerExecution, before.workerExecution); assert.equal(f.loop.tasks().length, 2);
+  assert.equal((await f.state(worker.id)).lifecycle.kind, 'open'); assert.equal((await f.state(worker.id)).completionHistory.length, 1);
+  assert.equal(f.loop.store.inputs(worker.id).find(input => input.id === message.id)?.status, 'delivered');
+  assert.equal(f.loop.store.inputs(f.coordinatorId).filter(input => input.id.startsWith('completed-followup:')).length, 0);
+  assert.equal(f.codex.starts.filter(start => start.deliveryId === message.id).length, 1);
 });
 
 test('completed-task followups cannot answer coordinator native questions while direct group replies can', async t => {
   const f = await fixture(t), worker = await f.worker();
   await f.action({ action: 'open_group', requestId: 'group', taskId: worker.id });
   const workerChat = f.loop.store.task(worker.id).chatId; assert.ok(workerChat);
-  await f.finish(worker.id); await f.complete(worker.id);
+  await f.finish(worker.id); await f.close(worker.id);
   const coordinator = f.loop.store.task(f.coordinatorId); assert.ok(coordinator.threadId); assert.ok(coordinator.chatId);
   const snapshot = f.codex.snapshot(coordinator.threadId); assert.ok(snapshot.turnId);
   const request = {
@@ -364,32 +333,31 @@ test('completed-task followups cannot answer coordinator native questions while 
   await f.loop.receive(followup); await f.loop.receive(followup); await f.loop.tick();
   assert.equal(f.codex.replies.length, 0); assert.deepEqual(snapshot.requests, [request]);
   const forwarded = f.loop.store.inputs(f.coordinatorId).filter(input => input.id === `completed-followup:${worker.id}:${followup.id}`);
-  assert.equal(forwarded.length, 1); assert.equal(forwarded[0]?.status, 'delivered');
-  assert.deepEqual(forwarded[0]?.provenance, { kind: 'user', message: followup });
-  assert.ok(f.codex.steers.some(input => input.deliveryId === forwarded[0]?.id && input.input.some(item => item.kind === 'text' && item.text.includes(followup.text))));
+  assert.equal(forwarded.length, 0);
+  assert.equal(f.loop.store.inputs(worker.id).find(input => input.id === followup.id)?.status, 'delivered');
   await f.loop.receive({ id: 'direct-answer', chatId: coordinator.chatId, senderId: 'owner', chatType: 'group',
     text: 'Use the QA target', attachments: [], createdAt: Date.now() });
   await f.loop.tick();
   assert.deepEqual(f.codex.replies.map(input => [input.request.id, input.text]), [[request.id, 'Use the QA target']]);
 });
 
-test('forwarded followup attachments use the original Feishu message identity and deduplicate delivery', async t => {
+test('continued Worker attachments use the original Feishu message identity and deduplicate delivery', async t => {
   const f = await fixture(t), worker = await f.worker();
   await f.action({ action: 'open_group', requestId: 'group', taskId: worker.id });
   const chatId = f.loop.store.task(worker.id).chatId; assert.ok(chatId);
-  await f.finish(worker.id); await f.complete(worker.id);
+  await f.finish(worker.id); await f.close(worker.id);
   const message = { id: 'original-feishu-message', chatId, senderId: 'owner', chatType: 'group' as const,
     text: 'Use the attached log for the followup', attachments: [{ kind: 'file' as const, key: 'followup-log', name: 'followup.log' }], createdAt: Date.now() };
   f.feishu.resources.set('followup-log', Buffer.from('original followup log'));
   const download = f.feishu.download.bind(f.feishu);
   f.feishu.download = async input => { assert.equal(input.messageId, message.id, 'Feishu resource lookup requires its original message ID'); await download(input); };
   await f.loop.receive(message); await f.loop.receive(message); await f.loop.tick();
-  const forwardedId = `completed-followup:${worker.id}:${message.id}`;
-  const forwarded = f.loop.store.inputs(f.coordinatorId).find(input => input.id === forwardedId); assert.ok(forwarded);
+  const forwardedId = message.id;
+  const forwarded = f.loop.store.inputs(worker.id).find(input => input.id === forwardedId); assert.ok(forwarded);
   assert.equal(forwarded.status, 'delivered'); assert.equal(f.feishu.downloads.length, 1);
   assert.equal(f.feishu.downloads[0]?.messageId, message.id);
   assert.deepEqual(forwarded.provenance, { kind: 'user', message });
-  const directory = join(f.data, 'attachments', f.coordinatorId), files = await readdir(directory, { recursive: true });
+  const directory = join(f.data, 'attachments', worker.id), files = await readdir(directory, { recursive: true });
   const log = files.find(file => file.endsWith('.log')); assert.ok(log);
   assert.equal(await readFile(join(directory, log), 'utf8'), 'original followup log');
   assert.equal([...f.codex.steers, ...f.codex.starts].filter(input => input.deliveryId === forwardedId).length, 1);
@@ -403,9 +371,9 @@ test('lost cleanup acknowledgement and immutable action receipt converge against
     if (lose && key === `task-closeout:${worker.id}` && value.includes('"state":"removed"')) { lose = false; throw new Error('Lost cleanup acknowledgement'); }
     setMeta(key, value);
   };
-  await assert.rejects(f.complete(worker.id), /Lost cleanup acknowledgement/); assert.equal(await exists(scope.location.root.path), false);
+  await assert.rejects(f.close(worker.id), /Lost cleanup acknowledgement/); assert.equal(await exists(scope.location.root.path), false);
   assert.equal((await f.state(worker.id)).operations[0]?.targets[0]?.state, 'pending');
-  await f.restart(); const result = await f.complete(worker.id); assert.equal(result.operationId, (await f.state(worker.id)).operations[0]?.id);
+  await f.restart(); const result = await f.close(worker.id); assert.equal(result.operationId, (await f.state(worker.id)).operations[0]?.id);
   assert.equal((await f.state(worker.id)).operations[0]?.targets[0]?.state, 'removed');
 });
 
@@ -415,23 +383,23 @@ test('allocation reservation prevents incomplete closeout snapshots and later sc
   const gate = new Promise<void>(resolve => { release = resolve; }), started = new Promise<void>(resolve => { entered = resolve; });
   f.workspace.ensure = async input => { if (input.kind === 'git-worktree') { entered(); await gate; } return original(input); };
   const acquire = f.loop.ensureWorkspace(worker.id, 'example/app'); await started;
-  await assert.rejects(f.complete(worker.id), /in flight/); assert.equal((await f.state(worker.id)).lifecycle.kind, 'open'); release(); await acquire;
-  await f.complete(worker.id); assert.ok((await f.state(worker.id)).operations[0]?.targets.some(target => target.scope.resource.kind === 'worktree'));
+  try { await f.complete(worker.id); await assert.rejects(f.cleanup(worker.id, undefined, 'during-allocation'), /in flight/); assert.equal((await f.state(worker.id)).lifecycle.kind, 'completed'); } finally { release(); await acquire; }
+  await f.close(worker.id); assert.ok((await f.state(worker.id)).operations[0]?.targets.some(target => target.scope.resource.kind === 'worktree'));
   const next = await f.worker(), nextScope = await f.scope(next.id); await writeFile(join(nextScope.location.root.path, 'new.txt'), 'new task');
-  await f.complete(worker.id); assert.equal(await readFile(join(nextScope.location.root.path, 'new.txt'), 'utf8'), 'new task');
+  await f.close(worker.id); assert.equal(await readFile(join(nextScope.location.root.path, 'new.txt'), 'utf8'), 'new task');
 });
 
 test('coordinator scopes close after its turn without closing the coordinator or touching later work and project records', async t => {
   const f = await fixture(t), scope = await f.scope(f.coordinatorId);
   await writeFile(join(scope.location.root.path, 'temporary.txt'), 'inspection');
   await f.action({ action: 'record', requestId: 'record', key: 'decision', text: 'Durable decision', expectedVersion: 0 });
-  const clean: ProjectAction = { action: 'cleanup_artifacts', requestId: 'batch-one', scopeIds: [scope.id] };
+  const clean: ProjectAction = { action: 'cleanup_artifacts', taskId: f.coordinatorId, requestId: 'batch-one', scopeIds: [scope.id] };
   const handle = await f.action(clean); assert.equal(await exists(scope.location.root.path), true);
   const next = z.object({ id: z.string(), location: z.object({ root: z.object({ path: z.string() }) }) }).parse(await f.action({ action: 'allocate_artifacts', requestId: 'batch-two', label: 'Next dispatch', parent: f.project }));
   await writeFile(join(next.location.root.path, 'next.txt'), 'active next work');
   await f.finish(f.coordinatorId); await f.loop.tick(); assert.equal(await exists(scope.location.root.path), false);
   assert.equal(await readFile(join(next.location.root.path, 'next.txt'), 'utf8'), 'active next work'); assert.equal((await f.state(f.coordinatorId)).lifecycle.kind, 'open');
-  assert.deepEqual(await f.action(clean), handle); assert.equal(f.loop.projects.ledger.project('app')?.records[0]?.text, 'Durable decision');
+  assert.equal(receipt.parse(await f.action(clean)).operationId, receipt.parse(handle).operationId); assert.equal(f.loop.projects.ledger.project('app')?.records[0]?.text, 'Durable decision');
 });
 
 test('role boundaries reject workers and cross-project targets without deleting; uncertain input prevents sealing', async t => {
@@ -439,8 +407,11 @@ test('role boundaries reject workers and cross-project targets without deleting;
   await assert.rejects(f.action(f.completeAction(worker.id), worker.id), /Only the coordinator/);
   await assert.rejects(f.action(f.completeAction(f.coordinatorId)), /not a worker/);
   await assert.rejects(f.action(f.completeAction('other-project-task')), /not a worker/);
+  await assert.rejects(f.action({ action: 'cleanup_artifacts', taskId: worker.id, scopeIds: [scope.id], requestId: 'forbidden-cleanup' }, worker.id), /Only the coordinator/);
+  await assert.rejects(f.action({ action: 'cleanup_artifacts', taskId: 'other-project-task', scopeIds: [scope.id], requestId: 'foreign-cleanup' }), /not owned/);
   f.loop.store.receive(worker.id, { id: 'uncertain', chatId: '', senderId: 'owner', chatType: 'group', text: 'new work', attachments: [], createdAt: Date.now() }); f.loop.store.markInput('uncertain', 'uncertain');
-  await assert.rejects(f.complete(worker.id), /Reconcile unresolved/); assert.equal((await f.state(worker.id)).lifecycle.kind, 'open'); assert.equal(await exists(scope.location.root.path), true);
+  await f.close(worker.id); assert.equal((await f.state(worker.id)).lifecycle.kind, 'completed'); assert.equal(await exists(scope.location.root.path), true);
+  assert.match((await f.state(worker.id)).operations[0]?.targets[0]?.reason ?? '', /unresolved/);
 });
 
 test('historical resource associations are not enrolled by restart or idle checks', async t => {
@@ -448,14 +419,14 @@ test('historical resource associations are not enrolled by restart or idle check
   const association = { id: 'historical', kind: 'git-worktree' as const, branch: `historical/${worker.id}`, repository: repositorySchema.parse({ name: 'example/app', path: f.project, baseBranch: 'main', criteria: { labelsAny: ['work'] } }) };
   const workspace = await f.workspace.ensure({ taskId: worker.id, resourceId: association.id, repository: association.repository, branch: association.branch });
   const task = f.loop.store.task(worker.id); task.resources.push({ ...association, workspace }); f.loop.store.saveTask(task);
-  await writeFile(join(workspace, 'historical.bin'), 'old evidence'); await f.restart(); await f.loop.tick(); await f.complete(worker.id);
+  await writeFile(join(workspace, 'historical.bin'), 'old evidence'); await f.restart(); await f.loop.tick(); await f.close(worker.id);
   assert.equal(await readFile(join(workspace, 'historical.bin'), 'utf8'), 'old evidence'); assert.equal((await f.state(worker.id)).scopes.some(scope => scope.resource.kind === 'worktree'), false);
 });
 
 test('cleanup admission racing attachment preparation leaves input pending until execution can start', { timeout: 10_000 }, async t => {
   const f = await fixture(t), scope = await f.scope(f.coordinatorId), coordinator = f.loop.store.task(f.coordinatorId);
   assert.ok(coordinator.threadId); assert.ok(coordinator.chatId);
-  await f.action({ action: 'cleanup_artifacts', requestId: 'cleanup-race', scopeIds: [scope.id] });
+  await f.action({ action: 'cleanup_artifacts', taskId: f.coordinatorId, requestId: 'cleanup-race', scopeIds: [scope.id] });
   f.codex.complete(coordinator.threadId, null);
   let releaseDownload!: () => void, enteredDownload!: () => void, releaseUsage!: () => void, enteredUsage!: () => void;
   const downloadGate = new Promise<void>(resolve => { releaseDownload = resolve; }), downloadStarted = new Promise<void>(resolve => { enteredDownload = resolve; });
@@ -477,7 +448,7 @@ test('cleanup admission racing attachment preparation leaves input pending until
 test('a slow cleanup does not delay another task reply across successive sweeps', { timeout: 10_000 }, async t => {
   const f = await fixture(t), worker = await f.worker(), coordinator = f.loop.store.task(f.coordinatorId);
   assert.ok(worker.threadId); assert.ok(coordinator.threadId); assert.ok(coordinator.chatId);
-  await f.complete(worker.id);
+  await f.close(worker.id);
   let releaseUsage!: () => void, enteredUsage!: () => void;
   const usageGate = new Promise<void>(resolve => { releaseUsage = resolve; });
   const usageStarted = new Promise<void>(resolve => { enteredUsage = resolve; });
@@ -495,9 +466,10 @@ test('a slow cleanup does not delay another task reply across successive sweeps'
       if (index) await f.loop.receive({ id: 'second-owner-input', chatId: coordinator.chatId, senderId: 'owner',
         chatType: 'group', text: 'Another question', attachments: [], createdAt: Date.now() });
       const reply = new Promise<void>(resolve => { delivered = resolve; });
-      f.codex.complete(coordinator.threadId, 'Responsive reply');
       sweeps.push(f.loop.tick());
       await usageStarted;
+      await f.loop.projectCall(coordinator.id, { tool: 'send_group_message', arguments: { requestId: `responsive-${index}`, text: 'Responsive reply' } });
+      f.codex.complete(coordinator.threadId, 'Internal final');
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
         await Promise.race([reply, new Promise<never>((_, reject) => {
@@ -519,9 +491,9 @@ test('lost generic receipts do not allocate a second scope or lose the atomic co
   const allocated = await f.action(allocate, worker.id); assert.deepEqual(await f.action(allocate, worker.id), allocated);
   assert.equal((await f.state(worker.id)).scopes.length, 2);
   await f.finish(worker.id); failRequest = `complete-${worker.id}`;
-  await assert.rejects(f.complete(worker.id), /Lost generic receipt/);
-  assert.equal((await f.state(worker.id)).lifecycle.kind, 'completed'); assert.equal((await f.state(worker.id)).operations.length, 1);
-  await f.restart(); await f.complete(worker.id); assert.ok((await f.state(worker.id)).operations[0]?.targets.every(target => target.state === 'removed'));
+  await assert.rejects(f.close(worker.id), /Lost generic receipt/);
+  assert.equal((await f.state(worker.id)).lifecycle.kind, 'completed'); assert.equal((await f.state(worker.id)).operations.length, 0);
+  await f.restart(); await f.close(worker.id); assert.ok((await f.state(worker.id)).operations[0]?.targets.every(target => target.state === 'removed'));
 });
 
 test('external worktree scopes respect nested delivery holds and changed branch identity', async t => {
@@ -529,7 +501,7 @@ test('external worktree scopes respect nested delivery holds and changed branch 
   const scope = z.object({ id: z.string(), location: z.object({ root: z.object({ path: z.string() }) }) }).parse(await f.action({ action: 'allocate_artifacts', requestId: 'tree-output', parent: tree.workspace, label: 'Build output' }, worker.id));
   const file = join(scope.location.root.path, 'only.bin'); await writeFile(file, 'unique binary');
   await f.action({ action: 'register_artifact', requestId: 'tree-hold', scopeId: scope.id, path: file, disposition: 'undelivered' }, worker.id);
-  await f.finish(worker.id); await f.complete(worker.id); assert.equal(await exists(file), true); assert.equal(await exists(tree.workspace), true);
+  await f.finish(worker.id); await f.close(worker.id); assert.equal(await exists(file), true); assert.equal(await exists(tree.workspace), true);
   await writeFile(join(tree.workspace, 'later.txt'), 'changed after frozen intent'); await git(tree.workspace, 'add', '.'); await git(tree.workspace, 'commit', '-m', 'later external change');
   await f.action({ action: 'register_artifact', requestId: 'tree-delivery', taskId: worker.id, scopeId: scope.id, path: file, disposition: 'delivered', reference: 'https://example.test/build' });
   await f.loop.tick(); assert.equal(await exists(file), false); assert.equal(await exists(tree.workspace), true);
@@ -538,7 +510,7 @@ test('external worktree scopes respect nested delivery holds and changed branch 
 
 test('interrupted worktree directory removal reconciles its saved Git registration on restart', async t => {
   const f = await fixture(t), worker = await f.worker(), tree = await f.loop.ensureWorkspace(worker.id, 'example/app'); if (tree.kind !== 'git-worktree') throw new Error('Expected worktree');
-  await f.complete(worker.id);
+  await f.close(worker.id);
   await rm(tree.workspace, { recursive: true });
   assert.match(await git(f.project, 'worktree', 'list', '--porcelain'), new RegExp(tree.branch));
   assert.ok(worker.threadId); f.codex.complete(worker.threadId, null);
@@ -578,10 +550,10 @@ test('artifact inventory changes use input context without changing stable threa
   assert.ok(!f.loop.projects.context(worker.id).includes(scope.location.root.path));
   await f.loop.receive({ id: 'scope-context-input', chatId: coordinator.chatId, senderId: 'owner', chatType: 'group', text: 'Continue this review', attachments: [], createdAt: Date.now() });
   assert.ok(f.codex.steers.find(input => input.deliveryId === 'scope-context-input')?.additionalContext?.includes(scope.location.root.path));
-  await f.action({ action: 'cleanup_artifacts', requestId: 'clean-dynamic-scope', scopeIds: [scope.id] });
+  await f.action({ action: 'cleanup_artifacts', taskId: f.coordinatorId, requestId: 'clean-dynamic-scope', scopeIds: [scope.id] });
   await f.loop.tick();
   assert.ok(updates.every(instructions => instructions === before));
-  assert.ok(!f.loop.projects.context(f.coordinatorId).includes(scope.location.root.path));
+  assert.ok(f.loop.projects.context(f.coordinatorId).includes(scope.location.root.path));
   assert.equal(await exists(scope.location.root.path), true);
 });
 
@@ -609,8 +581,8 @@ for (const entry of ['native', 'capability'] as const) test(`${entry} project ac
   f.codex.snapshot(coordinator.threadId).status = 'running'; f.codex.activity = originalActivity;
   receipt.parse(await call());
   assert.equal((await f.state(worker.id)).lifecycle.kind, 'completed');
-  assert.equal(await exists(scope.location.root.path), false);
-  assert.ok((await f.state(worker.id)).operations[0]?.targets.every(target => target.state === 'removed'));
+  assert.equal(await exists(scope.location.root.path), true);
+  assert.equal((await f.state(worker.id)).operations.length, 0);
 });
 
 for (const mode of ['disposal-file', 'root', 'removed-recreated'] as const) test(`nested ownership protects ${mode} from recursive parent cleanup`, async t => {
@@ -620,7 +592,7 @@ for (const mode of ['disposal-file', 'root', 'removed-recreated'] as const) test
   const scope = (await f.state(worker.id)).scopes.find(scope => scope.id === allocated.id); assert.ok(scope);
   const file = join(scope.location.root.path, 'result.txt'); await writeFile(file, 'original output');
   if (mode === 'disposal-file') await f.action({ action: 'register_artifact', requestId: 'delivery', scopeId: scope.id, path: file, disposition: 'delivered', reference: 'fixture://delivered' }, worker.id);
-  await f.complete(worker.id);
+  await f.close(worker.id);
   const child = (await f.state(worker.id)).operations[0]?.targets.find(target => target.scope.id === scope.id); assert.ok(child);
   let retained = file;
   if (mode === 'disposal-file') {
@@ -656,7 +628,7 @@ test('allocation branch generation rejects same-name same-OID recreation before 
   await f.finish(worker.id);
   await git(f.project, 'worktree', 'remove', '--force', tree.workspace); await git(f.project, 'branch', '-D', tree.branch);
   await git(f.project, 'branch', tree.branch, head);
-  await f.complete(worker.id); await f.restart();
+  await f.close(worker.id); await f.restart();
   assert.equal(await git(f.project, 'rev-parse', `refs/heads/${tree.branch}`), head);
   const target = (await f.state(worker.id)).operations[0]?.targets.find(target => target.scope.resource.kind === 'worktree');
   assert.equal(target?.state, 'pending'); assert.match(target?.reason ?? '', /branch.*(generation|identity)/);
@@ -669,7 +641,7 @@ test('allocation branch generation permits normal Worker commits and packed refs
     await writeFile(join(tree.workspace, 'source.txt'), `Worker commit ${i}`); await git(tree.workspace, 'add', '.'); await git(tree.workspace, 'commit', '-m', `Worker ${i}`);
   }
   await git(f.project, 'pack-refs', '--all');
-  await f.finish(worker.id); await f.complete(worker.id); await f.restart();
+  await f.finish(worker.id); await f.close(worker.id); await f.restart();
   assert.equal(await exists(tree.workspace), false);
   assert.equal(await git(f.project, 'for-each-ref', '--format=%(refname)', `refs/heads/${tree.branch}`), '');
   assert.ok((await f.state(worker.id)).operations[0]?.targets.every(target => target.state === 'removed'));
@@ -687,7 +659,7 @@ for (const mode of ['absent', 'replacement', 'symlink', 'missing-ref'] as const)
   await git(f.project, 'update-ref', '-d', `refs/heads/${tree.branch}`);
   if (mode === 'replacement') { await mkdir(tree.workspace); await writeFile(join(tree.workspace, 'retained.txt'), 'replacement'); }
   if (mode === 'symlink') await symlink(f.project, tree.workspace);
-  await f.complete(worker.id); await f.restart();
+  await f.close(worker.id); await f.restart();
   const state = await f.state(worker.id);
   if (mode === 'absent') {
     assert.ok(state.operations[0]?.targets.every(target => target.state === 'removed'));
@@ -708,7 +680,7 @@ for (const childLocation of ['original', 'disposal'] as const) test(`constructed
   const outer = z.object({ id: z.string(), location: z.object({ root: z.object({ path: z.string() }) }) }).parse(await f.action({ action: 'allocate_artifacts', requestId: 'outer', parent: tree.workspace, label: 'Outer build' }, worker.id));
   const innerParent = join(outer.location.root.path, 'deep', 'output'); await mkdir(innerParent, { recursive: true });
   const inner = z.object({ id: z.string(), location: z.object({ root: z.object({ path: z.string() }) }) }).parse(await f.action({ action: 'allocate_artifacts', requestId: 'inner', parent: innerParent, label: 'Inner output' }, worker.id));
-  await f.complete(worker.id);
+  await f.close(worker.id);
   const state = await f.state(worker.id), child = state.operations[0]?.targets.find(target => target.scope.id === inner.id), parent = state.operations[0]?.targets.find(target => target.scope.id === outer.id);
   assert.ok(child); assert.ok(parent);
   await rm(inner.location.root.path, { recursive: true });
@@ -731,7 +703,7 @@ test('unproven allocation branch generation retains worktree when reflogs were d
   const tree = await f.loop.ensureWorkspace(worker.id, 'example/app');
   if (tree.kind !== 'git-worktree') throw new Error('Expected worktree');
   await writeFile(join(tree.workspace, 'retained.txt'), 'unproven ownership');
-  await f.finish(worker.id); await f.complete(worker.id); await f.restart();
+  await f.finish(worker.id); await f.close(worker.id); await f.restart();
   assert.equal(await readFile(join(tree.workspace, 'retained.txt'), 'utf8'), 'unproven ownership');
   const target = (await f.state(worker.id)).operations[0]?.targets.find(target => target.scope.resource.kind === 'worktree');
   assert.equal(target?.state, 'pending'); assert.match(target?.reason ?? '', /branch.*generation/);
@@ -741,7 +713,7 @@ test('constructed interrupted disposal preserves a new coordinator scope allocat
   const f = await fixture(t), tree = await f.loop.ensureWorkspace(f.coordinatorId, 'example/app');
   if (tree.kind !== 'git-worktree') throw new Error('Expected worktree');
   const outer = z.object({ id: z.string(), location: z.object({ root: z.object({ path: z.string() }) }) }).parse(await f.action({ action: 'allocate_artifacts', requestId: 'outer-batch', parent: tree.workspace, label: 'Completed batch' }));
-  await f.action({ action: 'cleanup_artifacts', requestId: 'close-batch', scopeIds: [outer.id] });
+  await f.action({ action: 'cleanup_artifacts', taskId: f.coordinatorId, requestId: 'close-batch', scopeIds: [outer.id] });
   const target = (await f.state(f.coordinatorId)).operations[0]?.targets.find(target => target.scope.id === outer.id); assert.ok(target);
   await rename(outer.location.root.path, target.disposalPath);
   const next = z.object({ location: z.object({ root: z.object({ path: z.string() }) }) }).parse(await f.action({ action: 'allocate_artifacts', requestId: 'next-batch', parent: target.disposalPath, label: 'New work' }));
@@ -755,7 +727,7 @@ test('constructed interrupted disposal preserves a new coordinator scope allocat
 test('shutdown drains an in-flight cleanup sweep before closing its store', { timeout: 10_000 }, async t => {
   const f = await fixture(t), worker = await f.worker();
   assert.ok(worker.threadId);
-  await f.complete(worker.id);
+  await f.close(worker.id);
   let release!: () => void, entered!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
   const started = new Promise<void>(resolve => { entered = resolve; });
@@ -776,4 +748,195 @@ test('shutdown drains an in-flight cleanup sweep before closing its store', { ti
     await Promise.all([sweep, close]);
   }
   await f.loop.tick();
+});
+
+test('completion preserves bytes, scopes and running turns; retries keep immutable history', async t => {
+  const f = await fixture(t), worker = await f.worker(), scope = await f.scope(worker.id);
+  const file = join(scope.location.root.path, 'evidence.bin'); await writeFile(file, 'retained bytes');
+  const first = await f.complete(worker.id); assert.deepEqual(await f.complete(worker.id), first);
+  await f.loop.tick(); await f.restart();
+  const state = await f.state(worker.id);
+  assert.equal(await readFile(file, 'utf8'), 'retained bytes'); assert.equal(state.scopes[0]?.sealed, false);
+  assert.equal(state.operations.length, 0); assert.equal(state.completionHistory.length, 1);
+  assert.equal(f.codex.interrupts.length, 0); assert.equal(f.loop.store.task(worker.id).threadId, worker.threadId);
+});
+
+test('paused completion keeps new input through restart and continues only after explicit resume', async t => {
+  const f = await fixture(t), worker = await f.worker();
+  await f.action({ action: 'open_group', taskId: worker.id, requestId: 'open-paused' });
+  await f.loop.control(worker.id, 'pause'); await f.complete(worker.id);
+  const before = f.loop.store.task(worker.id); assert.ok(before.chatId);
+  const message = { id: 'paused-after-completion', chatId: before.chatId, senderId: 'owner', chatType: 'group' as const, text: 'Continue after the pause', attachments: [], createdAt: Date.now() };
+  await f.loop.receive(message); await f.restart(); await f.loop.tick();
+  assert.equal(f.loop.store.task(worker.id).status, 'paused');
+  assert.equal([...f.codex.starts, ...f.codex.steers].filter(input => input.deliveryId === message.id).length, 0);
+  await f.loop.control(worker.id, 'resume');
+  const after = f.loop.store.task(worker.id);
+  assert.equal(after.threadId, before.threadId); assert.equal(after.chatId, before.chatId); assert.deepEqual(after.workerExecution, before.workerExecution);
+  assert.equal(f.loop.store.inputs(worker.id).find(input => input.id === message.id)?.status, 'delivered');
+  assert.equal((await f.state(worker.id)).lifecycle.kind, 'open'); assert.equal((await f.state(worker.id)).completionHistory.length, 1);
+});
+
+test('an Agent instruction continues a completed Worker and preserves historical completion on retries', async t => {
+  const f = await fixture(t), worker = await f.worker(); await f.finish(worker.id); await f.complete(worker.id);
+  const send = { tool: 'send_agent_message' as const, arguments: { requestId: 'continued-agent-message', taskId: worker.id, text: 'Inspect the retained result' } };
+  await f.loop.projectCall(f.coordinatorId, send); await f.loop.tick(); await f.loop.projectCall(f.coordinatorId, send); await f.loop.tick();
+  await eventually(() => assert.equal(f.loop.store.inputs(worker.id).find(input => input.provenance.kind === 'agent_message')?.status, 'delivered'));
+  assert.equal((await f.state(worker.id)).lifecycle.kind, 'open'); assert.equal((await f.state(worker.id)).completionHistory.length, 1);
+  const delivered = f.loop.store.inputs(worker.id).filter(input => input.provenance.kind === 'agent_message' && input.provenance.requestId === send.arguments.requestId);
+  assert.equal(delivered.length, 1); assert.equal(delivered[0]?.status, 'delivered');
+  assert.equal(f.loop.store.task(worker.id).threadId, worker.threadId);
+  await f.complete(worker.id); assert.equal((await f.state(worker.id)).lifecycle.kind, 'open');
+});
+
+test('input accepted during cleanup waits, then continues the same Worker with actual removed resource state', { timeout: 10_000 }, async t => {
+  const f = await fixture(t), worker = await f.worker(), scope = await f.scope(worker.id);
+  await f.action({ action: 'open_group', taskId: worker.id, requestId: 'open-cleaning' });
+  await f.finish(worker.id); await f.complete(worker.id);
+  const before = f.loop.store.task(worker.id); assert.ok(before.chatId);
+  let entered!: () => void, release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+  const usage = f.codex.executionUse.bind(f.codex);
+  f.codex.executionUse = async threadId => { if (threadId === worker.threadId) { entered(); await gate; } return usage(threadId); };
+  const cleanup = f.cleanup(worker.id, [scope.id]); await started;
+  const message = { id: 'during-cleanup', chatId: before.chatId, senderId: 'owner', chatType: 'group' as const, text: 'Inspect the result after cleanup', attachments: [], createdAt: Date.now() };
+  try {
+    await f.loop.receive(message);
+    assert.equal(f.loop.store.inputs(worker.id).find(input => input.id === message.id)?.status, 'pending');
+    assert.equal(f.codex.starts.some(input => input.deliveryId === message.id), false);
+  } finally { release(); await cleanup; }
+  await f.loop.tick();
+  const delivered = f.codex.starts.find(input => input.deliveryId === message.id); assert.ok(delivered);
+  assert.equal(delivered.threadId, before.threadId); assert.match(delivered.additionalContext ?? '', /"state":"removed"/);
+  assert.equal(await exists(scope.location.root.path), false); assert.equal((await f.state(worker.id)).completionHistory.length, 1);
+});
+
+test('blocked cleanup permits new work; a cleaned worktree gets a new persisted generation immune to old cleanup', async t => {
+  const f = await fixture(t), worker = await f.worker();
+  const original = await f.loop.ensureWorkspace(worker.id, 'example/app'); assert.equal(original.kind, 'git-worktree');
+  const scopes = (await f.state(worker.id)).scopes.map(scope => scope.id);
+  await f.complete(worker.id); await f.cleanup(worker.id, scopes);
+  await f.loop.projectCall(f.coordinatorId, { tool: 'send_agent_message', arguments: { taskId: worker.id, requestId: 'while-cleanup-blocked', text: 'Continue while your active turn protects its files' } });
+  await f.loop.tick();
+  await eventually(() => assert.ok(f.codex.steers.some(input => input.threadId === worker.threadId && input.input.some(part => part.kind === 'text' && part.text.includes('active turn protects')))));
+  await f.finish(worker.id); await f.loop.tick(); assert.equal(await exists(original.workspace), false);
+  const replacement = await f.loop.ensureWorkspace(worker.id, 'example/app'); assert.equal(replacement.kind, 'git-worktree');
+  assert.notEqual(replacement.id, original.id); assert.notEqual(replacement.workspace, original.workspace);
+  if (replacement.kind !== 'git-worktree' || original.kind !== 'git-worktree') throw new Error('Expected worktrees');
+  assert.notEqual(replacement.branch, original.branch);
+  await writeFile(join(replacement.workspace, 'preserve.txt'), 'new generation');
+  await f.cleanup(worker.id, scopes); await f.loop.closeout.progress(worker.id); await f.restart();
+  assert.equal(await readFile(join(replacement.workspace, 'preserve.txt'), 'utf8'), 'new generation');
+  assert.equal((await f.loop.ensureWorkspace(worker.id, 'example/app')).id, replacement.id);
+  assert.equal(f.loop.store.task(worker.id).resources.some(resource => resource.id === original.id), false);
+});
+
+for (const interrupted of [false, true]) test(`legacy implicit cleanup migration retains ${interrupted ? 'renamed' : 'untouched'} resources without waking history`, async t => {
+  const f = await fixture(t), worker = await f.worker(), scope = await f.scope(worker.id);
+  const file = join(scope.location.root.path, 'legacy.txt'); await writeFile(file, 'legacy bytes');
+  await f.close(worker.id);
+  const old = await f.state(worker.id), operation = old.operations[0]; assert.ok(operation);
+  const target = operation.targets.find(item => item.scope.id === scope.id); assert.ok(target);
+  if (interrupted) await rename(scope.location.root.path, target.disposalPath);
+  const retainedPath = interrupted ? join(target.disposalPath, 'legacy.txt') : file;
+  const legacyInput = { id: 'old-pending-input', chatId: '', senderId: 'owner', chatType: 'group' as const, text: 'Historical pending message', attachments: [], createdAt: worker.createdAt };
+  f.loop.store.receive(worker.id, legacyInput);
+  operation.kind = 'completion';
+  if (old.lifecycle.kind !== 'completed') throw new Error('Expected completion');
+  old.lifecycle.operationId = operation.id;
+  const { version: _version, completionHistory: _history, ...legacy } = old;
+  const { inboxSequence: _sequence, ...completion } = old.lifecycle;
+  f.loop.store.setMeta(`task-closeout:${worker.id}`, JSON.stringify({ ...legacy, lifecycle: completion }));
+  assert.ok(worker.threadId); f.codex.complete(worker.threadId, null);
+  const starts = f.codex.starts.length;
+  await f.restart(); await f.loop.tick(); await f.restart();
+  const migrated = await f.state(worker.id);
+  assert.equal(await readFile(retainedPath, 'utf8'), 'legacy bytes');
+  assert.equal(migrated.lifecycle.kind, 'completed'); assert.equal(migrated.completionHistory.length, 1);
+  assert.equal(migrated.operations[0]?.targets[0]?.state, 'retained'); assert.equal(f.codex.starts.length, starts);
+  await f.cleanup(worker.id, [scope.id], 'explicit-after-migration');
+  assert.equal(await exists(retainedPath), false);
+  assert.equal((await f.state(worker.id)).operations[1]?.targets[0]?.state, 'removed');
+});
+
+test('legacy partial worktree cleanup preserves its branch until a new explicit cleanup and cannot affect its replacement', async t => {
+  const f = await fixture(t), worker = await f.worker();
+  const tree = await f.loop.ensureWorkspace(worker.id, 'example/app'); if (tree.kind !== 'git-worktree') throw new Error('Expected worktree');
+  await f.close(worker.id);
+  const state = await f.state(worker.id), operation = state.operations[0]; assert.ok(operation);
+  const target = operation.targets.find(item => item.scope.resource.kind === 'worktree'); assert.ok(target);
+  await git(f.project, 'worktree', 'remove', '--force', '--', tree.workspace);
+  operation.kind = 'completion';
+  if (state.lifecycle.kind !== 'completed') throw new Error('Expected completion');
+  state.lifecycle.operationId = operation.id;
+  const { version: _version, completionHistory: _history, ...legacy } = state;
+  const { inboxSequence: _sequence, ...completion } = state.lifecycle;
+  f.loop.store.setMeta(`task-closeout:${worker.id}`, JSON.stringify({ ...legacy, lifecycle: completion }));
+  assert.ok(worker.threadId); f.codex.complete(worker.threadId, null);
+  await f.restart();
+  assert.notEqual(await git(f.project, 'for-each-ref', '--format=%(refname)', `refs/heads/${tree.branch}`), '');
+  assert.equal(f.loop.store.task(worker.id).resources.some(resource => resource.id === tree.id), false);
+  const replacement = await f.loop.ensureWorkspace(worker.id, 'example/app');
+  await writeFile(join(replacement.workspace, 'keep.txt'), 'replacement bytes');
+  await f.cleanup(worker.id, [target.scope.id], 'explicit-partial-worktree');
+  assert.equal(await git(f.project, 'for-each-ref', '--format=%(refname)', `refs/heads/${tree.branch}`), '');
+  assert.equal(await readFile(join(replacement.workspace, 'keep.txt'), 'utf8'), 'replacement bytes');
+});
+
+test('dashboard displays completion history independently of explicit resource cleanup', async t => {
+  const f = await fixture(t), worker = await f.worker(), scope = await f.scope(worker.id);
+  await f.finish(worker.id); await f.complete(worker.id);
+  const reader = new ProjectDashboardReader(f.loop.store);
+  const before = (await reader.taskDetail(worker.id))?.task; assert.ok(before);
+  assert.equal(before.completion.kind, 'completed'); assert.equal(before.completionHistory.length, 1); assert.deepEqual(before.cleanup, []);
+  await f.cleanup(worker.id, [scope.id]);
+  const after = (await reader.taskDetail(worker.id))?.task; assert.ok(after);
+  assert.deepEqual(after.completionHistory, before.completionHistory); assert.equal(after.cleanup[0]?.state, 'removed');
+});
+
+test('shutdown waits for an explicit cleanup tool still holding the resource admission', { timeout: 10_000 }, async t => {
+  const f = await fixture(t), worker = await f.worker(), scope = await f.scope(worker.id); await f.finish(worker.id);
+  let entered!: () => void, release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+  const usage = f.codex.executionUse.bind(f.codex);
+  f.codex.executionUse = async threadId => { if (threadId === worker.threadId) { entered(); await gate; } return usage(threadId); };
+  const cleanup = f.cleanup(worker.id, [scope.id]); await started;
+  let closed = false; const closing = f.loop.close().then(() => { closed = true; });
+  try { await new Promise<void>(resolve => setImmediate(resolve)); assert.equal(closed, false); }
+  finally { release(); await cleanup; await closing; }
+  assert.equal(await exists(scope.location.root.path), false);
+});
+
+test('ensure_workspace replaces a resource whose interrupted release finishes during acquisition', async t => {
+  const f = await fixture(t), worker = await f.worker();
+  const original = await f.loop.ensureWorkspace(worker.id, 'example/app');
+  f.loop.store.setMeta(`released-resource:${worker.id}:${original.id}`, 'releasing');
+  const replacement = await f.loop.ensureWorkspace(worker.id, 'example/app');
+  assert.notEqual(replacement.id, original.id); assert.equal(await exists(original.workspace), false);
+  assert.equal(await exists(replacement.workspace), true);
+  assert.deepEqual(f.loop.store.task(worker.id).resources.map(resource => resource.id), [replacement.id]);
+});
+
+async function eventually(assertion: () => void) {
+  for (let attempt = 0; ; attempt++) {
+    try { assertion(); return; } catch (error) {
+      if (attempt === 100) throw error;
+      await new Promise<void>(resolve => setTimeout(resolve, 5));
+    }
+  }
+}
+
+test('a due self-reminder continues completed work on its original Thread without losing completion history', async t => {
+  const f = await fixture(t), worker = await f.worker(), dueAt = Date.now() + 60_000;
+  await f.action({ action: 'schedule_reminder', requestId: 'completed-followup', dueAt, text: 'Check the retained result' }, worker.id);
+  await f.finish(worker.id); await f.complete(worker.id);
+  t.mock.method(Date, 'now', () => dueAt);
+  await f.loop.tick();
+  const reminder = f.loop.store.inputs(worker.id).find(input => input.provenance.kind === 'reminder');
+  assert.ok(reminder); assert.equal(reminder.status, 'delivered');
+  assert.equal(f.loop.store.task(worker.id).threadId, worker.threadId);
+  assert.equal((await f.state(worker.id)).lifecycle.kind, 'open');
+  assert.equal((await f.state(worker.id)).completionHistory.length, 1);
+  await f.loop.tick();
+  assert.equal(f.codex.starts.filter(input => input.deliveryId === reminder.id).length, 1);
 });

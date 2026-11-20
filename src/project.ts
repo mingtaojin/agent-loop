@@ -51,7 +51,7 @@ export const projectActionSchema = z.discriminatedUnion('action', [
   z.strictObject({ action: z.literal('allocate_artifacts'), requestId: idSchema, label: textSchema, parent: z.string().min(1).optional() }),
   z.strictObject({ action: z.literal('register_artifact'), requestId: idSchema, taskId: idSchema.optional(), scopeId: idSchema, path: z.string().min(1), disposition: artifactDispositionSchema, reference: textSchema.optional() }),
   z.strictObject({ action: z.literal('complete_task'), requestId: idSchema, taskId: idSchema, outcome: z.enum(['delivered', 'terminated']), summary: textSchema, deliveryReferences: z.array(textSchema) }),
-  z.strictObject({ action: z.literal('cleanup_artifacts'), requestId: idSchema, scopeIds: z.array(idSchema).min(1) }),
+  z.strictObject({ action: z.literal('cleanup_artifacts'), requestId: idSchema, taskId: idSchema, scopeIds: z.array(idSchema).min(1) }),
   z.strictObject({ action: z.literal('request_decision'), requestId: idSchema, key: idSchema, prompt: textSchema,
     options: z.array(textSchema).min(1).max(20), context: textSchema.optional(), expiresAt: versionSchema.optional() }),
   z.strictObject({ action: z.literal('claim_intake'), requestId: idSchema, taskId: idSchema, messageId: idSchema }),

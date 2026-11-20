@@ -105,7 +105,6 @@ export interface CodexPort extends ExecutionHistoryPort {
   createThread(input: { cwd: string; instructions: string; model?: string; reasoningEffort?: ReasoningEffort }): Promise<string>;
   inspect(threadId: string, instructions?: string, model?: string, reasoningEffort?: ReasoningEffort): Promise<ExecutionSnapshot>;
   executionUse?(threadId: string): Promise<'idle' | 'busy' | 'unknown'>;
-  setThreadCompletionPolicy?(policy: { isCompleted(threadId: string): boolean }): void;
   assertThreadCompletionAllowed?(threadId: string): void;
   activity(threadId: string, instructions?: string, model?: string, reasoningEffort?: ReasoningEffort): Promise<Activity>;
   isActiveTurn(identity: TurnIdentity): boolean;

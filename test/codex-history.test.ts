@@ -24,9 +24,8 @@ const turn = { id: 'turn', itemsView: 'full', status: 'failed', startedAt: null,
   { id: 'command', type: 'commandExecution', command: 'npm test', status: 'completed', aggregatedOutput: 'PRIVATE_OUTPUT', exitCode: 0, startedAtMs: 1234 },
 ] };
 
-test('unloaded and sealed current Threads expose visible history without resume, ownership, native replies or synthetic time', async t => {
+test('unloaded current Threads expose visible history without resume, ownership, native replies or synthetic time', async t => {
   const f = fixture({ id: 'thread', historyMode: 'paginated', status: { type: 'notLoaded' }, turns: [turn] });
-  f.adapter.setThreadCompletionPolicy({ isCompleted: () => true });
   t.after(() => f.adapter.close());
   const first = await f.adapter.readHistory('thread'), second = await f.adapter.readHistory('thread');
   assert.deepEqual(first, second);
