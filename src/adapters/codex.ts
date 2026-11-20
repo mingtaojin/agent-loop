@@ -642,7 +642,7 @@ export class CodexAppServer implements CodexPort {
     if (expectedTurn && !thread.turns.some(turn => turn.id === expectedTurn)) throw new TurnHistoryPendingError('Accepted Codex turn is not visible in history yet; reconcile before continuing');
     for (const turn of thread.turns) {
       for (const item of turn.items) {
-        if (turn.status === 'inProgress' && typeof item.completedAtMs !== 'number') continue;
+        if (turn.status !== 'completed' && typeof item.completedAtMs !== 'number') continue;
         this.captureOutput(threadId, turn.id, item, turn.status === 'completed');
       }
     }

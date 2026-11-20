@@ -659,6 +659,16 @@ test('completed assistant phases reach running and completed snapshots without l
   assert.equal(done.outputs.at(-1)?.phase, 'final');
 });
 
+test('interrupt retains finished messages and excludes unfinished assistant text', async t => {
+  const server = adapter('outputs'); t.after(() => server.close());
+  const active = await start(server);
+  const before = await server.inspect(active.threadId);
+  await server.interrupt(active);
+  const after = await server.inspect(active.threadId);
+  assert.equal(after.status, 'interrupted');
+  assert.deepEqual(after.outputs, before.outputs);
+});
+
 test('workspace provisioning remains asynchronous while an RPC and callback inspect are pending', async t => {
   const server = adapter('workspace'); t.after(() => server.close());
   const requests: WorkspaceRequest[] = [];
