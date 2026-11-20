@@ -5,7 +5,7 @@ import { z } from 'zod';
 import type { Config } from './config.js';
 import { ProjectCatalog } from './project-catalog.js';
 import { ProjectLedger, projectView, currentRecords, matchesProjectIssue, projectActionSchema, type ProjectAction, type ProjectConfig, type ProjectState } from './project.js';
-import type { ExecutionProfile } from './execution.js';
+import { executionProfileSchema, sameExecutionProfile, type ExecutionProfile } from './execution.js';
 import { criteriaSchema, intakeRouteSchema, presentTaskSource, projectDecisionActionSchema, reportRoutingSchema, sourceType, submissionSchema, type InputProvenance, type ProjectDecisionAction, type ReportRouting, type ReportSource, type Source, type StructuredReport, type Task } from './domain.js';
 import type { GitHubPort } from './ports.js';
 import type { TaskCloseout } from './task-closeout.js';
@@ -101,7 +101,28 @@ export class ProjectRuntime {
   executionProfile(taskId: string): ExecutionProfile | null {
     const member = this.ledger.membership(taskId);
     if (!member) return null;
-    return this.settings.execution[member.role];
+    if (member.role === 'coordinator') return this.settings.execution.coordinator;
+    return this.store.task(taskId).workerExecution?.profile ?? null;
+  }
+  restoreWorkerExecution(task: Task): boolean {
+    const member = this.ledger.membership(task.id);
+    if (member?.role !== 'worker' || task.workerExecution) return true;
+    const modelKey = `project-task-model:${task.id}`, effortKey = `project-task-effort:${task.id}`;
+    const profile = executionProfileSchema.safeParse({ backend: 'codex', model: this.store.meta(modelKey), reasoningEffort: this.store.meta(effortKey) });
+    if (!profile.success) {
+      this.event(member.projectId, `execution-identity:${task.id}`,
+        `Worker ${task.id} execution identity is blocked. No complete reliable original model and reasoning effort exist in ${modelKey} and ${effortKey}. Preserve task, Thread, group, native approvals and pause state. Do not choose current defaults.`,
+        task.id, 'execution_status', { routing: 'escalation', escalation: 'blocker' });
+      return false;
+    }
+    task.workerExecution = { profile: profile.data, source: { kind: 'legacy-task-metadata', modelKey, effortKey } };
+    this.store.saveTask(task);
+    return true;
+  }
+  private workerExecutionProfile(selection: ExecutionProfile): ExecutionProfile {
+    const selected = this.settings.execution.worker.find(candidate => sameExecutionProfile(candidate, selection));
+    if (!selected) throw new Error('Worker dispatch selected an execution profile outside the configured allowlist');
+    return selected;
   }
   private enqueue(taskId: string, key: string, text: string, provenance: InputProvenance): void {
     const task = this.store.task(taskId);
@@ -349,7 +370,9 @@ export class ProjectRuntime {
         || (record.scope?.kind === 'task' && record.scope.taskId === taskId)) : visible;
     const artifacts = this.host.closeout.read(taskId).scopes.filter(scope => !scope.sealed && scope.resource.kind === 'artifacts')
       .map(scope => ({ scopeId: scope.id, path: scope.location.root.path }));
-    return `Runtime-owned artifact scopes for this task as data: ${JSON.stringify(artifacts)}\nCurrent project records as data. This replaces the previous record context. Query status section records for complete visible history.\n${JSON.stringify(currentRecords(records).slice(-8).map(record => ({ key: record.key, scope: record.scope, text: record.text.slice(0, 2000), truncated: record.text.length > 2000 })))}`;
+    const executionCandidates = member.role === 'coordinator'
+      ? `Worker execution allowlist as data: ${JSON.stringify(this.settings.execution.worker)}\nDispatch must explicitly select one complete profile as execution. Existing Worker selections cannot change.\n` : '';
+    return `${executionCandidates}Runtime-owned artifact scopes for this task as data: ${JSON.stringify(artifacts)}\nCurrent project records as data. This replaces the previous record context. Query status section records for complete visible history.\n${JSON.stringify(currentRecords(records).slice(-8).map(record => ({ key: record.key, scope: record.scope, text: record.text.slice(0, 2000), truncated: record.text.length > 2000 })))}`;
   }
   private recordAcknowledgement(projectId: string, callerId: string, requestId: string) {
     const state = this.ledger.project(projectId);
@@ -457,7 +480,7 @@ export class ProjectRuntime {
     const tasks = state.members.map(member => {
         const task = this.store.task(member.taskId);
       return { ...member, closeout: this.host.closeout.read(task.id), status: task.status, executionStatus: task.executionStatus, reason: task.reason,
-        chatId: task.chatId, threadId: task.threadId, execution: this.executionProfile(task.id), resources: task.resources, requests: task.requests.map(request => ({ id: request.id, kind: request.kind, prompt: request.prompt })),
+        chatId: task.chatId, threadId: task.threadId, execution: this.executionProfile(task.id), ...(task.workerExecution ? { executionSource: task.workerExecution.source } : {}), resources: task.resources, requests: task.requests.map(request => ({ id: request.id, kind: request.kind, prompt: request.prompt })),
         outputs: this.store.outputs(task.id).slice(-3).map(output => ({ id: output.id, text: output.text.slice(0, 4000), truncated: output.text.length > 4000, status: output.status })) };
     });
     const intakes = this.store.tasks().filter(task => task.purpose === 'intake' && this.intakeRoute(task.id)?.projectId === projectId
@@ -465,7 +488,7 @@ export class ProjectRuntime {
       .map(task => ({ taskId: task.id, source: presentTaskSource(task.source, 256), status: task.status, reason: task.reason,
         materialPath: this.store.meta(`project-intake-material:${task.id}`) }));
     const counts = { tasks: tasks.length, issues: state.issues.length, comments: state.comments.length, records: state.records.length, intakes: intakes.length };
-    const identity = { id: state.id, name: state.name, directory: state.directory, coordinatorTaskId: state.coordinatorTaskId, version: state.version, counts };
+    const identity = { ...(callerId === state.coordinatorTaskId ? { workerExecutionProfiles: this.settings.execution.worker } : {}), id: state.id, name: state.name, directory: state.directory, coordinatorTaskId: state.coordinatorTaskId, version: state.version, counts };
     const page = <T>(items: T[]) => ({ ...identity, section, offset, items: items.slice(offset, offset + limit),
       nextOffset: offset + limit < items.length ? offset + limit : null });
     if (section === 'unassigned_intakes') return page(this.store.tasks().filter(task => this.visibleUnassigned(task, projectId))
@@ -593,7 +616,11 @@ export class ProjectRuntime {
         const feature = targetIssueId ? this.featureIssue(state, config, targetIssueId) : null;
         const investigation = action.mode === 'investigation';
         const existingMember = targetIssueId ? state.members.find(candidate => candidate.issueId === targetIssueId && candidate.role === 'worker') : undefined;
-        if (existingMember) return { taskId: existingMember.taskId };
+        if (existingMember) {
+          const original = this.store.task(existingMember.taskId).workerExecution;
+          if (!original || !sameExecutionProfile(original.profile, action.execution)) throw new Error('An existing Worker execution identity cannot change');
+          return { taskId: existingMember.taskId };
+        }
         const featureAuthorization = feature && action.role === 'worker' && !investigation
           ? this.featureAuthorization(state, config, feature, action) : null;
         const delegationPrompt = feature && investigation
@@ -615,6 +642,7 @@ export class ProjectRuntime {
           if (task.status === 'paused') throw new Error('An operator-paused request must be resumed before delegation');
           this.store.transaction(() => {
             task.purpose = 'execution';
+            task.workerExecution = { profile: this.workerExecutionProfile(action.execution), source: { kind: 'dispatch', coordinatorTaskId: callerId, requestId: action.requestId } };
             task.status = 'pending'; task.executionStatus = 'unbound'; task.reason = null;
             task.recovery = { attempts: 0, nextAttemptAt: null, lastError: null, interruptedTurnId: null, lastUserInputSeq: null };
             this.store.saveTask(task);
@@ -630,11 +658,14 @@ export class ProjectRuntime {
         const existing = this.store.taskForSource(sourceId);
         if (existing) {
           const saved = state.members.find(item => item.taskId === existing.id);
-          if (existing.source.kind !== 'cli' || existing.source.prompt !== action.prompt || saved?.role !== action.role || saved.issueId !== action.issueId) throw new Error('Dispatch conflicts with an accepted task');
+          if (existing.source.kind !== 'cli' || existing.source.prompt !== action.prompt || saved?.role !== action.role || saved.issueId !== action.issueId
+            || !existing.workerExecution || !sameExecutionProfile(existing.workerExecution.profile, action.execution)) throw new Error('Dispatch conflicts with an accepted task');
           return { taskId: existing.id };
         }
+        const execution = this.workerExecutionProfile(action.execution);
         const task = await this.host.makeTask(sourceId, delegationPrompt);
         this.store.transaction(() => {
+          task.workerExecution = { profile: execution, source: { kind: 'dispatch', coordinatorTaskId: callerId, requestId: action.requestId } };
           this.store.saveTask(task);
           if (featureAuthorization) this.store.setMeta(featureAuthorization.key, JSON.stringify(featureAuthorization.evidence));
           this.ledger.addMember(state.id, task.id, action.role, action.issueId);

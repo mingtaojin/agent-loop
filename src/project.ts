@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { criteriaSchema, matchSource, sourceSchema, sourceCommentSchema, structuredReportSchema, type Source, type SourceComment } from './domain.js';
+import { executionProfileSchema } from './execution.js';
 import type { Store } from './store.js';
 export { reasoningEffortSchema } from './execution.js';
 export type { ReasoningEffort } from './execution.js';
@@ -49,7 +50,8 @@ export const projectActionSchema = z.discriminatedUnion('action', [
     offset: versionSchema.optional(), limit: z.number().int().min(1).max(100).optional() }),
   z.strictObject({ action: z.literal('dispatch'), requestId: idSchema, prompt: textSchema,
     predecessorTaskId: idSchema.optional(), issueId: idSchema.optional(), intakeTaskId: idSchema.optional(), role: z.literal('worker').default('worker'),
-    mode: z.enum(['investigation', 'implementation']).optional(), authorization: featureAuthorizationSchema.optional() }),
+    mode: z.enum(['investigation', 'implementation']).optional(), authorization: featureAuthorizationSchema.optional(),
+    execution: executionProfileSchema }),
   z.strictObject({ action: z.literal('allocate_artifacts'), requestId: idSchema, label: textSchema, parent: z.string().min(1).optional() }),
   z.strictObject({ action: z.literal('register_artifact'), requestId: idSchema, taskId: idSchema.optional(), scopeId: idSchema, path: z.string().min(1), disposition: artifactDispositionSchema, reference: textSchema.optional() }),
   z.strictObject({ action: z.literal('complete_task'), requestId: idSchema, taskId: idSchema, outcome: z.enum(['delivered', 'terminated']), summary: textSchema, deliveryReferences: z.array(textSchema) }),

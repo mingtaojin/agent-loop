@@ -469,7 +469,8 @@ async function fixture(t: TestContext, options: { secondProject?: boolean } = {}
       const repository = configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner' }, repositories: [{ name: source.repository, path: directory, baseBranch: 'main', workspace: { kind: 'project-directory', path: directory } }] }).repositories[0];
       assert.ok(repository && 'path' in repository && repository.workspace?.kind === 'project-directory');
       const id = `legacy-${source.number}`, chatId = await feishu.ensureGroup({ taskId: id, title: source.title, sourceUrl: source.url });
-      const threadId = await codex.createThread({ cwd: directory, instructions: 'Saved legacy instructions' });
+      const threadId = await codex.createThread({ cwd: directory, instructions: 'Saved legacy instructions',
+        model: testExecution.worker.model, reasoningEffort: testExecution.worker.reasoningEffort });
       const turnId = await codex.startTurn({ threadId, deliveryId: `${id}:initial`, input: [{ kind: 'text', text: source.body }] });
       const task = taskSchema.parse({ id, sourceId: source.id, source: { kind: 'github', issue: source, repository, collectionReason: 'legacy' },
         contextDirectory: join(root, 'tasks', id), resources: [{ id: 'legacy-workspace', kind: 'project-directory', repository, workspace: directory }],
@@ -478,6 +479,8 @@ async function fixture(t: TestContext, options: { secondProject?: boolean } = {}
       });
       assert.equal(task.purpose, 'legacy');
       loop.store.saveTask(task);
+      loop.store.setMeta(`project-task-model:${id}`, testExecution.worker.model);
+      loop.store.setMeta(`project-task-effort:${id}`, testExecution.worker.reasoningEffort);
       loop.store.receive(id, { id: `${id}:initial`, chatId, senderId: 'runtime:initial', chatType: 'group', text: source.body, attachments: [], createdAt: task.createdAt }, 'initial');
       loop.store.markInput(`${id}:initial`, 'delivered');
       return task;
@@ -486,7 +489,7 @@ async function fixture(t: TestContext, options: { secondProject?: boolean } = {}
     async status(callerId = coordinator().id) { return overviewSchema.parse(await loop.projectAction(callerId, { action: 'status' })); },
     async dispatch(requestId: string, prompt: string, extra: { issueId?: string; role?: 'worker'; callerId?: string; mode?: 'investigation' | 'implementation'; authorization?: Extract<ProjectAction, { action: 'dispatch' }>['authorization'] } = {}) {
       const result = dispatchReceipt.parse(await loop.projectAction(extra.callerId ?? coordinator().id, {
-        action: 'dispatch', requestId, prompt, role: extra.role ?? 'worker', ...(extra.issueId ? { issueId: extra.issueId } : {}),
+        action: 'dispatch', execution: testExecution.worker, requestId, prompt, role: extra.role ?? 'worker', ...(extra.issueId ? { issueId: extra.issueId } : {}),
         ...(extra.mode ? { mode: extra.mode } : extra.issueId ? { mode: 'investigation' as const } : {}),
         ...(extra.authorization ? { authorization: extra.authorization } : {}),
       }));
@@ -606,7 +609,7 @@ test('enabling a project adopts a paused legacy Issue and preserves its group, T
 test('dispatch is idempotent under concurrent requests and restart, rejects conflicts and carries generic worker guidance', async t => {
   const f = await fixture(t); f.github.sources = [projectIssue(12)];
   const coordinator = await f.initialize();
-  const action: ProjectAction = { action: 'dispatch', requestId: 'investigate-12', issueId: f.github.sources[0]!.id,
+  const action: ProjectAction = { action: 'dispatch', execution: testExecution.worker, requestId: 'investigate-12', issueId: f.github.sources[0]!.id,
     role: 'worker', mode: 'investigation', prompt: 'Investigate batch export. Deliver findings and acceptance criteria only. Do not edit business code or deploy.' };
   const [first, duplicate] = await Promise.all([f.loop.projectAction(coordinator.id, action), f.loop.projectAction(coordinator.id, action)]);
   assert.deepEqual(first, duplicate);
@@ -634,7 +637,7 @@ test('dispatch is idempotent under concurrent requests and restart, rejects conf
 
 test('a durable dispatch intent rejects changed retries after its result receipt is lost', async t => {
   const f = await fixture(t); const coordinator = await f.initialize();
-  const action: ProjectAction = { action: 'dispatch', requestId: 'lost-receipt', role: 'worker', prompt: 'Investigate the existing export contract only.' };
+  const action: ProjectAction = { action: 'dispatch', execution: testExecution.worker, requestId: 'lost-receipt', role: 'worker', prompt: 'Investigate the existing export contract only.' };
   t.mock.method(f.loop.projects.ledger, 'saveReceipt', () => { throw new Error('Simulated receipt write failure'); }, { times: 1 });
   await assert.rejects(f.loop.projectAction(coordinator.id, action), /Simulated receipt write failure/);
   const member = f.state().members.find(member => member.role === 'worker'); assert.ok(member);
@@ -712,7 +715,7 @@ test('a direct project-group message keeps the coordinator final reply visible',
 test('Feature implementation needs owner authorization while investigation remains allowed', async t => {
   const f = await fixture(t); const source = projectIssue(14); f.github.sources = [source]; const coordinator = await f.initialize(); await f.idleCoordinator();
   const intake = f.loop.store.taskForSource(source.id); assert.ok(intake);
-  const missing: ProjectAction = { action: 'dispatch', requestId: 'feature-implementation-missing', issueId: source.id, intakeTaskId: intake.id,
+  const missing: ProjectAction = { action: 'dispatch', execution: testExecution.worker, requestId: 'feature-implementation-missing', issueId: source.id, intakeTaskId: intake.id,
     role: 'worker', mode: 'implementation', prompt: 'Implement the requested feature.' };
   await assert.rejects(f.loop.projectAction(coordinator.id, missing), /authorization/);
   assert.equal(f.loop.projects.ledger.membership(intake.id), null);
@@ -1023,7 +1026,7 @@ test('rotation waits for coordinator idleness and retains its group, members, pe
   assert.equal(f.loop.tasks().length, 2);
 });
 
-test('role profiles reach Thread creation and hot reload applies to existing tasks', async t => {
+test('Worker identity stays fixed while coordinator hot reload applies to existing tasks', async t => {
   const f = await fixture(t);
   const coordinator = await f.initialize(); assert.ok(coordinator.threadId);
   const worker = await f.dispatch('model-worker', 'Investigate the export contract.');
@@ -1031,12 +1034,14 @@ test('role profiles reach Thread creation and hot reload applies to existing tas
   const inspected = f.codex.instructionUpdates.length;
   f.config.execution = {
     coordinator: { backend: 'codex', model: 'reloaded-coordinator', reasoningEffort: 'low' },
-    worker: { backend: 'codex', model: 'reloaded-worker', reasoningEffort: 'medium' },
+    worker: [{ backend: 'codex', model: 'reloaded-worker', reasoningEffort: 'medium' }],
     backends: f.config.execution.backends,
   };
   await f.restart();
   assert.ok(f.codex.instructionUpdates.slice(inspected).some(input => input.threadId === coordinator.threadId && input.model === 'reloaded-coordinator'));
-  assert.ok(f.codex.instructionUpdates.slice(inspected).some(input => input.threadId === worker.threadId && input.model === 'reloaded-worker'));
+  assert.ok(f.codex.instructionUpdates.slice(inspected).some(input => input.threadId === worker.threadId
+    && input.model === 'test-worker' && input.reasoningEffort === 'xhigh'));
+  assert.ok(!f.codex.instructionUpdates.slice(inspected).some(input => input.threadId === worker.threadId && input.model === 'reloaded-worker'));
   await f.loop.projectAction(coordinator.id, { action: 'rotate', requestId: 'rotate-model', checkpoint: 'Use the current role profiles.' });
   f.codex.complete(coordinator.threadId, null);
   await f.loop.tick(); await f.loop.tick();
@@ -1053,7 +1058,7 @@ test('configured coordinator and Worker use the shared role profiles', async t =
 
 test('dispatch persisted before launch is recovered once and an uncertain accepted input is never resent', async t => {
   const f = await fixture(t); await f.initialize();
-  const action: ProjectAction = { action: 'dispatch', requestId: 'before-restart', role: 'worker', prompt: 'Investigate without changing source.' };
+  const action: ProjectAction = { action: 'dispatch', execution: testExecution.worker, requestId: 'before-restart', role: 'worker', prompt: 'Investigate without changing source.' };
   const receipt = dispatchReceipt.parse(await f.loop.projectAction(f.coordinator().id, action));
   assert.equal(f.loop.store.task(receipt.taskId).threadId, null);
   f.codex.loseInputAck = true;
@@ -1077,8 +1082,8 @@ test('project and role permissions reject cross-project messages, foreign Issues
   const before = f.loop.store.inputs(foreign.id).length;
   const forbidden: { caller: string; action: ProjectAction }[] = [
     { caller: app.id, action: { action: 'send', requestId: 'foreign-send', taskId: foreign.id, text: 'Change another project.' } },
-    { caller: app.id, action: { action: 'dispatch', requestId: 'foreign-issue', issueId: docsIssue.id, role: 'worker', prompt: 'Take over another project.' } },
-    { caller: worker.id, action: { action: 'dispatch', requestId: 'worker-dispatch', role: 'worker', prompt: 'Spawn a peer.' } },
+    { caller: app.id, action: { action: 'dispatch', execution: testExecution.worker, requestId: 'foreign-issue', issueId: docsIssue.id, role: 'worker', prompt: 'Take over another project.' } },
+    { caller: worker.id, action: { action: 'dispatch', execution: testExecution.worker, requestId: 'worker-dispatch', role: 'worker', prompt: 'Spawn a peer.' } },
     { caller: worker.id, action: { action: 'send', requestId: 'worker-send', taskId: foreign.id, text: 'Direct another Worker.' } },
     { caller: worker.id, action: { action: 'rotate', requestId: 'worker-rotate', checkpoint: 'Rotate the coordinator.' } },
     { caller: app.id, action: { action: 'report', requestId: 'coordinator-report', kind: 'question', text: 'Pretend to be a Worker.' } },
@@ -1860,7 +1865,7 @@ test('current reporting and event guidance reaches new and resumed Worker, secon
 test('a constructed initial-batch fixture excludes dropped copies while delivering its valid source inputs', async t => {
   const f = await fixture(t); await f.loop.collect();
   const coordinator = f.coordinator();
-  const receipt = dispatchReceipt.parse(await f.loop.projectAction(coordinator.id, { action: 'dispatch', requestId: 'before-first-turn', prompt: 'Wait for an explicit task.', role: 'worker' }));
+  const receipt = dispatchReceipt.parse(await f.loop.projectAction(coordinator.id, { action: 'dispatch', execution: testExecution.worker, requestId: 'before-first-turn', prompt: 'Wait for an explicit task.', role: 'worker' }));
   const eventId = `${receipt.taskId}:user:obsolete-before-start`;
   f.loop.projects.event('app', eventId, 'Obsolete initial copy.', receipt.taskId, 'owner_input');
   f.loop.store.setMeta(`project-intake-promotion:${coordinator.id}`, 'constructed initial-batch fixture');

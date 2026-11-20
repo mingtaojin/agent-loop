@@ -16,7 +16,7 @@ Worker 默认不建群；用户需要直接交流时，由协调者打开指定�
 {
   "execution": {
     "coordinator": {"backend": "codex", "model": "gpt-6-astra", "reasoningEffort": "high"},
-    "worker": {"backend": "codex", "model": "gpt-6.1-sol", "reasoningEffort": "xhigh"},
+    "worker": [{"backend": "codex", "model": "gpt-6.1-sol", "reasoningEffort": "xhigh"}],
     "backends": {"codex": {"executable": "codex", "approvalPolicy": "on-request", "sandbox": "workspace-write", "requestTimeoutMs": 120000}}
   },
   "projects": [
@@ -42,9 +42,11 @@ Worker 默认不建群；用户需要直接交流时，由协调者打开指定�
 
 配置在启动时加载。启用实际配置前，按[本机服务操作](agents/operations.md)执行切换并核对。源码测试不代表正式实例已经启用。
 
-协调者和 Worker 使用实例级 `execution` 配置。配置为每个角色指定执行后端、模型和推理强度，所有协调项目共用同一套值。Agent Loop 不提供 验证角色，独立验证由 pstack 负责。执行配置变化由 watcher 读取，已有任务在下一次调用使用新配置。
+协调者和 Worker 使用实例级 `execution` 配置。`execution.coordinator` 指定协调者配置，`execution.worker` 是非空的完整配对允许列表，所有项目共用该配置。旧单配置可加载为只含一项的允许列表。Agent Loop 不提供 验证角色，独立验证由 pstack 负责。执行配置变化由 watcher 读取，协调者在下一次调用使用新配置；Worker 创建后固定使用保存值。
 
-模型名必须能由本机 Codex 解析。Runtime 不按名称猜测模型家族，也不默默更换不可用模型。任务只保存 coordinator 或 worker 角色；恢复和下一次调用按当前配置解析模型与推理强度。既有任务按保存的项目身份恢复。
+模型名必须能由本机 Codex 解析。Runtime 不按名称猜测模型家族，也不默默更换不可用模型。Worker 任务在创建或接管 intake 时保存完整 `workerExecution` 身份与派单来源。后续多轮、暂停恢复、provider 迁移和服务重启均沿用保存值。允许列表变化或删除仅限制新 Worker。`status` 的 `workerExecutionProfiles` 与协调者每轮上下文提供当前候选。派单必须显式携带完整 `execution`，即使允许列表只有一项。
+
+历史 Worker 只从完整有效的 `project-task-model:<taskId>` 与 `project-task-effort:<taskId>` 恢复原配对，身份来源保留这两个键。缺失、半项或非法值会生成一次协调者执行身份阻塞事件，保留群、Thread、原生审批、暂停状态及 held 输入。Runtime 不执行该 Worker，也不使用当前默认补值。Thread 当前设置不能证明历史原选择。
 
 ## 对话与角色指导
 
@@ -52,7 +54,7 @@ Runtime 为项目建立一个协调 Task 及项目群。协调者使用 `prompts
 
 GitHub 和历史接单记录保留原文、来源和附件，不自动创建执行 Thread、工作区或任务群。项目不明确时保留问题和现场，不回退到无项目执行。
 
-协调者派单携带目标、背景、范围、禁止动作、验收及交付要求。接单请求通过 `dispatch` 的 `intakeTaskId` 原地转为 Worker，保留请求身份、原文、附件和范围回答。项目群直接交办的子任务仍可使用普通 `dispatch`。共享项目入口本身不是隔离工作树。
+协调者派单携带目标、背景、范围、禁止动作、验收及交付要求，并根据创建时的相关对话选择一个允许的完整 `execution` 配置。接单请求通过 `dispatch` 的 `intakeTaskId` 原地转为 Worker，保留请求身份、原文、附件和范围回答。项目群直接交办的子任务仍可使用普通 `dispatch`。共享项目入口本身不是隔离工作树。
 
 模糊的新需求先交 Worker 调查和澄清，本轮不实施业务代码。Worker 使用 grill-with-docs 查明已有事实，整理需求文档和待决问题。协调者把问题、证据、选项、影响和建议带回项目群，再将实际用户答复及消息、群和发送者来源交回原 Worker。已解决的问题不重复问。
 

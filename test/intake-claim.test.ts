@@ -75,7 +75,7 @@ test('claim preserves the saved Task and all materials without execution, then e
   await f.loop.tick();
   assert.equal(f.loop.store.task(task.id).threadId, null); assert.equal(f.loop.store.task(task.id).chatId, null);
   assert.ok(f.loop.store.meta(`project-intake-material:${task.id}`));
-  const delegated = { action: 'dispatch', requestId: 'dispatch-claimed', intakeTaskId: task.id, role: 'worker', prompt: 'Preserve original scope.' } satisfies ProjectAction;
+  const delegated = { action: 'dispatch', execution: testExecution.worker, requestId: 'dispatch-claimed', intakeTaskId: task.id, role: 'worker', prompt: 'Preserve original scope.' } satisfies ProjectAction;
   assert.deepEqual(await f.loop.projectAction(coordinator.id, delegated), { taskId: task.id });
   await f.loop.tick();
   const worker = f.loop.store.task(task.id); assert.ok(worker.threadId); assert.equal(worker.chatId, null);
@@ -137,7 +137,7 @@ test('claims reject non-owner decisions, Worker callers, paused, bound and forei
   const page = await f.loop.projectAction(caller.id, { action: 'status', section: 'unassigned_intakes' });
   assert.ok(!JSON.stringify(page).includes(foreign.id));
   const receipt = z.object({ taskId: z.string() }).parse(await f.loop.projectAction(caller.id,
-    { action: 'dispatch', requestId: 'fixture-worker', prompt: 'Do not execute external actions.', role: 'worker' }));
+    { action: 'dispatch', execution: testExecution.worker, requestId: 'fixture-worker', prompt: 'Do not execute external actions.', role: 'worker' }));
   await assert.rejects(f.loop.projectAction(receipt.taskId, { ...base, requestId: 'worker-claim' }), /coordinator/i);
   await assert.rejects(f.loop.projectAction(receipt.taskId, { action: 'status', section: 'unassigned_intakes' }), /coordinator/i);
   assert.equal(f.loop.projects.intakeRoute(task.id), null);
@@ -146,7 +146,7 @@ test('claims reject non-owner decisions, Worker callers, paused, bound and forei
 test('a concurrent open action cannot reuse a claiming request identity for different content', async t => {
   const f = await fixture(t), caller = f.coordinator();
   const worker = z.object({ taskId: z.string() }).parse(await f.loop.projectAction(caller.id,
-    { action: 'dispatch', requestId: 'existing-worker', prompt: 'Only preserve this fixture.', role: 'worker' }));
+    { action: 'dispatch', execution: testExecution.worker, requestId: 'existing-worker', prompt: 'Only preserve this fixture.', role: 'worker' }));
   const task = f.saved(), messageId = await f.decision('collision-owner');
   const outcomes = await Promise.allSettled([
     f.loop.projectAction(caller.id, { action: 'claim_intake', requestId: 'same-identity', taskId: task.id, messageId }),

@@ -3,10 +3,13 @@ import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
+import { isDeepStrictEqual } from 'node:util';
+import { workerExecutionIdentitySchema } from './execution.js';
 import { approvalActionSchema, feishuCardRecordSchema, inputProvenanceSchema, incomingSchema, repositorySchema, sourceSchema, taskSchema, type ApprovalAction, type FeishuCardRecord, type IncomingMessage, type InputProvenance, type Source, type Task } from './domain.js';
 
 const payloadRow = z.object({ payload: z.string() });
 const taskPayloadRow = payloadRow.extend({ id: z.string() });
+const savedWorkerExecutionSchema = z.object({ workerExecution: workerExecutionIdentitySchema.optional() });
 const taskIdRow = z.object({ task_id: z.string() });
 const metaRow = z.object({ value: z.string() });
 const dataVersionRow = z.object({ data_version: z.number() });
@@ -124,6 +127,11 @@ export class Store {
     return this.prepare('SELECT payload,reason FROM sources').all().map(row => { const parsed = sourceRow.parse(row); return { source: sourceSchema.parse(JSON.parse(parsed.payload)), reason: parsed.reason }; });
   }
   saveTask(task: Task): void {
+    const saved = this.prepare('SELECT payload FROM tasks WHERE id=?').get(task.id);
+    if (saved) {
+      const original = savedWorkerExecutionSchema.parse(JSON.parse(payloadRow.parse(saved).payload));
+      if (original.workerExecution && !isDeepStrictEqual(original.workerExecution, task.workerExecution)) throw new Error('Worker execution identity is immutable');
+    }
     const previousThread = this.taskThreads.get(task.id);
     this.prepare('INSERT INTO tasks VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET chat_id=excluded.chat_id,thread_id=excluded.thread_id,payload=excluded.payload').run(task.id, task.sourceId, task.chatId, task.threadId, JSON.stringify(task));
     if (previousThread && previousThread !== task.threadId) this.taskIdsByThread.delete(previousThread);

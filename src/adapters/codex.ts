@@ -461,7 +461,7 @@ export class CodexAppServer implements CodexPort {
     await this.ready();
     const { thread } = threadResponseSchema.parse(await this.rpc('thread/start', { ...this.config(), ...(input.model ? { model: input.model } : {}),
       ...(input.reasoningEffort ? { config: { model_reasoning_effort: input.reasoningEffort } } : {}),
-      cwd: input.cwd, developerInstructions: input.instructions, dynamicTools: this.projectHandler ? [workspaceTool, projectTool] : [workspaceTool], ephemeral: false }));
+      allowProviderModelFallback: false, cwd: input.cwd, developerInstructions: input.instructions, dynamicTools: this.projectHandler ? [workspaceTool, projectTool] : [workspaceTool], ephemeral: false }));
     if (thread.status.type !== 'idle' || thread.turns.length) throw new UncertainOperationError('New Codex thread was not empty and idle');
     this.threads.set(thread.id, { load: { kind: 'ready' }, untouched: true, instructions: input.instructions, model: input.model, reasoningEffort: input.reasoningEffort });
     return thread.id;

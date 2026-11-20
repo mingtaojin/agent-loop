@@ -1,3 +1,4 @@
+import { testExecution } from './test-config.js';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -185,8 +186,8 @@ const validActions = [
   { action: 'control', requestId: 'resume-worker', taskId: 'task-1', operation: 'resume' },
   { action: 'status' },
   ...['overview', 'issues', 'comments', 'records', 'tasks'].map(section => ({ action: 'status', section, offset: 2, limit: 10 })),
-  { action: 'dispatch', requestId: 'dispatch-default', prompt: 'Investigate within the assigned scope.' },
-  { action: 'dispatch', requestId: 'dispatch-worker', prompt: 'Verify the fixed artifact.', issueId: 'issue-1', role: 'worker' },
+  { action: 'dispatch', execution: testExecution.worker, requestId: 'dispatch-default', prompt: 'Investigate within the assigned scope.' },
+  { action: 'dispatch', execution: testExecution.worker, requestId: 'dispatch-worker', prompt: 'Verify the fixed artifact.', issueId: 'issue-1', role: 'worker' },
   { action: 'send', requestId: 'send-1', taskId: 'task-1', text: 'Additional evidence' },
   { action: 'report', requestId: 'report-result', kind: 'result', text: 'Artifact and validation evidence' },
   { action: 'report', requestId: 'report-question', kind: 'question', text: 'A business decision is required.' },
@@ -225,12 +226,12 @@ const invalidCalls = [
   { name: 'fractional status offset', call: { arguments: { action: 'status', offset: 0.5 } } },
   { name: 'zero status limit', call: { arguments: { action: 'status', limit: 0 } } },
   { name: 'oversized status page', call: { arguments: { action: 'status', limit: 101 } } },
-  { name: 'missing request ID', call: { arguments: { action: 'dispatch', prompt: 'Work' } } },
-  { name: 'empty dispatch prompt', call: { arguments: { action: 'dispatch', requestId: 'request', prompt: '' } } },
-  { name: 'blank dispatch prompt', call: { arguments: { action: 'dispatch', requestId: 'request', prompt: ' \n\t' } } },
-  { name: 'blank request ID', call: { arguments: { action: 'dispatch', requestId: '  ', prompt: 'Work' } } },
-  { name: 'control character in request ID', call: { arguments: { action: 'dispatch', requestId: 'request\u0000', prompt: 'Work' } } },
-  { name: 'invalid worker role', call: { arguments: { action: 'dispatch', requestId: 'request', prompt: 'Work', role: 'coordinator' } } },
+  { name: 'missing request ID', call: { arguments: { action: 'dispatch', execution: testExecution.worker, prompt: 'Work' } } },
+  { name: 'empty dispatch prompt', call: { arguments: { action: 'dispatch', execution: testExecution.worker, requestId: 'request', prompt: '' } } },
+  { name: 'blank dispatch prompt', call: { arguments: { action: 'dispatch', execution: testExecution.worker, requestId: 'request', prompt: ' \n\t' } } },
+  { name: 'blank request ID', call: { arguments: { action: 'dispatch', execution: testExecution.worker, requestId: '  ', prompt: 'Work' } } },
+  { name: 'control character in request ID', call: { arguments: { action: 'dispatch', execution: testExecution.worker, requestId: 'request\u0000', prompt: 'Work' } } },
+  { name: 'invalid worker role', call: { arguments: { action: 'dispatch', execution: testExecution.worker, requestId: 'request', prompt: 'Work', role: 'coordinator' } } },
   { name: 'invalid report kind', call: { arguments: { action: 'report', requestId: 'request', kind: 'approval', text: 'Approve' } } },
   { name: 'negative record version', call: { arguments: { action: 'record', requestId: 'request', key: 'key', text: 'text', expectedVersion: -1 } } },
   { name: 'fractional record version', call: { arguments: { action: 'record', requestId: 'request', key: 'key', text: 'text', expectedVersion: 0.5 } } },
@@ -315,7 +316,7 @@ test('duplicate native RPC requests invoke the project handler once', async t =>
 
 test('project action bounds accept the largest valid identifiers, text, and status page', async t => {
   const actions = [
-    { action: 'dispatch', requestId: 'r'.repeat(512), prompt: 'p'.repeat(131_072) },
+    { action: 'dispatch', execution: testExecution.worker, requestId: 'r'.repeat(512), prompt: 'p'.repeat(131_072) },
     { action: 'status', section: 'records', offset: Number.MAX_SAFE_INTEGER, limit: 100 },
   ];
   const f = await adapter(t, { calls: actions.map(action => ({ arguments: action })), expectedReplies: actions.length });

@@ -54,7 +54,7 @@ async function fixture(t: TestContext) {
   t.after(async () => { await loop.close(); await rm(root, { recursive: true, force: true }); });
   return { root, project, data, codex, feishu, workspace, action, state, finish, completeAction, coordinatorId,
     get loop() { return loop; },
-    async worker() { const result = z.object({ taskId: z.string() }).parse(await action({ action: 'dispatch', requestId: `dispatch-${++request}`, prompt: 'Do fixture work', role: 'worker' })); await loop.tick(); return loop.store.task(result.taskId); },
+    async worker() { const result = z.object({ taskId: z.string() }).parse(await action({ action: 'dispatch', execution: testExecution.worker, requestId: `dispatch-${++request}`, prompt: 'Do fixture work', role: 'worker' })); await loop.tick(); return loop.store.task(result.taskId); },
     async scope(taskId: string) { const value = (await state(taskId)).scopes.find(scope => scope.resource.kind === 'artifacts'); assert.ok(value); return value; },
     async complete(taskId: string) { return receipt.parse(await action(completeAction(taskId))); },
     async restart() { await loop.close(); loop = new AgentLoop(config, ports); await loop.recover(); },
@@ -341,7 +341,7 @@ test('completed followups retain original provenance and create no automatic exe
   assert.equal(f.loop.tasks().length, 2); assert.equal(f.codex.starts.filter(start => start.threadId === worker.threadId).length, starts);
   await assert.rejects(f.loop.control(worker.id, 'resume'), /completed/); await assert.rejects(f.loop.ensureWorkspace(worker.id, 'example/app'), /completed/);
   await assert.rejects(f.action({ action: 'send', requestId: 'old-send', taskId: worker.id, text: 'continue' }), /completed/);
-  const newTask = z.object({ taskId: z.string() }).parse(await f.action({ action: 'dispatch', requestId: 'follow-new', predecessorTaskId: worker.id, prompt: 'New output', role: 'worker' }));
+  const newTask = z.object({ taskId: z.string() }).parse(await f.action({ action: 'dispatch', execution: testExecution.worker, requestId: 'follow-new', predecessorTaskId: worker.id, prompt: 'New output', role: 'worker' }));
   assert.equal((await f.state(newTask.taskId)).predecessorTaskId, worker.id); assert.notEqual((await f.scope(newTask.taskId)).location.root.path, (await f.scope(worker.id)).location.root.path);
   assert.match(f.loop.store.inputs(newTask.taskId)[0]?.message.text ?? '', /Delivered result/);
 });

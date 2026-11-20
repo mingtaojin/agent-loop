@@ -33,9 +33,9 @@ cp config/example.json config.json
 
 正式任务共用本机 Codex daemon。Agent Loop 通过官方 `daemon version` 发现服务，只在服务未运行时调用 `daemon start`。连接失败会报告错误，断线后重新连接并核对原 Thread。Agent Loop 不停止、重启或更新 daemon，也不回退私有 App Server。
 
-在 `execution.backends` 配置执行后端连接参数，在角色配置中填写 `backend`、`model` 和 `reasoningEffort`。当前提供 Codex 后端，未来可以增加其他执行后端。模型配置属于 Agent Loop 运行时，不修改后端的全局配置；配置文件变化由运行时 watcher 读取，下一次模型调用生效。
+在 `execution.backends` 配置执行后端连接参数。`execution.coordinator` 填写一个完整执行配置，`execution.worker` 列出允许的完整 `backend`、`model`、`reasoningEffort` 组合。当前提供 Codex 后端，未来可以增加其他执行后端。模型配置属于 Agent Loop 运行时，不修改后端的全局配置；配置文件变化由运行时 watcher 读取。协调者在下次调用使用新配置；Worker 只在创建时从允许列表选定一次。多轮对话、暂停恢复和服务重启始终沿用任务保存的选择，删除允许项也不改变已有 Worker。旧的单个 Worker 配置仍作为只含一项的允许列表加载。
 
-Agent Loop 不再使用模型选择目录。任务必须先归属到已配置项目；未归属 intake 和历史任务保持等待，不创建执行 Thread。项目协调者和 Worker 直接使用项目目录及统一的角色执行配置。
+Agent Loop 不再使用模型选择目录。任务必须先归属到已配置项目；未归属 intake 和历史任务保持等待，不创建执行 Thread。项目协调者和 Worker 直接使用项目目录。协调者从当前配置读取执行参数，Worker 使用自身保存的执行身份。
 
 本地项目可使用 `repositories: []`，不需要 GitHub token。正式会话按角色读取 `prompts/coordinator.md` 或 `prompts/worker.md`，`engineering.promptPath` 不覆盖角色规则。角色指导、委派范围和环境信息通过 `developerInstructions` 与 `additionalContext` 传入正式 Thread；用户消息和 Issue 内容作为请求材料。`engineering.skillPath` 指向已安装的 poteto-mode，其他技能通过现有机制发现。加载与更新方式见[正式会话提示词](docs/prompts/task.md)。
 

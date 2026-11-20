@@ -117,7 +117,7 @@ test('project intake can require an assigned account AND Bug classification', ()
 
 test('project actions are discriminated strict shapes with a default worker role', () => {
   const actions: ProjectAction[] = [
-    { action: 'status' }, { action: 'dispatch', requestId: 'd', prompt: 'Investigate.', role: 'worker' },
+    { action: 'status' }, { action: 'dispatch', execution: testExecution.worker, requestId: 'd', prompt: 'Investigate.', role: 'worker' },
     { action: 'send', requestId: 's', taskId: 'worker', text: 'Preserve order.' },
     { action: 'announce', requestId: 'a', kind: 'delivery', text: 'Delivered.' },
     { action: 'report', requestId: 'r', kind: 'question', text: 'Which format?' },
@@ -128,7 +128,7 @@ test('project actions are discriminated strict shapes with a default worker role
     { action: 'release_workspace', requestId: 'rel', resourceId: 'resource' },
   ];
   for (const action of actions) assert.deepEqual(projectActionSchema.parse(action), action);
-  assert.deepEqual(projectActionSchema.parse({ action: 'dispatch', requestId: 'd', prompt: 'Investigate.' }), actions[1]);
+  assert.deepEqual(projectActionSchema.parse({ action: 'dispatch', execution: testExecution.worker, requestId: 'd', prompt: 'Investigate.' }), actions[1]);
   for (const action of actions) assert.equal(projectActionSchema.safeParse({ ...action, projectId: 'other' }).success, false);
 });
 
@@ -147,9 +147,9 @@ test('status accepts optional bounded paging without injecting defaults', () => 
 
 test('project actions reject blank or oversized payloads and invalid record versions', () => {
   const invalid: unknown[] = [
-    { action: 'dispatch', requestId: 'd', prompt: ' ' },
-    { action: 'dispatch', requestId: 'd', prompt: 'p'.repeat(131_073) },
-    { action: 'dispatch', requestId: 'd', prompt: 'Work.', role: 'coordinator' },
+    { action: 'dispatch', execution: testExecution.worker, requestId: 'd', prompt: ' ' },
+    { action: 'dispatch', execution: testExecution.worker, requestId: 'd', prompt: 'p'.repeat(131_073) },
+    { action: 'dispatch', execution: testExecution.worker, requestId: 'd', prompt: 'Work.', role: 'coordinator' },
     { action: 'send', requestId: '', taskId: 'w', text: 'Hello.' },
     { action: 'send', requestId: 's', taskId: 'w'.repeat(513), text: 'Hello.' },
     { action: 'send', requestId: 's', taskId: 'w', text: '' },
@@ -207,7 +207,7 @@ test('membership rejects cross-project reuse, role changes and missing issue ass
   fx.create(); fx.create(config('beta'), 'beta-coordinator');
   fx.write(ledger => ledger.addMember('alpha', 'worker', 'worker'));
   assert.throws(() => fx.write(ledger => ledger.addMember('beta', 'worker', 'worker')));
-  assert.throws(() => projectActionSchema.parse({ action: 'dispatch', requestId: 'v', prompt: 'Verify.', role: 'verifier', issueId: 'issue-1' }));
+  assert.throws(() => projectActionSchema.parse({ action: 'dispatch', execution: testExecution.worker, requestId: 'v', prompt: 'Verify.', role: 'verifier', issueId: 'issue-1' }));
   assert.throws(() => fx.write(ledger => ledger.addMember('alpha', 'second-coordinator', 'coordinator')));
   assert.throws(() => fx.write(ledger => ledger.addMember('alpha', 'new-worker', 'worker', 'missing')));
   assert.throws(() => fx.write(ledger => ledger.addMember('missing', 'new-worker', 'worker')));

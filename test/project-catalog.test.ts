@@ -118,13 +118,14 @@ test('dispatch promotes the same intake with old group and resources and rejects
   await f.runtime.acceptIntake(intake.id, 'explicit-alpha', f.material(intake.id, 'Full original input and prepared files.'));
   const route = f.runtime.intakeRoute(intake.id); assert.ok(route);
   const originalInputs = f.store.inputs(intake.id);
-  const action = { action: 'dispatch', requestId: 'promote', intakeTaskId: intake.id, prompt: 'Delegated scope before initial input.' };
+  const action = { action: 'dispatch', execution: testExecution.worker, requestId: 'promote', intakeTaskId: intake.id, prompt: 'Delegated scope before initial input.' };
   await assert.rejects(f.runtime.action(route.coordinatorTaskId, action), /paused/);
   f.store.saveTask({ ...intake, status: 'pending', reason: null });
   const first = await f.runtime.action(route.coordinatorTaskId, action);
   assert.deepEqual(first, { taskId: intake.id });
   assert.deepEqual(await f.runtime.action(route.coordinatorTaskId, action), first);
-  assert.deepEqual(f.store.task(intake.id), { ...intake, purpose: 'execution', status: 'pending', reason: null });
+  assert.deepEqual(f.store.task(intake.id), { ...intake, purpose: 'execution', status: 'pending', reason: null,
+    workerExecution: { profile: testExecution.worker, source: { kind: 'dispatch', coordinatorTaskId: route.coordinatorTaskId, requestId: action.requestId } } });
   assert.deepEqual(f.store.inputs(intake.id), originalInputs);
   assert.equal(f.store.meta(`project-delegation:${intake.id}`), action.prompt);
   assert.equal(f.store.meta(`project-task-model:${intake.id}`), null);
@@ -198,7 +199,7 @@ test('concurrent source collection cannot overwrite a promoted intake with an ea
   const earlier = f.store.task(request.id);
   const collecting = f.runtime.collect({ ...source, body: 'Updated issue facts.' }, earlier, resolved);
   const route = f.runtime.intakeRoute(request.id); assert.ok(route);
-  await f.runtime.action(route.coordinatorTaskId, { action: 'dispatch', requestId: 'concurrent-promotion', intakeTaskId: request.id, prompt: 'Use the original request and scope.' });
+  await f.runtime.action(route.coordinatorTaskId, { action: 'dispatch', execution: testExecution.worker, requestId: 'concurrent-promotion', intakeTaskId: request.id, prompt: 'Use the original request and scope.' });
   const promoted = f.store.task(request.id);
   await collecting;
   const latest = f.store.task(request.id);
