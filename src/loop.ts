@@ -145,7 +145,7 @@ export class AgentLoop {
       return this.ensureWorkspace(taskId, repository);
     }, async (taskId, action) => {
       const activity = await this.capabilityActivity(taskId);
-      return this.projectAction(taskId, action, () => this.assertActiveTask(taskId, activity));
+      return this.projectAction(taskId, action, () => this.assertActiveTask(taskId, activity), activity);
     });
     ports.codex.setWorkspaceHandler(async request => {
       const task = this.store.taskForThread(request.threadId);
@@ -156,7 +156,7 @@ export class AgentLoop {
     ports.codex.setProjectHandler?.(async request => {
       const task = this.store.taskForThread(request.threadId);
       if (!task) throw new Error('Project action requires an active task');
-      return this.projectAction(task.id, request.action, () => this.assertActiveTask(task.id, request));
+      return this.projectAction(task.id, request.action, () => this.assertActiveTask(task.id, request), request);
     });
   }
   private assertActiveTask(taskId: string, identity: TurnIdentity): void {
@@ -175,9 +175,9 @@ export class AgentLoop {
     if (activity.kind !== 'running') throw new Error('Capability requires a proven active turn');
     return activity;
   }
-  async projectAction(taskId: string, action: ProjectAction, assertActive?: () => void): Promise<unknown> {
+  async projectAction(taskId: string, action: ProjectAction, assertActive?: () => void, identity?: TurnIdentity): Promise<unknown> {
     if (this.stopping) throw new Error('Runtime is stopping');
-    const result = await this.projects.action(taskId, action, assertActive);
+    const result = await this.projects.action(taskId, action, assertActive, identity);
     if (action.action === 'complete_task') { this.forwardCompletedInputs(this.store.task(action.taskId)); await this.closeout.progress(action.taskId); }
     if (action.action === 'cleanup_artifacts') await this.closeout.progress(taskId);
     return result;
@@ -253,18 +253,19 @@ export class AgentLoop {
   private onWorkerEvent(taskId: string, event: ExecutionEvent): void {
     if (this.stopping || !event.turnId || !['turn_start', 'agent_message', 'turn_end'].includes(event.kind)) return;
     const task = this.store.task(taskId);
-    if (task.lastHandledTurnId === event.turnId || this.closeout.completed(taskId)) return;
-    const turn = this.workerChatTurn(task, event.threadId, event.turnId);
-    if (!turn || turn.ended) return;
+    if (this.closeout.completed(taskId) || this.projects.ledger.membership(taskId)?.role !== 'worker') return;
     if (event.kind === 'turn_end') {
       void this.serial(taskId, async () => {
         const latest = this.store.task(taskId);
-        if (this.stopping || latest.threadId !== event.threadId || latest.turnId !== event.turnId || latest.lastHandledTurnId === event.turnId || this.closeout.completed(taskId)) return;
+        if (this.stopping || latest.threadId !== event.threadId || latest.turnId !== event.turnId || this.closeout.completed(taskId)) return;
         this.publishWorkerSnapshot(latest, await this.inspect(event.threadId));
         await this.flush(this.store.task(taskId));
       }).catch(error => this.problem(taskId, error));
       return;
     }
+    if (task.lastHandledTurnId === event.turnId) return;
+    const turn = this.workerChatTurn(task, event.threadId, event.turnId);
+    if (!turn || turn.ended) return;
     this.store.transaction(() => {
       turn.start();
       if (event.kind === 'agent_message' && event.itemId) turn.message({
@@ -274,6 +275,7 @@ export class AgentLoop {
     if (task.chatId) void this.serial(taskId, () => this.flush(this.store.task(taskId))).catch(error => this.problem(taskId, error));
   }
   private publishWorkerSnapshot(task: Task, snapshot: ExecutionSnapshot | RunningActivity): void {
+    this.projects.reconcileWorkerResult(task.id, snapshot);
     if (snapshot.turnId === task.lastHandledTurnId) return;
     const turn = this.workerChatTurn(task, snapshot.threadId, snapshot.turnId);
     if (!turn || turn.ended) return;
@@ -776,6 +778,7 @@ export class AgentLoop {
     task.executionStatus = 'unknown'; task.reason = message;
     task.recovery.lastError = message; task.recovery.interruptedTurnId = turnId;
     if (task.recovery.attempts >= this.config.recovery.maxAttempts || !task.threadId) {
+      this.projects.invalidateWorkerResult(task.id);
       task.status = 'failed'; task.recovery.nextAttemptAt = null;
       task.recovery.lastUserInputSeq = this.store.inputs(task.id).filter(input => input.origin === 'user').at(-1)?.seq ?? 0;
       this.notify(task, `任务恢复已停止，保留现场。\n${message}`, `recovery-exhausted:${digest(message)}`);
@@ -863,6 +866,7 @@ export class AgentLoop {
         task = this.store.task(id);
       }
       this.requireMember(task);
+      if (task.status === 'paused' || task.status === 'failed') this.projects.invalidateWorkerResult(task.id);
       if (!this.projects.restoreWorkerExecution(task)) return;
       if (task.purpose !== 'execution') { task.purpose = 'execution'; this.persist(task); }
       if (task.status === 'failed' && this.store.inputs(task.id, { statuses: ['pending'], origin: 'user' }).some(input =>
@@ -1238,6 +1242,7 @@ export class AgentLoop {
     return result;
   }
   private async pause(task: Task, reason: string): Promise<void> {
+    this.projects.invalidateWorkerResult(task.id);
     task.status = 'paused'; task.reason = reason; task.recovery.nextAttemptAt = null; this.persist(task);
     if (task.threadId) {
       if (!this.projects.restoreWorkerExecution(task)) return;
@@ -1260,6 +1265,7 @@ export class AgentLoop {
         await this.flush(task); return;
       }
       else if (['paused', 'failed'].includes(task.status)) {
+        this.projects.invalidateWorkerResult(task.id);
         if (!this.projects.restoreWorkerExecution(task)) return;
         if (task.status === 'paused') {
           const migration = await this.migratePausedProvider(task, true);

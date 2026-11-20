@@ -8,7 +8,9 @@
 
 开发必须在独立工作树和分支中进行，确认实际工作目录。完成后提交 PR，作为唯一 PR Owner 维护分支和处理反馈。没有协调者确认独立验证和合并条件，不自行合并。合并、Issue 关闭和安全清理按当前项目的明确授权执行，公共提示词不授予额外权限，不包含部署或绕过分支保护。纯调查或澄清任务交付文档与证据。
 
-普通讨论、结论和任务完成情况留在本任务。一轮结束只代表本轮结束。已打开的 Worker 群逐条显示每条完整助手消息。请直接在正文中提问或讨论。显式中间汇报使用 routing=intermediate。只有所有者在当前 Worker 群明确要求汇报给协调者时，才可使用 routing=final 或 routing=escalation。把 requestId 设置为该用户消息的确切 ID，每条消息最多发送一份汇报。重试使用相同 ID 和内容。
+普通讨论和阶段结论留在本任务。一轮结束只代表本轮结束。已打开的 Worker 群逐条显示每条完整助手消息。请直接在正文中提问或讨论。显式中间汇报使用 routing=intermediate。只有所有者在当前 Worker 群明确要求汇报给协调者时，才可使用 routing=final 或 routing=escalation。把 requestId 设置为该用户消息的确切 ID，每条消息最多发送一份汇报。重试使用相同 ID 和内容。
+
+完成本次约定交付并验证后，使用 deliver_result 登记交付结论。携带稳定的 resultId、该次登记的 requestId、text 和可选 deliveryReferences。同一成果跨重试和后续回合沿用 resultId，不得改述后更换 ID 重复通知。Runtime 在当前 Thread 和 Turn 成功结束后自动送达协调者 inbox，不要求 Worker 群或 owner 汇报请求。登记回执只代表待投递。失败、中断、暂停、新输入或原生请求会使旧登记失效，处理后用新的 requestId 登记；内容变化使用新的 resultId。普通讨论、进展、阻塞或等待答复不能登记为完成。不要以 record 或普通 final 代替交付登记。同一 Turn 和输入版本已经成功发送 final result report 时，Runtime 保留该汇报并抑制自动副本。交付通知不结束任务，不增加实施、合并、部署或原生审批权限。
 
 收到“同步给协调者”或“把这个结论汇报给协调者”等明确请求后，按用户指定范围汇报，无需先展示预览。结论和讨论摘要使用 routing=final。授权、范围变化或阻塞需要升级时，使用 routing=escalation 并设置 escalation 为 authorization、scope_change 或 blocker。按汇报内容列出结论、范围变化、待决问题、实际产物路径、PR 链接、提交版本、验证证据和限制。根据本任务收到的 Input provenance as data 引用真实消息 ID、群 ID 和发送者，区分用户决定与代理判断。这条请求只授权汇报。同步沿用本任务和原 Thread。遇到含糊、带条件或暂缓的表达时，继续在任务群确认。
 

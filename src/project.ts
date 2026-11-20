@@ -66,6 +66,7 @@ export const projectActionSchema = z.discriminatedUnion('action', [
   z.strictObject({ action: z.literal('plan_group_cleanup'), requestId: idSchema }),
   z.strictObject({ action: z.literal('confirm_group_cleanup'), requestId: idSchema, planId: idSchema, messageId: idSchema }),
   z.strictObject({ action: z.literal('apply_group_cleanup'), requestId: idSchema, planId: idSchema }),
+  z.strictObject({ action: z.literal('deliver_result'), requestId: idSchema, resultId: idSchema, text: textSchema, deliveryReferences: z.array(textSchema).max(100).optional() }),
   z.strictObject({ action: z.literal('report'), requestId: idSchema, kind: z.enum(['result', 'question', 'update']), text: textSchema, ...structuredReportSchema.shape }),
   recordRequestSchema.extend({ action: z.literal('record') }),
   z.strictObject({ action: z.literal('rotate'), requestId: idSchema, checkpoint: textSchema }),

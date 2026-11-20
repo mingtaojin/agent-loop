@@ -43,7 +43,7 @@ async function nativeWorkerAction(f: Awaited<ReturnType<typeof fixture>>, taskId
     connectionEpoch: 'fake-epoch', callId: action.action === 'status' ? 'status' : action.requestId, action });
 }
 
-function deliverResult(requestId = 'delivery-attempt-1', resultId = 'result-v1'): ProjectAction {
+function deliverResult(requestId = 'delivery-attempt-1', resultId = 'result-v1'): Extract<ProjectAction, { action: 'deliver_result' }> {
   return { action: 'deliver_result', requestId, resultId, text: 'Verified deliverable. Independent review remains pending.',
     deliveryReferences: ['https://github.com/example/app/pull/42', 'docs/verification.md'] };
 }
@@ -242,6 +242,110 @@ test('intermediate or rejected reports cannot consume a declared Worker result',
   f.codex.complete(worker.threadId!, null); await f.loop.tick(); await f.loop.tick();
   assert.equal(f.events(f.coordinator().id, 'result').length, 0);
   assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
+});
+
+test('Worker delivery event and publication state roll back together and recover after a partial write', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('atomic-publication', 'Deliver evidence.');
+  await nativeWorkerAction(f, worker.id, deliverResult());
+  const event = f.loop.projects.event.bind(f.loop.projects); let injected = false;
+  f.loop.projects.event = (...args) => {
+    event(...args);
+    if (args[4] === 'worker_result' && !injected) { injected = true; throw new Error('Crash after inbox insertion'); }
+  };
+  f.codex.complete(worker.threadId!, null); await f.loop.tick();
+  assert.equal(injected, true);
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
+  await f.restart(); await f.loop.tick(); await f.loop.tick();
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
+  assert.equal(f.events(f.coordinator().id, 'worker_result')[0]?.status, 'delivered');
+});
+
+test('Worker declaration and operation receipt roll back together', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('atomic-declaration', 'Deliver evidence.');
+  const saveReceipt = f.loop.projects.ledger.saveReceipt.bind(f.loop.projects.ledger); let injected = false;
+  f.loop.projects.ledger.saveReceipt = (...args) => {
+    saveReceipt(...args);
+    if (args[2] === 'delivery-attempt-1' && !injected) { injected = true; throw new Error('Crash after receipt insertion'); }
+  };
+  await assert.rejects(nativeWorkerAction(f, worker.id, deliverResult()), /Crash after receipt/);
+  await f.restart();
+  await nativeWorkerAction(f, worker.id, deliverResult());
+  f.codex.complete(worker.threadId!, null); await f.loop.tick(); await f.loop.tick();
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
+});
+
+test('Worker result reconciliation ignores saved ordinary output and ended-turn receipts', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('saved-chat-receipt', 'Deliver evidence.');
+  await nativeWorkerAction(f, worker.id, deliverResult());
+  const task = f.loop.store.task(worker.id); assert.ok(task.threadId && task.turnId);
+  task.lastHandledTurnId = task.turnId; task.executionStatus = 'completed';
+  f.loop.store.saveTask(task);
+  f.loop.store.setMeta(`worker-chat-ended:${JSON.stringify([task.id, task.threadId, task.turnId])}`, 'ended');
+  f.codex.complete(worker.threadId!, null); await f.restart(); await f.loop.tick();
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
+});
+
+test('a paused coordinator retains Worker delivery until its original task resumes', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('paused-coordinator-delivery', 'Deliver evidence.');
+  const coordinator = f.coordinator();
+  await f.loop.control(coordinator.id, 'pause');
+  const starts = f.codex.starts.length, steers = f.codex.steers.length;
+  await nativeWorkerAction(f, worker.id, deliverResult());
+  f.codex.complete(worker.threadId!, null); await f.loop.tick(); await f.loop.tick();
+  assert.equal(f.events(coordinator.id, 'worker_result').length, 1);
+  assert.notEqual(f.events(coordinator.id, 'worker_result')[0]?.status, 'delivered');
+  assert.equal(f.codex.starts.length, starts); assert.equal(f.codex.steers.length, steers);
+  await f.restart(); await f.loop.control(coordinator.id, 'resume'); await f.loop.tick();
+  assert.equal(f.events(coordinator.id, 'worker_result')[0]?.status, 'delivered');
+  assert.equal(f.coordinator().threadId, coordinator.threadId);
+  assert.equal(f.events(coordinator.id, 'worker_result').length, 1);
+});
+
+test('a retained Worker Thread can register delivery through the actual capability client', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('fallback-delivery', 'Deliver evidence.');
+  await f.restart(); f.codex.projectHandler = null;
+  const instructions = f.codex.instructionUpdates.findLast(update => update.threadId === worker.threadId)?.instructions ?? '';
+  const command = /write the action JSON to a file and run (.+?) '<absolute-action-json-file>' using your shell tool/.exec(instructions)?.[1];
+  assert.ok(command);
+  const actionFile = join(f.root, 'delivery-action.json'); await writeFile(actionFile, JSON.stringify(deliverResult()));
+  const run = () => promisify(execFile)('/bin/sh', ['-c', `${command} "$1"`, 'delivery-fallback', actionFile], { timeout: 10_000 });
+  const receipt = await run(); assert.deepEqual(JSON.parse((await run()).stdout), JSON.parse(receipt.stdout));
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
+  f.codex.complete(worker.threadId!, null);
+  await assert.rejects(run(), /active turn/i);
+  await f.loop.tick(); await f.restart(); await f.loop.tick();
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
+  assert.equal(f.events(f.coordinator().id, 'worker_result')[0]?.status, 'delivered');
+});
+
+test('an explicit result before steering cannot suppress a fresh delivery after that steering', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('report-watermark', 'Deliver evidence.');
+  const requestId = await requestReport(f, worker.id, 'early-delivery-report');
+  await nativeWorkerAction(f, worker.id, { action: 'report', requestId, kind: 'result', text: 'Earlier result.' });
+  await f.loop.projectAction(f.coordinator().id, { action: 'send', requestId: 'new-delivery-work', taskId: worker.id, text: 'Complete the additional check.' });
+  await f.loop.tick();
+  await nativeWorkerAction(f, worker.id, deliverResult());
+  f.codex.complete(worker.threadId!, null); await f.loop.tick(); await f.loop.tick();
+  assert.equal(f.events(f.coordinator().id, 'result').length, 1);
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
+});
+
+test('Worker delivery does not publish from an idle or superseded turn observation', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('superseded-delivery', 'Deliver evidence.');
+  await nativeWorkerAction(f, worker.id, deliverResult());
+  const snapshot = f.codex.snapshot(worker.threadId!);
+  snapshot.status = 'idle'; await f.loop.tick();
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
+  snapshot.turnId = 'unrelated-turn'; f.codex.complete(worker.threadId!, 'Unrelated completion.');
+  await f.loop.tick(); await f.restart();
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
 });
 
 const dispatchReceipt = z.object({ taskId: z.string().min(1) });

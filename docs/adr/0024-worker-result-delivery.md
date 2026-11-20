@@ -1,0 +1,23 @@
+---
+status: accepted
+---
+
+# Worker 交付通知
+
+无任务群的 Worker 可以完成调查、开发或验证，但普通 final 只保存在任务内。ADR 0021 的显式 report 还要求当前任务群中的所有者请求。二者叠加，使完成结果可能只有记录、没有协调者 inbox 事件。
+
+2026-11-20，所有者授权修复 Worker 完成后自动通知协调者，保留普通 final、显式 report、用户追加输入、原生请求和任务记录。授权消息为 `om_x100b7f36735388b4c334efb3a00403a`，群为 `oc_586b1866902382e0db4dff8d25c0f3f7`，发送者为 `ou_5c280b16780ac4016c7455a276b2d95b`。消息由协调者在本任务交接中转达。以下接口和状态机是本次实现选择。
+
+Worker 完成约定交付并验证后，调用 `deliver_result`，携带 `requestId`、`resultId`、`text` 和可选 `deliveryReferences`。Runtime 从已校验的工具入口取得 Thread 和 Turn，保存待投递声明。该动作不要求任务群或所有者汇报请求，也不使用 final 的文字推断是否交付。
+
+只有精确对应的 Turn 成功 `completed`，且没有未处理输入、原生请求或暂停状态时，Runtime 才把声明写入协调者 inbox。事件类别为 `worker_result`。声明携带的结论和引用为代理来源，不代表用户授权。协调者使用既有输入投递与未知回执对账处理该事件；项目群公告仍使用 `announce`。
+
+`resultId` 标识同一 Worker 的一份成果，跨回合保持稳定。`requestId` 标识一次登记尝试。登记与回执、发布状态与协调者事件分别事务性提交。重试和重启不会重复发布已交付的 `resultId`。同一成果换 ID 或改述正文不属于语义去重，Worker 必须沿用成果身份。
+
+新输入、原生请求、失败、中断、暂停或执行身份变化使旧声明失效。处理完成后以新 `requestId` 重新登记；旧请求重放只返回旧回执。相同 `resultId` 的正文和引用不可修改，修改交付内容使用新 `resultId`。登记时仍有未处理输入或原生请求会拒绝登记。
+
+同一 Thread、Turn 和输入版本已经成功发送 `report kind=result routing=final` 时，自动交付使用该显式汇报，不再产生副本。两种调用顺序都适用。Runtime 保留原 report 的所有者请求校验、来源和投递内容。中间汇报、问题或被拒绝的 report 不消耗交付声明。
+
+直接在登记动作中唤醒协调者更短，但登记之后的失败或追加指令无法撤回已投递结果。因此本实现等待匹配执行成功结束。把所有 final 自动转发会把讨论结束误当成成果，违背普通 final 的既有契约。
+
+此决策为 ADR 0012 和 ADR 0021 增加独立交付路径。普通讨论、显式 report 和原生 question、approval、permissions 的路由保持原契约。交付不会触发 `complete_task`、清理、合并、部署、服务重启或历史 Worker 自动恢复。
