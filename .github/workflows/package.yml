@@ -1,19 +1,23 @@
 name: Package Agent Loop
 
 on:
-  pull_request:
+  pull_request_target:
     branches: [main]
     types: [closed]
 
 permissions:
   contents: read
 
+concurrency:
+  group: package-${{ github.event.pull_request.merge_commit_sha || github.run_id }}
+
+env:
+  PACKAGE_NAME: agent-loop-pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.merge_commit_sha }}.tar.gz
+
 jobs:
   package:
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
-    env:
-      PACKAGE_NAME: agent-loop-pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.merge_commit_sha }}.tar.gz
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -57,3 +61,44 @@ jobs:
           archive: false
           if-no-files-found: error
           overwrite: true
+
+  publish:
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ env.PACKAGE_NAME }}
+          path: ${{ runner.temp }}
+
+      - name: Publish GitHub prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          tag="${PACKAGE_NAME%.tar.gz}"
+          package="$RUNNER_TEMP/$PACKAGE_NAME"
+          test -s "$package"
+
+          if release=$(gh release view "$tag" --json isDraft,assets); then
+            if jq -e '.isDraft == false' <<< "$release" >/dev/null; then
+              jq -e --arg name "$PACKAGE_NAME" \
+                'any(.assets[]; .name == $name and .state == "uploaded")' \
+                <<< "$release" >/dev/null
+              exit 0
+            fi
+          else
+            gh release create "$tag" --target "$MERGE_SHA" --draft --prerelease \
+              --title "Agent Loop build from PR #$PR_NUMBER" \
+              --notes "Verified package built from $PR_URL at commit $MERGE_SHA."
+          fi
+
+          gh release upload "$tag" "$package" --clobber
+          gh release edit "$tag" --draft=false
