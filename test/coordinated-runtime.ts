@@ -24,7 +24,7 @@ export async function dispatchIntake(loop: AgentLoop, taskId: string, prompt = '
   assert.equal(loop.projects.ledger.membership(taskId), null);
   const inbox = loop.store.inputs(taskId);
   const result = z.object({ taskId: z.string() }).parse(await loop.projectAction(route.coordinatorTaskId, {
-    action: 'dispatch', execution: testExecution.worker, requestId: `accept-${taskId}`, intakeTaskId: taskId, role: 'worker', mode: 'investigation', prompt,
+    action: 'dispatch', execution: testExecution.worker, requestId: `accept-${taskId}`, intakeTaskId: taskId, role: 'worker', prompt,
   }));
   assert.equal(result.taskId, taskId);
   const worker = loop.store.task(taskId);
@@ -78,8 +78,15 @@ export async function instructWorker(loop: AgentLoop, taskId: string, requestId:
   assert.ok(member);
   const project = loop.projects.ledger.project(member.projectId);
   assert.ok(project);
-  await loop.projectAction(project.coordinatorTaskId, { action: 'send', requestId, taskId, text });
-  await loop.tick();
+  const receipt = z.object({ inputId: z.string() }).parse(await loop.projectCall(project.coordinatorTaskId,
+    { tool: 'send_agent_message', arguments: { requestId, taskId, text } }));
+  for (let attempt = 0; attempt < 1000; attempt++) {
+    await loop.tick();
+    const status = loop.store.input(taskId, receipt.inputId)?.status;
+    if (status && !['pending', 'delivering'].includes(status)) return;
+    await delay(5);
+  }
+  throw new Error('Worker message did not settle');
 }
 
 export function workerCalls(loop: AgentLoop, codex: CodexFake) {

@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { workspaceTargetSchema, type TaskResource, type WorkspaceTarget } from './domain.js';
-import { projectActionSchema, type ProjectAction } from './project.js';
+import { projectToolCallSchema, type ProjectToolCall } from './project.js';
 
 export class WorkspaceBridge {
   private readonly capabilities = new Map<string, { token: string; file: string }>();
@@ -12,7 +12,7 @@ export class WorkspaceBridge {
   private directory: string | null = null;
   private opening: Promise<string> | null = null;
   constructor(private readonly dataDir: string, private readonly ensure: (taskId: string, target: WorkspaceTarget) => Promise<TaskResource>,
-    private readonly project?: (taskId: string, action: ProjectAction) => Promise<unknown>) {}
+    private readonly project?: (taskId: string, call: ProjectToolCall) => Promise<unknown>) {}
 
   private open(): Promise<string> {
     this.opening ??= (async () => {
@@ -34,7 +34,7 @@ export class WorkspaceBridge {
           const raw: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
           if (request.url === '/project' && !this.project) throw new Error('Project actions unavailable');
           const resource = request.url === '/project' && this.project
-            ? await this.project(capability[0], projectActionSchema.parse(raw))
+            ? await this.project(capability[0], projectToolCallSchema.parse(raw))
             : await this.ensure(capability[0], workspaceTargetSchema.parse(raw));
           response.end(JSON.stringify(resource));
         } catch (error) {

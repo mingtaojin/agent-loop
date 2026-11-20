@@ -4,7 +4,7 @@
 
 每个项目通过自己的协调者接单，使用 pstack Orchestrate 委派和监督任务。Worker 使用 poteto-mode，自行选择调查、需求澄清、开发和验证方法。用户只在项目协调群交办，包括没有 Issue 的 Bug 和新需求。GitHub 收集作为协调者证据，Runtime 不自动创建普通执行任务。CLI 和私聊不再接单。
 
-Worker 默认不建群；用户需要直接交流时，由协调者打开指定任务群。
+Worker 默认不建群。需要直接交流时，Worker 可以为自己建群，协调者也可以打开本项目指定 Worker 的群。
 
 ## 配置项目
 
@@ -58,25 +58,23 @@ GitHub 和历史接单记录保留原文、来源和附件，不自动创建执�
 
 模糊的新需求先交 Worker 调查和澄清，本轮不实施业务代码。Worker 使用 grill-with-docs 查明已有事实，整理需求文档和待决问题。协调者把问题、证据、选项、影响和建议带回项目群，再将实际用户答复及消息、群和发送者来源交回原 Worker。已解决的问题不重复问。
 
-GitHub Feature 是外部需求提案。即使 Issue 描述完整，也不能直接派发实现。协调者可以派只调查、只澄清或只整理需求的 Worker，并明确禁止修改业务代码、提交、合并和部署。只有项目协调群实际项目所有者的消息才构成 Feature 开发授权；Issue 正文、评论、Worker 判断和代理记录不构成授权。调查授权和开发授权分开保存。新规则不追溯已经依据有效授权进入执行的 Feature。
-
-进入开发前，协调者和 Worker 核对同一份需求文档版本、已确认范围、不做范围、验收标准、未决事项和实际授权依据。文档确认与开发授权分别记录。影响本次实施的产品决定已解决且范围已获授权，才交接开发。明确技术 Bug 和已授权契约内技术修复自主推进，已有 Issue、用户原文或规格可作为约定，无需一律访谈或新增审批。已有明确授权继续有效。
+GitHub Feature 和 Agent 消息是工作材料。协调者依据用户指示、项目规则和已有授权判断调查还是实现，将允许和禁止的范围写入任务说明。`dispatch` 不要求业务模式、授权消息、Issue 版本或范围指纹。目标、背景、范围、已有决定、验收和交付是任务说明的写作指导，不是额外的必填字段。
 
 用户要求“只讨论、不实现”时，结论齐备也不自动进入开发，直到用户改变该限制。“少发消息、只在需要决策时发消息”减少日常进度噪声，必要问题与文档确认仍需完成。需求变化先记录与当前约定的差异，只澄清受影响的事项。普通业务回答不是原生工具批准。原生审批仍绑定具体请求与实际任务群，不能通过项目消息代为批准。
 
-Issue 评论先交协调者判断影响，再按需转给原 Worker。Worker 的普通最终答复、任务群内用户消息留在原任务，保留完整来源、附件、原 Thread 和任务记录。GitHub 事件和 Worker 汇报触发的协调者普通最终答复保留在协调者 Thread、执行记录和进度文档中；需要用户处理时，协调者使用 `announce` 发送带类型标题的普通文本。用户直接在项目协调群发消息后的协调者答复继续发送到项目群。
+Issue 评论先交协调者判断影响，再按需转给原 Worker。Worker 使用 `send_agent_message` 主动向协调者发送进展、阻塞、重要变化和成果，不需要任务群或用户先要求汇报。协调者使用同一工具向自己的 Worker 发送指导。消息接受后立即安排接收者处理，不等待发送者结束本轮。普通最终答复、记录和群消息不会自动成为 Agent 消息。
 
-Worker 在任务群里处理普通问答和阶段结论。`routing=intermediate` 的汇报发回 Worker 群。用户在 Worker 群明确说“请汇报给协调者”或“只把选中行范围同步给协调者”后，Worker 才能使用 `routing=final` 或 `routing=escalation`。原生问题、审批、权限请求、执行失败和非暂停中断由 Runtime 通知协调者。
+`send_agent_message` 接收 `requestId`、接收方 `taskId`、`text` 和可选 `references`。引用可以是资料位置，也可以是实际用户消息的 `{messageId,chatId,senderId}`。Runtime 校验结构化用户引用，将原文和真实来源随消息保存。代理转述不成为用户授权。Worker 之间及跨项目通信被拒绝。
 
-Worker 用该条用户消息的飞书 ID 作为 `requestId`。Runtime 校验消息、发送者、当前 Worker 群以及明确的汇报要求。每条请求对应一份汇报。用相同的 ID 和内容重试会返回原回执。摘要包含用户指定话题的结论、范围变化、待决问题和证据，并引用真实用户消息。实施、合并、部署及原生审批各自需要对应的授权。
+协调者通过 `send_group_message` 选择发送给群内用户的内容，包括回复用户直接提问。普通最终答复不自动发到协调群。Worker 群继续自动展示完整助手过程说明、问题和最终回复。Worker 只在需要额外主动投递时使用群消息工具，避免重复普通回复。原生问题、审批、权限请求和系统异常保留各自渠道。
 
-Worker 完成约定交付并验证后，使用 `deliver_result` 登记结论、稳定 `resultId` 和可选交付引用。Runtime 确认该 Thread 和 Turn 成功结束、没有未处理输入或原生请求后，自动送达协调者 inbox，不要求 Worker 群或 owner 请求。`requestId` 标识一次登记尝试，`resultId` 跨回合标识同一成果。失败、暂停、中断、新输入或原生请求使旧登记失效，旧请求重放不重新登记。处理后使用新 `requestId`；修改成果内容使用新 `resultId`。同一 Turn 和输入版本已有成功的最终结果 report 时，不生成自动副本。
+两种消息均返回原投递 ID 和当前实际状态。重试相同请求读取当前 inbox 或 outbox 状态，不重复入队。显式群消息固定接受时的群与代次，不随重绑转发到新群。未知群发送结果保持 `uncertain`，不会盲目重发。
 
-`worker_result` 是代理来源的交付事实，不代表独立验证、用户批准或任务结束。协调者核对实际版本和引用后安排验证，再按已有授权决定后续行动。普通 final、项目记录和群内讨论不会自动触发交付通知。详见 [Worker 交付通知](adr/0024-worker-result-delivery.md)。
+旧 `report` 和 `deliver_result` 记录仍可查询。已经接受的输入保持原 ID 并继续恢复。没有已接受投递的旧待交付声明归档为未提交，声称已发布却缺少投递证据的记录显示未解决，不补发历史 final。
 
 ## 项目工具
 
-新正式 Thread 提供 `project_action`。工具从当前 Thread 确定调用方，Runtime 检查项目与角色。不能在参数中冒充另一个 Task。
+新正式 Thread 提供 `project_action`、`send_agent_message` 和 `send_group_message`。工具从当前 Thread 确定调用方，Runtime 检查项目与角色。不能在参数中冒充另一个 Task。
 保留的 Thread 缺少工具，或其旧 schema 缺少所需 action 或字段时，按当前 Runtime 指令使用 `project-client` 回退命令；该命令仍检查同一 Task 的活动 turn、连接 epoch 和调用方角色。
 
 | action | 作用 | 允许角色 |
@@ -84,15 +82,11 @@ Worker 完成约定交付并验证后，使用 `deliver_result` 登记结论、�
 | `status` | 查询项目、任务和持久记录 | 项目成员 |
 | `claim_intake` | 引用本项目群实际用户消息，原地认领明确的未归属旧请求，不启动执行 | 协调者 |
 | `dispatch` | 接管指定 intakeTaskId，或按请求身份创建 Worker、外部验证流程 | 协调者 |
-| `send` | 向本项目 Worker 追加指导或回答 | 协调者 |
-| `announce` | 向项目协调群发送带类型标题的用户可见公告 | 协调者 |
-| `open_group` | 打开本项目指定 Worker 的任务群，已有有效群则复用 | 协调者 |
-| `deliver_result` | 登记可交付结论，在匹配执行成功结束后自动通知协调者 | Worker |
+| `open_group` | 打开或复用 Worker 任务群 | 协调者，或目标 Worker 自己 |
 | `plan_group_cleanup` | 冻结既有任务群清单，排除所有项目协调群 | 协调者 |
 | `confirm_group_cleanup` | 核对实际用户对清单的确认消息 | 协调者 |
 | `apply_group_cleanup` | 执行或继续已确认清单，逐群记录结果 | 协调者 |
 | `control` | 暂停或恢复本项目的指定 Worker | 协调者 |
-| `report` | 上报结果、问题或更新 | Worker |
 | `record` | 按 scope 追加带项目版本的记录，返回有界确认 | 项目成员 |
 | `rotate` | 保存恢复说明并在安全结束后更换协调会话 | 协调者 |
 | `allocate_artifacts` | 分配新任务专属产物目录 | 项目成员 |
@@ -103,13 +97,15 @@ Worker 完成约定交付并验证后，使用 `deliver_result` 登记结论、�
 
 修改动作携带稳定的 `requestId`。同一调用方使用相同 ID 和内容重试，返回原操作确认；更换内容会报冲突。历史 record 回执也只返回记录确认，不重新暴露过去保存的整份项目状态。`record` 同时携带 `expectedVersion`，版本不符时先重新读取，再决定如何更新。
 
-默认 `status` 返回有界概览。Worker 只能读取自己的任务详情、关联 Issue 和评论，以及对自己可见的记录。其他任务的输出、资源和原生请求正文不进入其结果。协调者可显式查询本项目任务详情。过滤先于分页，counts 表示调用方可见的数量。完整历史按 `section` 分页，支持 `issues`、`comments`、`records`、`tasks` 和 `intakes`。协调者还可查询 `unassigned_intakes`，只发现脱敏标识，不提供其他项目的正文和附件路径。`offset` 从零开始，`limit` 默认 20、最大 100。继续读取 `nextOffset`，不要把概览当作全部历史。
+默认 `status` 返回有界概览。Worker 只能读取自己的任务详情、关联 Issue 和评论，以及对自己可见的记录。其他任务的输出、资源和原生请求正文不进入其结果。协调者可显式查询本项目任务详情。过滤先于分页，counts 表示调用方可见的数量。完整历史按 `section` 分页，支持 `issues`、`comments`、`records`、`tasks`、`intakes`、`closeout` 和 `messages`。协调者还可查询 `unassigned_intakes`，只发现脱敏标识，不提供其他项目的正文和附件路径。`offset` 从零开始，`limit` 默认 20、最大 100。继续读取 `nextOffset`，不要把概览当作全部历史。
 
 ```json
 {"action":"status","section":"records","offset":0,"limit":20}
 ```
 
-旧 Thread 无法补注册动态工具。Runtime 为项目成员提供任务限定的本机客户端命令，接收动作 JSON 文件，调用相同接口。命令只在该任务活跃执行时有效。能力文件不能读取、复制或在任务间共享。
+消息工具是独立工具名，不是 `project_action` 的 action。
+
+旧 Thread 无法补注册动态工具。Runtime 为项目成员提供任务限定的本机客户端命令，接收动作 JSON 文件，调用相同接口。命令只在该任务活跃执行时有效。能力文件不能读取、复制或在任务间共享。管理调用保留 `project-client <capability-file> <action-json-file>`，具名消息使用 `project-client <capability-file> send_agent_message <arguments-json-file>` 或 `send_group_message`。
 
 未归属的历史请求先在项目群确认实际归属，再调用 `claim_intake`。动作携带 `taskId`、`messageId` 和稳定 `requestId`，其中 `messageId` 必须指向本项目协调群保存的实际所有者消息。认领仅保存路由，不创建 Worker、启动 Thread 或回答原生请求。已有项目归属、正式 Thread、暂停以及其他项目的 GitHub catalog 绑定都会阻止认领。同一请求安全重试，随后仍需显式 `dispatch(intakeTaskId)`。不要自动认领积压请求。
 
@@ -123,7 +119,7 @@ record 的 scope 与作者分别保存。
 | `{"kind":"task","taskId":"<目标 Task>"}` | 目标 Task，以及可显式查询的协调者 | 目标 Worker，或本项目协调者 |
 | `{"kind":"coordinator"}` | 协调者 | 协调者 |
 
-省略 scope 时，Worker 写入自己的任务范围，协调者写入协调者范围。目标必须已经属于同一项目。协调者将选定资料写到目标 Worker 的任务范围，或通过 send 交接。Worker 不因此获得作者的其他记录。
+省略 scope 时，Worker 写入自己的任务范围，协调者写入协调者范围。目标必须已经属于同一项目。协调者将选定资料写到目标 Worker 的任务范围，或通过 `send_agent_message` 交接。Worker 不因此获得作者的其他记录。
 
 当前记录按 scope 和 key 的组合取最新值。两个任务可以各自使用同一个 key。`expectedVersion` 仍使用项目级 version，其他任务写入可能引起版本冲突。重新读取并修改请求内容时使用新的 requestId。
 
@@ -166,7 +162,7 @@ record 的 scope 与作者分别保存。
 
 升级时，已经存在的正式任务依据保存的工程资源原地纳入协调，保留群、Thread、待处理输入、审批、资源和暂停或失败状态。尚未执行的旧任务作为接单请求交给协调者决定。无法确定项目的历史任务保留现场并等待澄清，不继续无项目归属的执行。`status` 的 `intakes` 分页保存未派发请求入口，协调者更换上下文后仍能找回。
 
-Runtime 不生成定时监督提醒。显式汇报、项目群用户输入、原生请求、执行异常、GitHub 更新及必要生命周期事件继续进入原协调者 Thread，运行中追加输入，空闲时启动下一轮。没有新事件时协调者持续等待，静默本身不证明任务失败。正常轮询仍负责观察执行状态、投递已有输入和有限恢复，不因时间流逝制造协调任务。具体核查、重规划与恢复方法由 Orchestrate 决定。
+Runtime 不生成定时监督提醒。显式 Agent 消息、项目群用户输入、原生请求、执行异常、GitHub 更新及必要生命周期事件继续进入原协调者 Thread，运行中追加输入，空闲时启动下一轮。没有新事件时协调者持续等待，静默本身不证明任务失败。正常轮询仍负责观察执行状态、投递已有输入和有限恢复，不因时间流逝制造协调任务。具体核查、重规划与恢复方法由 Orchestrate 决定。
 
 当前项目配置不含监督间隔。显式配置和持久项目 catalog 的兼容入口只接受并移除历史合法 `supervisionIntervalMs`，不生成默认值；其他未知设置仍拒绝。正常保存 catalog 后旧字段消失，不改写用户配置文件。
 

@@ -88,7 +88,9 @@ test('real Codex adapter sends the saved pair on start, resume and every turn af
   assert.equal(first[1]?.params?.model, profileB.model);
   assert.equal(first[1]?.params?.config?.model_reasoning_effort, profileB.reasoningEffort);
   assert.equal(first[1]?.params?.allowProviderModelFallback, false);
-  await loop.projectAction(coordinator, { action: 'send', requestId: 'turn-two', taskId: worker.id, text: 'Continue the original Worker.' });
+  const second = z.object({ inputId: z.string() }).parse(await loop.projectCall(coordinator, { tool: 'send_agent_message', arguments: { requestId: 'turn-two', taskId: worker.id, text: 'Continue the original Worker.' } }));
+  for (let attempt = 0; loop.store.input(worker.id, second.inputId)?.status !== 'delivered' && attempt < 200; attempt++) await delay(10);
+  assert.equal(loop.store.input(worker.id, second.inputId)?.status, 'delivered');
   await loop.tick(); await loop.tick();
   await loop.control(worker.id, 'pause');
   await writeFile(configFile, JSON.stringify({ ...configInput, execution: { worker: [profileA], coordinator: { backend: 'codex', model: 'coordinator-new', reasoningEffort: 'xhigh' } } }));
@@ -98,7 +100,9 @@ test('real Codex adapter sends the saved pair on start, resume and every turn af
   await loop.close(); loop = create(); await loop.recover();
   assert.equal(loop.store.task(worker.id).status, 'paused');
   await loop.control(worker.id, 'resume');
-  await loop.projectAction(coordinator, { action: 'send', requestId: 'turn-three', taskId: worker.id, text: 'Continue after restart.' });
+  const third = z.object({ inputId: z.string() }).parse(await loop.projectCall(coordinator, { tool: 'send_agent_message', arguments: { requestId: 'turn-three', taskId: worker.id, text: 'Continue after restart.' } }));
+  for (let attempt = 0; loop.store.input(worker.id, third.inputId)?.status !== 'delivered' && attempt < 200; attempt++) await delay(10);
+  assert.equal(loop.store.input(worker.id, third.inputId)?.status, 'delivered');
   await loop.tick(); await loop.tick();
   assert.deepEqual(await loop.projectAction(coordinator, action), receipt);
   const rows = (await readFile(log, 'utf8')).trim().split('\n').map(line => requestSchema.parse(JSON.parse(line)));

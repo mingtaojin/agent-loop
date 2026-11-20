@@ -118,11 +118,6 @@ test('project intake can require an assigned account AND Bug classification', ()
 test('project actions are discriminated strict shapes with a default worker role', () => {
   const actions: ProjectAction[] = [
     { action: 'status' }, { action: 'dispatch', execution: testExecution.worker, requestId: 'd', prompt: 'Investigate.', role: 'worker' },
-    { action: 'send', requestId: 's', taskId: 'worker', text: 'Preserve order.' },
-    { action: 'announce', requestId: 'a', kind: 'delivery', text: 'Delivered.' },
-    { action: 'report', requestId: 'r', kind: 'question', text: 'Which format?' },
-    { action: 'report', requestId: 'r', kind: 'result', text: 'Evidence is ready.' },
-    { action: 'report', requestId: 'r', kind: 'update', text: 'Still investigating.' },
     { action: 'record', requestId: 'n', key: 'decision', text: 'CSV.', expectedVersion: 0 },
     { action: 'rotate', requestId: 'rot', checkpoint: 'Resume with task worker.' },
     { action: 'release_workspace', requestId: 'rel', resourceId: 'resource' },

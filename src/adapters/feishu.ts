@@ -395,7 +395,7 @@ export class FeishuAdapter implements FeishuPort, FeishuProgressPort {
     if (response?.code === 232009) return;
     if (response?.code !== 0) check(response);
   }
-  async send(input: { chatId: string; text: string; id: string }): Promise<void> {
+  async send(input: { chatId: string; text: string; id: string }): Promise<{ messageId: string }> {
     let response: Awaited<ReturnType<FeishuApi['message']['create']>>;
     try {
       response = await this.api.message.create({ params: { receive_id_type: 'chat_id' },
@@ -404,7 +404,9 @@ export class FeishuAdapter implements FeishuPort, FeishuProgressPort {
       throw new UncertainOperationError(`Feishu message delivery outcome is unknown: ${errorMessage(error)}`);
     }
     const data = checkWrite(response);
-    if (!id.safeParse(data.message_id).success) throw new UncertainOperationError('Feishu message delivery returned no valid message_id');
+    const messageId = id.safeParse(data.message_id);
+    if (!messageId.success) throw new UncertainOperationError('Feishu message delivery returned no valid message_id');
+    return { messageId: messageId.data };
   }
   async sendApproval(input: { chatId: string; id: string; taskId: string; request: PendingRequest }): Promise<FeishuCardDelivery> {
     if (input.request.kind !== 'approval' && input.request.kind !== 'permissions') throw new Error('Only native approvals can create approval cards');

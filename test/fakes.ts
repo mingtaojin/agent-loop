@@ -74,7 +74,7 @@ export class FeishuFake implements FeishuPort {
   async dissolveGroup(chatId: string): Promise<void> {
     for (const [key, group] of this.groups) if (group === chatId) this.groups.delete(key);
   }
-  async send(input: Parameters<FeishuPort['send']>[0]): Promise<void> {
+  async send(input: Parameters<FeishuPort['send']>[0]): ReturnType<FeishuPort['send']> {
     this.sent.push(input);
     if (this.loseSendAck) { this.loseSendAck = false; throw new UncertainOperationError('Message sent; acknowledgement lost'); }
   }

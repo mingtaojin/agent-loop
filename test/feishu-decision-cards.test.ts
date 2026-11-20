@@ -94,8 +94,8 @@ test('project decision submission is a one-shot project record and coordinator i
     store.saveTask(task);
     const config = configSchema.parse({ dataDir: root, execution: testExecution, feishu: { userOpenId: 'owner' }, projects: [{ id: 'project', name: 'Project', directory: root, repositories: [] }] });
     const runtime = new ProjectRuntime(config, store, { closeout: { assertOpen() {}, completed() { return false; } } as any, makeTask: async () => { throw new Error('not used'); },
-      releaseWorkspace: async () => undefined, control: async () => undefined, openGroup: async () => 'chat', announce: async () => undefined,
-      groupCleanup: async () => undefined });
+      releaseWorkspace: async () => undefined, control: async () => undefined, openGroup: async () => 'chat', requestDecision: async () => undefined,
+      verifyGroup: async () => {}, groupCleanup: async () => undefined });
     runtime.ledger.create(config.projects[0]!, task.id);
     const action = { kind: 'project_decision' as const, id: 'card:decision', projectId: 'project', coordinatorTaskId: task.id, requestId: 'decision-1', key: 'strategy',
       customText: 'Ship in two stages.', chatId: 'chat', senderId: 'owner', cardId: 'card-1', messageId: 'message-1', sequence: 0, epoch: 'expiry', expiresAt: Date.now() + 60_000 };

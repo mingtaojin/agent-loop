@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { RejectedInputError, TurnChangedError, UncertainOperationError, workspaceTargetSchema, type AgentInput, type AgentOutput, type ExecutionSnapshot, type PendingRequest, type WorkspaceRequest } from '../domain.js';
 import { CodexProviderMismatchError, type Activity, type CodexPort, type TurnIdentity } from '../ports.js';
 import { executionEvent, executionKey, type ExecutionHistory, type ExecutionEvent } from '../execution-events.js';
-import { projectActionSchema } from '../project.js';
+import { projectToolCallSchema } from '../project.js';
 import type { ReasoningEffort } from '../execution.js';
 import { normalizeDaemonSettings, sharedDaemonConnector, type CodexConnection, type CodexConnector, type DaemonSettings } from './codex-daemon.js';
 import { taskTitleInput, taskTitleInstructions, taskTitleOutputSchema } from '../task-title.js';
@@ -88,12 +88,16 @@ const workspaceTool = {
   description: 'Get an additional engineering workspace using an exact Runtime-supplied projectId, or a configured or saved legacy repository name. Use the returned absolute path and read its project instructions. This does not grant additional filesystem permissions.',
   inputSchema: z.toJSONSchema(workspaceTargetSchema),
 };
-const { $schema: _projectSchema, ...projectInputSchema } = z.toJSONSchema(projectActionSchema, { io: 'input' });
-const projectTool = {
-  type: 'function', name: 'project_action',
-  description: 'Query project status, dispatch or message a task, report progress or questions, record durable project information, rotate the coordinator session, or release an owned workspace. Use nonblank identifiers and text. Project membership and caller role determine allowed actions. Reuse requestId only to retry the same action. This tool grants no additional engineering permissions.',
-  inputSchema: projectInputSchema,
+const projectToolDescriptions = {
+  project_action: 'Query project status, dispatch a Worker, manage groups and resources, record project facts or rotate the coordinator session. Membership and role determine allowed actions. Keep requestId stable for identical retries. This tool grants no additional engineering permissions.',
+  send_agent_message: 'Send text and optional factual references to your own coordinator or one of your Workers. taskId is the recipient. Delivery is durable and starts promptly, without waiting for your turn to end. Returns the original input ID and its current delivery state. Keep requestId stable for identical retries.',
+  send_group_message: 'Send text for people to your currently bound group. This does not deliver an Agent input. Coordinator replies to users require this tool. Worker ordinary replies already appear in its group. Returns the original output ID and its current delivery state. Keep requestId stable for identical retries.',
 };
+const projectTools = projectToolCallSchema.options.map(schema => {
+  const name = schema.shape.tool.value;
+  const { $schema: _schema, ...inputSchema } = z.toJSONSchema(schema.shape.arguments, { io: 'input' });
+  return { type: 'function', name, description: projectToolDescriptions[name], inputSchema };
+});
 type RpcId = z.infer<typeof rpcIdSchema>;
 type LiveRequest = {
   rpcId: RpcId;
@@ -374,7 +378,7 @@ export class CodexAppServer implements CodexPort {
     if (method === 'item/tool/call' && !completed) {
       const epoch = this.epoch;
       const { tool } = z.object({ tool: z.string() }).parse(payload);
-      const operation = tool === 'project_action' ? this.projectCall(rpcId, payload, epoch) : this.workspaceCall(rpcId, payload, epoch);
+      const operation = projectTools.some(definition => definition.name === tool) ? this.projectCall(rpcId, payload, epoch) : this.workspaceCall(rpcId, payload, epoch);
       void operation.catch(error => {
         if (epoch === this.epoch) this.fail(error instanceof Error ? error : new Error(String(error)));
       });
@@ -461,7 +465,7 @@ export class CodexAppServer implements CodexPort {
     await this.ready();
     const { thread } = threadResponseSchema.parse(await this.rpc('thread/start', { ...this.config(), ...(input.model ? { model: input.model } : {}),
       ...(input.reasoningEffort ? { config: { model_reasoning_effort: input.reasoningEffort } } : {}),
-      allowProviderModelFallback: false, cwd: input.cwd, developerInstructions: input.instructions, dynamicTools: this.projectHandler ? [workspaceTool, projectTool] : [workspaceTool], ephemeral: false }));
+      allowProviderModelFallback: false, cwd: input.cwd, developerInstructions: input.instructions, dynamicTools: this.projectHandler ? [workspaceTool, ...projectTools] : [workspaceTool], ephemeral: false }));
     if (thread.status.type !== 'idle' || thread.turns.length) throw new UncertainOperationError('New Codex thread was not empty and idle');
     this.threads.set(thread.id, { load: { kind: 'ready' }, untouched: true, instructions: input.instructions, model: input.model, reasoningEffort: input.reasoningEffort });
     return thread.id;
@@ -833,13 +837,13 @@ export class CodexAppServer implements CodexPort {
     const call = z.object({ threadId: z.string(), turnId: z.string(), callId: z.string(), tool: z.string(), namespace: z.string().nullish(), arguments: z.unknown() }).parse(payload);
     let result: { success: boolean; contentItems: { type: 'inputText'; text: string }[] };
     try {
-      if (call.tool !== 'project_action' || call.namespace) throw new Error(`Unsupported dynamic tool ${call.tool}`);
+      if (call.namespace) throw new Error(`Unsupported dynamic tool ${call.tool}`);
       if (!this.threads.has(call.threadId)) throw new Error('Project request belongs to an unknown thread');
       if (!this.projectHandler) throw new Error('Project coordination is unavailable');
-      const action = projectActionSchema.parse(call.arguments);
+      const command = projectToolCallSchema.parse({ tool: call.tool, arguments: call.arguments });
       const activity = await this.activity(call.threadId);
       if (epoch !== this.epoch || activity.kind !== 'running' || activity.turnId !== call.turnId || !this.isActiveTurn(activity)) throw new Error('Project request belongs to an inactive turn');
-      const value = await this.projectHandler({ threadId: call.threadId, turnId: call.turnId, callId: call.callId, action, connectionEpoch: epoch });
+      const value = await this.projectHandler({ threadId: call.threadId, turnId: call.turnId, callId: call.callId, call: command, connectionEpoch: epoch });
       result = { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify(value) }] };
     } catch (error) {
       result = { success: false, contentItems: [{ type: 'inputText', text: error instanceof Error ? error.message : String(error) }] };

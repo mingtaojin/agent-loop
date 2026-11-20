@@ -340,7 +340,7 @@ test('completed followups retain original provenance and create no automatic exe
   assert.equal(forwarded.length, 2); assert.deepEqual(forwarded[0]?.provenance, { kind: 'user', message });
   assert.equal(f.loop.tasks().length, 2); assert.equal(f.codex.starts.filter(start => start.threadId === worker.threadId).length, starts);
   await assert.rejects(f.loop.control(worker.id, 'resume'), /completed/); await assert.rejects(f.loop.ensureWorkspace(worker.id, 'example/app'), /completed/);
-  await assert.rejects(f.action({ action: 'send', requestId: 'old-send', taskId: worker.id, text: 'continue' }), /completed/);
+  await assert.rejects(f.loop.projectCall(f.coordinatorId, { tool: 'send_agent_message', arguments: { requestId: 'old-send', taskId: worker.id, text: 'continue' } }), /completed/);
   const newTask = z.object({ taskId: z.string() }).parse(await f.action({ action: 'dispatch', execution: testExecution.worker, requestId: 'follow-new', predecessorTaskId: worker.id, prompt: 'New output', role: 'worker' }));
   assert.equal((await f.state(newTask.taskId)).predecessorTaskId, worker.id); assert.notEqual((await f.scope(newTask.taskId)).location.root.path, (await f.scope(worker.id)).location.root.path);
   assert.match(f.loop.store.inputs(newTask.taskId)[0]?.message.text ?? '', /Delivered result/);
@@ -596,7 +596,7 @@ for (const entry of ['native', 'capability'] as const) test(`${entry} project ac
   const call = async () => {
     if (entry === 'native') {
       assert.ok(f.codex.projectHandler);
-      return f.codex.projectHandler({ ...activity, callId: 'closeout-call', action });
+      return f.codex.projectHandler({ ...activity, callId: 'closeout-call', call: { tool: 'project_action', arguments: action } });
     }
     const output = await execute(process.execPath, ['--import', 'tsx', fileURLToPath(new URL('../src/project-client.ts', import.meta.url)), join(f.data, 'workspace-capabilities', `${coordinator.id}.json`), actionFile]);
     return JSON.parse(output.stdout);

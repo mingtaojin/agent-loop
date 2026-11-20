@@ -22,7 +22,7 @@ import { FeishuProgressPublisher } from './feishu-progress.js';
 import { FeishuDocumentProgressPublisher } from './feishu-document-progress.js';
 import { HistoricalExecutionIdentityError } from './execution.js';
 import { IntakeOwnershipChanged, intakeMaterialVersion, ProjectRuntime } from './project-runtime.js';
-import type { ProjectAction, ProjectConfig } from './project.js';
+import type { ProjectAction, ProjectToolCall, ProjectConfig } from './project.js';
 import { matchesProjectIssue } from './project.js';
 import type { FeishuArtifactPort } from './feishu-artifact.js';
 
@@ -112,7 +112,15 @@ export class AgentLoop {
       releaseWorkspace: (taskId, resourceId) => this.releaseWorkspace(taskId, resourceId),
       control: (taskId, action) => this.control(taskId, action),
       openGroup: taskId => this.openGroup(taskId),
-      announce: async (taskId, action) => this.announce(taskId, action),
+      requestDecision: async (taskId, action) => this.requestDecision(taskId, action),
+      verifyGroup: async taskId => {
+        const task = this.store.task(taskId);
+        if (!task.chatId) throw new Error('Task group is unavailable; use open_group first');
+        const generation = groupGeneration(this.store, taskId);
+        await this.ports.feishu.verifyGroup(task.chatId);
+        assertGroupBinding(this.store, taskId, task.chatId);
+        if (groupGeneration(this.store, taskId) !== generation) throw new Error('Task group binding changed');
+      },
       groupCleanup: async (callerId, action) => {
         const cleanup = new GroupCleanup(this.store, ports.feishu, config.feishu.userOpenId);
         switch (action.action) {
@@ -143,9 +151,9 @@ export class AgentLoop {
       const activity = await this.capabilityActivity(taskId);
       this.assertActiveTask(taskId, activity);
       return this.ensureWorkspace(taskId, repository);
-    }, async (taskId, action) => {
+    }, async (taskId, call) => {
       const activity = await this.capabilityActivity(taskId);
-      return this.projectAction(taskId, action, () => this.assertActiveTask(taskId, activity), activity);
+      return this.projectCall(taskId, call, () => this.assertActiveTask(taskId, activity), activity);
     });
     ports.codex.setWorkspaceHandler(async request => {
       const task = this.store.taskForThread(request.threadId);
@@ -156,7 +164,7 @@ export class AgentLoop {
     ports.codex.setProjectHandler?.(async request => {
       const task = this.store.taskForThread(request.threadId);
       if (!task) throw new Error('Project action requires an active task');
-      return this.projectAction(task.id, request.action, () => this.assertActiveTask(task.id, request), request);
+      return this.projectCall(task.id, request.call, () => this.assertActiveTask(task.id, request), request);
     });
   }
   private assertActiveTask(taskId: string, identity: TurnIdentity): void {
@@ -176,10 +184,20 @@ export class AgentLoop {
     return activity;
   }
   async projectAction(taskId: string, action: ProjectAction, assertActive?: () => void, identity?: TurnIdentity): Promise<unknown> {
+    return this.projectCall(taskId, { tool: 'project_action', arguments: action }, assertActive, identity);
+  }
+  async projectCall(taskId: string, call: ProjectToolCall, assertActive?: () => void, identity?: TurnIdentity): Promise<unknown> {
     if (this.stopping) throw new Error('Runtime is stopping');
-    const result = await this.projects.action(taskId, action, assertActive, identity);
-    if (action.action === 'complete_task') { this.forwardCompletedInputs(this.store.task(action.taskId)); await this.closeout.progress(action.taskId); }
-    if (action.action === 'cleanup_artifacts') await this.closeout.progress(taskId);
+    const result = await this.projects.call(taskId, call, assertActive, identity);
+    if (call.tool === 'send_agent_message') {
+      void this.serial(call.arguments.taskId, () => this.advance(call.arguments.taskId)).catch(error => this.problem(call.arguments.taskId, error));
+    } else if (call.tool === 'send_group_message') {
+      void this.serial(taskId, () => this.flush(this.store.task(taskId))).catch(error => this.problem(taskId, error));
+    } else {
+      const action = call.arguments;
+      if (action.action === 'complete_task') { this.forwardCompletedInputs(this.store.task(action.taskId)); await this.closeout.progress(action.taskId); }
+      if (action.action === 'cleanup_artifacts') await this.closeout.progress(taskId);
+    }
     return result;
   }
 
@@ -207,8 +225,8 @@ export class AgentLoop {
       if (this.stopping || this.lanes.has(taskId)) return;
       const task = this.store.task(taskId);
       if (task.status === 'failed'
-        && !this.store.inputs(taskId, { statuses: ['pending'], origin: 'user' }).some(input =>
-          task.recovery.lastUserInputSeq === null ? input.message.createdAt > task.updatedAt : input.seq > task.recovery.lastUserInputSeq)
+        && !this.store.inputs(taskId, { statuses: ['pending'] }).some(input =>
+          (input.origin === 'user' || input.provenance.kind === 'agent_message') && (task.recovery.lastUserInputSeq === null ? input.message.createdAt > task.updatedAt : input.seq > task.recovery.lastUserInputSeq))
         && !this.store.hasOutputs(taskId, ['pending', 'sending', 'uncertain'])) return;
       if (task.status === 'idle' && task.executionStatus === 'completed'
         && !this.store.hasInputs(taskId, { statuses: ['pending', 'delivering', 'uncertain', 'held'] })
@@ -275,7 +293,6 @@ export class AgentLoop {
     if (task.chatId) void this.serial(taskId, () => this.flush(this.store.task(taskId))).catch(error => this.problem(taskId, error));
   }
   private publishWorkerSnapshot(task: Task, snapshot: ExecutionSnapshot | RunningActivity): void {
-    this.projects.reconcileWorkerResult(task.id, snapshot);
     if (snapshot.turnId === task.lastHandledTurnId) return;
     const turn = this.workerChatTurn(task, snapshot.threadId, snapshot.turnId);
     if (!turn || turn.ended) return;
@@ -295,10 +312,10 @@ export class AgentLoop {
       && this.store.outputs(task.id).find(output => output.id === id)?.status === 'pending')
       this.store.markOutput(id, 'dropped', '任务当前无群，不补发历史');
   }
-  private async announce(taskId: string, action: Extract<ProjectAction, { action: 'announce' }>): Promise<unknown> {
+  private async requestDecision(taskId: string, action: Extract<ProjectAction, { action: 'request_decision' }>): Promise<unknown> {
     const task = this.store.task(taskId);
     if (!task.chatId) throw new Error('Project coordinator group is unavailable');
-    if (action.kind === 'decision' && action.options?.length && this.ports.feishu.sendDecisionCard) {
+    if (this.ports.feishu.sendDecisionCard) {
       const expiresAt = action.expiresAt ?? Date.now() + 7 * 24 * 60 * 60 * 1000;
       const cardRecordId = `project:${taskId}:${action.requestId}`;
       const existing = this.store.feishuCard(cardRecordId);
@@ -309,7 +326,7 @@ export class AgentLoop {
         id: cardRecordId, kind: 'project_decision' as const, requestId: action.requestId, taskId,
         projectId: this.projects.ledger.membership(taskId)?.projectId, chatId: task.chatId, ownerId: this.config.feishu.userOpenId,
         cardId: null, messageId: null, sequence: 0, uuid, status: 'pending' as const, expiresAt,
-        fingerprint: digest(JSON.stringify({ taskId, requestId: action.requestId, key: action.key ?? action.requestId, options: action.options, text: action.text })),
+        fingerprint: digest(JSON.stringify({ taskId, requestId: action.requestId, key: action.key ?? action.requestId, options: action.options, text: action.prompt })),
         receipt: null, updatedAt: Date.now(),
       };
       const parsed = pending.projectId ? pending : { ...pending, projectId: this.projects.ledger.membership(taskId)?.projectId };
@@ -317,17 +334,14 @@ export class AgentLoop {
       this.store.saveFeishuCard(parsed);
       try {
         const delivery = await this.ports.feishu.sendDecisionCard({ id: cardRecordId, projectId: parsed.projectId, coordinatorTaskId: taskId,
-          requestId: action.requestId, key: action.key ?? action.requestId, prompt: action.text, options: action.options, context: action.context,
+          requestId: action.requestId, key: action.key ?? action.requestId, prompt: action.prompt, options: action.options, context: action.context,
           chatId: task.chatId, ownerId: this.config.feishu.userOpenId, expiresAt });
         this.store.updateFeishuCard(cardRecordId, { cardId: delivery.cardId, messageId: delivery.messageId, sequence: delivery.sequence,
           uuid: delivery.uuid, status: 'pending' });
       } catch (error) { this.store.updateFeishuCard(cardRecordId, { status: 'uncertain' }); throw error; }
-      this.projects.markCoordinatorAnnouncement(taskId, task.turnId);
       return { accepted: true, requestId: action.requestId, cardId: this.store.feishuCard(cardRecordId)?.cardId };
     }
-    const headings = { decision: '【需要决定】', blocker: '【任务阻塞】', approval: '【需要处理审批】', delivery: '【交付结论】' } as const;
-    this.store.enqueue(task.id, `${headings[action.kind]}\n${action.text}`, `project-announcement:${action.requestId}`);
-    return { accepted: true, requestId: action.requestId };
+    throw new Error('Project decision cards are unavailable');
   }
   private async openGroup(taskId: string): Promise<string> {
     let chatId = '';
@@ -389,12 +403,13 @@ export class AgentLoop {
       const client = fileURLToPath(new URL(import.meta.url.endsWith('.ts') ? './project-client.ts' : './project-client.js', import.meta.url));
       const quote = (text: string) => `'${text.replaceAll("'", "'\"'\"'")}'`;
       const launcher = [process.execPath, ...(import.meta.url.endsWith('.ts') ? ['--import', fileURLToPath(import.meta.resolve('tsx'))] : []), client].map(quote).join(' ');
-      projectFallback = `\nIf project_action is absent or its retained schema lacks the required action or fields, write the action JSON to a file and run ${launcher} ${quote(capability)} '<absolute-action-json-file>' using your shell tool. This task-scoped capability uses the same project operations. Never read, copy or share the capability contents.`;
+      projectFallback = `\nIf any current tool is absent or its retained schema lacks the required fields, write its arguments JSON to a file and run ${launcher} ${quote(capability)} '<tool-name>' '<absolute-arguments-json-file>' using your shell tool. Valid tool names are project_action, send_agent_message and send_group_message. The two-argument administrative invocation remains ${launcher} ${quote(capability)} '<absolute-action-json-file>'. Never read, copy or share the capability contents.`;
     }
-    const delegation = this.store.meta(`project-delegation:${task.id}`);
+    const delegation = this.store.meta(`project-delegation:${task.id}`)
+      ?? (membership.role === 'worker' && task.source.kind === 'cli' ? task.source.prompt : null);
     const artifactInstructions = '\nCurrent Runtime-owned artifact scopes are supplied with each input and available through status section closeout. Put temporary files, logs, build outputs and evidence there. Set supported build output flags and TMPDIR to a returned scope when needed. Use allocate_artifacts for a fresh scope, register_artifact for unique delivery holds. Execution cwd and original inputs are not artifact scopes.';
-    const prompt = rolePrompt + artifactInstructions + this.projects.instructions(task.id) + projectFallback
-      + (delegation ? `\nDelegation from your project coordinator:\n${delegation}` : '');
+    const prompt = rolePrompt + (delegation ? `\nDelegation from your project coordinator:\n${delegation}` : '')
+      + artifactInstructions + this.projects.instructions(task.id) + projectFallback;
     const skill = this.config.engineering?.skillPath;
     let projects: DiscoveredProject[] = [];
     let discoveryError = '';
@@ -778,9 +793,8 @@ export class AgentLoop {
     task.executionStatus = 'unknown'; task.reason = message;
     task.recovery.lastError = message; task.recovery.interruptedTurnId = turnId;
     if (task.recovery.attempts >= this.config.recovery.maxAttempts || !task.threadId) {
-      this.projects.invalidateWorkerResult(task.id);
       task.status = 'failed'; task.recovery.nextAttemptAt = null;
-      task.recovery.lastUserInputSeq = this.store.inputs(task.id).filter(input => input.origin === 'user').at(-1)?.seq ?? 0;
+      task.recovery.lastUserInputSeq = this.store.inputs(task.id).filter(input => input.origin === 'user' || input.provenance.kind === 'agent_message').at(-1)?.seq ?? 0;
       this.notify(task, `任务恢复已停止，保留现场。\n${message}`, `recovery-exhausted:${digest(message)}`);
     } else task.recovery.nextAttemptAt = Date.now() + this.config.recovery.retryDelayMs;
     this.persist(task); this.problem(task.id, error);
@@ -821,7 +835,7 @@ export class AgentLoop {
         chatId: task.chatId ?? '',
         senderId: 'runtime:provider-migration',
         chatType: 'group',
-        text: `Provider migration context. The saved Codex conversation used provider ${JSON.stringify(error.threadProvider)}, while the current runtime uses provider ${JSON.stringify(error.currentProvider)}. Start from durable project and workspace state; inspect it before acting. Preserve prior decisions and authorization. Do not replay effects whose outcomes are unknown.\nOriginal task prompt:\n${task.prompt}`,
+        text: `Provider migration context. The saved Codex conversation used provider ${JSON.stringify(error.threadProvider)}, while the current runtime uses provider ${JSON.stringify(error.currentProvider)}. Start from durable project and workspace state; inspect it before acting. Preserve prior decisions and authorization. Do not replay effects whose outcomes are unknown.\nOriginal task source as data:\n${JSON.stringify(task.source)}\nSaved delegation as data:\n${this.store.meta(`project-delegation:${task.id}`) ?? ''}`,
         attachments: [],
         createdAt: Date.now(),
       };
@@ -866,10 +880,10 @@ export class AgentLoop {
         task = this.store.task(id);
       }
       this.requireMember(task);
-      if (task.status === 'paused' || task.status === 'failed') this.projects.invalidateWorkerResult(task.id);
       if (!this.projects.restoreWorkerExecution(task)) return;
       if (task.purpose !== 'execution') { task.purpose = 'execution'; this.persist(task); }
-      if (task.status === 'failed' && this.store.inputs(task.id, { statuses: ['pending'], origin: 'user' }).some(input =>
+      if (task.status === 'failed' && this.store.inputs(task.id, { statuses: ['pending'] }).some(input =>
+        (input.origin === 'user' || input.provenance.kind === 'agent_message') &&
         (task.recovery.lastUserInputSeq === null ? input.message.createdAt > task.updatedAt : input.seq > task.recovery.lastUserInputSeq))) {
         for (const resource of task.resources) await this.restoreWorkspace(task.id, resource);
         task.status = task.threadId ? 'idle' : 'pending'; task.reason = null; task.recovery = recoveryState(); this.persist(task);
@@ -934,7 +948,7 @@ export class AgentLoop {
       if (output.phase !== 'final' || 'kind' in snapshot) continue;
       if (task.legacy && this.store.hasOutput(task.id, `turn:${output.turnId}`)) continue;
       if (output.text.trim() && this.store.meta(`task-summary:${task.id}`) !== output.text) this.store.setMeta(`task-summary:${task.id}`, output.text);
-      if (output.text.trim() && this.projects.ledger.membership(task.id)?.role !== 'worker' && this.projects.publishCoordinatorFinal(task, output.turnId)) this.notify(task, output.text, `agent-output:${output.id}`);
+      if (output.text.trim() && !this.projects.ledger.membership(task.id)) this.notify(task, output.text, `agent-output:${output.id}`);
     }
     for (const request of snapshot.requests) {
       const identity = `${request.connectionEpoch}:${request.id}`;
@@ -1134,7 +1148,6 @@ export class AgentLoop {
         this.store.transaction(() => { for (const input of initial) this.store.markInput(input.id, 'delivering'); });
         try {
           task.turnId = await this.ports.codex.startTurn({ threadId: threadId, input: prepared, deliveryId: first.id, additionalContext: this.projects.context(task.id), additionalDeliveryIds: initial.slice(1).map(input => input.id) });
-          for (const input of initial) this.projects.markCoordinatorInput(task, task.turnId, input);
           this.store.transaction(() => {
             this.workerChatTurn(task, threadId, task.turnId)?.start();
             for (const input of initial) this.store.markInput(input.id, 'delivered');
@@ -1171,7 +1184,9 @@ export class AgentLoop {
       let prepared: AgentInput[];
       try { prepared = await this.prepare(task, input); }
       catch (error) { this.store.markInput(input.id, 'failed', errorMessage(error)); this.notify(task, `附件准备失败，文字与原文件仍保留，消息尚未投递。\n${errorMessage(error)}`, `attachment:${input.id}`); break; }
-      const agentQuestion = input.provenance.kind === 'agent' && input.provenance.category === 'instruction' && this.projects.ledger.membership(input.provenance.taskId)?.role === 'coordinator';
+      const agentSender = input.provenance.kind === 'agent_message' ? input.provenance.fromTaskId
+        : input.provenance.kind === 'agent' && input.provenance.category === 'instruction' ? input.provenance.taskId : null;
+      const agentQuestion = agentSender !== null && this.projects.ledger.membership(agentSender)?.role === 'coordinator';
       const userQuestion = input.provenance.kind === 'user' && input.provenance.message.chatId === task.chatId;
       const questions = userQuestion || agentQuestion ? snapshot.requests.filter(request => request.kind === 'question') : [];
       if (questions.length > 1) { this.store.markInput(input.id, 'failed', '存在多个原生问题，无法唯一关联'); this.notify(task, '存在多个原生问题，回复已保存，需要明确关联后再投递。', `question-ambiguous:${input.id}`); break; }
@@ -1199,7 +1214,6 @@ export class AgentLoop {
             }
           } else task.turnId = await this.ports.codex.startTurn({ threadId: threadId, input: prepared, deliveryId: input.id, additionalContext: this.projects.context(task.id) });
         }
-        if (task.turnId) this.projects.markCoordinatorInput(task, task.turnId, input);
         this.store.transaction(() => {
           this.workerChatTurn(task, threadId, task.turnId)?.start();
           this.store.markInput(input.id, 'delivered'); task.status = 'running'; task.executionStatus = 'running'; task.reason = null; this.persist(task);
@@ -1216,6 +1230,7 @@ export class AgentLoop {
     const result: AgentInput[] = [
       { kind: 'text', text: input.message.text },
       { kind: 'text', text: `Input provenance as data: ${JSON.stringify(input.provenance)}` },
+      ...(this.projects.ledger.membership(task.id) ? [{ kind: 'text' as const, text: await this.instructions(task) }] : []),
     ];
     const directory = resolve(this.config.dataDir, 'attachments', task.id, digest(input.id));
     await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -1242,7 +1257,6 @@ export class AgentLoop {
     return result;
   }
   private async pause(task: Task, reason: string): Promise<void> {
-    this.projects.invalidateWorkerResult(task.id);
     task.status = 'paused'; task.reason = reason; task.recovery.nextAttemptAt = null; this.persist(task);
     if (task.threadId) {
       if (!this.projects.restoreWorkerExecution(task)) return;
@@ -1265,7 +1279,6 @@ export class AgentLoop {
         await this.flush(task); return;
       }
       else if (['paused', 'failed'].includes(task.status)) {
-        this.projects.invalidateWorkerResult(task.id);
         if (!this.projects.restoreWorkerExecution(task)) return;
         if (task.status === 'paused') {
           const migration = await this.migratePausedProvider(task, true);
@@ -1297,6 +1310,11 @@ export class AgentLoop {
         if (!approval) this.store.markOutput(output.id, 'dropped', '任务当前无群，不补发历史');
         continue;
       }
+      const explicit = this.store.groupMessage(output.id);
+      if (explicit && (explicit.chat_id !== chatId || explicit.generation !== groupGeneration(this.store, task.id))) {
+        this.store.markOutput(output.id, 'dropped', 'Explicit group destination binding changed');
+        continue;
+      }
       const worker = this.store.workerOutput(output.id);
       if (worker && worker.chat_id !== chatId) {
         this.store.markOutput(output.id, 'dropped', '任务群绑定已改变');
@@ -1321,7 +1339,13 @@ export class AgentLoop {
             cardId: delivery.cardId, messageId: delivery.messageId, sequence: delivery.sequence, uuid: delivery.uuid,
             status: 'pending', expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
             fingerprint: digest(JSON.stringify({ taskId: task.id, requestId: data.request.id, epoch: data.request.connectionEpoch })), receipt: null, updatedAt: Date.now() });
-        } else await this.ports.feishu.send({ chatId, text: output.text, id: output.id });
+        } else {
+          const delivery = await this.ports.feishu.send({ chatId, text: output.text, id: output.id });
+          if (delivery && explicit) this.store.transaction(() => {
+            this.store.confirmGroupMessage(output.id, delivery.messageId);
+            this.store.markOutput(output.id, 'sent');
+          });
+        }
         this.store.markOutput(output.id, 'sent');
       } catch (error) {
         this.store.markOutput(output.id, approval && error instanceof FeishuApiError ? 'pending' : 'uncertain', errorMessage(error)); this.problem(task.id, error);
@@ -1374,7 +1398,7 @@ export class AgentLoop {
         const failed = this.store.task(task.id);
         if (failed.status !== 'paused' || failed.reason !== 'Operator paused') { failed.status = 'failed'; failed.reason = errorMessage(error); }
         failed.recovery.nextAttemptAt = null; failed.recovery.lastError = errorMessage(error);
-        failed.recovery.lastUserInputSeq = this.store.inputs(task.id).filter(input => input.origin === 'user').at(-1)?.seq ?? 0; this.persist(failed);
+        failed.recovery.lastUserInputSeq = this.store.inputs(task.id).filter(input => input.origin === 'user' || input.provenance.kind === 'agent_message').at(-1)?.seq ?? 0; this.persist(failed);
         this.problem(task.id, error); this.notify(failed, `任务关联核对失败，保留现场。\n${errorMessage(error)}`, `association:${digest(errorMessage(error))}`);
         await this.flush(failed);
       }

@@ -255,8 +255,6 @@ try {
   loop.projects.ledger.membership = (...args) => { count('ledger.membership'); return membership(...args); };
   const projectRead = loop.projects.ledger.project.bind(loop.projects.ledger);
   loop.projects.ledger.project = (...args) => { count('ledger.project'); return projectRead(...args); };
-  const publish = loop.projects.publishCoordinatorFinal.bind(loop.projects);
-  loop.projects.publishCoordinatorFinal = (...args) => { count('runtime.publishCoordinatorFinal'); return publish(...args); };
 
   const idleMs = Math.round(durationMs * 0.43);
   const targetIds = ['record-heavy-0', 'history-heavy-0', 'history-heavy-1'];

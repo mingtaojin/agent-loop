@@ -30,6 +30,8 @@ const inboxRow = z.object({ seq: z.number(), id: z.string(), task_id: z.string()
 export type Inbox = Omit<z.infer<typeof inboxRow>, 'payload'> & { message: IncomingMessage; provenance: InputProvenance; requestId: string | null };
 export type InboxFilter = { statuses?: readonly Inbox['status'][]; origin?: Inbox['origin'] };
 const outboxSchema = z.object({ id: z.string(), task_id: z.string(), text: z.string(), status: z.enum(['pending', 'sending', 'sent', 'uncertain', 'dropped']), error: z.string().nullable() });
+const groupDeliverySchema = z.object({ project_id: z.string(), request_id: z.string(), chat_id: z.string(), generation: z.number(), message_id: z.string().nullable() });
+export type GroupDelivery = z.infer<typeof groupDeliverySchema>;
 export type Outbox = z.infer<typeof outboxSchema>;
 const workerDeliverySchema = z.object({ chat_id: z.string().nullable(), turn_key: z.string(), kind: z.enum(['body', 'working', 'ended']) });
 type WorkerDelivery = z.infer<typeof workerDeliverySchema>;
@@ -66,6 +68,7 @@ export class Store {
         CREATE INDEX IF NOT EXISTS inbox_task_status ON inbox(task_id,status,seq);
         CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id),text TEXT NOT NULL,status TEXT NOT NULL,error TEXT);
         CREATE INDEX IF NOT EXISTS outbox_task_status ON outbox(task_id,status);
+        CREATE TABLE IF NOT EXISTS group_message_deliveries(output_id TEXT PRIMARY KEY REFERENCES outbox(id) ON DELETE CASCADE,project_id TEXT NOT NULL,request_id TEXT NOT NULL,chat_id TEXT NOT NULL,generation INTEGER NOT NULL,message_id TEXT);
         CREATE TABLE IF NOT EXISTS worker_chat_deliveries(output_id TEXT PRIMARY KEY REFERENCES outbox(id) ON DELETE CASCADE,chat_id TEXT,turn_key TEXT NOT NULL,kind TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS worker_chat_turn ON worker_chat_deliveries(turn_key,chat_id,kind);
         CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id),kind TEXT NOT NULL,status TEXT NOT NULL,result TEXT,error TEXT);
@@ -228,6 +231,18 @@ export class Store {
     this.prepare("INSERT OR IGNORE INTO outbox VALUES(?,?,?,'pending',NULL)").run(id, taskId, text);
     return id;
   }
+  enqueueGroupMessage(taskId: string, text: string, delivery: Omit<GroupDelivery, 'message_id'>): string {
+    const id = this.enqueue(taskId, text, `group-message:${delivery.request_id}`);
+    this.prepare('INSERT OR IGNORE INTO group_message_deliveries VALUES(?,?,?,?,?,NULL)').run(id, delivery.project_id, delivery.request_id, delivery.chat_id, delivery.generation);
+    return id;
+  }
+  groupMessage(id: string): GroupDelivery | null {
+    const row = this.prepare('SELECT project_id,request_id,chat_id,generation,message_id FROM group_message_deliveries WHERE output_id=?').get(id);
+    return row ? groupDeliverySchema.parse(row) : null;
+  }
+  confirmGroupMessage(id: string, messageId: string): void {
+    this.prepare('UPDATE group_message_deliveries SET message_id=? WHERE output_id=?').run(messageId, id);
+  }
   enqueueWorkerOutput(taskId: string, text: string, key: string, delivery: WorkerDelivery): void {
     const id = this.enqueue(taskId, text, key);
     this.prepare('INSERT INTO worker_chat_deliveries VALUES(?,?,?,?)').run(id, delivery.chat_id, delivery.turn_key, delivery.kind);
@@ -323,6 +338,10 @@ export class Store {
       if (seen.has(identity)) return false;
       seen.add(identity); return true;
     }).slice(0, diagnosticReadLimit);
+  }
+  metadata(prefix: string): { key: string; value: string }[] {
+    return this.prepare('SELECT key,value FROM meta WHERE substr(key,1,?)=? ORDER BY key').all(prefix.length, prefix)
+      .map(row => z.object({ key: z.string(), value: z.string() }).parse(row));
   }
   meta(key: string): string | null { const row = this.prepare('SELECT value FROM meta WHERE key=?').get(key); return row ? metaRow.parse(row).value : null; }
   metaRevision(key: string): symbol {

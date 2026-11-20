@@ -208,6 +208,8 @@ export const structuredReportSchema = z.strictObject({
 });
 export type StructuredReport = z.infer<typeof structuredReportSchema>;
 export const inputProvenanceSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('agent_message'), projectId: z.string(), fromTaskId: z.string(), toTaskId: z.string(),
+    requestId: z.string(), references: z.array(z.string()), sources: z.array(incomingSchema) }),
   z.strictObject({ kind: z.literal('agent'), projectId: z.string(), taskId: z.string(), eventId: z.string(), category: z.string(),
     ...structuredReportSchema.shape }),
   z.object({ kind: z.literal('user'), message: incomingSchema }),

@@ -1,6 +1,6 @@
 import type { AgentOutput, AgentInput, ApprovalAction, Attachment, CollectionRepository, ExecutionSnapshot, IncomingMessage, PendingRequest, ProjectDecisionAction, Repository, Source, SourceComment, TaskResource, WorkspaceRequest } from './domain.js';
 import type { ExecutionEvent, ExecutionHistory } from './execution-events.js';
-import type { ProjectAction } from './project.js';
+import type { ProjectToolCall } from './project.js';
 import type { ReasoningEffort } from './execution.js';
 
 export type Activity = { kind: 'reconcile' } | RunningActivity;
@@ -18,7 +18,7 @@ export interface ProjectRequest {
   threadId: string;
   turnId: string;
   callId: string;
-  action: ProjectAction;
+  call: ProjectToolCall;
   connectionEpoch: string;
 }
 
@@ -34,7 +34,7 @@ export interface FeishuPort {
   ensureGroup(input: { taskId: string; title: string; sourceUrl: string; generation?: number; reconcileOnly?: boolean }): Promise<string>;
   verifyGroup(chatId: string): Promise<void>;
   dissolveGroup(chatId: string): Promise<void>;
-  send(input: { chatId: string; text: string; id: string }): Promise<void>;
+  send(input: { chatId: string; text: string; id: string }): Promise<{ messageId: string } | void>;
   download(input: { messageId: string; attachment: Attachment; destination: string; maxBytes: number }): Promise<void>;
   history(input: { chatId: string; since: number }): Promise<IncomingMessage[]>;
   start(onMessage: (message: IncomingMessage) => Promise<void>, onError: (error: unknown) => void, onAction?: (action: ApprovalAction) => Promise<void>, onReconnect?: (event: FeishuReconnectEvent) => void, onDecision?: (action: ProjectDecisionAction) => Promise<void>): Promise<void>;

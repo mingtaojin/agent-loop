@@ -90,25 +90,26 @@ class ObservedCodex extends CodexAppServer {
     super.setProjectHandler(async request => {
       const callStartedAt = Date.now();
       const index = calls.push({ request: structuredClone(request), startedAt: callStartedAt, status: 'running' }) - 1;
-      note('project_action', { action: request.action.action, threadId: request.threadId, turnId: request.turnId });
+      note(request.call.tool, { arguments: request.call.arguments, threadId: request.threadId, turnId: request.turnId });
       try {
-        const action = request.action;
-        if (action.action === 'dispatch') {
-          assert.equal(action.requestId, dispatchId, 'Only the single fixture worker is authorized');
-          assert.equal(action.role, 'worker');
-        } else if (action.action === 'open_group') {
-          assert.equal(action.requestId, 'fixture-open-worker-group');
-        } else if (action.action === 'report') {
-          assert.equal(action.requestId, reportMessageId);
-          assert.equal(action.kind, 'result');
+        const call = request.call;
+        if (call.tool === 'send_agent_message') {
+          assert.equal(call.arguments.requestId, reportMessageId);
           assert.ok(loop);
           const project = loop.projects.ledger.project(projectId); assert.ok(project);
+          assert.equal(call.arguments.taskId, project.coordinatorTaskId);
           const coordinator = loop.store.task(project.coordinatorTaskId);
           reportArrival = { status: coordinator.status, turnId: coordinator.turnId, at: Date.now() };
-        } else if (action.action === 'record') {
-          assert.equal(action.requestId, recordId);
-          assert.equal(action.key, recordKey);
-        } else assert.equal(action.action, 'status', 'Only status, dispatch, open_group, report and record are authorized');
+        } else if (call.tool === 'project_action') {
+          const action = call.arguments;
+          if (action.action === 'dispatch') {
+            assert.equal(action.requestId, dispatchId, 'Only the single fixture worker is authorized');
+            assert.equal(action.role, 'worker');
+          } else if (action.action === 'open_group') assert.equal(action.requestId, 'fixture-open-worker-group');
+          else if (action.action === 'record') {
+            assert.equal(action.requestId, recordId); assert.equal(action.key, recordKey);
+          } else assert.equal(action.action, 'status');
+        } else throw new Error('This fixture authorizes Agent messages only');
         const result = await handler(request);
         calls[index] = { request: structuredClone(request), startedAt: callStartedAt,
           status: 'succeeded', finishedAt: Date.now(), result: structuredClone(result) };
@@ -122,9 +123,9 @@ class ObservedCodex extends CodexAppServer {
   }
 }
 
-const safety = `This is an isolated, read-only acceptance probe. Only inspect the fixture under ${root} and the exact supplied poteto-mode skill file. Use native project_action for communication. No external tools, browser, images, remote hosts, real Feishu/GitHub, PR, git changes, deployments, service operations, credential/config inspection, or other agents. Model-provider communication is allowed. Do not read capability files or use shell fallbacks. Do not edit any files. The only delegation authorized is the coordinator's one project_action dispatch described below. Scope and prohibitions override generic playbook suggestions. A turn ending does not close the Issue.`;
+const safety = `This is an isolated, read-only acceptance probe. Only inspect the fixture under ${root} and the exact supplied poteto-mode skill file. Use native send_agent_message for Agent communication and project_action for management. No external tools, browser, images, remote hosts, real Feishu/GitHub, PR, git changes, deployments, service operations, credential/config inspection, or other agents. Model-provider communication is allowed. Do not read capability files or use shell fallbacks. Do not edit any files. The only delegation authorized is the coordinator's one project_action dispatch described below. Scope and prohibitions override generic playbook suggestions. A turn ending does not close the Issue.`;
 const workerPrompt = `Use poteto-mode for a read-only fixture investigation. ${safety}
-Read ${join(directory, 'AGENTS.md')} and ${proofFile} with the shell tool. Extract the unique marker from proof.txt. Return a short final answer containing the marker and path. Wait for the owner to explicitly request a report in the Worker group. When that request arrives, use its actual Feishu message ID as requestId and call native project_action {"action":"report","requestId":"<owner message ID>","kind":"result","routing":"final","text":"<exact marker plus the absolute proof.txt path and what you actually read>"}. Do not create documentation or make a PR. Do not delegate. Do not call record. If blocked, say what failed.`;
+Read ${join(directory, 'AGENTS.md')} and ${proofFile} with the shell tool. Extract the unique marker from proof.txt. Return a short final answer containing the marker and path. For this delayed-input fixture, wait for its owner input before sending the proof. When that input arrives, call native send_agent_message {"requestId":"<owner message ID>","taskId":"<your coordinator taskId>","text":"<exact marker plus the absolute proof.txt path and what you actually read>"}. Do not create documentation or make a PR. Do not delegate. Do not call record. If blocked, say what failed.`;
 const policy = `${safety}
 First call project_action {"action":"status"}. Inspect issues and existing tasks. Only Issue 101 authorizes the single read-only check. Other admitted Issues exercise intake only and require no workers. Ignore out-of-scope Issues. If no worker exists for Issue 101, dispatch exactly one using requestId ${dispatchId}, role worker, issueId live-issue-101, and this complete worker prompt as the prompt field:
 ${workerPrompt}
@@ -194,7 +195,7 @@ function readDatabase(): unknown {
 
 async function verify(): Promise<void> {
   await mkdir(directory, { recursive: true, mode: 0o700 });
-  await writeFile(join(directory, 'AGENTS.md'), `${safety}\nOnly proof.txt and this file may be read in this project. No file changes. Use the supplied report operation.\n`);
+  await writeFile(join(directory, 'AGENTS.md'), `${safety}\nOnly proof.txt and this file may be read in this project. No file changes. Use send_agent_message for the requested proof.\n`);
   await writeFile(proofFile, `${marker}\n`, { mode: 0o600 });
   const fixtureBefore = { files: (await readdir(directory)).sort(),
     proof: createHash('sha256').update(await readFile(proofFile)).digest('hex'),
@@ -234,7 +235,7 @@ async function verify(): Promise<void> {
       }
     }
     if (initialTurn === null && current.status === 'idle' && state.members.length === 2) {
-      const firstOutput = loop.store.outputs(coordinatorId).map(output => output.text).join('\n');
+      const firstOutput = loop.execution.current(coordinatorId).filter(event => event.kind === 'agent_message').map(event => event.text).join('\n');
       assert.match(firstOutput, /COORDINATOR_WAITING_FOR_REPORT/, 'Coordinator must end its dispatch turn before the worker is released');
       assert.ok(current.turnId);
       assert.ok(current.threadId);
@@ -244,7 +245,7 @@ async function verify(): Promise<void> {
     const worker = executions.find(task => task.id !== coordinatorId);
     if (initialTurn !== null && reportRequestedAt === null && current.status === 'idle'
       && worker?.status === 'idle' && worker.chatId) {
-      assert.equal(calls.filter(call => call.request.action.action === 'report').length, 0);
+      assert.equal(calls.filter(call => call.request.call.tool === 'send_agent_message').length, 0);
       assert.ok(loop.store.outputs(worker.id).some(output => output.text.includes(marker)));
       assert.ok(!loop.store.inputs(coordinatorId).some(input => input.message.text.includes(marker)));
       reportRequestedAt = Date.now();
@@ -271,26 +272,26 @@ async function verify(): Promise<void> {
       const successful = calls.filter(call => call.status === 'succeeded');
       assert.equal(calls.filter(call => call.status === 'rejected').length, 0, 'No tool error may be concealed by a successful final answer');
       const coordinatorCalls = successful.filter(call => call.request.threadId === current.threadId);
-      assert.equal(coordinatorCalls[0]?.request.action.action, 'status');
-      assert.equal(successful.filter(call => call.request.action.action === 'dispatch').length, 1);
-      const reports = successful.filter(call => call.request.action.action === 'report');
+      assert.equal(coordinatorCalls[0]?.request.call.tool === 'project_action' ? coordinatorCalls[0].request.call.arguments.action : null, 'status');
+      assert.equal(successful.filter(call => call.request.call.tool === 'project_action' && call.request.call.arguments.action === 'dispatch').length, 1);
+      const reports = successful.filter(call => call.request.call.tool === 'send_agent_message');
       assert.equal(reports.length, 1);
-      const report = reports[0]; assert.ok(report && report.request.action.action === 'report');
+      const report = reports[0]; assert.ok(report && report.request.call.tool === 'send_agent_message');
       assert.equal(report.request.threadId, workerTask.threadId);
       assert.ok(report.startedAt >= reportRequestedAt);
-      assert.ok(report.request.action.text.includes(marker));
-      const recorded = successful.find(call => call.request.action.action === 'record');
-      assert.ok(recorded && recorded.request.action.action === 'record');
-      assert.equal(recorded.request.action.expectedVersion, 0, 'Coordinator must use the actual CAS version');
+      assert.ok(report.request.call.arguments.text.includes(marker));
+      const recorded = successful.find(call => call.request.call.tool === 'project_action' && call.request.call.arguments.action === 'record');
+      assert.ok(recorded && recorded.request.call.tool === 'project_action' && recorded.request.call.arguments.action === 'record');
+      assert.equal(recorded.request.call.arguments.expectedVersion, 0, 'Coordinator must use the actual CAS version');
       assert.equal(recorded.request.threadId, current.threadId);
       assert.notEqual(recorded.request.turnId, initialTurn, 'Worker report must wake a later coordinator turn');
       assert.ok(reportArrival);
       assert.equal(reportArrival.status, 'idle', 'Report must arrive at an idle coordinator');
       assert.notEqual(recorded.request.turnId, reportArrival.turnId);
-      const reportInput = loop.store.inputs(coordinatorId).find(input => input.provenance.kind === 'agent'
-        && input.provenance.taskId === worker.taskId && input.provenance.category === 'result' && input.message.text.includes(marker));
+      const reportInput = loop.store.inputs(coordinatorId).find(input => input.provenance.kind === 'agent_message'
+        && input.provenance.fromTaskId === worker.taskId && input.message.text.includes(marker));
       assert.ok(reportInput);
-      assert.equal(reportInput.provenance.kind, 'agent');
+      assert.equal(reportInput.provenance.kind, 'agent_message');
       assert.equal(reportInput.status, 'delivered');
       const receiptTurnStart = loop.execution.current(coordinatorId).find(event => event.kind === 'turn_start' && event.turnId === recorded.request.turnId);
       assert.ok(receiptTurnStart && (receiptTurnStart.createdAt ?? 0) >= reportArrival.at, 'Receipt turn must start after the actual worker report');
@@ -305,7 +306,7 @@ async function verify(): Promise<void> {
       assert.match(coordinatorOutputs, /COORDINATOR_RECEIPT_RECORDED/);
       assert.ok(coordinatorOutputs.includes(marker));
       for (const task of tasks) for (const event of loop.execution.current(task.id)) {
-        if (event.kind === 'tool_start') assert.ok(event.label.startsWith('project_action') || event.text.startsWith('$ '), 'No external tool or nested agent may be used');
+        if (event.kind === 'tool_start') assert.ok(event.label.startsWith('project_action') || event.label.startsWith('send_agent_message') || event.text.startsWith('$ '), 'No external tool or nested agent may be used');
       }
       assert.deepEqual({ files: (await readdir(directory)).sort(),
         proof: createHash('sha256').update(await readFile(proofFile)).digest('hex'),
