@@ -6,7 +6,7 @@ import { pipeline } from 'node:stream/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Client, WSClient, EventDispatcher, Domain, LoggerLevel, defaultHttpInstance, type HttpInstance, type HttpRequestOptions } from '@larksuiteoapi/node-sdk';
 import { z } from 'zod';
-import { credentialSafeLogger } from '../credentials.js';
+import { credentialSafeLogger, publicJson, redactCredentials } from '../credentials.js';
 import { UncertainOperationError, errorMessage, projectDecisionActionSchema, type ApprovalAction, type Attachment, type IncomingMessage, type PendingRequest, type ProjectDecisionAction, type ReplyTarget } from '../domain.js';
 import { FeishuApiError, GroupCreationRejected, TaskGroupUnavailable, type FeishuCardDelivery, type FeishuDecisionCardInput, type FeishuPort, type FeishuProgressPort, type FeishuReconnectEvent, type ProgressWriteGuard } from '../ports.js';
 import { FeishuDocumentAdapter, type FeishuDocumentApi } from './feishu-document.js';
@@ -284,7 +284,7 @@ export class FeishuAdapter implements FeishuPort, FeishuProgressPort {
         ...(input.dashboardUrl ? [{ tag: 'button', text: { tag: 'plain_text', content: '查看完整日志' }, type: 'default',
           multi_url: { url: input.dashboardUrl, pc_url: '', android_url: '', ios_url: '' } }] : []),
       ] } };
-    const data = JSON.stringify(card);
+    const data = publicJson(card);
     if (Buffer.byteLength(data) >= 30_000) throw new Error('Progress card exceeds the 30KB payload budget');
     await this.paceProgressRequest();
     guard?.();
@@ -332,7 +332,7 @@ export class FeishuAdapter implements FeishuPort, FeishuProgressPort {
     await this.paceProgressRequest();
     guard?.();
     checkWrite(await this.cardkit.cardElement.content({ path: { card_id: input.cardId, element_id: 'progress' },
-      data: { content: input.content, sequence: input.sequence, uuid: input.uuid } }));
+      data: { content: redactCredentials(input.content, { embedded: true }), sequence: input.sequence, uuid: input.uuid } }));
   }
   async setProgressStreaming(input: Parameters<FeishuProgressPort['setProgressStreaming']>[0], guard?: ProgressWriteGuard): Promise<void> {
     await this.paceProgressRequest();

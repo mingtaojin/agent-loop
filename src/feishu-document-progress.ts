@@ -10,6 +10,7 @@ import { documentChunks } from './feishu-document-text.js';
 import { DocumentRequestRejected, TaskGroupBindingChanged, TaskGroupUnavailable, type FeishuDocumentProgressPort } from './ports.js';
 import { assertGroupBinding, retireTaskGroup } from './task-groups.js';
 import type { Store } from './store.js';
+import { redactCredentials } from './credentials.js';
 
 const id = z.string().min(1);
 const writeSchema = z.strictObject({ clientToken: id, text: z.string(), sent: z.boolean() });
@@ -45,7 +46,7 @@ const discoverySchema = z.strictObject({ excludedTurns: z.array(z.string()) });
 const discoveryKey = 'feishu-document-progress:discovery:v2';
 const turnKey = (taskId: string, turnId: string) => JSON.stringify([taskId, turnId]);
 const emptyView = () => progressViewSchema.parse({ status: 'running', cursor: 0, lastExecutionEventAt: null, assistant: [], tool: null });
-const content = (record: DocumentPublication) => record.text;
+const content = (record: DocumentPublication) => redactCredentials(record.text, { embedded: true });
 export class FeishuDocumentProgressPublisher {
   private readonly inFlight = new Map<string, Promise<void>>();
   private readonly publications = new Map<string, { payload: string; record: DocumentPublication }>();
@@ -213,7 +214,7 @@ export class FeishuDocumentProgressPublisher {
       record.threadId = task.threadId; record.turnId = task.turnId; record.sourceFrontier = sourceFrontier(observation.entries);
       const conversation = projectDocumentConversation(task, store.inputs(task.id), observation.entries);
       record.view = { status: conversation.status, cursor: conversation.cursor, lastExecutionEventAt: conversation.lastExecutionEventAt, assistant: [], tool: null, notice: null };
-      record.text = documentConversationText(conversation, this.maxLines);
+      record.text = redactCredentials(documentConversationText(conversation, this.maxLines), { embedded: true });
       record.projectionRevision = hash(record.text);
       this.save(record);
       this.observed.set(task.id, signature); this.historyRetries.succeeded(task.id);

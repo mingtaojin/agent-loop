@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { configSchema } from '../src/config.js';
-import { publicJson } from '../src/credentials.js';
+import { ConfigCredential, credentialSafeLogger, publicJson, redactCredentials } from '../src/credentials.js';
 import { errorMessage, taskSchema } from '../src/domain.js';
 import { Store } from '../src/store.js';
 import { ProjectLedger } from '../src/project.js';
@@ -36,6 +36,52 @@ test('parsed credentials stay usable by clients and serialize safely in config e
   assertRedacted(String(value.feishu.appSecret));
   assertRedacted(publicJson({ nested: payload, encoded: encodeURIComponent(secrets[0]!) }));
   assertRedacted(errorMessage(new Error(payload)));
+});
+
+test('URI and form encodings and object keys are redacted in storage and SDK logs', async t => {
+  const secret = 'synthetic?a~b +/文!()';
+  new ConfigCredential(secret);
+  const variants = [secret, encodeURI(secret), encodeURIComponent(secret), new URLSearchParams({ secret }).toString().slice(7)];
+  variants.push(...variants.map(value => value.replace(/%[0-9A-F]{2}/g, code => code.toLowerCase())));
+  const root = await mkdtemp(join(tmpdir(), 'encoded-redaction-'));
+  const store = new Store(root);
+  t.after(async () => { store.close(); await rm(root, { recursive: true, force: true }); });
+  const logging = t.mock.method(process.stderr, 'write', () => true);
+  for (const value of variants) {
+    assert.equal(redactCredentials(value), '[REDACTED]');
+    const json = publicJson({ [value]: { text: `credential=${value}` } });
+    assert.deepEqual(JSON.parse(json), { '[REDACTED]': { text: 'credential=[REDACTED]' } });
+    store.diagnostic('encoding', value);
+    store.setMeta('encoded-report', JSON.stringify({ [value]: value }));
+    assert.deepEqual(JSON.parse(store.meta('encoded-report')!), { '[REDACTED]': '[REDACTED]' });
+    credentialSafeLogger.error({ [value]: value });
+  }
+  assert.ok(store.diagnostics().every(row => row.message === '[REDACTED]'));
+  for (const call of logging.mock.calls) {
+    const text = String(call.arguments[0]);
+    for (const value of variants) assert.equal(text.includes(value), false);
+    assert.match(text, /REDACTED/);
+  }
+});
+
+test('credential substrings preserve ordinary persisted words and JSON structure', async t => {
+  new ConfigCredential('alpha');
+  assert.equal(redactCredentials('prefix alpha suffix'), 'prefix alpha suffix');
+  assert.equal(redactCredentials('alphabet'), 'alphabet');
+  assert.deepEqual(JSON.parse(publicJson({ alphabet: 'alphabet alphanumeric alpha_suffix', exact: 'alpha', sentence: 'token=alpha' })), {
+    alphabet: 'alphabet alphanumeric alpha_suffix', exact: '[REDACTED]', sentence: 'token=[REDACTED]',
+  });
+  const root = await mkdtemp(join(tmpdir(), 'collision-redaction-'));
+  const store = new Store(root);
+  t.after(async () => { store.close(); await rm(root, { recursive: true, force: true }); });
+  store.setMeta('normal-state', JSON.stringify({ alphabet: 'alphabet' }));
+  store.diagnostic('alphabet', 'alphabet');
+  assert.equal(store.meta('normal-state'), '{"alphabet":"alphabet"}');
+  assert.equal(store.diagnostics()[0]?.message, 'alphabet');
+  assert.equal(store.diagnostics()[0]?.scope, 'alphabet');
+  const shared = ['alphabet'];
+  const date = new Date('2026-11-20T00:00:00Z');
+  assert.equal(publicJson({ shared, again: shared, date }), JSON.stringify({ shared, again: shared, date }));
 });
 
 test('diagnostics, task snapshots, reports, dashboard detail and SSE do not disclose configured credentials', async t => {

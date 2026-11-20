@@ -211,10 +211,10 @@ export class Store {
     if (!input) throw new Error('Unknown inbox input');
     this.prepare('UPDATE inbox SET payload=? WHERE id=?').run(publicJson({ message: input.message, provenance: input.provenance, requestId }), id);
   }
-  markInput(id: string, status: Inbox['status'], error: string | null = null): void { this.prepare('UPDATE inbox SET status=?,error=? WHERE id=?').run(status, error === null ? null : redactCredentials(error), id); }
+  markInput(id: string, status: Inbox['status'], error: string | null = null): void { this.prepare('UPDATE inbox SET status=?,error=? WHERE id=?').run(status, error === null ? null : redactCredentials(error, { embedded: true }), id); }
   enqueue(taskId: string, text: string, key: string): string {
     const id = createHash('sha256').update(`${taskId}:${key}`).digest('hex').slice(0, 32);
-    this.prepare("INSERT OR IGNORE INTO outbox VALUES(?,?,?,'pending',NULL)").run(id, taskId, redactCredentials(text));
+    this.prepare("INSERT OR IGNORE INTO outbox VALUES(?,?,?,'pending',NULL)").run(id, taskId, redactCredentials(text, { embedded: true }));
     return id;
   }
   hasOutput(taskId: string, key: string): boolean {
@@ -230,15 +230,15 @@ export class Store {
     if (!statuses.length) return false;
     return this.prepare(`SELECT 1 FROM outbox WHERE task_id=? AND status IN (${statuses.map(() => '?').join(',')}) LIMIT 1`).get(taskId, ...statuses) !== undefined;
   }
-  markOutput(id: string, status: Outbox['status'], error: string | null = null): void { this.prepare('UPDATE outbox SET status=?,error=? WHERE id=?').run(status, error === null ? null : redactCredentials(error), id); }
+  markOutput(id: string, status: Outbox['status'], error: string | null = null): void { this.prepare('UPDATE outbox SET status=?,error=? WHERE id=?').run(status, error === null ? null : redactCredentials(error, { embedded: true }), id); }
   operation(id: string): Operation | null { const row = this.prepare('SELECT * FROM operations WHERE id=?').get(id); return row ? operationSchema.parse(row) : null; }
   beginOperation(id: string, taskId: string, kind: string): void { this.prepare("INSERT INTO operations VALUES(?,?,?,'attempting',NULL,NULL)").run(id, taskId, kind); }
   retryRejectedOperation(id: string): void {
     const result = this.prepare("UPDATE operations SET status='attempting',result=NULL,error=NULL WHERE id=? AND status='uncertain' AND error='rejected'").run(id);
     if (result.changes !== 1) throw new Error('Operation is not a rejected attempt');
   }
-  finishOperation(id: string, result: string): void { this.prepare("UPDATE operations SET status='confirmed',result=?,error=NULL WHERE id=?").run(redactCredentials(result), id); }
-  uncertainOperation(id: string, error: string): void { this.prepare("UPDATE operations SET status='uncertain',error=? WHERE id=?").run(redactCredentials(error), id); }
+  finishOperation(id: string, result: string): void { this.prepare("UPDATE operations SET status='confirmed',result=?,error=NULL WHERE id=?").run(redactCredentials(result, { embedded: true }), id); }
+  uncertainOperation(id: string, error: string): void { this.prepare("UPDATE operations SET status='uncertain',error=? WHERE id=?").run(redactCredentials(error, { embedded: true }), id); }
   queueApproval(action: ApprovalAction): boolean {
     const id = this.approvalKey(action);
     return this.prepare("INSERT OR IGNORE INTO approval_actions VALUES(?,?,?,'pending',NULL)").run(id, action.taskId, publicJson(action)).changes > 0;
@@ -251,7 +251,7 @@ export class Store {
     });
   }
   markApproval(id: string, status: 'processing' | 'confirmed' | 'uncertain' | 'rejected', error: string | null = null): void {
-    this.prepare('UPDATE approval_actions SET status=?,error=? WHERE id=?').run(status, error === null ? null : redactCredentials(error), id);
+    this.prepare('UPDATE approval_actions SET status=?,error=? WHERE id=?').run(status, error === null ? null : redactCredentials(error, { embedded: true }), id);
   }
   saveFeishuCard(record: FeishuCardRecord): void {
     const card = feishuCardRecordSchema.parse(record);
@@ -280,8 +280,8 @@ export class Store {
     return next;
   }
   diagnostic(scope: string, message: string): void {
-    scope = redactCredentials(scope);
-    message = redactCredentials(message);
+    scope = redactCredentials(scope, { embedded: true });
+    message = redactCredentials(message, { embedded: true });
     const createdAt = Date.now();
     const bounded = message.length <= diagnosticMessageLimit ? message : message.slice(0, diagnosticMessageLimit) + '\n…';
     const fingerprint = createHash('sha256').update(`${scope}\u0000${bounded}`).digest('hex');
@@ -320,7 +320,7 @@ export class Store {
     return sequenceRow.parse(this.prepare('SELECT COALESCE(MAX(seq),0) AS seq FROM inbox WHERE task_id=?').get(taskId)).seq;
   }
   setMeta(key: string, value: string): void {
-    const result = this.prepare('INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE meta.value IS NOT excluded.value').run(key, redactCredentials(value));
+    const result = this.prepare('INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE meta.value IS NOT excluded.value').run(key, redactCredentials(value, { embedded: true }));
     if (result.changes > 0) this.metaRevisions.delete(key);
   }
   deleteMeta(key: string): void {

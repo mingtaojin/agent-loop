@@ -259,4 +259,4 @@ export type FeishuCardRecord = z.infer<typeof feishuCardRecordSchema>;
 export class UncertainOperationError extends Error {}
 export class TurnChangedError extends Error {}
 export class RejectedInputError extends Error {}
-export function errorMessage(error: unknown): string { return redactCredentials(error instanceof Error ? error.message : String(error)); }
+export function errorMessage(error: unknown): string { return redactCredentials(error instanceof Error ? error.message : String(error), { embedded: true }); }

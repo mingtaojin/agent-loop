@@ -120,7 +120,7 @@ export async function loadConfig(path: string): Promise<Config> {
     }
     return config;
   } catch (error) {
-    throw new Error(redactCredentials(error instanceof Error ? error.message : String(error)));
+    throw new Error(redactCredentials(error instanceof Error ? error.message : String(error), { embedded: true }));
   }
 }
 

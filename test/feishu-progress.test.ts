@@ -12,6 +12,7 @@ import { configSchema } from '../src/config.js';
 import { taskSchema, type Task } from '../src/domain.js';
 import type { ExecutionEvent } from '../src/execution-events.js';
 import { FeishuProgressPublisher, progressPublicationSchema } from '../src/feishu-progress.js';
+import { FeishuAdapter } from '../src/adapters/feishu.js';
 import { AgentLoop } from '../src/loop.js';
 import { TaskGroupUnavailable, type FeishuProgressPort } from '../src/ports.js';
 import { Store } from '../src/store.js';
@@ -88,13 +89,13 @@ function task(id = 'task', turnId = 'turn'): Task {
     contextDirectory: '/tmp', resources: [], status: 'running', reason: null, prompt: '', promptHash: '', skillPath: null,
     chatId: `chat-${id}`, threadId: `thread-${id}`, turnId, executionStatus: 'running', lastHandledTurnId: null, requests: [], createdAt: 1, updatedAt: 1 });
 }
-async function fixture(t: TestContext, initialize = true) {
+async function fixture(t: TestContext, initialize = true, adapter?: FeishuProgressPort) {
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'feishu-progress-')));
   let store = new Store(directory);
   const transport = new Transport();
   const source = new ExecutionFixture();
   let now = Date.UTC(2026, 10, 7);
-  let publisher = new FeishuProgressPublisher({ store, execution: source.execution, transport, now: () => now });
+  let publisher = new FeishuProgressPublisher({ store, execution: source.execution, transport: adapter ?? transport, now: () => now });
   t.after(async () => { await publisher.close(); store.close(); await rm(directory, { recursive: true, force: true }); });
   if (initialize) await publisher.poll();
   const event = (kind: ExecutionEvent['kind'], text: string, changes: Partial<ExecutionEvent> = {}, taskId = 'task') => {
@@ -112,6 +113,34 @@ test('progress is opt-in and validates its interval and explicit dashboard URL',
   assert.deepEqual(configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner' } }).feishu.progress, { enabled: false, surface: 'card', intervalMs: 1000, maxLines: 3000 });
   assert.throws(() => configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner', progress: { intervalMs: 1 } } }));
   assert.throws(() => configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner', progress: { dashboardUrl: 'file:///etc/passwd' } } }));
+});
+
+test('actual publisher redacts cached execution text in CardKit creation and streaming updates', async t => {
+  const secret = 'synthetic-publisher-app-secret?value~end';
+  configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner', appSecret: secret } });
+  const requests: unknown[] = [];
+  const unused = async (): Promise<never> => { throw new Error('Unexpected Feishu request'); };
+  const adapter = new FeishuAdapter({ appId: 'synthetic-publisher-app', appSecret: secret, userOpenId: 'owner' }, {
+    api: { chat: { list: unused, get: unused, create: unused }, messageResource: { get: unused },
+      message: { list: unused, create: async input => { requests.push(input); return { code: 0, data: { message_id: 'message' } }; } } },
+    cardkit: { card: {
+      create: async input => { requests.push(input); return { code: 0, data: { card_id: 'card' } }; },
+      settings: async input => { requests.push(input); return { code: 0, data: {} }; }, idConvert: unused,
+    }, cardElement: { content: async input => { requests.push(input); return { code: 0, data: {} }; } } },
+  });
+  t.after(() => adapter.close());
+  const f = await fixture(t, true, adapter);
+  f.store.saveTask(task());
+  f.event('agent_message', `First credential=${secret}`);
+  await f.pump(4);
+  f.event('agent_message', `Changed credential=${encodeURIComponent(secret)}`);
+  await f.pump(3);
+  const serialized = JSON.stringify(requests);
+  assert.doesNotMatch(serialized, /synthetic-publisher-app-secret/);
+  assert.equal(serialized.includes(encodeURIComponent(secret)), false);
+  assert.match(serialized, /First credential=\[REDACTED\]/);
+  assert.match(serialized, /Changed credential=\[REDACTED\]/);
+  assert.deepEqual(f.store.diagnostics(), []);
 });
 
 test('saved cards stop publishing after group removal and recreated groups get a fresh card and UUID', async t => {

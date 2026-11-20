@@ -2,6 +2,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import type { Client } from '@larksuiteoapi/node-sdk';
 import { z } from 'zod';
 import { documentTextElements } from '../feishu-document-text.js';
+import { redactCredentials } from '../credentials.js';
 import { DocumentRequestRejected, TaskGroupUnavailable, type FeishuDocumentProgressPort, type ProgressWriteGuard } from '../ports.js';
 
 export type FeishuDocumentApi = {
@@ -74,13 +75,14 @@ export class FeishuDocumentAdapter implements FeishuDocumentProgressPort {
   }
   async createBlock(input: Parameters<FeishuDocumentProgressPort['createBlock']>[0], guard?: ProgressWriteGuard): Promise<string> {
     const index = z.number().int().min(-1).parse(input.index ?? -1);
-    const elements = documentTextElements(input.text);
+    const text = redactCredentials(input.text, { embedded: true });
+    const elements = documentTextElements(text);
     const data = await this.call(() => this.api().children.create({ path: { document_id: input.documentId, block_id: input.parentBlockId ?? input.documentId },
       params: { document_revision_id: -1, client_token: input.clientToken },
       data: { children: [{ block_type: 2, text: { elements } }], index } }), guard);
     const result = z.object({ children: z.array(textBlock).length(1), client_token: z.literal(input.clientToken) }).parse(data);
     const block = result.children[0];
-    if (!block || blockText(block) !== input.text) throw new Error('Created document block does not match intent');
+    if (!block || blockText(block) !== text) throw new Error('Created document block does not match intent');
     return block.block_id;
   }
   async findBlock(input: Parameters<FeishuDocumentProgressPort['findBlock']>[0]): Promise<string | null> {
@@ -135,11 +137,12 @@ export class FeishuDocumentAdapter implements FeishuDocumentProgressPort {
     return blockText(z.object({ block: z.unknown() }).parse(data).block, input.blockId);
   }
   async replaceContent(input: Parameters<FeishuDocumentProgressPort['replaceContent']>[0], guard?: ProgressWriteGuard): Promise<void> {
-    const elements = documentTextElements(input.text);
+    const text = redactCredentials(input.text, { embedded: true });
+    const elements = documentTextElements(text);
     const data = await this.call(() => this.api().block.patch({ path: { document_id: input.documentId, block_id: input.blockId },
       params: { document_revision_id: -1, client_token: input.clientToken }, data: { update_text_elements: { elements } } }), guard);
     const result = z.object({ block: textBlock, client_token: z.literal(input.clientToken) }).parse(data);
-    if (blockText(result.block, input.blockId) !== input.text) throw new Error('Document write response does not match intent');
+    if (blockText(result.block, input.blockId) !== text) throw new Error('Document write response does not match intent');
   }
   async grantGroupRead(input: Parameters<FeishuDocumentProgressPort['grantGroupRead']>[0], guard?: ProgressWriteGuard): Promise<void> {
     const data = await this.call(() => this.api().members.create({ path: { token: input.documentId }, params: { type: 'docx', need_notification: false },

@@ -112,6 +112,24 @@ test('document config requires an explicit HTTPS origin only when enabled', () =
   }
 });
 
+test('document publisher redacts execution credentials before chunking, persistence and retries', async t => {
+  const secret = 'synthetic-document-progress-secret?value~end';
+  configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner', appSecret: secret } });
+  const f = await fixture(t);
+  f.store.saveTask(task());
+  f.event('agent_message', `First credential=${secret}`);
+  await f.pump(6);
+  f.event('agent_message', `Updated credential=${encodeURIComponent(secret)}`);
+  f.transport.fail = { kind: 'write', when: 'after', error: new Error('lost acknowledgement') };
+  await f.pump(8);
+  const payloads = JSON.stringify(f.transport.calls);
+  assert.equal(payloads.includes(secret), false);
+  assert.equal(payloads.includes(encodeURIComponent(secret)), false);
+  assert.doesNotMatch(payloads, /synthetic-document-progress-secret/);
+  assert.match(f.transport.text(), /Updated credential=\[REDACTED\]/);
+  assert.equal(JSON.stringify(f.record()).includes(secret), false);
+});
+
 test('one task reuses its document and tab across turns, completion and restart; visible text has no internal IDs', async t => {
   const f = await fixture(t); f.store.saveTask(task()); f.event('agent_delta', 'First progress');
   await f.pump(5);

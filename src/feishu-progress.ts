@@ -6,6 +6,7 @@ import { type Task } from './domain.js';
 import { TaskGroupBindingChanged, TaskGroupUnavailable, type FeishuProgressPort } from './ports.js';
 import { assertGroupBinding, retireTaskGroup } from './task-groups.js';
 import type { Store } from './store.js';
+import { redactCredentials } from './credentials.js';
 import { coversSource, sourceFrontier, sourceFrontierSchema, HistoryRetries, finished, progressContent, progressViewSchema, projectProgress, taskProgressStatus } from './feishu-progress-view.js';
 
 const entityFields = { cardId: z.string().min(1), createdAt: z.number() };
@@ -33,6 +34,7 @@ type ProgressPublication = z.infer<typeof runtimePublicationSchema>;
 const discoverySchema = z.object({ snapshots: z.record(z.string(), z.string()), excludedTurns: z.array(z.string()) });
 const discoveryKey = 'feishu-progress:discovery:v2';
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
+const safeContent = (view: ProgressPublication['view']) => redactCredentials(progressContent(view), { embedded: true });
 const key = (record: Pick<ProgressPublication, 'taskId' | 'turnId'>) => JSON.stringify([record.taskId, record.turnId]);
 const renewalMs = 8 * 60_000;
 const entityLifetimeMs = 14 * 24 * 60 * 60_000;
@@ -197,7 +199,7 @@ export class FeishuProgressPublisher {
         const view = progressViewSchema.parse({ status: 'running', cursor: 0, lastExecutionEventAt: null, assistant: [], tool: null });
         for (const event of entries) projectProgress(view, event);
         if (turnId === task.turnId && (!finished(view.status) || taskProgressStatus(task) !== 'running')) view.status = taskProgressStatus(task);
-        record.view = view; record.sourceFrontier = sourceFrontier(entries); record.projectionHash = hash(progressContent(view)); record.terminal = finished(view.status); hydrated++;
+        record.view = view; record.sourceFrontier = sourceFrontier(entries); record.projectionHash = hash(safeContent(view)); record.terminal = finished(view.status); hydrated++;
         this.hydrated.add(key(record));
         this.save(record);
       }
@@ -221,7 +223,7 @@ export class FeishuProgressPublisher {
       case 'uncreated': case 'entity': case 'sending': return true;
       case 'closed': case 'disabled': return false;
       case 'published': return delivery.pending !== null || delivery.streamingAt === null || this.now() - delivery.streamingAt >= renewalMs
-        || delivery.contentHash !== hash(progressContent(record.view)) || finished(record.view.status);
+        || delivery.contentHash !== hash(safeContent(record.view)) || finished(record.view.status);
       default: { const exhaustive: never = delivery; return exhaustive; }
     }
   }
@@ -254,7 +256,7 @@ export class FeishuProgressPublisher {
       if (delivery.kind === 'uncreated') {
         // An unacknowledged entity is unsent. Retrying creation can only leave an orphan.
         const createdAt = this.now();
-        const cardId = await this.transport.createProgressCard({ content: progressContent(record.view), dashboardUrl: this.options.dashboardUrl }, guard);
+        const cardId = await this.transport.createProgressCard({ content: safeContent(record.view), dashboardUrl: this.options.dashboardUrl }, guard);
         record.delivery = { kind: 'entity', cardId, createdAt };
       } else if (delivery.kind === 'entity' || delivery.kind === 'sending') {
         const firstAttemptAt = delivery.kind === 'sending' ? delivery.firstAttemptAt : this.now();
@@ -274,7 +276,7 @@ export class FeishuProgressPublisher {
         }
         const sequence = ++record.sequence;
         const uuid = hash(`${record.uuid}:${sequence}`).slice(0, 32);
-        const content = progressContent(record.view);
+        const content = safeContent(record.view);
         const operation: z.infer<typeof operationSchema> = delivery.streamingAt === null || this.now() - delivery.streamingAt >= renewalMs
           ? { kind: 'settings', sequence, uuid, enabled: true }
           : delivery.contentHash !== hash(content) ? { kind: 'content', sequence, uuid, contentHash: hash(content) }

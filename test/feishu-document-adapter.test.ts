@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import { FeishuDocumentAdapter, type FeishuDocumentApi } from '../src/adapters/feishu-document.js';
 import { documentChunks, documentTextElements } from '../src/feishu-document-text.js';
 import { DocumentRequestRejected, TaskGroupBindingChanged, type FeishuDocumentProgressPort, type ProgressWriteGuard } from '../src/ports.js';
+import { ConfigCredential } from '../src/credentials.js';
 
 const success = (data: unknown) => ({ code: 0, data });
 const block = (text: string, blockId = 'block') => ({ block_id: blockId, block_type: 2, text: { elements: [{ text_run: { content: text } }] } });
@@ -33,6 +34,21 @@ const guardedWrites: { name: string; run(port: FeishuDocumentProgressPort, guard
   { name: 'grant', run: (port, guard) => port.grantGroupRead({ documentId: 'doc', chatId: 'group' }, guard) },
   { name: 'tab', run: (port, guard) => port.createTab({ chatId: 'group', documentUrl: 'https://tenant.feishu.cn/docx/doc' }, guard) },
 ];
+
+test('document adapter sends redacted creation and replacement text and verifies the sent intent', async () => {
+  const secret = 'synthetic-document-adapter-secret?value~end';
+  new ConfigCredential(secret);
+  const f = fixture();
+  f.replies.set('block', success({ children: [block('credential=[REDACTED]')], client_token: 'create' }));
+  await f.adapter.createBlock({ documentId: 'doc', text: `credential=${secret}`, clientToken: 'create' });
+  f.replies.set('write', success({ block: block('updated=[REDACTED]'), client_token: 'write' }));
+  await f.adapter.replaceContent({ documentId: 'doc', blockId: 'block', text: `updated=${encodeURIComponent(secret)}`, clientToken: 'write' });
+  const payloads = JSON.stringify(f.calls);
+  assert.equal(payloads.includes(secret), false);
+  assert.equal(payloads.includes(encodeURIComponent(secret)), false);
+  assert.match(payloads, /credential=\[REDACTED\]/);
+  assert.match(payloads, /updated=\[REDACTED\]/);
+});
 for (const operation of guardedWrites) test(`retiring a binding before SDK dispatch cancels queued document ${operation.name}`, async () => {
   const f = fixture();
   f.replies.set('read', success({ block: block('Original') }));
