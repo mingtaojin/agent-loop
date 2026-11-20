@@ -1,7 +1,8 @@
+import { LiveExecution, type ExecutionObservation } from './live-execution.js';
 import { intakeRouteSchema, presentTaskSource, type InputProvenance, type ReportEscalation, type ReportRouting, type ReportSource, type Task, type TaskResource } from './domain.js';
 import { ProjectLedger, type ProjectState } from './project.js';
 import { Store, type Inbox } from './store.js';
-import type { StoredExecutionEvent } from './execution-events.js';
+import type { VisibleExecution } from './execution-events.js';
 import { z } from 'zod';
 
 export const visibleTextLimit = 32_768;
@@ -38,16 +39,17 @@ export interface DashboardReport {
 }
 
 export interface DashboardExecutionEvent {
+  key: string;
   seq: number;
   taskId: string;
   threadId: string;
   turnId: string | null;
   itemId: string | null;
-  kind: Exclude<StoredExecutionEvent['kind'], 'tool_output'>;
+  kind: Exclude<VisibleExecution['kind'], 'tool_output'>;
   type: DashboardEventType;
   label: string;
   text: string;
-  createdAt: number;
+  createdAt: number | null;
 }
 
 export const dashboardEventTypes = ['INPUT', 'PHASE', 'NARRATIVE', 'TOOL_CALL', 'WAITING', 'BLOCKER', 'OUTPUT', 'EVIDENCE', 'RETRY'] as const;
@@ -63,7 +65,7 @@ export interface DashboardTimelineEntry {
   type: DashboardEventType;
   label: string;
   text: string;
-  createdAt: number;
+  createdAt: number | null;
   phase: string | null;
 }
 
@@ -103,10 +105,13 @@ export interface ProjectDashboard {
 }
 
 export interface DashboardTaskDetail {
+  threadId: string | null;
   task: ProjectTaskCard | null;
   projectId: string | null;
   inputs: ReturnType<Store['inputs']>;
   outputs: ReturnType<Store['outputs']>;
+  cursor: string;
+  history: ExecutionObservation['history'];
   events: DashboardExecutionEvent[];
   timeline: DashboardTimelineEntry[];
   reports: DashboardReport[];
@@ -131,7 +136,7 @@ function reportFromInput(input: Inbox): DashboardReport | null {
   return report;
 }
 
-function eventType(event: Pick<StoredExecutionEvent, 'kind' | 'label' | 'text'>): DashboardEventType {
+function eventType(event: Pick<VisibleExecution, 'kind' | 'label' | 'text'>): DashboardEventType {
   if (event.kind === 'agent_delta') return 'NARRATIVE';
   if (event.kind === 'agent_message') return event.label === '最终回答' ? 'OUTPUT' : 'NARRATIVE';
   if (event.kind === 'tool_start' || event.kind === 'tool_end') return 'TOOL_CALL';
@@ -140,7 +145,7 @@ function eventType(event: Pick<StoredExecutionEvent, 'kind' | 'label' | 'text'>)
   return 'PHASE';
 }
 
-function dashboardEvent(event: StoredExecutionEvent): DashboardExecutionEvent | null {
+function dashboardEvent(event: VisibleExecution): DashboardExecutionEvent | null {
   if (event.kind === 'tool_output') return null;
   let text = event.text;
   if (event.kind === 'tool_start' || event.kind === 'tool_end') {
@@ -151,37 +156,19 @@ function dashboardEvent(event: StoredExecutionEvent): DashboardExecutionEvent | 
   return { ...event, type: eventType(event), text: boundedDashboardText(text) } as DashboardExecutionEvent;
 }
 
-function coalesce(events: StoredExecutionEvent[]): DashboardExecutionEvent[] {
-  const result: DashboardExecutionEvent[] = [];
-  for (const raw of events) {
-    const event = dashboardEvent(raw);
-    if (!event) continue;
-    const previous = result.at(-1);
-    if (previous && previous.kind === 'agent_delta' && event.kind === 'agent_delta'
-      && previous.threadId === event.threadId && previous.turnId === event.turnId && previous.itemId === event.itemId) {
-      previous.text = boundedDashboardText(previous.text.replace(/\n…$/, '') + event.text);
-      previous.seq = event.seq;
-      previous.createdAt = event.createdAt;
-      continue;
-    }
-    result.push(event);
-  }
-  return result;
-}
-
 type DashboardOwnership = { projectId: string; role: ProjectTaskCard['role'] };
 interface DashboardContext {
   tasks: Task[];
   states: Map<string, ProjectState>;
   ownership: Map<string, DashboardOwnership>;
   reportsByTask: Map<string, DashboardReport[]>;
-  latestActivity: Map<string, StoredExecutionEvent>;
+  latestActivity: Map<string, VisibleExecution>;
 }
 const membershipMetadataSchema = z.strictObject({ projectId: z.string(), role: z.enum(['coordinator', 'worker']) });
 
 export class ProjectDashboardReader {
   readonly ledger: ProjectLedger;
-  constructor(private readonly store: Store) { this.ledger = new ProjectLedger(store); }
+  constructor(private readonly store: Store, private readonly execution = new LiveExecution()) { this.ledger = new ProjectLedger(store); }
 
   private route(taskId: string): { projectId: string; coordinatorTaskId: string } | null {
     const raw = this.store.meta(`project-intake-route:${taskId}`);
@@ -228,7 +215,7 @@ export class ProjectDashboardReader {
       const list = reportsByTask.get(input.provenance.taskId) ?? [];
       list.push(report); reportsByTask.set(input.provenance.taskId, list);
     }
-    return { tasks, states, ownership, reportsByTask, latestActivity: this.store.latestVisibleExecutionEvents(tasks.map(task => task.id)) };
+    return { tasks, states, ownership, reportsByTask, latestActivity: new Map(tasks.flatMap(task => { const event = this.execution.current(task.id, task.threadId).at(-1); return event ? [[task.id, event]] : []; })) };
   }
 
   private reportsForTask(taskId: string, context: DashboardContext): DashboardReport[] {
@@ -275,34 +262,12 @@ export class ProjectDashboardReader {
 
   project(projectId: string): ProjectDashboard | null { return this.projects().find(project => project.id === projectId) ?? null; }
 
-  private allEvents(taskId: string): StoredExecutionEvent[] {
-    const events: StoredExecutionEvent[] = [];
-    let after = 0;
-    while (true) {
-      const batch = this.store.visibleExecutionEvents(taskId, after);
-      if (!batch.length) return events;
-      events.push(...batch);
-      after = batch.at(-1)!.seq;
-      if (batch.length < 500) return events;
-    }
-  }
-
-  events(taskId: string, after = 0, limit = 500): { cursor: number; events: DashboardExecutionEvent[] } {
-    const raw = this.store.visibleExecutionEvents(taskId, after, limit);
-    const cursor = raw.at(-1)?.seq ?? after;
-    const events = raw.flatMap(event => {
-      const visible = dashboardEvent(event);
-      return visible ? [visible] : [];
-    });
-    return { cursor, events };
-  }
-
-  timeline(taskId: string, limit = 500): DashboardTimelineEntry[] {
+  timeline(taskId: string, events: VisibleExecution[] = [], limit = 500): DashboardTimelineEntry[] {
     const task = this.store.tasks().find(candidate => candidate.id === taskId);
     if (!task) return [];
-    const detailEvents: DashboardTimelineEntry[] = this.allEvents(taskId).flatMap(raw => {
+    const detailEvents: DashboardTimelineEntry[] = events.flatMap(raw => {
       const event = dashboardEvent(raw);
-      return event ? [{ ...event, id: 'event:' + event.seq, phase: null }] : [];
+      return event ? [{ ...event, id: 'event:' + event.key, phase: null }] : [];
     });
     const inputs = this.store.inputs(taskId).map((input, index): DashboardTimelineEntry => ({
       id: 'input:' + input.id, seq: -(index + 1), taskId, threadId: null, turnId: null, itemId: null,
@@ -324,21 +289,25 @@ export class ProjectDashboardReader {
       type: request.kind === 'question' ? 'WAITING' : 'BLOCKER', label: request.kind === 'question' ? '等待回答' : '等待审批', text: boundedDashboardText(request.prompt), createdAt: task.updatedAt, phase: null,
     }));
     return [...inputs, ...reports, ...waiting, ...detailEvents]
-      .sort((a, b) => a.createdAt - b.createdAt || a.seq - b.seq)
+      .sort((a, b) => (a.createdAt ?? Infinity) - (b.createdAt ?? Infinity) || a.seq - b.seq)
       .slice(-limit);
   }
 
-  taskDetail(taskId: string, tasks = this.store.tasks()): DashboardTaskDetail | null {
+  async taskDetail(taskId: string, tasks = this.store.tasks()): Promise<DashboardTaskDetail | null> {
     const task = tasks.find(candidate => candidate.id === taskId);
     if (!task) return null;
+    const observation: ExecutionObservation = task.threadId ? await this.execution.read(taskId, task.threadId) : { cursor: this.execution.cursor, canonicalTurnIds: [], history: { kind: 'available' }, entries: [] };
+    const current = this.store.tasks().find(candidate => candidate.id === taskId);
+    if (!current) return null;
+    if (current.threadId !== task.threadId) return this.taskDetail(taskId);
     const context = this.context(tasks);
     const ownership = context.ownership.get(taskId);
     const project = ownership ? context.states.get(ownership.projectId) : null;
     const reports = this.reportsForTask(taskId, context);
     return {
       task: ownership && project ? this.card(task, project.id, ownership.role, context, project.members.find(member => member.taskId === taskId)?.issueId ?? null) : null,
-      projectId: ownership?.projectId ?? null,
-      inputs: this.store.inputs(taskId), outputs: this.store.outputs(taskId), events: coalesce(this.allEvents(taskId)), timeline: this.timeline(taskId), reports,
+      threadId: task.threadId, projectId: ownership?.projectId ?? null,
+      inputs: this.store.inputs(taskId), outputs: this.store.outputs(taskId), cursor: observation.cursor, history: observation.history, events: observation.entries.flatMap(event => { const visible = dashboardEvent(event); return visible ? [visible] : []; }), timeline: this.timeline(taskId, observation.entries), reports,
       diagnostics: this.store.diagnostics().filter(row => row.scope === taskId || row.scope.endsWith(':' + taskId)),
     };
   }

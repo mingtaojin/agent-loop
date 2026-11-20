@@ -1,3 +1,4 @@
+import { LiveExecution } from './live-execution.js';
 import { createServer, type ServerResponse } from 'node:http';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
@@ -8,17 +9,17 @@ import { boundedDashboardText, dashboardResources, ProjectDashboardReader } from
 import { errorMessage, presentTaskSource } from './domain.js';
 import { dashboardHtml, dashboardCss, dashboardScript } from './dashboard-page.js';
 
-const cursorSchema = z.coerce.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const heartbeatSchema = z.object({ pid: z.number(), lastSeenAt: z.number(), intervalMs: z.number(), status: z.enum(['running', 'stopped']) });
 
-export async function startDashboard(options: { dataDir: string; port: number; host?: '127.0.0.1' | '0.0.0.0' }) {
+export async function startDashboard(options: { execution?: LiveExecution; dataDir: string; port: number; host?: '127.0.0.1' | '0.0.0.0' }) {
+  const execution = options.execution ?? new LiveExecution();
   const listenHost = options.host ?? '0.0.0.0';
   const networkAddresses = () => Object.values(networkInterfaces()).flatMap(addresses => (addresses ?? []).filter(address => address.family === 'IPv4' && !address.internal).map(address => address.address));
   let store: Store | null = null;
   const clients = new Set<ServerResponse>();
   let dashboardReader: ProjectDashboardReader | null = null;
-  const readerFor = (db: Store) => dashboardReader ??= new ProjectDashboardReader(db);
-  let readModelCache: { version: number; expiresAt: number; tasks: ReturnType<Store['tasks']>; projects: ReturnType<ProjectDashboardReader['projects']>; diagnostics: ReturnType<Store['diagnostics']> } | null = null;
+  const readerFor = (db: Store) => dashboardReader ??= new ProjectDashboardReader(db, execution);
+  let readModelCache: { version: number; cursor: string; expiresAt: number; tasks: ReturnType<Store['tasks']>; projects: ReturnType<ProjectDashboardReader['projects']>; diagnostics: ReturnType<Store['diagnostics']> } | null = null;
   const readStore = () => {
     if (!store && existsSync(join(options.dataDir, 'tasks.sqlite'))) store = new Store(options.dataDir, { readOnly: true });
     return store;
@@ -34,11 +35,11 @@ export async function startDashboard(options: { dataDir: string; port: number; h
     const now = Date.now();
     const db = readStore();
     const version = db?.dataVersion() ?? 0;
-    if (readModelCache && readModelCache.version === version && readModelCache.expiresAt > now) return readModelCache;
+    if (readModelCache && readModelCache.version === version && readModelCache.cursor === execution.cursor && readModelCache.expiresAt > now) return readModelCache;
     const tasks = db?.tasks() ?? [];
     const projects = db ? readerFor(db).projects(tasks) : [];
     const diagnostics = db?.diagnostics() ?? [];
-    readModelCache = { version, expiresAt: now + 250, tasks, projects, diagnostics };
+    readModelCache = { version, cursor: execution.cursor, expiresAt: now + 250, tasks, projects, diagnostics };
     return readModelCache;
   };
   const snapshot = () => {
@@ -62,7 +63,7 @@ export async function startDashboard(options: { dataDir: string; port: number; h
     };
     return value;
   };
-  const server = createServer((request, response) => {
+  const server = createServer(async (request, response) => {
     response.setHeader('cache-control', 'no-store');
     response.setHeader('x-content-type-options', 'nosniff');
     response.setHeader('referrer-policy', 'no-referrer');
@@ -101,47 +102,66 @@ export async function startDashboard(options: { dataDir: string; port: number; h
         const db = readStore();
         const tasks = db?.tasks() ?? [];
         if (!db || !tasks.some(task => task.id === taskId)) { json(response, 404, { error: '任务不存在' }); return; }
-        const detail = readerFor(db).taskDetail(taskId, tasks);
+        const detail = await readerFor(db).taskDetail(taskId, tasks);
+        if (!detail) { json(response, 404, { error: '任务不存在' }); return; }
         json(response, 200, {
           inputs: db.inputs(taskId).map(input => ({ id: input.id, text: boundedDashboardText(input.message.text), createdAt: input.message.createdAt, origin: input.origin, status: input.status, error: input.error ? boundedDashboardText(input.error) : null, attachments: input.message.attachments.map(attachment => ({ name: attachment.name, kind: attachment.kind })) })),
           outputs: db.outputs(taskId).map(output => ({ ...output, text: boundedDashboardText(output.text), error: output.error ? boundedDashboardText(output.error) : null })), projectId: detail?.projectId ?? null, task: detail?.task ?? null,
-          events: detail?.events ?? [], executionEvents: detail?.events ?? [], timeline: detail?.timeline ?? [], reports: detail?.reports ?? [], diagnostics: detail?.diagnostics ?? [],
+          threadId: detail?.threadId ?? null, cursor: detail?.cursor ?? execution.cursor, history: detail?.history, timeline: detail?.timeline ?? [], reports: detail?.reports ?? [], diagnostics: detail?.diagnostics ?? [],
         }); return;
       }
       if (url.pathname !== '/api/events') { json(response, 404, { error: '未找到' }); return; }
       const taskId = url.searchParams.get('taskId');
-      const after = cursorSchema.safeParse(request.headers['last-event-id'] ?? url.searchParams.get('after') ?? 0);
-      if (!taskId || !after.success) { json(response, 400, { error: '无效的任务或事件游标' }); return; }
+      const after = request.headers['last-event-id'] ?? url.searchParams.get('after') ?? execution.cursor;
+      if (!taskId || typeof after !== 'string' || !/^[^:]+:\d+$/.test(after)) { json(response, 400, { error: '无效的任务或事件游标' }); return; }
       const db = readStore();
       if (!db?.tasks().some(task => task.id === taskId)) { json(response, 404, { error: '任务不存在' }); return; }
       response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', connection: 'keep-alive', 'x-accel-buffering': 'no' });
       response.write('retry: 1000\n\n');
       clients.add(response);
-      let cursor = after.data;
+      let cursor = after;
+      const threadId = url.searchParams.has('threadId') ? url.searchParams.get('threadId') || null : db.task(taskId).threadId;
       let blocked = false;
       let lastKeepAlive = Date.now();
+      let closed = false;
+      const finish = () => {
+        if (closed) return;
+        closed = true;
+        clearInterval(timer); unsubscribe(); clients.delete(response);
+      };
+      const end = (event: string) => {
+        finish();
+        if (response.destroyed || response.writableEnded) return;
+        response.end(event);
+      };
       response.on('drain', () => { blocked = false; });
       const send = () => {
-        if (blocked || response.destroyed) return;
+        if (closed || response.destroyed || response.writableEnded) { finish(); return; }
+        if (blocked) { if (execution.since(cursor) === null || response.writableLength > 262144) end('event: reset\ndata: {}\n\n'); return; }
         try {
-          const page = reader.events(taskId, cursor);
-          for (const event of page.events) {
-            cursor = event.seq;
-            if (!response.write('id: ' + event.seq + '\nevent: execution\ndata: ' + JSON.stringify(event) + '\n\n')) { blocked = true; break; }
+          const changes = execution.since(cursor);
+          const task = db.tasks().find(candidate => candidate.id === taskId);
+          if (changes === null || !task || task.threadId !== threadId) {
+            end('event: reset\ndata: {}\n\n'); return;
           }
-          if (!blocked) cursor = page.cursor;
+          for (const change of changes) {
+            cursor = change.cursor;
+            if (change.event.taskId !== taskId || change.event.threadId !== threadId) continue;
+            if (!response.write('id: ' + cursor + '\nevent: execution\ndata: ' + JSON.stringify(change.event) + '\n\n')) { blocked = true; break; }
+          }
           if (Date.now() - lastKeepAlive > 10_000 && !blocked) {
             lastKeepAlive = Date.now();
             blocked = !response.write(': heartbeat\n\n');
           }
         } catch (error) {
-          response.write('event: stream-error\ndata: ' + JSON.stringify({ error: errorMessage(error) }) + '\n\n');
-          response.end();
+          end('event: stream-error\ndata: ' + JSON.stringify({ error: errorMessage(error) }) + '\n\n');
         }
       };
-      const reader = new ProjectDashboardReader(db);
+      const unsubscribe = execution.subscribe(() => send());
       const timer = setInterval(send, 1_000);
-      response.on('close', () => { clearInterval(timer); clients.delete(response); });
+      response.on('close', finish);
+      response.on('finish', finish);
+      response.on('error', () => { finish(); response.destroy(); });
       send();
     } catch (error) { json(response, 500, { error: errorMessage(error) }); }
   });

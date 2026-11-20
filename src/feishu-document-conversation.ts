@@ -1,13 +1,13 @@
 import { z } from 'zod';
 import type { Task } from './domain.js';
-import type { StoredExecutionEvent } from './execution-events.js';
+import type { VisibleExecution } from './execution-events.js';
 import { finished, progressStatusSchema, taskProgressStatus, type ProgressStatus } from './feishu-progress-view.js';
 import type { Inbox } from './store.js';
 import { formatFeishuTime } from './feishu-time.js';
 
 export const conversationMessageSchema = z.strictObject({
   key: z.string(), role: z.enum(['user', 'assistant', 'cli']), text: z.string(),
-  createdAt: z.number(), sequence: z.number(), completed: z.boolean(),
+  createdAt: z.number().nullable(), sequence: z.number(), completed: z.boolean(),
 });
 export type ConversationMessage = z.infer<typeof conversationMessageSchema>;
 export const documentConversationSchema = z.strictObject({
@@ -17,7 +17,7 @@ export const documentConversationSchema = z.strictObject({
 export type DocumentConversation = z.infer<typeof documentConversationSchema>;
 const normalize = (text: string) => text.replace(/\r\n?/g, '\n');
 
-export function projectDocumentConversation(task: Task, inputs: Inbox[], events: Iterable<StoredExecutionEvent>): DocumentConversation {
+export function projectDocumentConversation(task: Task, inputs: Inbox[], events: Iterable<VisibleExecution>): DocumentConversation {
   const messages = new Map<string, ConversationMessage>();
   const addUser = (message: Inbox['message'], sequence: number) => {
     const key = JSON.stringify(['user', message.id]);
@@ -44,8 +44,8 @@ export function projectDocumentConversation(task: Task, inputs: Inbox[], events:
         messages.set(key, message);
       }
       if (event.kind === 'agent_message') { message.text = event.text; message.completed = true; }
-      else if (!message.completed) message.text += event.text;
-      lastExecutionEventAt = Math.max(lastExecutionEventAt ?? event.createdAt, event.createdAt);
+      else if (!message.completed) message.text = event.text;
+      if (event.createdAt !== null) lastExecutionEventAt = Math.max(lastExecutionEventAt ?? event.createdAt, event.createdAt);
     }
     if (event.threadId !== task.threadId || event.turnId !== task.turnId) continue;
     if (event.kind === 'turn_start') status = 'running';
@@ -64,7 +64,7 @@ export function projectDocumentConversation(task: Task, inputs: Inbox[], events:
   if (!finished(status) || snapshotStatus !== 'running') status = snapshotStatus;
   return documentConversationSchema.parse({ status, cursor, lastExecutionEventAt,
     messages: [...messages.values()].map(message => ({ ...message, text: normalize(message.text) }))
-      .sort((a, b) => a.createdAt - b.createdAt || (a.role === b.role ? a.sequence - b.sequence : a.role === 'assistant' ? 1 : -1)) });
+      .sort((a, b) => (a.createdAt ?? Infinity) - (b.createdAt ?? Infinity) || (a.role === b.role ? a.sequence - b.sequence : a.role === 'assistant' ? 1 : -1)) });
 }
 
 const labels: Record<ProgressStatus, string> = { running: '执行中', waiting_input: '等待输入', waiting_approval: '等待审批', completed: '已完成', failed: '失败', paused: '已暂停' };
@@ -72,7 +72,7 @@ export function documentConversationText(view: DocumentConversation, maxLines: n
   const header = [`状态：${labels[view.status]}`, '',
     `最近对话事件：${view.lastExecutionEventAt === null ? '尚无事件' : formatFeishuTime(view.lastExecutionEventAt)}`];
   const messages = view.messages.filter(message => message.text).toReversed().map(message => ['',
-    `${message.role === 'cli' ? 'CLI 提交' : message.role === 'user' ? '用户' : '助手'} · ${formatFeishuTime(message.createdAt)}`, ...message.text.split('\n')]);
+    `${message.role === 'cli' ? 'CLI 提交' : message.role === 'user' ? '用户' : '助手'} · ${message.createdAt === null ? '时间未知' : formatFeishuTime(message.createdAt)}`, ...message.text.split('\n')]);
   const lines = [...header, ...messages.flat()];
   if (lines.length <= maxLines) return lines.join('\n');
   const marker = '[仅展示最近对话，较早内容已省略]';

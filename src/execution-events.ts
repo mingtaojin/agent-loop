@@ -2,12 +2,16 @@ import { z } from 'zod';
 
 export const executionEventSchema = z.object({
   threadId: z.string(), turnId: z.string().nullable(), itemId: z.string().nullable(),
-  kind: z.enum(['agent_delta', 'agent_message', 'tool_start', 'tool_output', 'tool_end', 'turn_start', 'turn_end', 'turn_status', 'error']),
+  kind: z.enum(['agent_start', 'agent_delta', 'agent_message', 'tool_start', 'tool_output', 'tool_end', 'turn_start', 'turn_end', 'turn_status', 'error']),
   label: z.string(), text: z.string(), createdAt: z.number(),
 });
 export type ExecutionEvent = z.infer<typeof executionEventSchema>;
-export const storedExecutionEventSchema = executionEventSchema.extend({ seq: z.number(), taskId: z.string() });
-export type StoredExecutionEvent = z.infer<typeof storedExecutionEventSchema>;
+export type VisibleExecution = Omit<ExecutionEvent, 'createdAt'> & { key: string; seq: number; taskId: string; createdAt: number | null };
+export type ExecutionHistory = Omit<VisibleExecution, 'taskId' | 'seq'>[];
+export function executionKey(event: Pick<ExecutionEvent, 'threadId' | 'turnId' | 'itemId' | 'kind'>): string {
+  const category = event.kind.startsWith('agent_') ? 'agent' : event.kind.startsWith('tool_') ? 'tool' : event.kind.startsWith('turn_') ? 'turn' : event.kind;
+  return JSON.stringify([event.threadId, event.turnId, event.itemId, category]);
+}
 
 const scopeSchema = z.object({ threadId: z.string(), turnId: z.string() });
 const deltaSchema = scopeSchema.extend({ itemId: z.string(), delta: z.string() });
@@ -53,8 +57,7 @@ export function executionEvent(method: string, params: unknown): ExecutionEvent 
   const { threadId, turnId, item } = parsed.data;
   const scope = { ...base, threadId, turnId, itemId: item.id };
   if (item.type === 'agentMessage') {
-    if (method !== 'item/completed') return null;
-    return { ...scope, kind: 'agent_message', label: item.phase === 'final_answer' ? '最终回答' : 'Agent', text: item.text };
+    return { ...scope, kind: method === 'item/started' ? 'agent_start' : 'agent_message', label: item.phase === 'final_answer' ? '最终回答' : 'Agent', text: item.text };
   }
   const kind = method === 'item/started' ? 'tool_start' : 'tool_end';
   switch (item.type) {

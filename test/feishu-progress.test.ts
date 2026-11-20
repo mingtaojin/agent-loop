@@ -1,9 +1,11 @@
+import { ExecutionFixture } from './execution-fixture.js';
 import { testExecution } from './test-config.js';
 import { SurfaceCodex, testProject, restoreSurface, tickSurface } from './coordinated-surfaces.js';
 import assert from 'node:assert/strict';
 import { realpath, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { test, type TestContext } from 'node:test';
 import { setTimeout } from 'node:timers/promises';
 import { configSchema } from '../src/config.js';
@@ -11,7 +13,7 @@ import { taskSchema, type Task } from '../src/domain.js';
 import type { ExecutionEvent } from '../src/execution-events.js';
 import { FeishuProgressPublisher, progressPublicationSchema } from '../src/feishu-progress.js';
 import { AgentLoop } from '../src/loop.js';
-import type { FeishuProgressPort } from '../src/ports.js';
+import { TaskGroupUnavailable, type FeishuProgressPort } from '../src/ports.js';
 import { Store } from '../src/store.js';
 import { CodexFake, FeishuFake, GitHubFake } from './fakes.js';
 
@@ -90,17 +92,18 @@ async function fixture(t: TestContext, initialize = true) {
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'feishu-progress-')));
   let store = new Store(directory);
   const transport = new Transport();
+  const source = new ExecutionFixture();
   let now = Date.UTC(2026, 10, 7);
-  let publisher = new FeishuProgressPublisher({ store, transport, now: () => now });
+  let publisher = new FeishuProgressPublisher({ store, execution: source.execution, transport, now: () => now });
   t.after(async () => { await publisher.close(); store.close(); await rm(directory, { recursive: true, force: true }); });
   if (initialize) await publisher.poll();
   const event = (kind: ExecutionEvent['kind'], text: string, changes: Partial<ExecutionEvent> = {}, taskId = 'task') => {
-    store.recordExecutionEvent(taskId, { threadId: `thread-${taskId}`, turnId: 'turn', itemId: 'item', kind, label: kind, text, createdAt: now, ...changes });
+    source.publish(taskId, { threadId: `thread-${taskId}`, turnId: 'turn', itemId: 'item', kind, label: kind, text, createdAt: now, ...changes });
   };
-  return { transport, event, get store() { return store; }, get publisher() { return publisher; }, get now() { return now; },
+  return { source, directory, transport, event, get store() { return store; }, get publisher() { return publisher; }, get now() { return now; },
     advance(ms: number) { now += ms; },
     async pump(count = 1) { for (let i = 0; i < count; i++) { await publisher.poll(); now += 1000; } },
-    async restart() { await publisher.close(); store.close(); store = new Store(directory); publisher = new FeishuProgressPublisher({ store, transport, now: () => now }); },
+    async restart() { await publisher.close(); store.close(); store = new Store(directory); source.restart(); publisher = new FeishuProgressPublisher({ store, execution: source.execution, transport, now: () => now }); },
     publication(taskId = 'task', turnId = 'turn') { return progressPublicationSchema.parse(store.progressRecord(taskId, turnId)); },
   };
 }
@@ -164,15 +167,15 @@ test('discovery retains fast turns between polls and old terminal state after ta
   f.event('turn_start', 'running', { turnId: 'next' });
   await f.pump(6);
   assert.equal(f.transport.messages.size, 2);
-  const old = f.publication(); assert.equal(old.delivery.kind, 'closed'); assert.equal(old.view.status, 'failed');
-  assert.equal(f.publication('task', 'next').view.status, 'running');
+  const old = f.publication(); assert.equal(old.delivery.kind, 'closed'); assert.match(f.transport.cards.get('card-1')?.content ?? '', /失败/);
+  assert.match(f.transport.cards.get('card-2')?.content ?? '', /执行中/);
   await f.restart(); await f.pump(2); assert.equal(f.transport.messages.size, 2);
 });
 
 test('native waiting status wins over interrupted or idle snapshots and tool errors are not terminal', async t => {
   const f = await fixture(t); const current = task(); f.store.saveTask(current);
   f.event('tool_end', 'exit 1'); f.event('error', 'temporary tool failure'); await f.pump(3);
-  assert.equal(f.publication().view.status, 'running');
+  assert.match(f.transport.cards.get('card-1')?.content ?? '', /执行中/);
   assert.match(f.transport.cards.get('card-1')?.content ?? '', /temporary tool failure/);
   f.event('agent_delta', 'execution resumed'); await f.pump();
   assert.doesNotMatch(f.transport.cards.get('card-1')?.content ?? '', /temporary tool failure/);
@@ -191,6 +194,8 @@ test('restart retains card and sequence; stale streaming is renewed and then clo
   const before = f.publication().sequence;
   await f.restart(); f.advance(9 * 60_000);
   f.event('agent_delta', ' second'); await f.pump(2);
+  assert.equal(f.publication().sequence, before, 'unknown suffix position waits for canonical completion');
+  f.event('agent_message', 'first second'); await f.pump(4);
   assert.equal(f.transport.cards.size, 1); assert.equal(f.transport.messages.size, 1);
   assert.ok(f.publication().sequence > before);
   assert.ok(f.transport.calls.some(call => call.kind === 'settings' && call.enabled));
@@ -245,7 +250,7 @@ test('a stale absent lookup followed by 230099 does not acknowledge the send', a
   f.transport.findProgressMessage = async () => null;
   await f.restart(); await f.pump();
   assert.deepEqual(f.publication().delivery, original);
-  assert.ok(f.store.diagnostics().some(row => row.message.includes('230099')));
+  assert.ok(f.store.diagnostics().some(row => row.scope === 'task' && row.message.includes('card.')));
   assert.equal(f.transport.messages.size, 1);
   f.transport.findProgressMessage = lookup; f.advance(3000); await f.pump();
   assert.equal(f.publication().delivery.kind, 'published');
@@ -319,10 +324,10 @@ test('bounded discovery and UTF-8/JSON projections preserve latest inert tool ou
   f.event('tool_output', '<at id=all>unsafe</at>\n' + '中文🙂\\"\n'.repeat(8000) + 'LATEST_OUTPUT');
   await f.pump(5);
   const card = f.transport.cards.get('card-1'); assert.ok(card);
-  assert.match(card.content, /LATEST_OUTPUT/); assert.match(card.content, /已截断/);
+  assert.doesNotMatch(card.content, /LATEST_OUTPUT/); assert.match(card.content, /已截断/);
   assert.match(card.content, /649/);
   assert.ok(Buffer.byteLength(JSON.stringify(card.content)) < 24_000);
-  assert.ok(Buffer.byteLength(JSON.stringify(f.publication().view)) < 20_000);
+  assert.ok(Buffer.byteLength(JSON.stringify(f.publication())) < 20_000);
 });
 
 test('fair scheduler bounds publisher operation rate and concurrent card operations', async t => {
@@ -358,13 +363,20 @@ test('whole runtime delivers final answer unchanged while progress API fails', a
   codex.complete(current.threadId, 'The original final answer.'); await tickSurface(loop);
   assert.equal(feishu.sent.filter(message => message.text === 'The original final answer.').length, 1);
   assert.equal(loop.tasks().find(task => !task.sourceId.startsWith('project:'))?.status, 'idle');
-  assert.ok(loop.store.diagnostics().some(row => row.scope === 'feishu-progress'));
+  assert.ok(loop.store.diagnostics().some(row => row.scope === current.id && row.message.includes('card.')));
 });
 
 test('enabling progress after completed runtime history ignores recovery observations and publishes only new turns', async t => {
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'feishu-enable-')));
   const progress = new Transport();
   const feishu = Object.assign(new FeishuFake(), { progress }); const codex = new SurfaceCodex();
+  const readHistory = codex.readHistory.bind(codex);
+  t.mock.method(codex, 'readHistory', async (threadId: string) => {
+    const entries = await readHistory(threadId), snapshot = codex.snapshot(threadId);
+    if (snapshot.turnId) entries.push({ threadId, turnId: snapshot.turnId, itemId: null, kind: snapshot.status === 'running' ? 'turn_start' : 'turn_end',
+      label: 'turn', text: snapshot.status, createdAt: null, key: JSON.stringify([threadId, snapshot.turnId, null, 'turn']) });
+    return entries;
+  });
   const config = configSchema.parse({ execution: testExecution, dataDir: directory, projects: [testProject(directory)], feishu: { userOpenId: 'owner' } });
   const ports = { feishu, codex, github: new GitHubFake(), workspace: { ensure: async () => directory, head: async () => 'head' } };
   let loop = new AgentLoop(config, ports);
@@ -383,4 +395,151 @@ test('enabling progress after completed runtime history ignores recovery observa
   assert.equal(workerMessages.length, 1);
   assert.ok(workerMessages.every(message => progress.cards.has(message.cardId)));
   assert.equal(feishu.sent.filter(message => message.text === 'Historical final answer').length, 1);
+});
+
+test('acknowledged cards keep only receipts and source outages never replace the full card after restart', async t => {
+  const f = await fixture(t); f.store.saveTask(task());
+  const sentinel = 'UNIQUE_CARD_TRANSCRIPT_879423';
+  f.event('agent_message', sentinel); await f.pump(4);
+  assert.doesNotMatch(JSON.stringify(f.publication()), /UNIQUE_CARD_TRANSCRIPT|assistant|content"|view"/);
+  const full = f.transport.cards.get('card-1')!.content;
+  await f.restart(); f.source.unavailable = true;
+  f.event('agent_delta', 'only a suffix', { itemId: 'new-live' }); await f.pump(2);
+  assert.equal(f.transport.cards.get('card-1')!.content, full);
+  f.source.unavailable = false; await f.pump(3);
+  assert.match(f.transport.cards.get('card-1')!.content, /UNIQUE_CARD_TRANSCRIPT_879423/);
+  assert.match(f.transport.cards.get('card-1')!.content, /only a suffix/);
+  f.store.saveTask({ ...f.store.task('task'), chatId: 'replacement-chat' }); await f.pump(4);
+  assert.doesNotMatch(f.store.meta('retired-progress:task:chat-task:turn') ?? '', /UNIQUE_CARD_TRANSCRIPT/);
+  const db = new DatabaseSync(join(f.directory, 'tasks.sqlite'));
+  try {
+    for (const row of db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all()) {
+      const table = String(row.name); assert.match(table, /^[a-z_]+$/);
+      assert.doesNotMatch(JSON.stringify(db.prepare(`SELECT * FROM ${table}`).all()), new RegExp(sentinel));
+    }
+  } finally { db.close(); }
+});
+
+test('shutdown drains an outstanding history read without creating or writing a card afterwards', async t => {
+  const f = await fixture(t); f.store.saveTask(task());
+  const held = gate(), entered = gate(), read = f.source.execution.read.bind(f.source.execution);
+  t.mock.method(f.source.execution, 'read', async (...args: Parameters<typeof read>) => { entered.resolve(); await held.promise; return read(...args); });
+  const polling = f.publisher.poll(); await entered.promise;
+  let closed = false; const closing = f.publisher.close().then(() => { closed = true; });
+  await Promise.resolve(); assert.equal(closed, false);
+  held.resolve(); await Promise.all([closing, polling]);
+  assert.equal(f.transport.calls.length, 0); assert.equal(f.store.progressRecord('task', 'turn'), null);
+});
+
+
+test('first enable records the excluded head so completed turns during downtime are discovered', async t => {
+  const f = await fixture(t, false);
+  f.store.saveTask({ ...task(), status: 'idle', executionStatus: 'completed' });
+  f.event('turn_end', 'completed'); await f.pump(); await f.publisher.close();
+  for (const turnId of ['missed', 'latest']) {
+    f.event('agent_message', turnId, { turnId }); f.event('turn_end', 'completed', { turnId });
+  }
+  f.store.saveTask({ ...task('task', 'latest'), status: 'idle', executionStatus: 'completed' });
+  await f.restart(); await f.pump(8);
+  assert.equal(f.store.progressRecord('task', 'turn'), null);
+  assert.equal(f.publication('task', 'missed').delivery.kind, 'closed');
+  assert.equal(f.publication('task', 'latest').delivery.kind, 'closed');
+});
+
+test('disabled and retired card receipts never retain an upstream body echo in raw SQLite', async t => {
+  const f = await fixture(t); f.store.saveTask(task());
+  const sentinel = 'PRIVATE_CARD_TRACE_98761'; f.event('agent_message', sentinel);
+  f.transport.createProgressCard = async () => { throw new TaskGroupUnavailable(230002, sentinel); };
+  await f.pump(); assert.equal(f.publication().delivery.kind, 'disabled');
+  f.store.saveTask({ ...task(), chatId: 'replacement' }); await f.pump();
+  const db = new DatabaseSync(join(f.directory, 'tasks.sqlite'));
+  try {
+    for (const row of db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all()) {
+      const table = String(row.name); assert.match(table, /^[a-z_]+$/);
+      assert.doesNotMatch(JSON.stringify(db.prepare(`SELECT * FROM ${table}`).all()), new RegExp(sentinel));
+    }
+  } finally { db.close(); }
+});
+
+
+test('same-thread status changes during history read cannot publish a stale card', async t => {
+  const f = await fixture(t); f.store.saveTask(task());
+  const held = gate(), entered = gate(), read = f.source.execution.read.bind(f.source.execution);
+  const mocked = t.mock.method(f.source.execution, 'read', async (...args: Parameters<typeof read>) => { entered.resolve(); await held.promise; return read(...args); });
+  const polling = f.publisher.poll(); await entered.promise;
+  f.store.saveTask({ ...task(), status: 'paused' }); held.resolve(); await polling;
+  assert.equal(f.transport.cards.size, 0); mocked.mock.restore(); await f.pump(4);
+  assert.match(f.transport.cards.get('card-1')?.content ?? '', /已暂停/);
+});
+
+test('settled cards release projections without polling idle history and reject lagging partial history', async t => {
+  const f = await fixture(t); f.store.saveTask(task()); f.event('agent_message', 'Full acknowledged card'); await f.pump(4);
+  const full = f.transport.cards.get('card-1')!.content, history = structuredClone(f.source.history.get('thread-task')!);
+  const reads = f.source.reads.length; await f.pump(5); assert.equal(f.source.reads.length, reads);
+  await f.restart(); f.source.history.set('thread-task', history.map(event => ({ ...event, kind: 'agent_delta', text: 'suffix' })));
+  await f.pump(4); assert.equal(f.transport.cards.get('card-1')!.content, full);
+  const beforeRecovery = f.source.reads.length; f.source.history.set('thread-task', history); f.advance(60_000); await f.pump(3);
+  assert.ok(f.source.reads.length > beforeRecovery); assert.equal(f.transport.cards.get('card-1')!.content, full);
+});
+
+test('more delayed turns than resident card capacity all rehydrate and publish', async t => {
+  const f = await fixture(t); f.store.saveTask(task('task', 'turn-149'));
+  for (let n = 0; n < 150; n++) {
+    f.event('agent_message', `Output for ${n}`, { turnId: `turn-${n}` });
+    f.event('turn_end', 'completed', { turnId: `turn-${n}` });
+  }
+  const views: unknown = Reflect.get(f.publisher, 'views'); assert.ok(views instanceof Map); assert.ok(views.size <= 128);
+  await f.pump(180);
+  assert.equal(f.transport.messages.size, 150);
+  assert.ok([...f.transport.cards.values()].every(card => !card.streaming));
+  assert.equal(views.size, 0);
+});
+
+test('lagging restart history cannot acknowledge an unseen head or skip intervening turns', async t => {
+  const f = await fixture(t, false);
+  f.store.saveTask({ ...task('task', 'before'), executionStatus: 'completed' });
+  f.event('turn_end', 'completed', { turnId: 'before', itemId: null });
+  await f.pump(); await f.restart();
+  f.store.saveTask({ ...task('task', 'latest'), executionStatus: 'completed' });
+  await f.pump(8);
+  assert.equal(f.transport.cards.size, 0);
+  const prior = f.source.history.get('thread-task')!;
+  f.source.history.set('thread-task', [...prior,
+    { ...prior[0]!, turnId: 'missed', key: JSON.stringify(['thread-task', 'missed', null, 'turn']) },
+    { ...prior[0]!, turnId: 'latest', key: JSON.stringify(['thread-task', 'latest', null, 'turn']) },
+  ]);
+  await f.pump(60);
+  assert.ok(f.store.progressRecord('task', 'missed'));
+  assert.equal(f.transport.cards.size, 2);
+});
+
+test('transient retry errors do not prevent completed cards recovering after restart', async t => {
+  const f = await fixture(t); f.store.saveTask(task());
+  f.event('turn_start', 'inProgress', { itemId: null });
+  f.source.execution.publish('task', { threadId: 'thread-task', turnId: 'turn', itemId: null, kind: 'error', text: 'temporary retry', label: 'retry', createdAt: f.now });
+  await f.pump(4); assert.match(f.transport.cards.get('card-1')!.content, /temporary retry/);
+  await f.restart();
+  f.event('agent_message', 'Recovered completion'); f.event('turn_end', 'completed', { itemId: null });
+  f.store.saveTask({ ...task(), executionStatus: 'completed' });
+  await f.pump(12);
+  assert.match(f.transport.cards.get('card-1')!.content, /Recovered completion/);
+  assert.equal(f.transport.cards.get('card-1')!.streaming, false);
+});
+
+test('a live latest turn cannot advance discovery past missing canonical turns', async t => {
+  const f = await fixture(t, false);
+  f.store.saveTask({ ...task('task', 'before'), executionStatus: 'completed' });
+  f.event('turn_end', 'completed', { turnId: 'before', itemId: null });
+  await f.pump(); await f.restart();
+  f.store.saveTask({ ...task('task', 'latest'), executionStatus: 'completed' });
+  f.source.execution.publish('task', { threadId: 'thread-task', turnId: 'latest', itemId: null, kind: 'turn_end', text: 'completed', label: 'ended', createdAt: f.now });
+  await f.pump(8);
+  const prior = f.source.history.get('thread-task')!;
+  f.source.history.set('thread-task', [...prior,
+    { ...prior[0]!, turnId: 'missed', key: JSON.stringify(['thread-task', 'missed', null, 'turn']) },
+    { ...prior[0]!, turnId: 'latest', key: JSON.stringify(['thread-task', 'latest', null, 'turn']) },
+  ]);
+  await f.pump(60);
+  assert.ok(f.store.progressRecord('task', 'missed'));
+  assert.equal(f.transport.cards.size, 2);
 });

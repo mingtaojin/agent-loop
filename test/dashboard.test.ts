@@ -17,7 +17,7 @@ import { AgentLoop } from '../src/loop.js';
 import { configSchema } from '../src/config.js';
 import { CodexAppServer } from './helpers/codex.js';
 import { Store } from '../src/store.js';
-import { storedExecutionEventSchema, executionEvent } from '../src/execution-events.js';
+import { executionEventSchema, executionEvent } from '../src/execution-events.js';
 import { CodexFake, FeishuFake, GitHubFake } from './fakes.js';
 import { WorkspaceProvider } from '../src/workspace.js';
 
@@ -27,7 +27,7 @@ test('dashboard projects discovered resource identity and workspace without repo
   const config = configSchema.parse({ execution: testExecution, dataDir: join(root, 'data'), engineering: { projectRoot }, projects: [testProject(join(projectRoot, 'local'))], feishu: { userOpenId: 'owner' } });
   const codex = new SurfaceCodex();
   const loop = new AgentLoop(config, { codex, feishu: new FeishuFake(), github: new GitHubFake(), workspace: new WorkspaceProvider(config.dataDir) });
-  const dashboard = await startDashboard({ dataDir: config.dataDir, port: 0 });
+  const dashboard = await startDashboard({ execution: loop.execution, dataDir: config.dataDir, port: 0 });
   t.after(async () => { await dashboard.close(); await loop.close(); await rm(root, { recursive: true, force: true }); });
   await restoreSurface(loop, { id: 'dashboard-project-input', chatId: 'private', chatType: 'p2p', senderId: 'owner',
     text: 'Inspect the local project', attachments: [], createdAt: Date.now() });
@@ -102,23 +102,24 @@ test('group and dashboard titles share normalization while persisted manual sour
   }
 });
 
-test('real adapter to SQLite to SSE streams partial text, tools and capacity errors, resumes and isolates tasks', async t => {
+test('real adapter through transient feed to SSE streams partial text, tools and capacity errors, resumes and isolates tasks', async t => {
   const root = await mkdtemp(join(tmpdir(), 'agent-dashboard-live-'));
   const config = configSchema.parse({ execution: testExecution, dataDir: root, projects: [testProject(root)], feishu: { userOpenId: 'owner' } });
   const codex = new CodexAppServer({ command: [process.execPath, resolve('test/fixtures/debug-codex.mjs')], approvalPolicy: 'never', sandbox: 'read-only', requestTimeoutMs: 2000 });
   const feishu = new FeishuFake();
   const loop = new AgentLoop(config, { codex, feishu, github: new GitHubFake(), workspace: { async ensure(input) { if (input.kind === 'project-directory') return input.directory; throw new Error('No workspace needed'); }, async head() { return 'unused'; } } });
-  const dashboard = await startDashboard({ dataDir: root, port: 0 });
+  const dashboard = await startDashboard({ execution: loop.execution, dataDir: root, port: 0 });
   const abort = new AbortController();
   t.after(async () => { abort.abort(); await dashboard.close(); await loop.close(); await rm(root, { recursive: true, force: true }); });
   const message = (id: string, text: string, chatId = 'private', chatType: 'p2p' | 'group' = 'p2p') => ({ id, text, chatId, chatType, senderId: 'owner', attachments: [], createdAt: Date.now() });
+  const initialCursor = loop.execution.cursor;
   await restoreSurface(loop, message('one', 'First task')); await loop.tick();
   await restoreSurface(loop, message('two', '<img src=x onerror=alert(1)>')); await loop.tick();
   const [first, second] = loop.tasks().filter(task => !task.sourceId.startsWith('project:')); assert.ok(first?.threadId && first.chatId && second?.threadId);
   assert.throws(() => new Store(root), /已有 Agent Loop/);
   const initial = await (await fetch(dashboard.url + '/api/snapshot')).json();
   assert.equal(initial.tasks.length, 3);
-  const response = await fetch(dashboard.url + '/api/events?taskId=' + first.id, { signal: abort.signal });
+  const response = await fetch(dashboard.url + '/api/events?taskId=' + first.id + '&after=' + encodeURIComponent(initialCursor), { signal: abort.signal });
   assert.equal(response.status, 200); assert.ok(response.body);
   const reader = response.body.getReader();
   const chunk = await reader.read();
@@ -126,31 +127,27 @@ test('real adapter to SQLite to SSE streams partial text, tools and capacity err
   assert.match(raw, /agent_delta/); assert.match(raw, /tool_start/); assert.doesNotMatch(raw, /tool_output/); assert.match(raw, /Selected model is at capacity/);
   assert.doesNotMatch(raw, /private reasoning/);
   assert.ok(!raw.includes(second.threadId));
-  const before = loop.store.executionEvents(first.id);
+  const before = loop.execution.current(first.id);
   assert.equal(before.some(event => event.kind === 'agent_message'), false);
   assert.equal(before.some(event => event.kind === 'turn_end'), false);
   assert.equal(loop.tasks()[0]?.status, 'running');
+  const resumeCursor = loop.execution.cursor;
   await restoreSurface(loop, message('finish', 'finish', first.chatId, 'group')); await loop.tick();
-  const events = loop.store.executionEvents(first.id);
+  const events = loop.execution.current(first.id);
   assert.equal(events.filter(event => event.kind === 'agent_message').length, 1);
   assert.equal(events.at(-1)?.kind, 'turn_end');
   assert.equal(events.find(event => event.kind === 'agent_message')?.text, '正在检查运行状态，校验已完成。');
   assert.equal(feishu.sent.some(item => item.text.includes('Selected model is at capacity')), false);
   const cursor = before.at(-1)?.seq; assert.ok(cursor);
-  const resumed = await fetch(dashboard.url + '/api/events?taskId=' + first.id, { headers: { 'Last-Event-ID': String(cursor) }, signal: abort.signal });
+  const resumed = await fetch(dashboard.url + '/api/events?taskId=' + first.id, { headers: { 'Last-Event-ID': resumeCursor }, signal: abort.signal });
   assert.ok(resumed.body);
   const resumedChunk = await resumed.body.getReader().read();
   const resumedRaw = new TextDecoder().decode(resumedChunk.value);
-  const resumedEvents = resumedRaw.split('\n').filter(line => line.startsWith('data: ')).map(line => storedExecutionEventSchema.parse(JSON.parse(line.slice(6))));
+  const resumedEvents = resumedRaw.split('\n').filter(line => line.startsWith('data: ')).map(line => executionEventSchema.extend({ seq: z.number(), taskId: z.string() }).parse(JSON.parse(line.slice(6))));
   assert.ok(resumedEvents.length > 0);
   assert.ok(resumedEvents.every(event => event.seq > cursor && event.taskId === first.id));
   assert.equal(resumedEvents.at(-1)?.kind, 'turn_end');
   assert.equal((await (await fetch(dashboard.url + '/api/tasks/' + first.id)).json()).outputs.some((row: { text: string }) => row.text === '正在检查运行状态，校验已完成。'), true);
-  const readOnly = new Store(root, { readOnly: true });
-  const durable = readOnly.executionEvents(first.id);
-  assert.equal(durable.some(event => event.kind === 'tool_output'), false);
-  assert.equal(durable.filter(event => event.kind === 'agent_message').length, 1);
-  assert.equal(durable.at(-1)?.kind, 'turn_end'); readOnly.close();
   assert.equal(loop.store.task(second.id).status, 'running');
 });
 

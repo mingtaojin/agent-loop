@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { incomingSchema, taskSchema } from '../src/domain.js';
-import type { StoredExecutionEvent } from '../src/execution-events.js';
+import type { VisibleExecution } from '../src/execution-events.js';
 import { documentConversationText, projectDocumentConversation } from '../src/feishu-document-conversation.js';
 import type { Inbox } from '../src/store.js';
 import { progressContent } from '../src/feishu-progress-view.js';
@@ -11,8 +11,8 @@ const task = taskSchema.parse({ id: 'task', sourceId: 'source', source: { kind: 
   contextDirectory: '/tmp', resources: [], status: 'running', reason: null, prompt: '', promptHash: '', skillPath: null,
   chatId: 'chat', threadId: 'thread', turnId: 'second', executionStatus: 'running', lastHandledTurnId: null,
   requests: [], createdAt: 1, updatedAt: 10 });
-const event = (seq: number, kind: StoredExecutionEvent['kind'], text: string, turnId = 'first'): StoredExecutionEvent =>
-  ({ seq, taskId: task.id, threadId: 'thread', turnId, itemId: 'same-id', kind, text, label: kind, createdAt: seq + 1 });
+const event = (seq: number, kind: VisibleExecution['kind'], text: string, turnId = 'first'): VisibleExecution =>
+  ({ key: String(seq), seq, taskId: task.id, threadId: 'thread', turnId, itemId: 'same-id', kind, text, label: kind, createdAt: seq + 1 });
 
 test('Feishu timestamps display UTC+8 across date and year boundaries without changing stored timestamps', () => {
   const createdAt = Date.parse('2026-12-31T16:30:00.123Z');
@@ -85,10 +85,10 @@ test('line retention removes oldest messages rather than newest messages in a de
 });
 
 test('one-shot event iterable preserves exact messages, ordering, completion and metadata', () => {
-  const events: StoredExecutionEvent[] = [
+  const events: VisibleExecution[] = [
     { ...event(1, 'agent_delta', 'Discarded'), createdAt: 10 },
     { ...event(2, 'agent_delta', 'Other\r'), itemId: 'interleaved', createdAt: 10 },
-    { ...event(3, 'agent_delta', '\nline'), itemId: 'interleaved', createdAt: 8 },
+    { ...event(3, 'agent_delta', 'Other\r\nline'), itemId: 'interleaved', createdAt: 8 },
     { ...event(4, 'agent_message', ''), createdAt: 7 },
     { ...event(5, 'agent_delta', 'Ignored after completion'), createdAt: 90 },
     { ...event(6, 'agent_message', 'Second turn', 'second'), createdAt: 10 },
@@ -100,7 +100,7 @@ test('one-shot event iterable preserves exact messages, ordering, completion and
     { ...event(12, 'turn_end', 'failed'), createdAt: 120 },
   ];
   let iterations = 0;
-  const once: Iterable<StoredExecutionEvent> = {
+  const once: Iterable<VisibleExecution> = {
     [Symbol.iterator]() { assert.equal(++iterations, 1); return events.values(); },
   };
   const streamed = projectDocumentConversation(task, [], once);

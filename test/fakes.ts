@@ -1,3 +1,4 @@
+import { executionKey, type ExecutionHistory } from '../src/execution-events.js';
 import { writeFile } from 'node:fs/promises';
 import { TurnChangedError, UncertainOperationError, type ApprovalAction, type ExecutionSnapshot, type IncomingMessage, type PendingRequest, type ProjectDecisionAction, type Source, type SourceComment, type TaskResource, type WorkspaceRequest } from '../src/domain.js';
 export interface LegacyReport { status: 'waiting_user' | 'awaiting_review' | 'failed'; summary: string; question: string | null; prUrl: string | null; validation: string[]; limitations: string[] }
@@ -95,6 +96,13 @@ export class FeishuFake implements FeishuPort {
 }
 
 export class CodexFake implements CodexPort {
+  async readHistory(threadId: string): Promise<ExecutionHistory> {
+    const snapshot = this.snapshot(threadId);
+    return snapshot.outputs.map(output => {
+      const event = { threadId, turnId: output.turnId, itemId: output.id, kind: 'agent_message' as const, label: '最终回答', text: output.text, createdAt: null };
+      return { ...event, key: executionKey(event) };
+    });
+  }
   private completionPolicy: { isCompleted(threadId: string): boolean } | undefined;
   readonly nativeDenials: PendingRequest[] = [];
   uncertainNativeDenial = false;

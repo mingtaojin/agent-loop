@@ -3,7 +3,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
 import { RejectedInputError, TurnChangedError, UncertainOperationError, workspaceTargetSchema, type AgentInput, type AgentOutput, type ExecutionSnapshot, type PendingRequest, type WorkspaceRequest } from '../domain.js';
 import { CodexProviderMismatchError, type Activity, type CodexPort, type TurnIdentity } from '../ports.js';
-import { executionEvent, type ExecutionEvent } from '../execution-events.js';
+import { executionEvent, executionKey, type ExecutionHistory, type ExecutionEvent } from '../execution-events.js';
 import { projectActionSchema } from '../project.js';
 import type { ReasoningEffort } from '../execution.js';
 import { normalizeDaemonSettings, sharedDaemonConnector, type CodexConnection, type CodexConnector, type DaemonSettings } from './codex-daemon.js';
@@ -179,9 +179,38 @@ export class CodexAppServer implements CodexPort {
   private projectHandler: Parameters<NonNullable<CodexPort['setProjectHandler']>>[0] | undefined;
   private readonly outputs = new Map<string, AgentOutput>();
   private sequence = 0;
+  private observationReset: (() => void) | undefined;
   private eventHandler: ((event: ExecutionEvent) => void) | undefined;
   private completionPolicy: { isCompleted(threadId: string): boolean } | undefined;
 
+  async readHistory(threadId: string): Promise<ExecutionHistory> {
+    await this.ready();
+    const epoch = this.epoch;
+    const historyTurn = turnSchema.extend({ itemsView: z.literal('full'), startedAt: z.number().nullable(), completedAt: z.number().nullable() });
+    const { thread } = z.object({ thread: z.object({ id: z.string(), turns: z.array(historyTurn) }) })
+      .parse(await this.rpc('thread/read', { threadId, includeTurns: true }));
+    if (thread.id !== threadId) throw new Error('Codex history Thread identity changed');
+    const entries: ExecutionHistory = [], turns = new Set<string>();
+    for (const turn of thread.turns) {
+      if (turns.has(turn.id)) throw new Error('Codex history repeated a turn');
+      turns.add(turn.id);
+      for (const item of turn.items) {
+        const event = executionEvent('item/completed', { threadId, turnId: turn.id, item });
+        if (!event) {
+          if (['agentMessage', 'commandExecution', 'fileChange', 'mcpToolCall', 'dynamicToolCall', 'webSearch'].includes(item.type)) throw new Error('Codex visible history item is incomplete');
+          continue;
+        }
+        const timing = z.object({ startedAtMs: z.number().nullish(), completedAtMs: z.number().nullish() }).parse(item);
+        entries.push({ ...event, kind: event.kind === 'agent_message' && turn.status === 'inProgress' && timing.completedAtMs == null ? 'agent_delta' : event.kind,
+          key: executionKey(event), createdAt: timing.startedAtMs ?? (turn.startedAt === null ? null : turn.startedAt * 1000) });
+      }
+      const event = executionEvent(turn.status === 'inProgress' ? 'turn/started' : 'turn/completed', { threadId, turn });
+      if (event) entries.push({ ...event, key: executionKey(event), createdAt: (turn.completedAt ?? turn.startedAt) === null ? null : (turn.completedAt ?? turn.startedAt)! * 1000 });
+    }
+    if (epoch !== this.epoch) throw new Error('Codex connection changed during history read');
+    return entries;
+  }
+  setObservationResetHandler(handler: () => void): void { this.observationReset = handler; }
   setEventHandler(handler: (event: ExecutionEvent) => void): void { this.eventHandler = handler; }
   setThreadCompletionPolicy(policy: { isCompleted(threadId: string): boolean }): void { this.completionPolicy = policy; }
   assertThreadCompletionAllowed(threadId: string): void {
@@ -838,6 +867,7 @@ export class CodexAppServer implements CodexPort {
   }
 
   private async reconnect(): Promise<void> {
+    this.observationReset?.();
     this.connection = undefined;
     this.initialized = undefined;
     this.failure = undefined;

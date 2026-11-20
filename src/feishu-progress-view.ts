@@ -1,6 +1,7 @@
 import { z } from 'zod';
+import { createHash } from 'node:crypto';
 import type { Task } from './domain.js';
-import type { StoredExecutionEvent } from './execution-events.js';
+import type { VisibleExecution } from './execution-events.js';
 import { formatFeishuTime } from './feishu-time.js';
 
 export const progressStatusSchema = z.enum(['running', 'waiting_input', 'waiting_approval', 'completed', 'failed', 'paused']);
@@ -39,16 +40,16 @@ export function boundedText(text: string, bytes: number): string {
   const tail = text.slice(-low).replace(/^[\uDC00-\uDFFF]/, '');
   return marker + tail;
 }
-export function projectProgress(view: ProgressView, event: StoredExecutionEvent): void {
+export function projectProgress(view: ProgressView, event: VisibleExecution): void {
   if (event.seq <= view.cursor) return;
   view.cursor = event.seq;
-  if (event.kind !== 'turn_status') view.lastExecutionEventAt = Math.max(view.lastExecutionEventAt ?? 0, event.createdAt);
+  if (event.kind !== 'turn_status' && event.createdAt !== null) view.lastExecutionEventAt = Math.max(view.lastExecutionEventAt ?? 0, event.createdAt);
   switch (event.kind) {
-    case 'agent_delta': case 'agent_message': {
+    case 'agent_start': case 'agent_delta': case 'agent_message': {
       view.notice = null;
       let item = view.assistant.find(item => item.id === event.itemId);
       if (!item) { item = { id: event.itemId, text: '' }; view.assistant.push(item); }
-      item.text = boundedText(event.kind === 'agent_message' ? event.text : item.text + event.text, 2000);
+      item.text = boundedText(event.text, 2000);
       view.assistant = view.assistant.slice(-3);
       break;
     }
@@ -82,4 +83,46 @@ export function progressContent(view: ProgressView): string {
     ...(view.notice ? [`执行提示：${view.notice}`] : []),
     ...view.assistant.map(item => item.text),
     ...(view.tool ? [`工具：${view.tool.label}`, view.tool.text] : [])].filter(Boolean).join('\n\n');
+}
+
+
+export const sourceFrontierSchema = z.record(z.string(), z.object({
+  complete: z.boolean(), length: z.number().int().nonnegative(), digest: z.string(), createdAt: z.number().nullable(),
+}));
+export type SourceFrontier = z.infer<typeof sourceFrontierSchema>;
+const sourceDigest = (text: string) => createHash('sha256').update(text).digest('hex');
+export function sourceFrontier(entries: VisibleExecution[]): SourceFrontier {
+  return Object.fromEntries(entries.filter(event => !['error', 'turn_status', 'agent_start', 'tool_output'].includes(event.kind)).map(event => [event.key, {
+    complete: event.kind === 'agent_message' || event.kind === 'tool_end' || event.kind === 'turn_end',
+    length: event.text.length, digest: sourceDigest(event.text), createdAt: event.createdAt,
+  }]));
+}
+export function coversSource(entries: VisibleExecution[], frontier: SourceFrontier): boolean {
+  const current = new Map(entries.map(event => [event.key, event]));
+  return Object.entries(frontier).every(([key, previous]) => {
+    const event = current.get(key);
+    if (!event) return false;
+    const complete = event.kind === 'agent_message' || event.kind === 'tool_end' || event.kind === 'turn_end';
+    if (previous.complete && !complete) return false;
+    if (sourceDigest(event.text) === previous.digest) return true;
+    if (event.kind === 'agent_start' || event.kind === 'agent_delta') {
+      return event.text.length >= previous.length && sourceDigest(event.text.slice(0, previous.length)) === previous.digest;
+    }
+    if (event.createdAt !== null && previous.createdAt !== null && event.createdAt > previous.createdAt) return true;
+    return !previous.complete && (complete || (event.text.length >= previous.length && sourceDigest(event.text.slice(0, previous.length)) === previous.digest));
+  });
+}
+
+export class HistoryRetries {
+  private readonly tasks = new Map<string, { signature: string; failures: number; nextAttemptAt: number }>();
+  ready(taskId: string, signature: string, now: number): boolean {
+    const retry = this.tasks.get(taskId);
+    return !retry || retry.signature !== signature || retry.nextAttemptAt <= now;
+  }
+  failed(taskId: string, signature: string, now: number): void {
+    const previous = this.tasks.get(taskId);
+    const failures = previous?.signature === signature ? previous.failures + 1 : 1;
+    this.tasks.set(taskId, { signature, failures, nextAttemptAt: now + Math.min(60_000, 3000 * 2 ** Math.min(failures - 1, 5)) });
+  }
+  succeeded(taskId: string): void { this.tasks.delete(taskId); }
 }

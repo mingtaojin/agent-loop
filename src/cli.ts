@@ -135,7 +135,7 @@ async function main(): Promise<void> {
   const stop = () => { void close(); };
   process.on('SIGINT', stop); process.on('SIGTERM', stop);
   try {
-    dashboardStart = startDashboard({ dataDir: config.dataDir, host: config.dashboard.host, port: config.dashboard.port });
+    dashboardStart = startDashboard({ execution: loop.execution, dataDir: config.dataDir, host: config.dashboard.host, port: config.dashboard.port });
     const dashboard = await dashboardStart;
     if (closing) { await closing; return; }
     executionWatcher.start();
