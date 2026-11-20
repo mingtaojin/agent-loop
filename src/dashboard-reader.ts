@@ -1,5 +1,5 @@
-import { taskCloseoutSchema } from './task-closeout.js';
 import { LiveExecution, type ExecutionObservation } from './live-execution.js';
+import { readTaskCloseout } from './task-closeout.js';
 import { intakeRouteSchema, presentTaskSource, type InputProvenance, type ReportEscalation, type ReportRouting, type ReportSource, type Task, type TaskResource } from './domain.js';
 import { ProjectLedger, type ProjectState } from './project.js';
 import { Store, type Inbox } from './store.js';
@@ -70,10 +70,16 @@ export interface DashboardTimelineEntry {
   phase: string | null;
 }
 
+export type DashboardWorkSummary =
+  | { kind: 'event'; event: DashboardExecutionEvent }
+  | { kind: 'report'; report: DashboardReport }
+  | { kind: 'waiting'; text: string; createdAt: null }
+  | { kind: 'no-record' };
+
 export interface ProjectTaskCard {
   id: string;
-  projectId: string;
-  role: 'coordinator' | 'worker' | 'intake';
+  projectId: string | null;
+  role: 'coordinator' | 'worker' | 'intake' | null;
   title: string;
   sourceLabel: string;
   sourceKind: Task['source']['kind'];
@@ -82,6 +88,9 @@ export interface ProjectTaskCard {
   issueId: string | null;
   status: Task['status'];
   executionStatus: Task['executionStatus'];
+  reason: string | null;
+  lifecycle: ReturnType<typeof readTaskCloseout>['lifecycle'];
+  workSummary: DashboardWorkSummary;
   threadId: string | null;
   turnId: string | null;
   chatId: string | null;
@@ -94,8 +103,8 @@ export interface ProjectTaskCard {
   createdAt: number;
   updatedAt: number;
   latestReport: DashboardReport | null;
-  completion: z.infer<typeof taskCloseoutSchema>['lifecycle'];
-  completionHistory: z.infer<typeof taskCloseoutSchema>['completionHistory'];
+  completion: ReturnType<typeof readTaskCloseout>['lifecycle'];
+  completionHistory: ReturnType<typeof readTaskCloseout>['completionHistory'];
   cleanup: { operationId: string; kind: string; scopeId: string; state: string; reason: string | null; directoryRemoved: boolean; branchRemoved: boolean }[];
 }
 
@@ -160,13 +169,12 @@ function dashboardEvent(event: VisibleExecution): DashboardExecutionEvent | null
   return { ...event, type: eventType(event), text: boundedDashboardText(text) } as DashboardExecutionEvent;
 }
 
-type DashboardOwnership = { projectId: string; role: ProjectTaskCard['role'] };
+type DashboardOwnership = { projectId: string; role: NonNullable<ProjectTaskCard['role']> };
 interface DashboardContext {
   tasks: Task[];
   states: Map<string, ProjectState>;
   ownership: Map<string, DashboardOwnership>;
   reportsByTask: Map<string, DashboardReport[]>;
-  latestActivity: Map<string, VisibleExecution>;
 }
 const membershipMetadataSchema = z.strictObject({ projectId: z.string(), role: z.enum(['coordinator', 'worker']) });
 
@@ -219,7 +227,8 @@ export class ProjectDashboardReader {
       const list = reportsByTask.get(input.provenance.taskId) ?? [];
       list.push(report); reportsByTask.set(input.provenance.taskId, list);
     }
-    return { tasks, states, ownership, reportsByTask, latestActivity: new Map(tasks.flatMap(task => { const event = this.execution.current(task.id, task.threadId).at(-1); return event ? [[task.id, event]] : []; })) };
+    for (const reports of reportsByTask.values()) reports.sort((a, b) => a.createdAt - b.createdAt);
+    return { tasks, states, ownership, reportsByTask };
   }
 
   private reportsForTask(taskId: string, context: DashboardContext): DashboardReport[] {
@@ -229,44 +238,49 @@ export class ProjectDashboardReader {
     return context.reportsByTask.get(taskId) ?? [];
   }
 
-  private card(task: Task, projectId: string, role: ProjectTaskCard['role'], context: DashboardContext, issueId: string | null = null): ProjectTaskCard {
-    const latestActivity = context.latestActivity.get(task.id) ?? null;
+  private card(task: Task, context: DashboardContext, issueId: string | null = null): ProjectTaskCard {
+    const ownership = context.ownership.get(task.id);
+    const latestActivity = this.execution.latestPublished(task.id, task.threadId);
     const visibleActivity = latestActivity ? dashboardEvent(latestActivity) : null;
     const reports = this.reportsForTask(task.id, context);
     const waiting = task.requests.map(request => `${request.kind}: ${boundedDashboardText(request.prompt)}`);
+    const waitingReason = waiting[0] ?? (task.reason ? boundedDashboardText(task.reason) : null) ?? (task.recovery.lastError ? boundedDashboardText(task.recovery.lastError) : null);
+    const latestReport = reports.at(-1) ?? null;
+    const workSummary: DashboardWorkSummary = visibleActivity ? { kind: 'event', event: visibleActivity }
+      : latestReport ? { kind: 'report', report: latestReport }
+      : waitingReason ? { kind: 'waiting', text: waitingReason, createdAt: null } : { kind: 'no-record' };
     const source = presentTaskSource(task.source, 200);
     const repository = task.source.kind === 'github' ? task.source.issue.repository : task.resources.find(resource => resource.kind !== 'project')?.repository.name ?? null;
-    const rawCloseout = this.store.meta(`task-closeout:${task.id}`);
-    const closeout = rawCloseout ? taskCloseoutSchema.parse(JSON.parse(rawCloseout)) : null;
+    const closeout = readTaskCloseout(this.store, task.id);
     return {
-      completion: closeout?.lifecycle ?? { kind: 'open' }, completionHistory: closeout?.completionHistory ?? [],
-      cleanup: closeout?.operations.flatMap(operation => operation.targets.map(target => ({ operationId: operation.id, kind: operation.kind, scopeId: target.scope.id, state: target.state, reason: target.reason, directoryRemoved: target.directoryRemoved, branchRemoved: target.branchRemoved }))) ?? [],
-      id: task.id, projectId, role, title: source.title, sourceLabel: source.label, sourceKind: task.source.kind, sourceUrl: source.url, repository,
+      completion: closeout.lifecycle,
+      completionHistory: closeout.completionHistory,
+      cleanup: closeout.operations.flatMap(operation => operation.targets.map(target => ({ operationId: operation.id, kind: operation.kind, scopeId: target.scope.id, state: target.state, reason: target.reason, directoryRemoved: target.directoryRemoved, branchRemoved: target.branchRemoved }))),
+      id: task.id, projectId: ownership?.projectId ?? null, role: ownership?.role ?? null, title: source.title, sourceLabel: source.label, sourceKind: task.source.kind, sourceUrl: source.url, repository,
       issueId: issueId ?? (task.source.kind === 'github' ? task.source.issue.id : null),
-      status: task.status, executionStatus: task.executionStatus, currentTurn: task.turnId ?? visibleActivity?.turnId ?? null,
+      status: task.status, executionStatus: task.executionStatus, currentTurn: task.turnId,
+      reason: task.reason ? boundedDashboardText(task.reason) : null, lifecycle: closeout.lifecycle, workSummary,
       threadId: task.threadId, turnId: task.turnId, chatId: task.chatId, resources: dashboardResources(task.resources),
-      latestActivity: visibleActivity, waitingReason: waiting[0] ?? (task.reason ? boundedDashboardText(task.reason) : null) ?? (task.recovery.lastError ? boundedDashboardText(task.recovery.lastError) : null), requests: task.requests.map(request => ({ kind: request.kind, prompt: boundedDashboardText(request.prompt) })),
-      recovery: task.recovery, createdAt: task.createdAt, updatedAt: task.updatedAt, latestReport: reports.at(-1) ?? null,
+      latestActivity: visibleActivity, waitingReason, requests: task.requests.map(request => ({ kind: request.kind, prompt: boundedDashboardText(request.prompt) })),
+      recovery: task.recovery, createdAt: task.createdAt, updatedAt: task.updatedAt, latestReport,
     };
   }
 
-  projects(tasks = this.store.tasks()): ProjectDashboard[] {
+  overview(tasks = this.store.tasks()): { tasks: ProjectTaskCard[]; projects: ProjectDashboard[] } {
     const context = this.context(tasks);
-    const cards = new Map<string, ProjectTaskCard[]>();
-    for (const task of tasks) {
+    const projected = tasks.map(task => {
       const ownership = context.ownership.get(task.id);
-      if (!ownership) continue;
-      const state = context.states.get(ownership.projectId);
-      if (!state) continue;
-      const issueId = state.members.find(member => member.taskId === task.id)?.issueId ?? null;
-      const list = cards.get(state.id) ?? [];
-      list.push(this.card(task, state.id, ownership.role, context, issueId)); cards.set(state.id, list);
-    }
-    return [...context.states.values()].sort((a, b) => a.name.localeCompare(b.name)).map(state => ({
+      const state = ownership ? context.states.get(ownership.projectId) : null;
+      return this.card(task, context, state?.members.find(member => member.taskId === task.id)?.issueId ?? null);
+    });
+    const projects = [...context.states.values()].sort((a, b) => a.name.localeCompare(b.name)).map(state => ({
       id: state.id, name: state.name, directory: state.directory, coordinatorTaskId: state.coordinatorTaskId,
-      members: state.members, tasks: (cards.get(state.id) ?? []).sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id)),
+      members: state.members, tasks: projected.filter(task => task.projectId === state.id).sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id)),
     }));
+    return { tasks: projected, projects };
   }
+
+  projects(tasks = this.store.tasks()): ProjectDashboard[] { return this.overview(tasks).projects; }
 
   project(projectId: string): ProjectDashboard | null { return this.projects().find(project => project.id === projectId) ?? null; }
 
@@ -313,7 +327,7 @@ export class ProjectDashboardReader {
     const project = ownership ? context.states.get(ownership.projectId) : null;
     const reports = this.reportsForTask(taskId, context);
     return {
-      task: ownership && project ? this.card(task, project.id, ownership.role, context, project.members.find(member => member.taskId === taskId)?.issueId ?? null) : null,
+      task: this.card(task, context, project?.members.find(member => member.taskId === taskId)?.issueId ?? null),
       threadId: task.threadId, projectId: ownership?.projectId ?? null,
       inputs: this.store.inputs(taskId), outputs: this.store.outputs(taskId), cursor: observation.cursor, history: observation.history, events: observation.entries.flatMap(event => { const visible = dashboardEvent(event); return visible ? [visible] : []; }), timeline: this.timeline(taskId, observation.entries), reports,
       diagnostics: this.store.diagnostics().filter(row => row.scope === taskId || row.scope.endsWith(':' + taskId)),

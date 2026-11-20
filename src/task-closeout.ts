@@ -31,6 +31,10 @@ export const taskCloseoutSchema = z.strictObject({ version: z.number().default(1
   lifecycle: z.discriminatedUnion('kind', [z.strictObject({ kind: z.literal('open') }), completionSchema]),
   scopes: z.array(scopeSchema), operations: z.array(operationSchema), predecessorTaskId: z.string().nullable() });
 type Ledger = z.infer<typeof taskCloseoutSchema>;
+export function readTaskCloseout(store: Store, taskId: string): Ledger {
+  const value = store.meta(`task-closeout:${taskId}`);
+  return value ? taskCloseoutSchema.parse(JSON.parse(value)) : { version: 2, completionHistory: [], taskId, projectId: null, lifecycle: { kind: 'open' }, scopes: [], operations: [], predecessorTaskId: null };
+}
 type Scope = z.infer<typeof scopeSchema>;
 type Target = z.infer<typeof targetSchema>;
 export type CloseoutOperation = z.infer<typeof operationSchema>;
@@ -129,8 +133,7 @@ export class TaskCloseout {
     protectedPaths(): string[];
   }) { this.migrate(); }
   read(taskId: string): Ledger {
-    const value = this.store.meta(`task-closeout:${taskId}`);
-    return value ? taskCloseoutSchema.parse(JSON.parse(value)) : { version: 2, completionHistory: [], taskId, projectId: null, lifecycle: { kind: 'open' }, scopes: [], operations: [], predecessorTaskId: null };
+    return readTaskCloseout(this.store, taskId);
   }
   private save(value: Ledger) { this.store.setMeta(`task-closeout:${value.taskId}`, JSON.stringify(taskCloseoutSchema.parse(value))); }
   private status(taskId: string) {

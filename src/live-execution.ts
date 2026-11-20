@@ -79,6 +79,9 @@ export class LiveExecution {
   current(taskId: string, threadId?: string | null): VisibleExecution[] {
     return [...this.items.values()].flatMap(item => item.kind === 'snapshot' && item.event.taskId === taskId && (threadId === undefined || item.event.threadId === threadId) ? [item.event] : []);
   }
+  latestPublished(taskId: string, threadId: string | null): VisibleExecution | null {
+    return this.changes.findLast(change => change.event.taskId === taskId && change.event.threadId === threadId)?.event ?? null;
+  }
   revision(taskId: string, threadId?: string | null): number {
     return Math.max(0, ...[...this.items.values()].map(item => item.kind === 'snapshot' ? item.event : item).filter(item => item.taskId === taskId && (threadId === undefined || item.threadId === threadId)).map(item => item.seq));
   }
