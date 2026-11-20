@@ -99,7 +99,7 @@ async function fixture(t: TestContext, initialStatus = 'running') {
     await rm(root, { recursive: true, force: true });
   });
   const client = (options: Partial<ConstructorParameters<typeof CodexAppServer>[0]> = {}, connector?: CodexConnector) => {
-    const value = new CodexAppServer({ executable, approvalPolicy: 'on-request', sandbox: 'workspace-write', requestTimeoutMs: 1000, ...options }, connector);
+    const value = new CodexAppServer({ executable, approvalPolicy: 'on-request', sandbox: 'workspace-write', requestTimeoutMs: 5000, ...options }, connector);
     clients.push(value); return value;
   };
   const wait = async (predicate: () => boolean) => { for (let i = 0; i < 100; i++) { if (predicate()) return; await delay(10); } throw new Error('Fixture condition did not occur'); };

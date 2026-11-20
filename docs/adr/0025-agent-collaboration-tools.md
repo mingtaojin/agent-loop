@@ -4,7 +4,7 @@ status: accepted
 
 # 协作工具由 Agent 决定调用
 
-2026-11-20，用户确认梳理整个协作工具层，包括创建 Worker、建群、双向消息、群公告、任务结束和清理。Agent Loop 提供工具，由 Agent 判断调用时机与工作推进方式。十项行为决定及验收场景见[规格](../../.scratch/agent-collaboration-tools/spec.md)。本决策描述目标设计，尚未实施。
+2026-11-20，用户确认梳理整个协作工具层，包括创建 Worker、建群、双向消息、群公告、任务结束和清理。Agent Loop 提供工具，由 Agent 判断调用时机与工作推进方式。十项行为决定及验收场景见[规格](../../.scratch/agent-collaboration-tools/spec.md)。本决策已用于协作工具实现，运行实例启用另按实际部署授权执行。
 
 Agent Loop Worker 仍仅由协调者创建。Worker 使用 pstack 组织内部子 agent，不将这些子 agent 注册成独立的 Agent Loop Worker。
 

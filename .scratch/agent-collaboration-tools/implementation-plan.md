@@ -14,8 +14,8 @@
 - [x] Ground
 - [x] Sketch
 - [x] Agree
-- [ ] Implement
-- [ ] Scrap. Only if the chosen architecture fails.
+- [x] Implement
+- [x] Scrap. skip: the chosen architecture did not require replacement.
 
 ## Arena
 
@@ -43,9 +43,9 @@ Eight tickets cover 44 user stories and 56 acceptance criteria. The main risk is
 
 ## Units
 
-- [ ] Baseline and architectural synthesis.
-- [ ] Tickets 01–04. Explicit messages, group experience, self groups and prompt driven dispatch.
-- [ ] Ticket 05. Durable one-shot reminders.
-- [ ] Tickets 06–07. Independent cleanup and original Thread continuation.
+- [x] Baseline and architectural synthesis.
+- [x] Tickets 01–04. Explicit messages, group experience, self groups and prompt driven dispatch.
+- [x] Ticket 05. Durable one-shot reminders.
+- [x] Tickets 06–07. Independent cleanup and original Thread continuation.
 - [ ] Ticket 08. Full prompt migration and integrated acceptance.
 - [ ] Independent review, PR checks and main merge.
