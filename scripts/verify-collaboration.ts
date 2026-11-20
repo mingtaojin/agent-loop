@@ -88,6 +88,7 @@ let artifact: unknown = null;
 let executionProfiles: unknown = null;
 let proof: unknown = null;
 let readback: Readback[] = [];
+let expectedWorkerPrompt: string | undefined;
 let childStderr = '';
 const sourceFiles = ['scripts/verify-collaboration.ts', 'src/loop.ts', 'src/project.ts', 'src/project-runtime.ts',
   'src/store.ts', 'src/domain.ts', 'src/adapters/codex.ts', 'src/adapters/feishu.ts', 'prompts/coordinator.md', 'prompts/worker.md'];
@@ -118,6 +119,51 @@ function project() {
 }
 function ownedGroup(chatId: string): void {
   assert.ok(groups.some(group => group.chatId === chatId), 'Only newly created acceptance groups may be accessed');
+}
+
+function shellArguments(command: string): string[] {
+  const words: string[] = [];
+  let word: string | undefined;
+  let quote: 'single' | 'double' | null = null;
+  for (let index = 0; index < command.length; index++) {
+    const character = command[index];
+    assert.ok(character !== undefined);
+    assert.ok(character !== '\n' && character !== '\r', 'Fixture commands must be a single shell statement');
+    if (quote === 'single') {
+      if (character === "'") quote = null;
+      else word = (word ?? '') + character;
+    } else if (character === '\\') {
+      const next = command[++index];
+      assert.ok(next !== undefined && next !== '\n' && next !== '\r', 'Invalid shell escape');
+      assert.ok(quote !== 'double' || ['$', '`', '"', '\\'].includes(next), 'Unsupported double-quoted shell escape');
+      word = (word ?? '') + next;
+    } else if (character === '"') {
+      quote = quote === 'double' ? null : 'double';
+      word ??= '';
+    } else if (character === "'" && quote === null) {
+      quote = 'single';
+      word ??= '';
+    } else if (/\s/.test(character) && quote === null) {
+      if (word !== undefined) words.push(word);
+      word = undefined;
+    } else {
+      assert.ok(character !== '$' && character !== '`', 'Shell expansion is outside acceptance scope');
+      assert.ok(quote !== null || !/[;&|<>()]/.test(character), 'Shell operators are outside acceptance scope');
+      word = (word ?? '') + character;
+    }
+  }
+  assert.equal(quote, null, 'Unclosed shell quote');
+  if (word !== undefined) words.push(word);
+  return words;
+}
+
+function fixtureCommand(command: string): string[] {
+  const argv = shellArguments(command);
+  if (!['/bin/zsh', '/bin/bash', '/bin/sh'].includes(argv[0] ?? '')) return argv;
+  assert.equal(argv.length, 3, 'A shell wrapper must contain only its executable, command flag and command');
+  assert.ok(argv[1] === '-lc' || argv[1] === '-c', 'Unsupported shell wrapper flag');
+  assert.ok(argv[2] !== undefined);
+  return shellArguments(argv[2]);
 }
 
 class ObservedFeishu extends FeishuAdapter {
@@ -162,6 +208,7 @@ class ObservedCodex extends CodexAppServer {
             assert.equal(action.requestId, 'probe-dispatch');
             assert.equal(caller.id, project().coordinatorTaskId);
             assert.ok(project().members.length === 1, 'Exactly one Worker may be created');
+            assert.equal(action.prompt, expectedWorkerPrompt, 'Dispatch must contain only the bounded Worker prompt');
           }
           if (action.action === 'open_group') {
             assert.equal(action.requestId, 'probe-worker-group');
@@ -244,10 +291,11 @@ function isolatedConnector(executable: string, env: NodeJS.ProcessEnv): CodexCon
   };
 }
 
-async function groupReadback(): Promise<Readback[]> {
+async function groupReadback(until = deadline): Promise<Readback[]> {
   if (!sdk) return fakeFeishu?.sent.map((item, index) => ({ chatId: item.chatId, messageId: `fake-${index}`,
     body: item.text, messageType: 'fake-text', createdAt: '' })) ?? [];
   const messages: Readback[] = [];
+  readback = messages;
   for (const group of groups) {
     ownedGroup(group.chatId);
     let pageToken: string | undefined;
@@ -256,7 +304,7 @@ async function groupReadback(): Promise<Readback[]> {
       const response = await bounded('Feishu test-group readback', sdk.im.v1.message.list({ params: {
         container_id_type: 'chat', container_id: group.chatId, start_time: String(Math.floor(startedAt / 1000)),
         page_size: 50, page_token: pageToken, sort_type: 'ByCreateTimeAsc',
-      } }));
+      } }), until);
       if (response.code !== 0) throw new ProbeBlocked(`Feishu readback failed with code ${response.code}: ${response.msg}`);
       const data = z.object({ items: z.array(z.object({ message_id: z.string(), chat_id: z.string(), msg_type: z.string(),
         create_time: z.string(), deleted: z.boolean().optional(), body: z.object({ content: z.string() }).optional() })).default([]),
@@ -307,7 +355,7 @@ async function verify(): Promise<void> {
   }
   for (const name of [needed.feishu.appIdEnv, needed.feishu.appSecretEnv]) credential(name);
   await mkdir(directory, { recursive: true, mode: 0o700 });
-  const safety = `This is a marker-only acceptance fixture. Read only ${directory}/AGENTS.md and the explicitly named fixture files. Allowed shell commands are cat on the Worker proof file, node ${waitPath}, and node ${duePath}. Do not inspect credentials, environment, configuration, capability files, other projects or repositories. Do not edit files, use network tools, create PRs, deploy, operate services, clean resources, or create nested agents. The only Agent Loop dispatch permitted is one coordinator-created Worker. The native collaboration tools may create this fixture's test groups and send its marker messages. These explicit acceptance restrictions override generic pstack workflows. Do not read or invoke additional skills. A plain question is ordinary assistant prose; do not request native user input for this probe.`;
+  const safety = `This is a marker-only acceptance fixture. Read only ${directory}/AGENTS.md and the explicitly named fixture files. Allowed shell commands are cat on the Worker proof file, node ${waitPath}, and node ${duePath}. Do not inspect credentials, environment, configuration, capability files, other projects or repositories. Do not edit files, use network tools, create PRs, deploy, operate services, clean resources, or create nested agents. Keep both tasks open throughout this fixture, including after the Worker final and the reminder. Do not call complete_task, cleanup_artifacts or any closeout action. The only Agent Loop dispatch permitted is one coordinator-created Worker. The native collaboration tools may create this fixture's test groups and send its marker messages. These explicit acceptance restrictions override generic pstack workflows. Do not read or invoke additional skills. A plain question is ordinary assistant prose; do not request native user input for this probe.`;
   await writeFile(join(directory, 'AGENTS.md'), safety + '\n');
   await writeFile(proofPath, marker + '\n', { mode: 0o600 });
   await writeFile(waitPath, 'setTimeout(() => process.stdout.write("fixture wait completed\\n"), 8000);\n');
@@ -316,16 +364,23 @@ async function verify(): Promise<void> {
     sha256: createHash('sha256').update(await readFile(join(directory, name))).digest('hex') })));
   const before = await fixtureHash();
   const workerPrompt = `${safety}
+Your role is Worker. Follow this dispatch prompt and the common fixture restrictions. The coordinator_only block in shared project instructions addresses the coordinator and does not apply to you. Do not copy coordinator markers or perform coordinator actions.
 Goal: prove active collaboration and ordinary Worker group output. Read ${proofPath}; the proof marker is unknown until you read it. Query project_action status for your own task ID and coordinator task ID. While you still have no group, call send_agent_message with requestId probe-worker-progress, taskId equal to the coordinator task ID, and text containing the exact proof marker and its file path. No user report request is needed. After that call returns, immediately run node ${waitPath} and wait for it to finish without ending your turn. Then open your own group with project_action open_group, requestId probe-worker-group, taskId your own ID. Emit an ordinary commentary containing ${markers.commentary}. Emit an ordinary question containing ${markers.question} and a question mark. Neither requires a human answer. Finish with an ordinary final answer containing ${markers.final}. Do not use send_group_message. Do not send a second Agent message. Do not close the task or clean its files.`;
+  expectedWorkerPrompt = workerPrompt;
   const workerProfile = needed.execution.worker[0];
   assert.ok(workerProfile);
   const instructions = `${safety}
-This acceptance has one coordinator and one Worker. Query project_action status before dispatch. Dispatch exactly once with requestId probe-dispatch, role worker, execution ${JSON.stringify(workerProfile)}, and the complete following Worker instructions as prompt:
-${workerPrompt}
-Do not open the Worker group yourself. Do not read proof.txt yourself. End ordinary responses with ${markers.hidden}; ordinary coordinator text must stay out of the group.
+These project instructions are shared with both roles. A Worker follows only its own dispatch prompt and the common fixture restrictions above. Only the coordinator follows the coordinator_only block below.
+<coordinator_only>
+Your role is coordinator. This acceptance has one coordinator and one Worker. Query project_action status before dispatch. Dispatch exactly once with requestId probe-dispatch, role worker, execution ${JSON.stringify(workerProfile)}. Set the dispatch prompt to the exact decoded JSON string between worker_prompt_json delimiters. Do not include the delimiters, coordinator instructions, or Runtime fallback instructions.
+<worker_prompt_json>
+${JSON.stringify(workerPrompt)}
+</worker_prompt_json>
+Do not open the Worker group yourself. Do not read proof.txt yourself. Include ${markers.hidden} in every ordinary final response, including the initial dispatch turn; ordinary coordinator text must stay out of the group.
 When the Worker's message supplies the actual proof marker, query status, record it with requestId probe-receipt, key acceptance.receipt, text containing the actual marker, and the actual current expectedVersion. Then call send_group_message with requestId probe-coordinator-ack and text containing ${markers.acknowledged} plus the actual proof marker. Run node ${duePath} for a future epoch millisecond. Call project_action schedule_reminder exactly once with requestId probe-reminder, dueAt that returned number, and text instructing your future self to record acceptance.reminder and send ${markers.reminder}. Call list_reminders to inspect it, then end the turn.
 When the actual reminder input arrives, query status, record with requestId probe-reminder-record, key acceptance.reminder, text ${markers.reminder}, and current expectedVersion. Call send_group_message with requestId probe-reminder-group, text ${markers.reminder}. Do not schedule another reminder or dispatch again. End with ${markers.hidden}.
-If a later input explicitly identifies itself as a synthetic direct user question, answer it using send_group_message requestId probe-direct-reply with text ${markers.direct}, then end ordinary final text with ${markers.hidden}. This synthetic input proves routing only and is not a real human webhook. Existing records mean the corresponding step is already done; do not repeat it.`;
+If a later input explicitly identifies itself as a synthetic direct user question, answer it using send_group_message requestId probe-direct-reply with text ${markers.direct}, then end ordinary final text with ${markers.hidden}. This synthetic input proves routing only and is not a real human webhook. Existing records mean the corresponding step is already done; do not repeat it.
+</coordinator_only>`;
   const config = configSchema.parse({ dataDir, projects: [{ id: projectId, name: titlePrefix, directory, repositories: [], instructions }],
     repositories: [], feishu: { ...needed.feishu, progress: { enabled: false } },
     execution: { ...needed.execution, backends: { codex: { executable: needed.execution.backends.codex.executable,
@@ -402,6 +457,7 @@ If a later input explicitly identifies itself as a synthetic direct user questio
       continue;
     }
     assert.ok(!coordinatorBodies.includes(markers.hidden), 'Coordinator ordinary final must not appear in its group');
+    assert.ok(!workerBodies.includes(markers.hidden), 'Worker output must not copy coordinator-only markers');
     assert.equal(groups.length, 2, 'Only the coordinator and single Worker groups may be created');
     assert.equal(calls.filter(call => call.request.call.tool === 'project_action' && call.request.call.arguments.action === 'dispatch').length, 1);
     const progress = calls.filter(call => call.request.call.tool === 'send_agent_message');
@@ -449,12 +505,12 @@ If a later input explicitly identifies itself as a synthetic direct user questio
     const allowedCommands = new Set([
       `cat ${join(directory, 'AGENTS.md')}`, `cat ${proofPath}`, `cat ${join(directory, 'AGENTS.md')} ${proofPath}`,
       'cat AGENTS.md', 'cat proof.txt', 'cat AGENTS.md proof.txt', `node ${waitPath}`, `node ${duePath}`, 'node wait.cjs', 'node due.cjs',
-    ]);
+    ].map(command => JSON.stringify(shellArguments(command))));
     for (const event of events.filter(item => item.kind === 'tool_start')) {
       if (['project_action', 'send_agent_message', 'send_group_message'].some(tool => event.label.startsWith(`${tool} `))) continue;
       assert.ok(event.text.startsWith('$ '), `Unexpected tool used by the model: ${event.label}`);
-      const commands = event.text.slice(2).replace(/["']/g, '').trim().split(/\s*&&\s*|\s*;\s*/);
-      assert.ok(commands.every(command => allowedCommands.has(command)), `Fixture command is outside acceptance scope: ${event.text}`);
+      const command = fixtureCommand(event.text.slice(2));
+      assert.ok(allowedCommands.has(JSON.stringify(command)), `Fixture command is outside acceptance scope: ${event.text}`);
       if (event.threadId === coordinator.threadId) assert.ok(!event.text.includes('proof.txt'), 'Coordinator must learn the proof only from its Worker');
     }
     if (options.realFeishu) {
@@ -513,6 +569,12 @@ try {
         .catch(error => cleanup.push({ resource: `Probe process ${child.pid}`, result: errorText(error) }));
     }
     cleanup.push({ resource: `Probe process ${child.pid}`, result: child.exitCode !== null || child.signalCode !== null ? 'closed' : 'still running' });
+  }
+  if (outcome.result !== 'passed' && (groups.length || fakeFeishu?.sent.length)) {
+    try {
+      readback = await groupReadback(Date.now() + 15_000);
+      note('failure_group_readback', { messages: readback.length, groups: groups.map(group => group.chatId) });
+    } catch (error) { note('failure_group_readback_failed', { error: errorText(error), retainedMessages: readback.length }); }
   }
   if (cleanup.some(item => item.result !== 'closed')) {
     if (outcome.result === 'passed') outcome = { result: 'failed', error: 'Cleanup or evidence is incomplete' };
