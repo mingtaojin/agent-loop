@@ -104,6 +104,27 @@ test('Worker delivery survives a restart before successful completion and a lost
   assert.equal(f.codex.starts.length, starts + 1);
 });
 
+test('a verified Worker result survives connection rollover while new calls from the old epoch are rejected', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('reconnected-delivery', 'Deliver evidence.');
+  assert.ok(worker.threadId && f.codex.projectHandler);
+  const snapshot = f.codex.snapshot(worker.threadId); assert.ok(snapshot.turnId);
+  let epoch = 'connection-before';
+  f.codex.isActiveTurn = identity => identity.connectionEpoch === epoch && identity.threadId === worker.threadId
+    && identity.turnId === snapshot.turnId && snapshot.status === 'running';
+  const request = { threadId: worker.threadId, turnId: snapshot.turnId, callId: 'reconnected-result',
+    connectionEpoch: epoch, action: deliverResult() };
+  const receipt = await f.codex.projectHandler(request);
+  epoch = 'connection-after';
+  await assert.rejects(f.codex.projectHandler(request), /active/i);
+  await f.restart(); assert.ok(f.codex.projectHandler);
+  assert.deepEqual(await f.codex.projectHandler({ ...request, connectionEpoch: epoch }), receipt);
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 0);
+  f.codex.complete(worker.threadId, null); await f.loop.tick(); await f.loop.tick(); await f.restart();
+  assert.equal(f.events(f.coordinator().id, 'worker_result').length, 1);
+  assert.equal(f.events(f.coordinator().id, 'worker_result')[0]?.status, 'delivered');
+});
+
 test('Worker result identity deduplicates across turns while separate results with the same prose remain distinct', async t => {
   const f = await fixture(t); await f.initialize();
   const worker = await f.dispatch('stable-result-id', 'Deliver once.');
