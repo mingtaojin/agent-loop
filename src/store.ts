@@ -9,6 +9,7 @@ const payloadRow = z.object({ payload: z.string() });
 const taskPayloadRow = payloadRow.extend({ id: z.string() });
 const taskIdRow = z.object({ task_id: z.string() });
 const metaRow = z.object({ value: z.string() });
+const outputTargetSchema = z.strictObject({ chatId: z.string().min(1), generation: z.number().int().nonnegative() });
 const dataVersionRow = z.object({ data_version: z.number() });
 const nameRow = z.object({ name: z.string() });
 const sourceRow = payloadRow.extend({ reason: z.string() });
@@ -204,6 +205,10 @@ export class Store {
     if (filter.origin) { clauses.push('origin=?'); params.push(filter.origin); }
     return this.prepare(`SELECT 1 FROM inbox WHERE ${clauses.join(' AND ')} LIMIT 1`).get(...params) !== undefined;
   }
+  latestInputSeq(taskId: string): number {
+    const row = this.prepare('SELECT COALESCE(MAX(seq),0) AS seq FROM inbox WHERE task_id=?').get(taskId);
+    return sequenceRow.parse(row).seq;
+  }
   input(taskId: string, id: string): Inbox | null { return this.inputs(taskId).find(item => item.id === id) ?? null; }
   associateRequest(id: string, taskId: string, requestId: string): void {
     const input = this.inputs(taskId).find(item => item.id === id);
@@ -211,10 +216,20 @@ export class Store {
     this.prepare('UPDATE inbox SET payload=? WHERE id=?').run(JSON.stringify({ message: input.message, provenance: input.provenance, requestId }), id);
   }
   markInput(id: string, status: Inbox['status'], error: string | null = null): void { this.prepare('UPDATE inbox SET status=?,error=? WHERE id=?').run(status, error, id); }
-  enqueue(taskId: string, text: string, key: string): string {
+  enqueue(taskId: string, text: string, key: string, target?: { chatId: string; generation: number }): string {
     const id = createHash('sha256').update(`${taskId}:${key}`).digest('hex').slice(0, 32);
     this.prepare("INSERT OR IGNORE INTO outbox VALUES(?,?,?,'pending',NULL)").run(id, taskId, text);
+    if (target) {
+      const next = outputTargetSchema.parse(target);
+      const original = this.outputTarget(id);
+      if (original && (original.chatId !== next.chatId || original.generation !== next.generation)) throw new Error('Output destination conflicts with the original request');
+      if (!original) this.setMeta(`outbox-target:${id}`, JSON.stringify(next));
+    }
     return id;
+  }
+  outputTarget(id: string): { chatId: string; generation: number } | null {
+    const raw = this.meta(`outbox-target:${id}`);
+    return raw === null ? null : outputTargetSchema.parse(JSON.parse(raw));
   }
   hasOutput(taskId: string, key: string): boolean {
     const id = createHash('sha256').update(`${taskId}:${key}`).digest('hex').slice(0, 32);
@@ -224,6 +239,11 @@ export class Store {
     if (statuses?.length === 0) return [];
     const condition = statuses ? ` AND status IN (${statuses.map(() => '?').join(',')})` : '';
     return this.prepare(`SELECT * FROM outbox WHERE task_id=?${condition} ORDER BY rowid`).all(taskId, ...(statuses ?? [])).map(row => outboxSchema.parse(row));
+  }
+  outputForKey(taskId: string, key: string): Outbox | null {
+    const id = createHash('sha256').update(`${taskId}:${key}`).digest('hex').slice(0, 32);
+    const row = this.prepare('SELECT * FROM outbox WHERE id=?').get(id);
+    return row ? outboxSchema.parse(row) : null;
   }
   hasOutputs(taskId: string, statuses: readonly Outbox['status'][]): boolean {
     if (!statuses.length) return false;

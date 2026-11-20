@@ -139,7 +139,7 @@ export class AgentLoop {
       return this.ensureWorkspace(taskId, repository);
     }, async (taskId, action) => {
       const activity = await this.capabilityActivity(taskId);
-      return this.projectAction(taskId, action, () => this.assertActiveTask(taskId, activity));
+      return this.projectAction(taskId, action, () => this.assertActiveTask(taskId, activity), activity);
     });
     ports.codex.setWorkspaceHandler(async request => {
       const task = this.store.taskForThread(request.threadId);
@@ -150,7 +150,7 @@ export class AgentLoop {
     ports.codex.setProjectHandler?.(async request => {
       const task = this.store.taskForThread(request.threadId);
       if (!task) throw new Error('Project action requires an active task');
-      return this.projectAction(task.id, request.action, () => this.assertActiveTask(task.id, request));
+      return this.projectAction(task.id, request.action, () => this.assertActiveTask(task.id, request), request);
     });
   }
   private assertActiveTask(taskId: string, identity: TurnIdentity): void {
@@ -167,9 +167,9 @@ export class AgentLoop {
     if (activity.kind !== 'running') throw new Error('Capability requires a proven active turn');
     return activity;
   }
-  async projectAction(taskId: string, action: ProjectAction, assertActive?: () => void): Promise<unknown> {
+  async projectAction(taskId: string, action: ProjectAction, assertActive?: () => void, identity?: TurnIdentity): Promise<unknown> {
     if (this.stopping) throw new Error('Runtime is stopping');
-    const result = await this.projects.action(taskId, action, assertActive);
+    const result = await this.projects.action(taskId, action, assertActive, identity);
     if (action.action === 'complete_task') { this.forwardCompletedInputs(this.store.task(action.taskId)); await this.closeout.progress(action.taskId); }
     if (action.action === 'cleanup_artifacts') await this.closeout.progress(taskId);
     return result;
@@ -858,7 +858,8 @@ export class AgentLoop {
       if (output.phase !== 'final' || 'kind' in snapshot) continue;
       if (task.legacy && this.store.hasOutput(task.id, `turn:${output.turnId}`)) continue;
       if (output.text.trim() && this.store.meta(`task-summary:${task.id}`) !== output.text) this.store.setMeta(`task-summary:${task.id}`, output.text);
-      if (output.text.trim() && this.projects.publishCoordinatorFinal(task, output.turnId)) this.notify(task, output.text, `agent-output:${output.id}`);
+      if (output.text.trim() && !this.projects.shouldSuppressWorkerFinal(task, output)
+        && this.projects.publishCoordinatorFinal(task, output.turnId)) this.notify(task, output.text, `agent-output:${output.id}`);
     }
     for (const request of snapshot.requests) {
       const identity = `${request.connectionEpoch}:${request.id}`;
@@ -1196,6 +1197,11 @@ export class AgentLoop {
       }
       task.chatId = this.store.task(task.id).chatId;
       const chatId = task.chatId;
+      const target = this.store.outputTarget(output.id);
+      if (target && (chatId !== target.chatId || groupGeneration(this.store, task.id) !== target.generation)) {
+        this.store.markOutput(output.id, 'dropped', '任务群绑定已改变');
+        continue;
+      }
       if (!chatId) {
         if (!approval) this.store.markOutput(output.id, 'dropped', '任务当前无群，不补发历史');
         continue;

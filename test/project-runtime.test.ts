@@ -438,6 +438,18 @@ async function fixture(t: TestContext, options: { secondProject?: boolean } = {}
   });
   return { root, directory, config, projectConfigs, github, feishu, codex, workspaces, state, coordinator, events, message,
     get loop() { return loop; },
+    async invoke(taskId: string, action: ProjectAction) {
+      const task = loop.store.task(taskId); assert.ok(task.threadId);
+      const snapshot = codex.snapshot(task.threadId); assert.ok(snapshot.turnId && codex.projectHandler);
+      return codex.projectHandler({ threadId: task.threadId, turnId: snapshot.turnId, connectionEpoch: 'fake-epoch', callId: `call-${action.action}`, action });
+    },
+    async bridge(taskId: string, action: ProjectAction) {
+      const actionFile = join(root, `project-action-${taskId}.json`);
+      await writeFile(actionFile, JSON.stringify(action));
+      const capability = await (loop as unknown as { workspaceBridge: { grant(id: string): Promise<string> } }).workspaceBridge.grant(taskId);
+      const result = await promisify(execFile)(process.execPath, ['--import', 'tsx', new URL('../src/project-client.ts', import.meta.url).pathname, capability, actionFile]);
+      return JSON.parse(result.stdout);
+    },
     async seedLegacy(source: Source) {
       const repository = configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner' }, repositories: [{ name: source.repository, path: directory, baseBranch: 'main', workspace: { kind: 'project-directory', path: directory } }] }).repositories[0];
       assert.ok(repository && 'path' in repository && repository.workspace?.kind === 'project-directory');
@@ -763,6 +775,156 @@ test('coordinator reports require an affirmative request from the current Worker
     action: 'report', requestId: oldRequest.id, kind: 'update', routing: 'final', text: 'An old group summary.',
   }), /explicit.*report/i);
   assert.equal(f.events(coordinator.id, 'update').length, 0);
+});
+
+test('acknowledged intermediate report publishes once while a distinct final remains visible', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('ack-report', 'Discuss the assigned contract.');
+  const group = await f.openGroup(worker.id); assert.ok(group.chatId && group.threadId && group.turnId);
+  const sentBefore = f.feishu.sent.length;
+  const invoke = async (action: ProjectAction) => f.codex.projectHandler!({ threadId: group.threadId!, turnId: group.turnId!,
+    callId: `call-${action.action}`, connectionEpoch: 'fake-epoch', action });
+  const report: ProjectAction = { action: 'report', requestId: 'published-answer', kind: 'question', routing: 'intermediate', text: 'Keep existing Workers on their original model?' };
+  const receipt = z.object({ accepted: z.literal(true), destination: z.literal('worker_group'), delivery: z.literal('queued'),
+    acknowledgement: z.object({ reportRequestId: z.string(), instruction: z.string() }) }).parse(await invoke(report));
+  assert.match(receipt.acknowledgement.instruction, /acknowledge_report/);
+  await invoke({ action: 'acknowledge_report', requestId: 'ack-answer', reportRequestId: receipt.acknowledgement.reportRequestId, finalText: 'Already asked whether existing Workers retain their model.' });
+  f.codex.complete(group.threadId, 'Already asked whether existing Workers retain their model.');
+  await f.loop.tick(); await f.loop.tick();
+  const sent = () => f.feishu.sent.slice(sentBefore).filter(item => item.chatId === group.chatId).map(item => item.text);
+  assert.deepEqual(sent(), [report.text]);
+  assert.equal(f.loop.store.meta(`task-summary:${worker.id}`), 'Already asked whether existing Workers retain their model.');
+  await f.restart(); await f.loop.tick(); assert.deepEqual(sent(), [report.text]);
+  await f.loop.receive(f.message('new-findings-input', 'Please check the remaining details.', group.chatId));
+  await f.loop.tick();
+  f.codex.complete(group.threadId, 'New finding. The selected model is unavailable.');
+  await f.loop.tick();
+  assert.deepEqual(sent(), [report.text, 'New finding. The selected model is unavailable.']);
+});
+
+for (const ingress of ['native', 'bridge'] as const) test(`report acknowledgement workflow uses the ${ingress} receipt and survives restart before final`, async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch(`producer-${ingress}`, 'Discuss whether existing Workers keep their model.');
+  const group = await f.openGroup(worker.id); assert.ok(group.chatId && group.threadId);
+  const call = (action: ProjectAction) => ingress === 'native' ? f.invoke(worker.id, action) : f.bridge(worker.id, action);
+  const sentBefore = f.feishu.sent.length;
+  const report: ProjectAction = { action: 'report', requestId: `producer-report-${ingress}`, kind: 'question', routing: 'intermediate', text: 'Should existing Workers keep their original selection after configuration changes?' };
+  const receipt = z.object({ acknowledgement: z.object({ reportRequestId: z.string(), instruction: z.string() }) }).parse(await call(report));
+  assert.match(receipt.acknowledgement.instruction, /exact finalText/);
+  const finalText = 'The question about existing Workers is already in this task group.';
+  const acknowledgement: ProjectAction = { action: 'acknowledge_report', requestId: `producer-ack-${ingress}`, reportRequestId: receipt.acknowledgement.reportRequestId, finalText };
+  assert.deepEqual(await call(acknowledgement), { accepted: true, reportRequestId: report.requestId });
+  await f.restart();
+  assert.deepEqual(await call(acknowledgement), { accepted: true, reportRequestId: report.requestId });
+  f.codex.complete(group.threadId, finalText);
+  await f.loop.tick(); await f.restart(); await f.loop.tick();
+  assert.deepEqual(f.feishu.sent.slice(sentBefore).filter(item => item.chatId === group.chatId).map(item => item.text), [report.text]);
+  assert.equal(f.loop.store.meta(`task-summary:${worker.id}`), finalText);
+  assert.equal(f.events(f.coordinator().id, 'question').length, 0);
+});
+
+for (const restart of [false, true]) test(`new input after acknowledgement preserves even identical legitimate final with restart=${restart}`, async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('steered-ack', 'Discuss the existing selection.');
+  const group = await f.openGroup(worker.id); assert.ok(group.chatId && group.threadId);
+  const sentBefore = f.feishu.sent.length, text = 'Existing Workers retain their original model.';
+  await f.invoke(worker.id, { action: 'report', requestId: 'before-steer', kind: 'update', routing: 'intermediate', text });
+  const ack: ProjectAction = { action: 'acknowledge_report', requestId: 'before-steer-ack', reportRequestId: 'before-steer', finalText: text };
+  await f.invoke(worker.id, ack);
+  await f.loop.receive(f.message('after-ack-steer', 'Please repeat that answer as my new confirmation.', group.chatId));
+  assert.ok(f.codex.steers.some(item => item.deliveryId === 'after-ack-steer'));
+  if (restart) await f.restart();
+  await f.invoke(worker.id, ack);
+  f.codex.complete(group.threadId, text);
+  await f.loop.tick(); await f.restart();
+  assert.deepEqual(f.feishu.sent.slice(sentBefore).filter(item => item.chatId === group.chatId).map(item => item.text), [text, text]);
+});
+
+test('one acknowledged output identity does not consume another final item with the same text', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('multiple-finals', 'Discuss one answer.');
+  const group = await f.openGroup(worker.id); assert.ok(group.chatId && group.threadId && group.turnId);
+  const sentBefore = f.feishu.sent.length, text = 'Keep the original selection.';
+  await f.invoke(worker.id, { action: 'report', requestId: 'multiple-report', kind: 'update', routing: 'intermediate', text });
+  await f.invoke(worker.id, { action: 'acknowledge_report', requestId: 'multiple-ack', reportRequestId: 'multiple-report', finalText: text });
+  f.codex.complete(group.threadId, text);
+  f.codex.snapshot(group.threadId).outputs.push({ id: 'another-final-item', threadId: group.threadId, turnId: group.turnId, phase: 'final', text });
+  await f.loop.tick(); await f.restart(); await f.loop.tick();
+  assert.deepEqual(f.feishu.sent.slice(sentBefore).filter(item => item.chatId === group.chatId).map(item => item.text), [text, text]);
+});
+
+test('unknown, foreign, unbound and malformed report acknowledgements cannot suppress normal finals', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('invalid-acks', 'Discuss the contract.');
+  const group = await f.openGroup(worker.id); assert.ok(group.chatId && group.threadId);
+  const other = await f.dispatch('foreign-report', 'Discuss another contract.'); await f.openGroup(other.id);
+  await f.invoke(other.id, { action: 'report', requestId: 'foreign-report-only', kind: 'update', routing: 'intermediate', text: 'Foreign task answer.' });
+  await f.loop.projectAction(worker.id, { action: 'report', requestId: 'unbound-report', kind: 'update', routing: 'intermediate', text: 'Unbound answer.' });
+  for (const reportRequestId of ['unknown-report', 'foreign-report-only', 'unbound-report', 'coordinator-report']) {
+    await assert.rejects(f.invoke(worker.id, { action: 'acknowledge_report', requestId: `invalid-${reportRequestId}`, reportRequestId, finalText: 'Legitimate final.' }));
+  }
+  assert.ok(f.codex.projectHandler);
+  await assert.rejects(f.codex.projectHandler({ threadId: group.threadId, turnId: group.turnId!, connectionEpoch: 'fake-epoch', callId: 'malformed-ack',
+    action: { action: 'acknowledge_report', requestId: 'malformed', reportRequestId: 'unknown-report', finalText: '' } }));
+  const sentBefore = f.feishu.sent.length;
+  f.codex.complete(group.threadId, 'Legitimate final.'); await f.loop.tick();
+  assert.equal(f.feishu.sent.slice(sentBefore).filter(item => item.chatId === group.chatId && item.text === 'Legitimate final.').length, 1);
+});
+
+test('report acknowledgement cannot move to a later turn after a report receipt write failure', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('lost-report-receipt', 'Discuss the contract.');
+  const group = await f.openGroup(worker.id); assert.ok(group.chatId && group.threadId && group.turnId);
+  const report: ProjectAction = { action: 'report', requestId: 'lost-bound-report', kind: 'update', routing: 'intermediate', text: 'Original turn report.' };
+  t.mock.method(f.loop.projects.ledger, 'saveReceipt', () => { throw new Error('Lost report receipt'); }, { times: 1 });
+  await assert.rejects(f.invoke(worker.id, report), /Lost report receipt/);
+  assert.equal(f.loop.store.outputForKey(worker.id, `worker-report:${report.requestId}`)?.status, 'pending');
+  f.codex.complete(group.threadId, null); await f.loop.tick();
+  await f.loop.receive(f.message('later-turn-input', 'Continue with a new answer.', group.chatId));
+  await f.loop.tick(); await f.restart();
+  assert.notEqual(f.codex.snapshot(group.threadId).turnId, group.turnId);
+  await f.invoke(worker.id, report);
+  await assert.rejects(f.invoke(worker.id, { action: 'acknowledge_report', requestId: 'later-ack', reportRequestId: report.requestId, finalText: 'Later legitimate answer.' }), /turn/);
+  f.codex.complete(group.threadId, 'Later legitimate answer.'); await f.loop.tick();
+  assert.equal(f.feishu.sent.filter(item => item.chatId === group.chatId && item.text === report.text).length, 1);
+  assert.equal(f.feishu.sent.filter(item => item.chatId === group.chatId && item.text === 'Later legitimate answer.').length, 1);
+});
+
+test('failed acknowledgement receipt is atomic and leaves an unacknowledged final visible', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('lost-ack-receipt', 'Discuss the contract.');
+  const group = await f.openGroup(worker.id); assert.ok(group.chatId && group.threadId);
+  await f.invoke(worker.id, { action: 'report', requestId: 'ack-rollback-report', kind: 'update', routing: 'intermediate', text: 'Report before failed acknowledgement.' });
+  t.mock.method(f.loop.projects.ledger, 'saveReceipt', () => { throw new Error('Lost acknowledgement receipt'); }, { times: 1 });
+  await assert.rejects(f.invoke(worker.id, { action: 'acknowledge_report', requestId: 'ack-rollback', reportRequestId: 'ack-rollback-report', finalText: 'Final after failed acknowledgement.' }), /Lost acknowledgement receipt/);
+  await f.restart(); f.codex.complete(group.threadId, 'Final after failed acknowledgement.'); await f.loop.tick();
+  assert.equal(f.feishu.sent.filter(item => item.chatId === group.chatId && item.text === 'Final after failed acknowledgement.').length, 1);
+});
+
+test('unacknowledged paraphrases remain separate messages', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('unack-report', 'Discuss the assigned contract.');
+  const group = await f.openGroup(worker.id); assert.ok(group.chatId && group.threadId);
+  const sentBefore = f.feishu.sent.length;
+  await f.loop.projectAction(worker.id, { action: 'report', requestId: 'separate-answer', kind: 'question', routing: 'intermediate', text: 'Keep existing Workers on their original model?' });
+  f.codex.complete(group.threadId, 'New information. Existing Workers now retain their original model.');
+  await f.loop.tick();
+  assert.equal(f.feishu.sent.slice(sentBefore).filter(item => item.chatId === group.chatId).length, 2);
+});
+
+test('an uncertain report delivery leaves its explicitly acknowledged final deliverable', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('uncertain-report', 'Discuss the contract.');
+  const group = await f.openGroup(worker.id); assert.ok(group.chatId && group.threadId);
+  const originalSend = f.feishu.send.bind(f.feishu);
+  let failed = true;
+  f.feishu.send = async input => { if (failed && input.text === 'Report whose transport failed.') { failed = false; throw new Error('transport failed'); } await originalSend(input); };
+  await f.invoke(worker.id, { action: 'report', requestId: 'uncertain-report-action', kind: 'update', routing: 'intermediate', text: 'Report whose transport failed.' });
+  await f.loop.tick();
+  assert.equal(f.loop.store.outputForKey(worker.id, 'worker-report:uncertain-report-action')?.status, 'uncertain');
+  await f.invoke(worker.id, { action: 'acknowledge_report', requestId: 'uncertain-report-ack', reportRequestId: 'uncertain-report-action', finalText: 'Final remains deliverable.' });
+  f.codex.complete(group.threadId, 'Final remains deliverable.'); await f.loop.tick();
+  assert.equal(f.feishu.sent.filter(item => item.chatId === group.chatId && item.text === 'Final remains deliverable.').length, 1);
 });
 
 test('intermediate Worker reports stay in the Worker group, survive restart and never wake the coordinator', async t => {

@@ -64,7 +64,7 @@ GitHub Feature 是外部需求提案。即使 Issue 描述完整，也不能直�
 
 Issue 评论先交协调者判断影响，再按需转给原 Worker。Worker 的普通最终答复、任务群内用户消息留在原任务，保留完整来源、附件、原 Thread 和任务记录。GitHub 事件和 Worker 汇报触发的协调者普通最终答复保留在协调者 Thread、执行记录和进度文档中；需要用户处理时，协调者使用 `announce` 发送带类型标题的普通文本。用户直接在项目协调群发消息后的协调者答复继续发送到项目群。
 
-Worker 在任务群里处理普通问答和阶段结论。`routing=intermediate` 的汇报发回 Worker 群。用户在 Worker 群明确说“请汇报给协调者”或“只把选中行范围同步给协调者”后，Worker 才能使用 `routing=final` 或 `routing=escalation`。原生问题、审批、权限请求、执行失败和非暂停中断由 Runtime 通知协调者。
+Worker 在任务群里处理普通问答和阶段结论。普通问答使用最终答复留在任务群。`routing=intermediate` 的汇报发回 Worker 群。已接收入队且绑定当前执行轮次的 report 回执提供 acknowledgement 指导，Worker 可用 `acknowledge_report` 引用该 report 并指定完整 finalText，Runtime 只省略这次明确确认的 final 副本。未确认的普通 final、新发现、用户后续输入和原生问题、审批、权限请求继续正常处理。用户在 Worker 群明确说“请汇报给协调者”或“只把选中行范围同步给协调者”后，Worker 才能使用 routing=final 或 routing=escalation。
 
 Worker 用该条用户消息的飞书 ID 作为 `requestId`。Runtime 校验消息、发送者、当前 Worker 群以及明确的汇报要求。每条请求对应一份汇报。用相同的 ID 和内容重试会返回原回执。摘要包含用户指定话题的结论、范围变化、待决问题和证据，并引用真实用户消息。实施、合并、部署及原生审批各自需要对应的授权。
 
