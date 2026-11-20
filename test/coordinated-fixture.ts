@@ -1,3 +1,4 @@
+import { testExecution } from './test-config.js';
 import assert from 'node:assert/strict';
 import { z } from 'zod';
 import type { AgentLoop } from '../src/loop.js';
@@ -26,7 +27,7 @@ export async function delegateIntake(loop: AgentLoop, taskId: string, prompt = '
   assert.equal(loop.projects.ledger.membership(taskId), null);
   const inbox = loop.store.inputs(taskId).map(input => ({ id: input.id, message: input.message, provenance: input.provenance }));
   const receipt = dispatchReceipt.parse(await loop.projectAction(route.coordinatorTaskId, {
-    action: 'dispatch', requestId: `delegate-${taskId}`, intakeTaskId: taskId, role: 'worker', prompt,
+    action: 'dispatch', execution: testExecution.worker, requestId: `delegate-${taskId}`, intakeTaskId: taskId, role: 'worker', prompt,
   }));
   assert.equal(receipt.taskId, taskId);
   await loop.tick();

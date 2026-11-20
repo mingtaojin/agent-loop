@@ -20,6 +20,7 @@ import { GroupCleanup } from './group-cleanup.js';
 import { Store, type Inbox } from './store.js';
 import { FeishuProgressPublisher } from './feishu-progress.js';
 import { FeishuDocumentProgressPublisher } from './feishu-document-progress.js';
+import { HistoricalExecutionIdentityError } from './execution.js';
 import { IntakeOwnershipChanged, intakeMaterialVersion, ProjectRuntime } from './project-runtime.js';
 import type { ProjectAction, ProjectConfig } from './project.js';
 import { matchesProjectIssue } from './project.js';
@@ -168,7 +169,9 @@ export class AgentLoop {
     const task = this.store.task(taskId);
     this.requireMember(task);
     if (this.closeout.completed(taskId) || this.stopping || ['paused', 'failed'].includes(task.status) || !task.threadId) throw new Error('Capability requires an active conversation');
-    const activity = await this.ports.codex.activity(task.threadId);
+    if (!this.projects.restoreWorkerExecution(task)) throw new HistoricalExecutionIdentityError(task.id);
+    const profile = this.executionProfile(task);
+    const activity = await this.ports.codex.activity(task.threadId, undefined, profile.model, profile.reasoningEffort);
     if (activity.kind !== 'running') throw new Error('Capability requires a proven active turn');
     return activity;
   }
@@ -415,21 +418,27 @@ export class AgentLoop {
     const release = this.closeout.reserve(taskId);
     try { return await run(); } finally { release(); }
   }
+  private executionProfile(task: Task) {
+    const profile = this.projects.executionProfile(task.id);
+    if (profile) return profile;
+    if (this.projects.ledger.membership(task.id)?.role === 'worker') throw new HistoricalExecutionIdentityError(task.id);
+    throw new Error('Task has no execution role');
+  }
   private async inspect(threadId: string): Promise<ExecutionSnapshot> {
     const task = this.store.taskForThread(threadId);
     if (!task) throw new Error('Unbound Thread');
     const instructions = await this.instructions(task);
     this.closeout.assertOpen(task.id);
-    const profile = this.projects.executionProfile(task.id);
-    const snapshot = await this.admitted(task.id, () => this.ports.codex.inspect(threadId, instructions, profile?.model, profile?.reasoningEffort));
+    const profile = this.executionProfile(task);
+    const snapshot = await this.admitted(task.id, () => this.ports.codex.inspect(threadId, instructions, profile.model, profile.reasoningEffort));
     return snapshot;
   }
   private async observation(task: Task, reconcile = false): Promise<ExecutionSnapshot | RunningActivity> {
     if (!task.threadId) throw new Error('Unbound Thread');
     if (!reconcile && task.executionStatus === 'running' && !this.hasUnknownInput(task)
       && !this.store.approvals(task.id).some(approval => approval.status === 'processing' || approval.status === 'uncertain')) {
-      const profile = this.projects.executionProfile(task.id);
-      const activity = await this.ports.codex.activity(task.threadId, await this.instructions(task), profile?.model, profile?.reasoningEffort);
+      const profile = this.executionProfile(task);
+      const activity = await this.ports.codex.activity(task.threadId, await this.instructions(task), profile.model, profile.reasoningEffort);
       if (activity.kind === 'running') {
         return activity;
       }
@@ -611,8 +620,10 @@ export class AgentLoop {
       return false;
     }
     if (task.threadId) {
-      for (const resource of task.resources) await this.restoreWorkspace(task.id, resource);
       await this.projects.adopt(task.id, project.id);
+      task = this.store.task(task.id);
+      if (!this.projects.restoreWorkerExecution(task)) return false;
+      for (const resource of task.resources) await this.restoreWorkspace(task.id, resource);
       return true;
     }
     const materials = await this.intakeMaterials(task);
@@ -657,9 +668,8 @@ export class AgentLoop {
       task = this.store.task(task.id);
       const generation = this.store.meta(`project-generation:${task.id}`);
       this.closeout.assertOpen(task.id);
+      const profile = this.executionProfile(task);
       const releaseAdmission = this.closeout.reserve(task.id);
-      const profile = this.projects.executionProfile(task.id);
-      if (!profile) throw new Error('Task has no execution role');
       try { task.threadId = await this.effect(task, generation ? `thread:${generation}` : 'thread', false, () => this.ports.codex.createThread({ cwd: this.executionDirectory(task), instructions,
         model: profile.model, reasoningEffort: profile.reasoningEffort })); this.persist(task); } finally { releaseAdmission(); }
     }
@@ -774,6 +784,7 @@ export class AgentLoop {
   }
   private async migratePausedProvider(task: Task, forceProbe = false): Promise<ProviderMigrationResult> {
     if (task.status !== 'paused' || !task.threadId) return 'not-needed';
+    if (!this.projects.restoreWorkerExecution(task)) return 'deferred';
     const probeKey = `provider-migration-probed:${task.id}`;
     if (!forceProbe && this.store.meta(probeKey)) return 'not-needed';
     this.store.setMeta(probeKey, String(Date.now()));
@@ -852,6 +863,7 @@ export class AgentLoop {
         task = this.store.task(id);
       }
       this.requireMember(task);
+      if (!this.projects.restoreWorkerExecution(task)) return;
       if (task.purpose !== 'execution') { task.purpose = 'execution'; this.persist(task); }
       if (task.status === 'failed' && this.store.inputs(task.id, { statuses: ['pending'], origin: 'user' }).some(input =>
         (task.recovery.lastUserInputSeq === null ? input.message.createdAt > task.updatedAt : input.seq > task.recovery.lastUserInputSeq))) {
@@ -1228,6 +1240,7 @@ export class AgentLoop {
   private async pause(task: Task, reason: string): Promise<void> {
     task.status = 'paused'; task.reason = reason; task.recovery.nextAttemptAt = null; this.persist(task);
     if (task.threadId) {
+      if (!this.projects.restoreWorkerExecution(task)) return;
       const snapshot = this.projects.ledger.membership(task.id)
         ? await this.inspect(task.threadId) : await this.ports.codex.inspect(task.threadId);
       if (snapshot.status === 'running' && snapshot.turnId) {
@@ -1242,8 +1255,12 @@ export class AgentLoop {
       const task = this.store.task(taskId);
       this.projects.retireObsoleteInputs(task);
       if (action === 'pause') await this.pause(task, 'Operator paused');
-      else if (action === 'status') this.notify(task, `Task ${task.id}\n${task.status}\n${task.reason ?? ''}`, `status:${randomUUID()}`);
+      else if (action === 'status') {
+        this.notify(task, `Task ${task.id}\n${task.status}\n${task.reason ?? ''}`, `status:${randomUUID()}`);
+        await this.flush(task); return;
+      }
       else if (['paused', 'failed'].includes(task.status)) {
+        if (!this.projects.restoreWorkerExecution(task)) return;
         if (task.status === 'paused') {
           const migration = await this.migratePausedProvider(task, true);
           if (migration === 'deferred') { await this.flush(this.store.task(taskId)); return; }
@@ -1257,6 +1274,7 @@ export class AgentLoop {
     });
   }
   private async flush(task: Task): Promise<void> {
+    if (this.projects.ledger.membership(task.id)?.role === 'worker' && !task.workerExecution) return;
     for (const output of this.store.outputs(task.id, ['pending', 'sending', 'uncertain'])) {
       const approval = this.store.meta(`approval-output:${output.id}`);
       const native = approval ? approvalOutputSchema.parse(JSON.parse(approval)) : null;
@@ -1324,7 +1342,7 @@ export class AgentLoop {
     await Promise.all(tasks.map(task => this.serial(task.id, async () => {
       try {
         if (this.closeout.completed(task.id)) { this.forwardCompletedInputs(task); await this.flush(task); return; }
-        for (const resource of task.resources) await this.restoreWorkspace(task.id, resource);
+        if (!this.projects.restoreWorkerExecution(task)) return;
         if (!this.projects.ledger.membership(task.id)) {
           const project = await this.projects.resolveTask(task);
           if (project && task.threadId) {
@@ -1332,6 +1350,8 @@ export class AgentLoop {
             task = this.store.task(task.id);
           }
         }
+        if (!this.projects.restoreWorkerExecution(task)) return;
+        for (const resource of task.resources) await this.restoreWorkspace(task.id, resource);
         if (task.source.kind === 'github' && !this.projects.ledger.membership(task.id)) {
           try {
             const source = await this.ports.github.get(task.source.issue.repository, task.source.issue.number);
@@ -1356,7 +1376,7 @@ export class AgentLoop {
     await this.backfill();
   }
   private async backfillTask(task: Task): Promise<void> {
-    if (!task.chatId) return;
+    if (!task.chatId || (this.projects.ledger.membership(task.id)?.role === 'worker' && !task.workerExecution)) return;
     const previous = Number(this.store.meta(`history:${task.id}`) ?? task.createdAt);
     const failureKey = `history-failure:${task.id}`;
     const failure = parseHistoryFailure(task.id, this.store.meta(failureKey));

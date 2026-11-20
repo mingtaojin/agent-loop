@@ -57,7 +57,7 @@ async function fixture(t: TestContext) {
     async restart() { await loop.close(); loop = new AgentLoop(config, ports); await loop.recover(); },
     async githubTask() { github.sources = [issue(1)]; await loop.collect(); await loop.tick();
       const coordinator = loop.projects.ledger.project('runtime')!.coordinatorTaskId;
-      await loop.projectAction(coordinator, { action: 'dispatch', requestId: 'test-issue-1', issueId: 'issue-1', role: 'worker', prompt: 'Investigate Issue 1.' });
+      await loop.projectAction(coordinator, { action: 'dispatch', execution: testExecution.worker, requestId: 'test-issue-1', issueId: 'issue-1', role: 'worker', prompt: 'Investigate Issue 1.' });
       await loop.tick(); await openDirectGroup(loop, task().id); return task(); },
   };
 }

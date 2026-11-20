@@ -49,11 +49,13 @@
       "model": "gpt-6-astra",
       "reasoningEffort": "high"
     },
-    "worker": {
-      "backend": "codex",
-      "model": "gpt-6.1-sol",
-      "reasoningEffort": "xhigh"
-    },
+    "worker": [
+      {
+        "backend": "codex",
+        "model": "gpt-6.1-sol",
+        "reasoningEffort": "xhigh"
+      }
+    ],
     "backends": {
       "codex": {
         "executable": "codex",

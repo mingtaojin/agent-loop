@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { workerExecutionIdentitySchema } from './execution.js';
 
 export const criteriaSchema = z.object({
   states: z.array(z.enum(['open', 'closed'])).default(['open']),
@@ -149,6 +150,7 @@ export const taskSchema = z.object({
   status: z.enum(['pending', 'running', 'idle', 'paused', 'failed']),
   reason: z.string().nullable(), prompt: z.string(), promptHash: z.string(), skillPath: z.string().nullable(),
   chatId: z.string().nullable(), threadId: z.string().nullable(), turnId: z.string().nullable(),
+  workerExecution: workerExecutionIdentitySchema.optional(),
   executionStatus: z.enum(['unbound', 'idle', 'running', 'completed', 'interrupted', 'failed', 'unknown']).default('unbound'),
   lastHandledTurnId: z.string().nullable(), requests: z.array(requestSchema),
   recovery: recoverySchema.default({ attempts: 0, nextAttemptAt: null, lastError: null, interruptedTurnId: null, lastUserInputSeq: null }),
