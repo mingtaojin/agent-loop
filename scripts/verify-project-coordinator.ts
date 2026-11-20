@@ -1,4 +1,3 @@
-import { testExecution } from '../test/test-config.js';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -33,8 +32,9 @@ const execute = promisify(execFile);
 const options = z.object({
   timeoutMs: z.coerce.number().int().min(10_000).max(1_200_000).default(480_000),
   restart: z.enum(['0', '1']).default('1'),
+  model: z.string().min(1).default('gpt-5.4-mini'),
 }).parse({ timeoutMs: process.env.PROJECT_COORDINATOR_VERIFY_TIMEOUT_MS,
-  restart: process.env.PROJECT_COORDINATOR_VERIFY_RESTART });
+  restart: process.env.PROJECT_COORDINATOR_VERIFY_RESTART, model: process.env.PROJECT_COORDINATOR_VERIFY_MODEL });
 const startedAt = Date.now();
 const deadline = startedAt + options.timeoutMs;
 const sourceFiles = ['scripts/verify-project-coordinator.ts', 'scripts/project-coordinator-probe-tasks.ts', 'src/loop.ts', 'src/project.ts', 'src/project-runtime.ts',
@@ -48,12 +48,11 @@ await mkdir(evidenceDirectory, { recursive: true, mode: 0o700 });
 const root = await realpath(await mkdtemp(join(tmpdir(), 'agent-loop-project-live-')));
 const directory = join(root, 'project');
 const proofFile = join(directory, 'proof.txt');
-const gateFile = join(root, 'coordinator-idle.gate');
 const marker = `PROJECT_COORDINATOR_PROOF_${randomUUID()}`;
 const projectId = 'live-fixture';
 const repository = 'fixture/coordinator';
 const dispatchId = 'fixture-read-only-worker';
-const reportId = 'fixture-read-only-result';
+const reportMessageId = 'fixture-owner-report-request';
 const recordId = 'fixture-result-receipt';
 const recordKey = 'acceptance.worker-receipt';
 const calls: ActionCall[] = [];
@@ -64,7 +63,7 @@ let loop: AgentLoop | undefined;
 let outcome: Outcome = { result: 'blocked', error: 'Acceptance did not finish' };
 let initialTurn: string | null = null;
 let initialThread: string | null = null;
-let gateOpenedAt: number | null = null;
+let reportRequestedAt: number | null = null;
 let reportArrival: { status: string; turnId: string | null; at: number } | null = null;
 let coreProof: unknown = null;
 let restartProof: unknown = { result: 'skipped', reason: 'Core acceptance has not completed' };
@@ -97,8 +96,10 @@ class ObservedCodex extends CodexAppServer {
         if (action.action === 'dispatch') {
           assert.equal(action.requestId, dispatchId, 'Only the single fixture worker is authorized');
           assert.equal(action.role, 'worker');
+        } else if (action.action === 'open_group') {
+          assert.equal(action.requestId, 'fixture-open-worker-group');
         } else if (action.action === 'report') {
-          assert.equal(action.requestId, reportId);
+          assert.equal(action.requestId, reportMessageId);
           assert.equal(action.kind, 'result');
           assert.ok(loop);
           const project = loop.projects.ledger.project(projectId); assert.ok(project);
@@ -107,7 +108,7 @@ class ObservedCodex extends CodexAppServer {
         } else if (action.action === 'record') {
           assert.equal(action.requestId, recordId);
           assert.equal(action.key, recordKey);
-        } else assert.equal(action.action, 'status', 'Only status, dispatch, report and record are authorized');
+        } else assert.equal(action.action, 'status', 'Only status, dispatch, open_group, report and record are authorized');
         const result = await handler(request);
         calls[index] = { request: structuredClone(request), startedAt: callStartedAt,
           status: 'succeeded', finishedAt: Date.now(), result: structuredClone(result) };
@@ -123,13 +124,15 @@ class ObservedCodex extends CodexAppServer {
 
 const safety = `This is an isolated, read-only acceptance probe. Only inspect the fixture under ${root} and the exact supplied poteto-mode skill file. Use native project_action for communication. No external tools, browser, images, remote hosts, real Feishu/GitHub, PR, git changes, deployments, service operations, credential/config inspection, or other agents. Model-provider communication is allowed. Do not read capability files or use shell fallbacks. Do not edit any files. The only delegation authorized is the coordinator's one project_action dispatch described below. Scope and prohibitions override generic playbook suggestions. A turn ending does not close the Issue.`;
 const workerPrompt = `Use poteto-mode for a read-only fixture investigation. ${safety}
-Read ${join(directory, 'AGENTS.md')}. Wait for ${gateFile} to exist, then read ${proofFile} with the shell tool. You may use a bounded shell loop (at most 180 seconds, sleep 1) to wait for that file. The probe creates it after the coordinator's first turn ends. Extract the unique marker from proof.txt. Report it exactly once with native project_action {"action":"report","requestId":"${reportId}","kind":"result","text":"<exact marker plus the absolute proof.txt path and what you actually read>"}. Return a short final answer containing that same marker and path. Do not create documentation or make a PR. Do not delegate. Do not call record. If blocked, say what failed instead of inventing evidence.`;
+Read ${join(directory, 'AGENTS.md')} and ${proofFile} with the shell tool. Extract the unique marker from proof.txt. Return a short final answer containing the marker and path. Wait for the owner to explicitly request a report in the Worker group. When that request arrives, use its actual Feishu message ID as requestId and call native project_action {"action":"report","requestId":"<owner message ID>","kind":"result","routing":"final","text":"<exact marker plus the absolute proof.txt path and what you actually read>"}. Do not create documentation or make a PR. Do not delegate. Do not call record. If blocked, say what failed.`;
 const policy = `${safety}
 First call project_action {"action":"status"}. Inspect issues and existing tasks. Only Issue 101 authorizes the single read-only check. Other admitted Issues exercise intake only and require no workers. Ignore out-of-scope Issues. If no worker exists for Issue 101, dispatch exactly one using requestId ${dispatchId}, role worker, issueId live-issue-101, and this complete worker prompt as the prompt field:
 ${workerPrompt}
-After dispatch, END THIS TURN with COORDINATOR_WAITING_FOR_REPORT. Do not wait, sleep or poll inside that turn. The Runtime will wake you when the worker reports.
+After dispatch, call project_action open_group with requestId fixture-open-worker-group and the returned Worker task ID. End this turn with COORDINATOR_WAITING_FOR_REPORT. The fixture owner will ask the Worker to report after both turns end.
 On later turns call status first and do not dispatch again. When a worker result containing its unique proof marker is present, query status for the current version and records, then call project_action record with requestId ${recordId}, key ${recordKey}, expectedVersion equal to the current status version, and text containing the actual worker marker, worker task ID, proof file path, and an explicit receipt of the result. Never guess the marker or read proof.txt yourself. If this receipt already exists, do not record again. End with COORDINATOR_RECEIPT_RECORDED plus the actual marker. No rotation is requested in this probe.`;
-const config = configSchema.parse({ execution: { ...testExecution, backends: { codex: { command: ['codex', 'app-server'], approvalPolicy: 'never', sandbox: 'read-only', requestTimeoutMs: 30_000 } } }, dataDir: join(root, 'data'),
+const profile = { backend: 'codex', model: options.model, reasoningEffort: 'low' };
+const config = configSchema.parse({ execution: { coordinator: profile, worker: profile,
+  backends: { codex: { approvalPolicy: 'never', sandbox: 'read-only', requestTimeoutMs: 30_000 } } }, dataDir: join(root, 'data'),
   feishu: { userOpenId: 'fixture-owner', progress: { enabled: false } },
   engineering: { skillPath: '/Users/developer/.codex/packages/pstack/skills/poteto-mode/SKILL.md' },
   projects: [{ id: projectId, name: 'Coordinator live fixture', directory,
@@ -141,7 +144,7 @@ const github = new GitHubFake();
 const feishu = new FeishuFake();
 github.sources = [
   issue(101, { id: 'live-issue-101', repository, url: 'https://example.invalid/fixture/issues/101',
-    title: 'Read-only fixture proof', body: 'Inspect the local fixture and report its marker. No PR or external actions.', labels: ['coordinate'], assignees: [] }),
+    title: 'Read-only fixture proof', body: 'Inspect the local fixture and record the marker in the Worker conversation.', labels: ['coordinate'], assignees: [] }),
   issue(102, { id: 'live-issue-102', repository, url: 'https://example.invalid/fixture/issues/102',
     title: 'Assignee-only intake fixture', body: 'Intake only. No work authorized.', labels: [], assignees: ['fixture-owner'] }),
   issue(103, { id: 'live-issue-103', repository, url: 'https://example.invalid/fixture/issues/103',
@@ -238,19 +241,23 @@ async function verify(): Promise<void> {
       initialTurn = current.turnId; initialThread = current.threadId;
       note('dispatch_turn_ended', { initialTurn, initialThread });
     }
-    if (initialTurn !== null && gateOpenedAt === null && current.status === 'idle') {
-      if (!loop.store.inputs(coordinatorId).some(input => input.status !== 'delivered' && input.status !== 'dropped')) {
-        gateOpenedAt = Date.now();
-        await writeFile(gateFile, 'Coordinator dispatch turn has ended. The read-only worker may proceed.\n');
-        note('worker_gate_opened', { initialTurn, initialThread, at: gateOpenedAt });
-      }
+    const worker = executions.find(task => task.id !== coordinatorId);
+    if (initialTurn !== null && reportRequestedAt === null && current.status === 'idle'
+      && worker?.status === 'idle' && worker.chatId) {
+      assert.equal(calls.filter(call => call.request.action.action === 'report').length, 0);
+      assert.ok(loop.store.outputs(worker.id).some(output => output.text.includes(marker)));
+      assert.ok(!loop.store.inputs(coordinatorId).some(input => input.message.text.includes(marker)));
+      reportRequestedAt = Date.now();
+      await loop.receive({ id: reportMessageId, chatId: worker.chatId, senderId: config.feishu.userOpenId,
+        chatType: 'group', text: 'Please report this to the coordinator.', attachments: [], createdAt: reportRequestedAt });
+      note('owner_requested_report', { initialTurn, messageId: reportMessageId, at: reportRequestedAt });
     }
     const record = state.records.find(item => item.key === recordKey);
     const currentLoop = loop;
     const allIdle = executions.length === 2 && intakes.length === 2 && executions.every(task => task.status === 'idle'
       && currentLoop.store.inputs(task.id).every(input => input.status === 'delivered' || input.status === 'dropped'));
     if (record && allIdle) {
-      assert.ok(gateOpenedAt !== null);
+      assert.ok(reportRequestedAt !== null);
       const worker = state.members.find(member => member.role === 'worker'); assert.ok(worker);
       assert.equal(worker.issueId, 'live-issue-101');
       const workerTask = loop.store.task(worker.taskId);
@@ -270,7 +277,7 @@ async function verify(): Promise<void> {
       assert.equal(reports.length, 1);
       const report = reports[0]; assert.ok(report && report.request.action.action === 'report');
       assert.equal(report.request.threadId, workerTask.threadId);
-      assert.ok(report.startedAt >= gateOpenedAt);
+      assert.ok(report.startedAt >= reportRequestedAt);
       assert.ok(report.request.action.text.includes(marker));
       const recorded = successful.find(call => call.request.action.action === 'record');
       assert.ok(recorded && recorded.request.action.action === 'record');
@@ -288,11 +295,13 @@ async function verify(): Promise<void> {
       const receiptTurnStart = loop.execution.current(coordinatorId).find(event => event.kind === 'turn_start' && event.turnId === recorded.request.turnId);
       assert.ok(receiptTurnStart && (receiptTurnStart.createdAt ?? 0) >= reportArrival.at, 'Receipt turn must start after the actual worker report');
       const workerEvents = loop.execution.current(worker.taskId);
-      assert.ok(workerEvents.some(event => ['tool_output', 'tool_end'].includes(event.kind)
-        && event.text.includes(marker)), 'Marker must be observed in actual worker tool output');
+      assert.ok(workerEvents.some(event => event.kind === 'tool_end' && event.text.includes(proofFile)
+        && event.label.endsWith('exit 0')), 'Worker must successfully read the exact fixture file');
       const workerOutputs = loop.store.outputs(worker.taskId).map(output => output.text).join('\n');
       assert.ok(workerOutputs.includes(marker));
-      const coordinatorOutputs = loop.store.outputs(coordinatorId).map(output => output.text).join('\n');
+      const coordinatorOutputs = loop.execution.current(coordinatorId, current.threadId)
+        .filter(event => event.kind === 'agent_message' && event.turnId === recorded.request.turnId)
+        .map(event => event.text).join('\n');
       assert.match(coordinatorOutputs, /COORDINATOR_RECEIPT_RECORDED/);
       assert.ok(coordinatorOutputs.includes(marker));
       for (const task of tasks) for (const event of loop.execution.current(task.id)) {
@@ -306,7 +315,7 @@ async function verify(): Promise<void> {
       coreProof = { coordinatorId, workerTaskId: worker.taskId, taskIdentities,
         retainedIntakeIds: intakes.map(task => task.id), initialThread, initialTurn,
         receiptTurn: recorded.request.turnId, receiptTurnStartedAt: receiptTurnStart.createdAt,
-        gateOpenedAt, reportArrival, reportInputId: reportInput.id,
+        reportRequestedAt, reportArrival, reportInputId: reportInput.id,
         reportProvenance: reportInput.provenance, marker, record, fixtureBefore, calls: successful.length };
       note('core_acceptance_passed', coreProof);
       break;
