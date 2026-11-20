@@ -5,8 +5,8 @@
 - [x] Read the Principles section of the poteto-mode skill.
 - [x] Phase A: Frame
 - [x] Phase B: Design the workflow
-- [ ] Phase C: Run the loop
-- [ ] Phase D: Keep the audit trail
+- [x] Phase C: Run the loop
+- [x] Phase D: Keep the audit trail
 - [ ] Phase E: Verify and hand back
 
 ## Architect
@@ -24,7 +24,7 @@
 - [x] Cross-judge
 - [x] Pick
 - [x] Graft
-- [ ] Verify
+- [x] Verify
 
 ## Throughput checkpoint
 
@@ -47,5 +47,9 @@ Eight tickets cover 44 user stories and 56 acceptance criteria. The main risk is
 - [x] Tickets 01–04. Explicit messages, group experience, self groups and prompt driven dispatch.
 - [x] Ticket 05. Durable one-shot reminders.
 - [x] Tickets 06–07. Independent cleanup and original Thread continuation.
-- [ ] Ticket 08. Full prompt migration and integrated acceptance.
+- [x] Ticket 08. Full prompt migration and integrated acceptance.
 - [ ] Independent review, PR checks and main merge.
+
+## Publication checkpoint
+
+All eight tickets, final automated checks and independent source/live acceptance passed. The decision-trail audit returned PASS+NOTES; its documentation flag was corrected. PR [70](https://github.com/mingtaojin/agent-loop/pull/70) targets main. This record is committed before the merge action. The authoritative final merge result is the PR state and merge commit, not a prefilled checkbox.

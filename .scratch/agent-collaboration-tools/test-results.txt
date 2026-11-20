@@ -1,0 +1,14 @@
+Runtime: ece0b569a7765a6f559f8fdf8d0604abc9491772
+Command: node --import tsx --test --test-concurrency=1 test/*.test.ts
+Raw local log: /tmp/agent-loop-collaboration-final-full.log
+
+ℹ {"initialFullBytes":100746,"repeatedFullBytes":0,"repeatedResponseBytes":1428}
+ℹ Constructed interrupted cleanup by moving the owned child directory to its persisted disposal path.
+ℹ tests 775
+ℹ suites 0
+ℹ pass 775
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 103864.901292
