@@ -710,6 +710,21 @@ for (const kind of ['result', 'question', 'update'] as const) test(`worker ${kin
   await assert.rejects(f.loop.projectAction(worker.id, { ...action, text: 'Changed report under the same ID' }), /different|conflict|already/i);
 });
 
+test('Worker discussion cannot report to the coordinator without an explicit owner request', async t => {
+  const f = await fixture(t); await f.initialize();
+  const worker = await f.dispatch('unsolicited-report', 'Clarify the scope in the Worker group.');
+  const group = await f.openGroup(worker.id); assert.ok(group.chatId);
+  await f.idleCoordinator();
+  const discussion = f.message('ordinary-discussion', '需求还没聊完，继续讨论。', group.chatId);
+  await f.loop.receive(discussion);
+  await assert.rejects(f.loop.projectAction(worker.id, {
+    action: 'report', kind: 'result', requestId: discussion.id, text: 'Current findings.',
+  }), /explicit.*report/i);
+  await f.loop.tick();
+  assert.equal(f.events(f.coordinator().id, 'result').length, 0);
+  assert.equal(f.coordinator().status, 'idle');
+});
+
 test('intermediate Worker reports stay in the Worker group, survive restart and never wake the coordinator', async t => {
   const f = await fixture(t); await f.initialize();
   const worker = await f.dispatch('intermediate-report', 'Discuss the assigned contract.');
