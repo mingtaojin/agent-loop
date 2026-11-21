@@ -1,6 +1,6 @@
 import { executionKey, type ExecutionEvent, type ExecutionHistory } from '../src/execution-events.js';
 import { writeFile } from 'node:fs/promises';
-import { TurnChangedError, UncertainOperationError, type ApprovalAction, type ExecutionSnapshot, type IncomingMessage, type PendingRequest, type ProjectDecisionAction, type Source, type SourceComment, type TaskResource, type WorkspaceRequest } from '../src/domain.js';
+import { TurnChangedError, UncertainOperationError, type ApprovalAction, type ExecutionSnapshot, type IncomingMessage, type PendingRequest, type Source, type SourceComment, type TaskResource, type WorkspaceRequest } from '../src/domain.js';
 export interface LegacyReport { status: 'waiting_user' | 'awaiting_review' | 'failed'; summary: string; question: string | null; prUrl: string | null; validation: string[]; limitations: string[] }
 import { TaskGroupUnavailable, type Activity, type TurnIdentity, type CodexPort, type FeishuPort, type GitHubPort, type FeishuReconnectEvent } from '../src/ports.js';
 
@@ -59,7 +59,6 @@ export class FeishuFake implements FeishuPort {
   loseGroupAck = false;
   loseSendAck = false;
   receiver: ((message: IncomingMessage) => Promise<void>) | null = null;
-  decisionReceiver: ((action: ProjectDecisionAction) => Promise<void>) | null = null;
   reconnect: ((event: FeishuReconnectEvent) => void) | null = null;
   async ensureGroup(input: Parameters<FeishuPort['ensureGroup']>[0]): Promise<string> {
     const key = input.generation ? `${input.taskId}:${input.generation}` : input.taskId;
@@ -91,7 +90,7 @@ export class FeishuFake implements FeishuPort {
     if (this.historyError) throw this.historyError;
     return this.offline.filter(message => message.chatId === input.chatId && message.createdAt >= input.since);
   }
-  async start(onMessage: (message: IncomingMessage) => Promise<void>, _onError?: (error: unknown) => void, _onAction?: (action: ApprovalAction) => Promise<void>, onReconnect?: (event: FeishuReconnectEvent) => void, onDecision?: (action: ProjectDecisionAction) => Promise<void>): Promise<void> { this.receiver = onMessage; this.reconnect = onReconnect ?? null; this.decisionReceiver = onDecision ?? null; }
+  async start(onMessage: (message: IncomingMessage) => Promise<void>, _onError?: (error: unknown) => void, _onAction?: (action: ApprovalAction) => Promise<void>, onReconnect?: (event: FeishuReconnectEvent) => void): Promise<void> { this.receiver = onMessage; this.reconnect = onReconnect ?? null; }
   async close(): Promise<void> { this.receiver = null; }
 }
 

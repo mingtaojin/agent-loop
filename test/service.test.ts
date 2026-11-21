@@ -393,6 +393,11 @@ test('native question receives ordinary answer while approval requires bound act
   await assert.rejects(f.loop.approve({ ...action, chatId: f.task(2).chatId! }), /expired/);
   await assert.rejects(f.loop.approve({ ...action, epoch: 'old' }), /expired/);
   await assert.rejects(f.loop.approve({ ...action, senderId: 'other' }), /authorized/);
+  await assert.rejects(f.loop.approve({ ...action, taskId: f.task(2).id }), /expired/);
+  await assert.rejects(f.loop.approve({ ...action, threadId: 'other-thread' }), /expired/);
+  await assert.rejects(f.loop.approve({ ...action, turnId: 'other-turn' }), /expired/);
+  await assert.rejects(f.loop.approve({ ...action, requestId: 'other-request' }), /expired/);
+  assert.deepEqual(f.loop.store.approvals(first.id), []);
   await f.loop.approve(action);
   await f.loop.control(first.id, 'status');
   assert.deepEqual(f.codex.approvals.map(input => input.decision), ['reject']);

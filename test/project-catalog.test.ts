@@ -42,7 +42,6 @@ async function fixture(t: TestContext) {
     async releaseWorkspace() { throw new Error('Unexpected workspace release'); },
     async control() { throw new Error('Unexpected task control'); },
     async openGroup(): Promise<string> { throw new Error('Unexpected group creation'); },
-    async requestDecision() { throw new Error('Unexpected coordinator announcement'); },
     async verifyGroup() {}, async groupCleanup() { throw new Error('Unexpected group cleanup'); },
   };
   let runtime = new ProjectRuntime(config, store, host);

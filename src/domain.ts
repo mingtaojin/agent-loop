@@ -245,21 +245,6 @@ export const approvalActionSchema = z.object({
   cardId: z.string().optional(), messageId: z.string().optional(),
 });
 export type ApprovalAction = z.infer<typeof approvalActionSchema>;
-const boundedCardText = z.string().trim().min(1).max(8_192);
-export const projectDecisionActionSchema = z.strictObject({
-  kind: z.literal('project_decision'),
-  id: z.string().min(1), projectId: z.string().min(1), coordinatorTaskId: z.string().min(1),
-  requestId: z.string().min(1), key: z.string().min(1),
-  choice: boundedCardText.optional(), customText: boundedCardText.optional(),
-  chatId: z.string().min(1), senderId: z.string().min(1),
-  cardId: z.string().min(1).optional(), messageId: z.string().min(1).optional(),
-  sequence: z.number().int().nonnegative().default(0), uuid: z.string().min(1).optional(),
-  epoch: z.string().min(1), expiresAt: z.number().int().nonnegative(),
-}).superRefine((value, context) => {
-  if ((value.choice === undefined) === (value.customText === undefined))
-    context.addIssue({ code: 'custom', message: 'A project decision requires exactly one choice or custom text' });
-});
-export type ProjectDecisionAction = z.infer<typeof projectDecisionActionSchema>;
 export const feishuCardRecordSchema = z.strictObject({
   id: z.string().min(1), kind: z.enum(['native_approval', 'project_decision']),
   requestId: z.string().min(1), taskId: z.string().min(1).optional(), projectId: z.string().min(1).optional(),

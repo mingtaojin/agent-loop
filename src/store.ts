@@ -29,6 +29,7 @@ export type Operation = z.infer<typeof operationSchema>;
 const inboxRow = z.object({ seq: z.number(), id: z.string(), task_id: z.string(), payload: z.string(), status: z.enum(['pending', 'delivering', 'delivered', 'failed', 'uncertain', 'held', 'dropped']), origin: z.enum(['user', 'source', 'initial', 'resume']), error: z.string().nullable() });
 export type Inbox = Omit<z.infer<typeof inboxRow>, 'payload'> & { message: IncomingMessage; provenance: InputProvenance; requestId: string | null };
 export type InboxFilter = { statuses?: readonly Inbox['status'][]; origin?: Inbox['origin'] };
+const activeInputPredicate = "json_extract(payload, '$.provenance.kind') IS NOT 'project_decision_card'";
 const outboxSchema = z.object({ id: z.string(), task_id: z.string(), text: z.string(), status: z.enum(['pending', 'sending', 'sent', 'uncertain', 'dropped']), error: z.string().nullable() });
 const groupDeliverySchema = z.object({ project_id: z.string(), request_id: z.string(), chat_id: z.string(), generation: z.number(), message_id: z.string().nullable() });
 export type GroupDelivery = z.infer<typeof groupDeliverySchema>;
@@ -190,7 +191,13 @@ export class Store {
     return this.prepare("INSERT OR IGNORE INTO inbox(id,task_id,payload,status,origin) VALUES(?,?,?,'pending',?)").run(message.id, taskId, JSON.stringify({ message, provenance: facts, requestId: null }), origin).changes > 0;
   }
   inputs(taskId: string, filter: InboxFilter = {}): Inbox[] {
-    const clauses = ['task_id=?'];
+    return this.readInputs(taskId, filter, false);
+  }
+  activeInputs(taskId: string, filter: InboxFilter = {}): Inbox[] {
+    return this.readInputs(taskId, filter, true);
+  }
+  private readInputs(taskId: string, filter: InboxFilter, active: boolean): Inbox[] {
+    const clauses = ['task_id=?', ...(active ? [activeInputPredicate] : [])];
     const params: (string | number)[] = [taskId];
     if (filter.statuses) {
       if (!filter.statuses.length) return [];
@@ -212,7 +219,13 @@ export class Store {
     });
   }
   hasInputs(taskId: string, filter: InboxFilter): boolean {
-    const clauses = ['task_id=?'];
+    return this.hasSelectedInputs(taskId, filter, false);
+  }
+  hasActiveInputs(taskId: string, filter: InboxFilter): boolean {
+    return this.hasSelectedInputs(taskId, filter, true);
+  }
+  private hasSelectedInputs(taskId: string, filter: InboxFilter, active: boolean): boolean {
+    const clauses = ['task_id=?', ...(active ? [activeInputPredicate] : [])];
     const params: (string | number)[] = [taskId];
     if (filter.statuses) {
       if (!filter.statuses.length) return false;

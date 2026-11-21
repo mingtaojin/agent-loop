@@ -1,13 +1,26 @@
-# Feishu approval and project decision cards
+# Native approvals and retired project decision cards
 
-This change has local adapter, Runtime, SQLite and restart coverage. The test suite uses controlled Feishu API and CardKit doubles. It does not prove behavior in a real tenant.
+ProjectRuntime project decision cards are retired. `project_action` rejects `request_decision`, and the Feishu adapter has no project card sender or decision handler. An old `agent_loop_card` button or form callback returns an explicit read-only toast. It does not write a receipt, ledger record, coordinator input or CardKit update. A callback containing both retired and native fields also receives the read-only result.
 
-The native approval card remains bound to one Worker task, Thread, turn, request ID and connection epoch. The project decision card is a separate action type bound to the project coordinator and project group. A project decision is recorded in the project ledger and inserted as a coordinator input with `project_decision_card` provenance. It never calls the native approval responder.
+Historical project records, receipts, card identities and `project_decision_card` input provenance retain their stored formats and remain readable. Execution selects an active inbox view that excludes this historical provenance. Pending, held, failed and uncertain project card inputs cannot start or steer a turn, answer a question, reopen work or block an ordinary input after restart. Pause, recovery, resume and attachment retry do not rewrite those historical rows. Full history reads retain their original status and payload. No migration or deletion is required.
 
-Both cards use an authenticated opaque token, owner and chat validation, bounded visible text, one-shot receipt handling, runtime expiry, persisted card and message identity, CardKit sequence and UUID state, and an `uncertain` terminal state. Unknown delivery or update outcomes do not replay the business operation.
+Native Codex approval cards remain active. Their buttons and authenticated token bind a response to the owner, task, chat, Thread, turn, request ID and connection epoch. The existing durable queue, duplicate rejection, uncertain outcome handling and Codex responder remain in use. Command, file-change and permission requests retain their response mapping. Native `question` requests continue to accept ordinary text answers through the question responder. Ordinary messages do not become native approvals.
 
-Real tenant acceptance remains a separate gate. The target app must have the tenant permissions required by the message send, card create, CardKit update, group lookup and event subscription APIs. Verify the exact scope names in the current Feishu developer console for the target App ID before testing. The owner account must be able to operate both cards in the Worker task group and project coordination group.
+Project coordination continues through existing owner text, Agent messages and the project `record` operation. This change adds no natural-language approval interpreter or new decision workflow. Other messages and cards retain their existing routes. Deployment, service restart and production-state changes still require their existing separate authorization.
 
-The tenant run must record the App ID, granted tenant scopes, callback event payloads with secrets removed, client versions, card and message IDs, CardKit response codes, and SQLite card receipts. Exercise owner approve and reject, preset and custom decision submission, duplicate submission, expired card, cross-group or cross-card token, Runtime restart recovery, and CardKit processing and final updates. A local fixture pass does not count as evidence for these tenant cases.
+## Local checks
 
-Not verified in this implementation are real tenant form callback shape, Card JSON 2.0 client rendering, CardKit update behavior, tenant permission grants, callback latency, and owner-visible final card state. Deployment, restart and production data changes were not performed.
+Run the focused behavior suites and repository checks with Node 24 or newer:
+
+```sh
+npx tsx --test test/feishu-decision-cards.test.ts test/project-runtime.test.ts test/runtime.test.ts test/platforms.test.ts test/codex.test.ts test/service.test.ts
+npm run check
+npm test
+npm run build -- --outDir <artifact-scope>/build
+```
+
+The retirement tests use disposable SQLite stores and controlled Feishu and CardKit APIs. They cover rejected generation, read-only historical callbacks, restart and input consumption boundaries. The native regression suites exercise card delivery, callback identity checks, approval receipts, Codex protocol responses and question replies. These local runs do not establish real tenant behavior.
+
+## Verification limits
+
+A real Feishu tenant check requires separate authorization. Tenant event delivery, client rendering, CardKit network behavior, granted scopes, callback latency and the owner-visible state of previously sent cards are not verified by local fixtures. An old external card may still show its original buttons, but its callback returns the read-only result. This change does not update or delete external historical cards.
