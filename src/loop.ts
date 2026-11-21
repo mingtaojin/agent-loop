@@ -19,7 +19,6 @@ import { CleanupAdmissionBusy, isContinuationInput, TaskCloseout } from './task-
 import { GroupCleanup } from './group-cleanup.js';
 import { Store, type Inbox } from './store.js';
 import { FeishuProgressPublisher } from './feishu-progress.js';
-import { FeishuDocumentProgressPublisher } from './feishu-document-progress.js';
 import { HistoricalExecutionIdentityError } from './execution.js';
 import { IntakeOwnershipChanged, intakeMaterialVersion, ProjectRuntime } from './project-runtime.js';
 import type { ProjectAction, ProjectToolCall, ProjectConfig } from './project.js';
@@ -62,7 +61,7 @@ export class AgentLoop {
   readonly execution: LiveExecution;
   readonly feishuArtifacts: FeishuArtifactPort | undefined;
   private readonly workspaceBridge: WorkspaceBridge;
-  private readonly progress: FeishuProgressPublisher | FeishuDocumentProgressPublisher | null;
+  private readonly progress: FeishuProgressPublisher | null;
   private readonly lanes = new Map<string, Promise<void>>();
   private readonly sweeps = new Map<string, Promise<void>>();
   private readonly resourceLanes = new Map<string, Promise<TaskResource>>();
@@ -121,12 +120,10 @@ export class AgentLoop {
       },
     });
     const progress = config.feishu.progress;
-    this.progress = !progress.enabled ? null : progress.surface === 'document'
-      ? ports.feishu.documentProgress && progress.documentBaseUrl
-        ? new FeishuDocumentProgressPublisher({ store: this.store, execution: this.execution, transport: ports.feishu.documentProgress,
-          documentBaseUrl: progress.documentBaseUrl, intervalMs: progress.intervalMs, maxLines: progress.maxLines }) : null
-      : ports.feishu.progress ? new FeishuProgressPublisher({ store: this.store, execution: this.execution, transport: ports.feishu.progress,
-        intervalMs: progress.intervalMs, dashboardUrl: progress.dashboardUrl }) : null;
+    this.progress = !progress.enabled || !ports.feishu.progress ? null : new FeishuProgressPublisher({
+      store: this.store, execution: this.execution, transport: ports.feishu.progress,
+      intervalMs: progress.intervalMs, dashboardUrl: progress.dashboardUrl,
+    });
     ports.codex.setObservationResetHandler?.(() => this.execution.reset());
     ports.codex.setEventHandler?.(event => {
       try {

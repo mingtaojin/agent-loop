@@ -9,12 +9,20 @@ import { assertSupportedExecutionBackends, executionConfigSchema } from './execu
 
 const environmentName = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'Use an environment variable name, not a credential');
 const positiveMilliseconds = z.number().int().positive();
-export const documentMaxLinesSchema = z.number().int().positive().max(100_000).default(3000);
-export const documentBaseUrlSchema = z.url().max(2048).refine(value => {
-  const url = new URL(value);
-  return url.protocol === 'https:' && !url.username && !url.password && !url.port
-    && url.pathname === '/' && !url.search && !url.hash;
-}, 'Use an HTTPS tenant origin without credentials, path, query or fragment').transform(value => new URL(value).origin);
+const progressConfigSchema = z.strictObject({
+  enabled: z.boolean().default(false),
+  // Keep accepting this legacy selector so old config files load. The value is
+  // consumed at this boundary and never reaches the runtime publication mode.
+  surface: z.enum(['card', 'document']).default('card'),
+  documentBaseUrl: z.unknown().optional(),
+  maxLines: z.unknown().optional(),
+  intervalMs: positiveMilliseconds.min(1000).default(1000),
+  dashboardUrl: z.url().max(2048).refine(value => ['http:', 'https:'].includes(new URL(value).protocol)).optional(),
+}).transform(({ enabled, surface, intervalMs, dashboardUrl }) => ({
+  enabled: surface === 'document' ? false : enabled,
+  intervalMs,
+  ...(dashboardUrl === undefined ? {} : { dashboardUrl }),
+}));
 
 export const configSchema = z.strictObject({
   dataDir: z.string().min(1).default('./data'),
@@ -46,15 +54,7 @@ export const configSchema = z.strictObject({
     appIdEnv: environmentName.default('FEISHU_APP_ID'),
     appSecretEnv: environmentName.default('FEISHU_APP_SECRET'),
     userOpenId: z.string().min(1),
-    progress: z.strictObject({
-      enabled: z.boolean().default(false),
-      surface: z.enum(['card', 'document']).default('card'),
-      documentBaseUrl: documentBaseUrlSchema.optional(),
-      intervalMs: positiveMilliseconds.min(1000).default(1000),
-      maxLines: documentMaxLinesSchema,
-      dashboardUrl: z.url().max(2048).refine(value => ['http:', 'https:'].includes(new URL(value).protocol)).optional(),
-    }).refine(value => !value.enabled || value.surface !== 'document' || !!value.documentBaseUrl,
-      'documentBaseUrl is required for enabled document progress').default({ enabled: false, surface: 'card', intervalMs: 1000, maxLines: 3000 }),
+    progress: progressConfigSchema.prefault({ enabled: false, surface: 'card', intervalMs: 1000 }),
   }),
   execution: executionConfigSchema.extend({
     backends: z.strictObject({

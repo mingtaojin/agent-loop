@@ -42,7 +42,6 @@ node node_modules/typescript/bin/tsc
 | test/coordinator-intake.test.ts 与 test/project-catalog.test.ts | 项目责任、材料、同Task晋升及GitHub证据。 |
 | test/project-runtime.test.ts | 无群委派、权限、原生审批、退役重建、冻结清单、未知结果恢复，以及启动时先核验资源再推进已保存Thread。 |
 | test/intake-claim.test.ts | 空库显式初始化、无归属认领、双重认领互斥、事务回滚与重开、脱敏分页、catalog归属保护、接管期间旧handoff重核，以及迟到范围补充送达协调者。 |
-| test/feishu-document-adapter.test.ts 与 test/feishu-document-progress.test.ts | 退役期间排队文档写入不得在等待结束后新dispatch，包括子节点读取后的删除。 |
 | test/feishu-progress.test.ts | 卡片进度停止与新群重建。 |
 | test/runtime.test.ts 与 test/workspace-selection.test.ts | 保存任务与目录答复恢复、附件、同Thread、原生请求及不确定输入。 |
 

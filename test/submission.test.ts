@@ -9,7 +9,6 @@ import { test, type TestContext } from 'node:test';
 import { configSchema } from '../src/config.js';
 import { AgentLoop } from '../src/loop.js';
 import { submissionReceiptSchema, submissionSchema, submissionSourceId, taskSchema } from '../src/domain.js';
-import { projectDocumentConversation, documentConversationText } from '../src/feishu-document-conversation.js';
 import { startDashboard } from '../src/dashboard.js';
 import { CodexFake, FeishuFake, GitHubFake } from './fakes.js';
 import { delegateIntake } from './coordinated-fixture.js';
@@ -85,11 +84,9 @@ test('saved CLI intake remains pending until a coordinator claims it', async t =
   assert.deepEqual(f.loop.store.task(saved.id).source, saved.source);
 });
 
-test('historical CLI conversation and dashboard keep original request text and provenance', async t => {
+test('historical CLI receipt and dashboard keep original request text and provenance', async t => {
   const f = await fixture(t), task = f.saved();
-  const conversation = projectDocumentConversation(task, f.loop.store.inputs(task.id), []);
-  assert.equal(conversation.messages[0]?.role, 'cli'); assert.equal(conversation.messages[0]?.text, 'Saved CLI request\nDetails');
-  assert.match(documentConversationText(conversation, 3000), /CLI 提交/);
+  assert.equal(f.loop.store.inputs(task.id)[0]?.message.text, 'Saved CLI request\r\nDetails');
   const dashboard = await startDashboard({ dataDir: f.dataDir, port: 0 }); t.after(() => dashboard.close());
   const response = await fetch(dashboard.url + '/api/snapshot');
   const snapshot: unknown = await response.json();
