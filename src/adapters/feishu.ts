@@ -8,7 +8,6 @@ import { Client, WSClient, EventDispatcher, Domain, LoggerLevel, defaultHttpInst
 import { z } from 'zod';
 import { UncertainOperationError, errorMessage, type ApprovalAction, type Attachment, type IncomingMessage, type PendingRequest, type ReplyTarget } from '../domain.js';
 import { FeishuApiError, GroupCreationRejected, TaskGroupUnavailable, type FeishuCardDelivery, type FeishuPort, type FeishuProgressPort, type FeishuReconnectEvent, type ProgressWriteGuard } from '../ports.js';
-import { FeishuDocumentAdapter, type FeishuDocumentApi } from './feishu-document.js';
 
 export interface FeishuOptions {
   appId: string;
@@ -22,7 +21,6 @@ type FeishuApi = {
   messageResource: Pick<Client['im']['v1']['messageResource'], 'get'>;
 };
 export interface FeishuDependencies {
-  document?: FeishuDocumentApi;
   api?: FeishuApi;
   cardkit?: { card: Pick<Client['cardkit']['v1']['card'], 'create' | 'settings' | 'idConvert'>; cardElement: Pick<Client['cardkit']['v1']['cardElement'], 'content'> };
   cardkitNative?: boolean;
@@ -198,7 +196,6 @@ function timeoutTransport(timeout: number): HttpInstance {
 }
 export class FeishuAdapter implements FeishuPort, FeishuProgressPort {
   readonly progress: FeishuProgressPort = this;
-  readonly documentProgress: FeishuDocumentAdapter;
   private apiInstance: FeishuApi | undefined;
   private cardkitInstance: FeishuDependencies['cardkit'];
   private socket: Pick<WSClient, 'start' | 'close'> | undefined;
@@ -211,16 +208,6 @@ export class FeishuAdapter implements FeishuPort, FeishuProgressPort {
     this.cardkitInstance = dependencies.cardkit;
     this.cardkitNative = dependencies.cardkitNative ?? !dependencies.api;
     this.socket = dependencies.socket;
-    let documentApi = dependencies.document;
-    this.documentProgress = new FeishuDocumentAdapter(() => {
-      if (!documentApi) {
-        const client = new Client({ appId: this.options.appId, appSecret: this.options.appSecret,
-          domain: Domain.Feishu, httpInstance: this.http, loggerLevel: LoggerLevel.error });
-        documentApi = { document: client.docx.v1.document, children: client.docx.v1.documentBlockChildren,
-          block: client.docx.v1.documentBlock, members: client.drive.v1.permissionMember, tabs: client.im.v1.chatTab };
-      }
-      return documentApi;
-    });
   }
   private get api(): FeishuApi {
     this.apiInstance ??= new Client({ appId: this.options.appId, appSecret: this.options.appSecret,

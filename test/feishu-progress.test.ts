@@ -12,6 +12,7 @@ import { configSchema } from '../src/config.js';
 import { taskSchema, type Task } from '../src/domain.js';
 import type { ExecutionEvent } from '../src/execution-events.js';
 import { FeishuProgressPublisher, progressPublicationSchema } from '../src/feishu-progress.js';
+import { progressContent } from '../src/feishu-progress-view.js';
 import { AgentLoop } from '../src/loop.js';
 import { TaskGroupUnavailable, type FeishuProgressPort } from '../src/ports.js';
 import { Store } from '../src/store.js';
@@ -109,9 +110,20 @@ async function fixture(t: TestContext, initialize = true) {
 }
 
 test('progress is opt-in and validates its interval and explicit dashboard URL', () => {
-  assert.deepEqual(configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner' } }).feishu.progress, { enabled: false, surface: 'card', intervalMs: 1000, maxLines: 3000 });
+  assert.deepEqual(configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner' } }).feishu.progress, { enabled: false, intervalMs: 1000 });
+  assert.deepEqual(configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner', progress: { enabled: true, surface: 'card', maxLines: 50, documentBaseUrl: 'not-a-url' } } }).feishu.progress,
+    { enabled: true, intervalMs: 1000 });
+  assert.deepEqual(configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner', progress: { enabled: true, surface: 'document', documentBaseUrl: 'https://tenant.feishu.cn' } } }).feishu.progress,
+    { enabled: false, intervalMs: 1000 });
+  assert.throws(() => configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner', progress: { surface: 'other' } } }));
   assert.throws(() => configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner', progress: { intervalMs: 1 } } }));
   assert.throws(() => configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner', progress: { dashboardUrl: 'file:///etc/passwd' } } }));
+});
+
+test('progress timestamps display UTC+8 across a year boundary', () => {
+  const createdAt = Date.parse('2026-12-31T16:30:00.123Z');
+  assert.ok(progressContent({ status: 'running', lastExecutionEventAt: createdAt, cursor: 1,
+    assistant: [], tool: null, notice: null }).includes('最近执行事件：2027-01-01T00:30:00.123+08:00'));
 });
 
 test('saved cards stop publishing after group removal and recreated groups get a fresh card and UUID', async t => {
@@ -351,7 +363,7 @@ test('whole runtime delivers final answer unchanged while progress API fails', a
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'feishu-runtime-')));
   const progress = new Transport(); progress.rejectCreate = true;
   const feishu = Object.assign(new FeishuFake(), { progress }); const codex = new SurfaceCodex();
-  const loop = new AgentLoop(configSchema.parse({ execution: testExecution, dataDir: directory, projects: [testProject(directory)], feishu: { userOpenId: 'owner', progress: { enabled: true } } }), {
+  const loop = new AgentLoop(configSchema.parse({ execution: testExecution, dataDir: directory, projects: [testProject(directory)], feishu: { userOpenId: 'owner', progress: { enabled: true, surface: 'card' } } }), {
     feishu, codex, github: new GitHubFake(), workspace: { ensure: async () => directory, head: async () => 'head' },
   });
   t.after(async () => { await loop.close(); await rm(directory, { recursive: true, force: true }); });
@@ -364,6 +376,47 @@ test('whole runtime delivers final answer unchanged while progress API fails', a
   assert.equal(feishu.sent.filter(message => message.text === 'The original final answer.').length, 1);
   assert.equal(loop.tasks().find(task => !task.sourceId.startsWith('project:'))?.status, 'idle');
   assert.ok(loop.store.diagnostics().some(row => row.scope === current.id && row.message.includes('card.')));
+});
+
+test('legacy document progress stays disabled across AgentLoop recovery and keeps its receipt', async t => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'feishu-document-retired-')));
+  const progress = new Transport();
+  const documentWrites: string[] = [];
+  const feishu = Object.assign(new FeishuFake(), {
+    progress,
+    documentProgress: {
+      createDocument: async () => { documentWrites.push('create'); return 'unexpected'; },
+      createTab: async () => { documentWrites.push('tab'); return 'unexpected'; },
+      replaceContent: async () => { documentWrites.push('replace'); },
+    },
+  });
+  const codex = new SurfaceCodex();
+  const config = configSchema.parse({ execution: testExecution, dataDir: directory, projects: [testProject(directory)],
+    executionPollMs: 600_000, pollIntervalMs: 600_000,
+    feishu: { userOpenId: 'owner', progress: { enabled: true, surface: 'document', documentBaseUrl: 'https://tenant.feishu.cn', maxLines: 3000 } } });
+  const ports = { feishu, codex, github: new GitHubFake(), workspace: { ensure: async () => directory, head: async () => 'head' } };
+  let loop = new AgentLoop(config, ports);
+  t.after(async () => { await loop.close(); await rm(directory, { recursive: true, force: true }); });
+  await loop.start();
+  await restoreSurface(loop, { id: 'legacy-document', chatId: 'private', senderId: 'owner', chatType: 'p2p', text: 'legacy document mode', attachments: [], createdAt: Date.now() });
+  const current = loop.tasks().find(task => !task.sourceId.startsWith('project:'));
+  assert.ok(current?.threadId);
+  const db = new DatabaseSync(join(directory, 'tasks.sqlite'));
+  const receipt = '{"delivery":{"documentId":"doc-1","tabId":"tab-1","documentUrl":"https://tenant.feishu.cn/docx/doc-1"},"opaque":"legacy"}';
+  db.prepare('INSERT INTO feishu_document_progress(task_id,payload) VALUES(?,?)').run(current.id, receipt);
+  db.close();
+  codex.complete(current.threadId, 'The final answer remains observable.');
+  await tickSurface(loop);
+  assert.equal(feishu.sent.filter(message => message.text === 'The final answer remains observable.').length, 1);
+  assert.equal(progress.calls.length, 0);
+  assert.deepEqual(loop.store.documentProgressPayload(current.id), receipt);
+  await loop.close();
+  loop = new AgentLoop(config, ports);
+  await loop.start();
+  await loop.tick(); await loop.tick();
+  assert.equal(progress.calls.length, 0, 'legacy document mode must not fall back to card progress');
+  assert.deepEqual(loop.store.documentProgressPayload(current.id), receipt, 'historical receipt remains byte-for-byte unchanged');
+  assert.deepEqual(documentWrites, [], 'recovery and retries must not call document or tab APIs');
 });
 
 test('enabling progress after completed runtime history ignores recovery observations and publishes only new turns', async t => {

@@ -477,8 +477,4 @@ export class Store {
   documentProgressRecords(): unknown[] {
     return this.prepare('SELECT payload FROM feishu_document_progress ORDER BY rowid').all().map(row => JSON.parse(payloadRow.parse(row).payload));
   }
-  saveDocumentProgressRecord(taskId: string, record: unknown): void {
-    this.prepare('INSERT INTO feishu_document_progress VALUES(?,?) ON CONFLICT(task_id) DO UPDATE SET payload=excluded.payload').run(taskId, JSON.stringify(record));
-    this.documentPayloads.delete(taskId);
-  }
 }

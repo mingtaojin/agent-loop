@@ -1,10 +1,10 @@
-import { FeishuApiError, TaskGroupBindingChanged, DocumentRequestRejected } from './ports.js';
+import { FeishuApiError, TaskGroupBindingChanged } from './ports.js';
 
 export function progressFailure(error: unknown): string {
   if (error instanceof FeishuApiError) return `Feishu API error ${error.code}`;
   if (error instanceof TaskGroupBindingChanged) return 'Task group or Thread binding changed';
   const message = error instanceof Error ? error.message : String(error);
-  const code = /^(?:Feishu API error |Feishu document API )?(\d{6,9})\b/.exec(message)?.[1];
+  const code = /^(?:Feishu API error )?(\d{6,9})\b/.exec(message)?.[1];
   if (code) return `Feishu API error ${code}`;
   if (/permission|forbidden|denied|scope/i.test(message)) return 'Feishu progress permission denied';
   if (/timeout|timed out/i.test(message)) return 'Feishu progress request timed out';
@@ -13,7 +13,6 @@ export function progressFailure(error: unknown): string {
   if (/expired|expiry|retry window/i.test(message)) return 'Feishu progress safe delivery window expired';
   if (/sequence/i.test(message)) return 'Feishu progress operation sequence rejected or exhausted';
   if (/scan|lookup|readback/i.test(message)) return 'Feishu progress reconciliation read failed';
-  if (error instanceof DocumentRequestRejected) return 'Feishu rejected the document operation';
   return 'Feishu progress operation failed';
 }
 

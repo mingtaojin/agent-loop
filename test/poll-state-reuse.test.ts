@@ -68,26 +68,23 @@ test('repeated polling reuses SQL preparation without retaining parameter bindin
   assert.equal(preparing.mock.calls.filter(call => call.arguments[0] === 'SELECT value FROM meta WHERE key=?').length, 1);
 });
 
-test('document payload reuse avoids repeated blob reads and observes writes and rollback', async t => {
+test('document payload reuse reads legacy rows without a write API', async t => {
   const { store, task, db } = await fixture(t);
-  store.saveDocumentProgressRecord(task.id, { text: 'Original' });
+  const seed = '{"text":"Original"}';
+  db.prepare('INSERT INTO feishu_document_progress(task_id,payload) VALUES(?,?)').run(task.id, seed);
   const reads = t.mock.method(StatementSync.prototype, 'get');
-  for (let i = 0; i < 10; i++) assert.equal(store.documentProgressPayload(task.id), '{"text":"Original"}');
+  for (let i = 0; i < 10; i++) assert.equal(store.documentProgressPayload(task.id), seed);
   assert.equal(reads.mock.calls.filter(call => call.this instanceof StatementSync && call.this.sourceSQL === 'SELECT payload FROM feishu_document_progress WHERE task_id=?').length, 1);
-  store.saveDocumentProgressRecord(task.id, { text: 'Saved' });
-  assert.deepEqual(store.documentProgressRecord(task.id), { text: 'Saved' });
-  assert.throws(() => store.transaction(() => {
-    store.saveDocumentProgressRecord(task.id, { text: 'Uncommitted' });
-    assert.deepEqual(store.documentProgressRecord(task.id), { text: 'Uncommitted' });
-    throw new Error('rollback');
-  }), /rollback/);
+  db.prepare('UPDATE feishu_document_progress SET payload=? WHERE task_id=?').run('{"text":"Saved"}', task.id);
+  store.metaRevision('unrelated');
   assert.deepEqual(store.documentProgressRecord(task.id), { text: 'Saved' });
   db.prepare('UPDATE feishu_document_progress SET payload=? WHERE task_id=?').run('{"text":"External"}', task.id);
   store.metaRevision('unrelated');
   assert.deepEqual(store.documentProgressRecord(task.id), { text: 'External' });
   db.prepare('DELETE FROM feishu_document_progress WHERE task_id=?').run(task.id);
   assert.equal(store.documentProgressRecord(task.id), null);
-  store.saveDocumentProgressRecord(task.id, { text: 'Recreated' });
+  db.prepare('INSERT INTO feishu_document_progress(task_id,payload) VALUES(?,?)').run(task.id, '{"text":"Recreated"}');
+  store.metaRevision('unrelated');
   assert.deepEqual(store.documentProgressRecord(task.id), { text: 'Recreated' });
 });
 
@@ -119,14 +116,18 @@ test('closeout status reuse observes writes, external edits, deletion and rollba
 
 test('read-only stores see changed cached records and reject reads after closing', async t => {
   const { root, store, task } = await fixture(t);
-  store.saveDocumentProgressRecord(task.id, { text: 'First' });
+  const db = new DatabaseSync(join(root, 'tasks.sqlite'));
+  db.prepare('INSERT INTO feishu_document_progress(task_id,payload) VALUES(?,?)').run(task.id, '{"text":"First"}');
   const reader = new Store(root, { readOnly: true });
   assert.deepEqual(reader.task(task.id), task);
   assert.deepEqual(reader.documentProgressRecord(task.id), { text: 'First' });
-  store.saveTask({ ...task, reason: 'Changed' }); store.saveDocumentProgressRecord(task.id, { text: 'Second' });
+  store.saveTask({ ...task, reason: 'Changed' });
+  db.prepare('UPDATE feishu_document_progress SET payload=? WHERE task_id=?').run('{"text":"Second"}', task.id);
+  store.metaRevision('unrelated');
   assert.equal(reader.task(task.id).reason, 'Changed');
   assert.deepEqual(reader.documentProgressRecord(task.id), { text: 'Second' });
   reader.close();
+  db.close();
   assert.throws(() => reader.task(task.id));
   assert.throws(() => reader.documentProgressRecord(task.id));
 });
