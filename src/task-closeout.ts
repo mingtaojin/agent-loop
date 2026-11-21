@@ -153,7 +153,7 @@ export class TaskCloseout {
   pendingInputs(taskId: string): Inbox[] {
     const completion = this.read(taskId).completionHistory.at(-1);
     const retained = new Set(completion?.pendingInputIds);
-    return this.store.inputs(taskId, { statuses: ['pending', 'delivering', 'uncertain', 'held', 'failed'] })
+    return this.store.activeInputs(taskId, { statuses: ['pending', 'delivering', 'uncertain', 'held', 'failed'] })
       .filter(input => !completion || input.seq > completion.inboxSequence || retained.has(input.id)
         || input.status === 'delivering' || input.status === 'uncertain');
   }

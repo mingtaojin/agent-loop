@@ -1622,6 +1622,25 @@ test('retirement checks project, author, category, envelope and generated identi
   for (const input of before) assert.equal(f.loop.store.inputs(coordinator.id).find(candidate => candidate.id === input.id)?.status, 'delivered');
 });
 
+test('retained project-card history does not block coordinator rotation or enter the new Thread', async t => {
+  const f = await fixture(t); await f.initialize();
+  const coordinator = f.coordinator(); assert.ok(coordinator.threadId);
+  for (const status of ['pending', 'held', 'uncertain', 'failed'] as const) {
+    const message = f.message(`retired-${status}`, `Historical card choice ${status}`, coordinator.chatId!);
+    f.loop.store.receive(coordinator.id, message, 'user', { kind: 'project_decision_card', projectId: 'app', cardId: `card-${status}`,
+      requestId: status, ownerId: 'owner', value: message.text });
+    f.loop.store.markInput(message.id, status, `Original ${status} outcome`);
+  }
+  const retained = f.loop.store.inputs(coordinator.id).filter(input => input.provenance.kind === 'project_decision_card');
+  await f.loop.projectAction(coordinator.id, { action: 'rotate', requestId: 'rotate-retired', checkpoint: 'Preserve history while continuing ordinary coordination.' });
+  f.codex.complete(coordinator.threadId, null);
+  await f.loop.tick(); await f.loop.tick();
+  const rotated = f.coordinator(); assert.ok(rotated.threadId); assert.notEqual(rotated.threadId, coordinator.threadId);
+  const starts = f.codex.starts.filter(input => input.threadId === rotated.threadId); assert.equal(starts.length, 1);
+  assert.ok(!JSON.stringify(starts).includes('Historical card choice'));
+  assert.deepEqual(f.loop.store.inputs(coordinator.id).filter(input => input.provenance.kind === 'project_decision_card'), retained);
+});
+
 test('dropped historical inputs neither enter initial batches nor block coordinator rotation', async t => {
   const f = await fixture(t); await f.initialize();
   const worker = await f.dispatch('rotation-dropped', 'Investigate.'); await f.idleCoordinator();

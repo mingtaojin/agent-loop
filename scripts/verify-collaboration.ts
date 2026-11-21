@@ -185,7 +185,6 @@ class ObservedFeishu extends FeishuAdapter {
   override async dissolveGroup(): Promise<void> { throw new Error('Group deletion is outside this acceptance'); }
   override async download(): Promise<void> { throw new Error('Attachment download is outside this acceptance'); }
   override async sendApproval(): Promise<never> { throw new ProbeBlocked('Unexpected native approval during marker-only acceptance'); }
-  override async sendDecisionCard(): Promise<never> { throw new Error('Decision cards are outside this acceptance'); }
   override async start(): Promise<void> { throw new Error('A Feishu WebSocket must not be started by this probe'); }
 }
 

@@ -69,6 +69,85 @@ function action(f: Awaited<ReturnType<typeof fixture>>, native: PendingRequest):
   return { id: 'click', taskId: f.task().id, threadId: native.threadId, turnId: native.turnId, requestId: native.id, decision: 'approve', chatId: f.task().chatId!, senderId: 'owner', epoch: native.connectionEpoch };
 }
 
+function retainedProjectInputs(f: Awaited<ReturnType<typeof fixture>>, taskId: string) {
+  for (const status of ['pending', 'held', 'uncertain', 'failed'] as const) {
+    const message = f.message(`retired-${status}`, `Historical project choice ${status}`, f.loop.store.task(taskId).chatId!, 'group');
+    f.loop.store.receive(taskId, message, 'user', { kind: 'project_decision_card', projectId: 'runtime', cardId: `card-${status}`,
+      messageId: `card-message-${status}`, requestId: status, ownerId: 'owner', value: message.text });
+    f.loop.store.markInput(message.id, status, `Original ${status} outcome`);
+  }
+  return f.loop.store.inputs(taskId).filter(input => input.provenance.kind === 'project_decision_card');
+}
+
+function retainedInputRows(root: string, taskId: string) {
+  const database = new DatabaseSync(join(root, 'tasks.sqlite'), { readOnly: true });
+  try { return database.prepare("SELECT * FROM inbox WHERE task_id=? AND json_extract(payload, '$.provenance.kind')='project_decision_card' ORDER BY seq").all(taskId); }
+  finally { database.close(); }
+}
+
+test('retired project tool requests reject before old receipts, cards, inbox or ledger effects', async t => {
+  const f = await fixture(t); await f.loop.projects.ensure();
+  const project = f.loop.projects.ledger.project('runtime'); assert.ok(project);
+  const caller = project.coordinatorTaskId;
+  const old = { action: 'request_decision', requestId: 'old-decision', key: 'strategy', prompt: 'Choose.', options: ['A', 'B'] };
+  f.loop.projects.ledger.saveReceipt('runtime', caller, old.requestId, 'historical-fingerprint', { accepted: true, cardId: 'old-card' });
+  const before = { project: f.loop.projects.ledger.project('runtime'), cards: f.loop.store.feishuCards(), inputs: f.loop.store.inputs(caller), sent: f.feishu.sent.length };
+  for (const requestId of ['new-decision', old.requestId]) {
+    await assert.rejects(f.loop.projects.call(caller, { tool: 'project_action', arguments: { ...old, requestId } }), z.ZodError);
+    await assert.rejects(f.loop.projects.action(caller, { ...old, requestId }), z.ZodError);
+    assert.equal(f.loop.store.meta(`project-action-intent:${JSON.stringify(['runtime', caller, requestId])}`), null);
+  }
+  assert.deepEqual({ project: f.loop.projects.ledger.project('runtime'), cards: f.loop.store.feishuCards(), inputs: f.loop.store.inputs(caller), sent: f.feishu.sent.length }, before);
+  assert.deepEqual(f.loop.projects.ledger.receipt('runtime', caller, old.requestId)?.value, { accepted: true, cardId: 'old-card' });
+  assert.equal(f.loop.projects.ledger.receipt('runtime', caller, 'new-decision'), null);
+  assert.deepEqual(f.codex.approvals, []);
+});
+
+for (const execution of ['running', 'idle'] as const) test(`${execution} restart ignores retained project inputs and still delivers ordinary messages past uncertain history`, async t => {
+  const f = await fixture(t); const task = await f.manual();
+  if (execution === 'idle') { assert.ok(task.threadId); f.codex.complete(task.threadId, null); await f.loop.tick(); }
+  const inputs = retainedProjectInputs(f, task.id);
+  const rows = retainedInputRows(f.root, task.id);
+  const before = { starts: f.codex.starts.length, steers: f.codex.steers.length, replies: f.codex.replies.length };
+  await f.restart(); await f.loop.tick();
+  assert.deepEqual({ starts: f.codex.starts.length, steers: f.codex.steers.length, replies: f.codex.replies.length }, before);
+  assert.deepEqual(f.loop.store.inputs(task.id).filter(input => input.provenance.kind === 'project_decision_card'), inputs);
+  assert.deepEqual(retainedInputRows(f.root, task.id), rows);
+  await f.loop.receive(f.message('ordinary-after-history', 'Continue with the user request.', task.chatId!, 'group'));
+  assert.equal((execution === 'idle' ? f.codex.starts : f.codex.steers).at(-1)?.deliveryId, 'ordinary-after-history');
+  assert.equal(f.loop.store.input(task.id, 'ordinary-after-history')?.status, 'delivered');
+  assert.deepEqual(f.loop.store.inputs(task.id).filter(input => input.provenance.kind === 'project_decision_card'), inputs);
+  assert.deepEqual(retainedInputRows(f.root, task.id), rows);
+});
+
+for (const status of ['paused', 'failed'] as const) test(`retained inputs preserve ${status} tasks and failed history cannot be retried`, async t => {
+  const f = await fixture(t); const task = await f.manual();
+  task.status = status; task.reason = status === 'paused' ? 'Operator paused' : 'Original failure'; f.loop.store.saveTask(task);
+  const inputs = retainedProjectInputs(f, task.id);
+  const rows = retainedInputRows(f.root, task.id);
+  const before = { starts: f.codex.starts.length, steers: f.codex.steers.length, replies: f.codex.replies.length };
+  await f.restart(); await f.loop.tick(); await f.loop.control(task.id, 'status');
+  assert.equal(f.loop.store.task(task.id).status, status);
+  assert.equal(f.loop.store.task(task.id).reason, task.reason);
+  assert.deepEqual({ starts: f.codex.starts.length, steers: f.codex.steers.length, replies: f.codex.replies.length }, before);
+  await assert.rejects(f.loop.retryAttachment(task.id, 'retired-failed'), /Only confirmed undelivered/);
+  assert.deepEqual(f.loop.store.inputs(task.id).filter(input => input.provenance.kind === 'project_decision_card'), inputs);
+  await f.loop.control(task.id, 'resume');
+  assert.deepEqual(f.loop.store.inputs(task.id).filter(input => input.provenance.kind === 'project_decision_card'), inputs);
+  assert.deepEqual(retainedInputRows(f.root, task.id), rows);
+});
+
+test('pending task with only retained project inputs never creates a Thread or starts a turn', async t => {
+  const f = await fixture(t); const task = await f.manual();
+  task.threadId = null; task.turnId = null; task.status = 'pending'; task.executionStatus = 'unbound'; f.loop.store.saveTask(task);
+  const inputs = retainedProjectInputs(f, task.id);
+  const before = { created: f.codex.created.length, starts: f.codex.starts.length, steers: f.codex.steers.length, replies: f.codex.replies.length };
+  await f.restart(); await f.loop.tick();
+  assert.equal(f.loop.store.task(task.id).threadId, null);
+  assert.deepEqual({ created: f.codex.created.length, starts: f.codex.starts.length, steers: f.codex.steers.length, replies: f.codex.replies.length }, before);
+  assert.deepEqual(f.loop.store.inputs(task.id).filter(input => input.provenance.kind === 'project_decision_card'), inputs);
+});
+
 test('private text, commands and attachments never admit or modify tasks', async t => {
   const f = await fixture(t);
   await f.loop.collect(); await f.loop.tick();
@@ -199,10 +278,15 @@ test('approval receipt is durable before native resolution and duplicate decisio
   assert.equal(f.codex.approvals.length, 1); assert.equal(f.loop.store.approvals(f.task().id)[0]?.status, 'confirmed');
 });
 
-for (const decision of ['approve', 'reject'] as const) {
-  test(`Feishu ${decision} callback acknowledges durable receipt before native resolution and never replays`, { timeout: 5000 }, async t => {
+for (const nativeType of [
+  { label: 'command', kind: 'approval', method: 'item/commandExecution/requestApproval' },
+  { label: 'file change', kind: 'approval', method: 'item/fileChange/requestApproval' },
+  { label: 'permissions', kind: 'permissions', method: 'item/permissions/requestApproval' },
+] as const) for (const decision of ['approve', 'reject'] as const) {
+  test(`Feishu ${nativeType.label} ${decision} callback acknowledges durable receipt before native resolution and never replays`, { timeout: 5000 }, async t => {
     const f = await fixture(t); await f.manual();
-    const native = request(f); f.snapshot().requests = [native]; await f.loop.tick();
+    const retained = retainedProjectInputs(f, f.task().id), rows = retainedInputRows(f.root, f.task().id);
+    const native = { ...request(f, nativeType.kind), method: nativeType.method }; f.snapshot().requests = [native]; await f.loop.tick();
     const entered = gate(), release = gate();
     const respond = f.codex.respondApproval.bind(f.codex);
     f.codex.respondApproval = async input => { entered.resolve(); await release.promise; return respond(input); };
@@ -255,6 +339,8 @@ for (const decision of ['approve', 'reject'] as const) {
     assert.equal(feedback.parse(await click(0)).toast.type, 'error');
     assert.equal(f.codex.approvals.length, 1);
     assert.equal(errors.length, 3);
+    assert.deepEqual(f.loop.store.inputs(task.id).filter(input => input.provenance.kind === 'project_decision_card'), retained);
+    assert.deepEqual(retainedInputRows(f.root, task.id), rows);
   });
 }
 
@@ -301,6 +387,8 @@ test('external comments do not answer a native Worker question while owner input
   assert.equal(f.codex.replies.length, 0); assert.equal(f.workerSteers().length, 0);
   await f.loop.receive(f.message('answer', 'user answer', f.task().chatId!, 'group'));
   assert.equal(f.codex.replies[0]?.text, 'user answer');
+  assert.ok(f.feishu.sent.some(message => message.text === native.prompt));
+  assert.deepEqual(f.codex.approvals, []);
 });
 
 test('Worker groups see each complete answer and the current turn status across restarts', async t => {

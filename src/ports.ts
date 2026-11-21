@@ -1,4 +1,4 @@
-import type { AgentOutput, AgentInput, ApprovalAction, Attachment, CollectionRepository, ExecutionSnapshot, IncomingMessage, PendingRequest, ProjectDecisionAction, Repository, Source, SourceComment, TaskResource, WorkspaceRequest } from './domain.js';
+import type { AgentOutput, AgentInput, ApprovalAction, Attachment, CollectionRepository, ExecutionSnapshot, IncomingMessage, PendingRequest, Repository, Source, SourceComment, TaskResource, WorkspaceRequest } from './domain.js';
 import type { ExecutionEvent, ExecutionHistory } from './execution-events.js';
 import type { ProjectToolCall } from './project.js';
 import type { ReasoningEffort } from './execution.js';
@@ -37,31 +37,17 @@ export interface FeishuPort {
   send(input: { chatId: string; text: string; id: string }): Promise<{ messageId: string } | void>;
   download(input: { messageId: string; attachment: Attachment; destination: string; maxBytes: number }): Promise<void>;
   history(input: { chatId: string; since: number }): Promise<IncomingMessage[]>;
-  start(onMessage: (message: IncomingMessage) => Promise<void>, onError: (error: unknown) => void, onAction?: (action: ApprovalAction) => Promise<void>, onReconnect?: (event: FeishuReconnectEvent) => void, onDecision?: (action: ProjectDecisionAction) => Promise<void>): Promise<void>;
+  start(onMessage: (message: IncomingMessage) => Promise<void>, onError: (error: unknown) => void, onAction?: (action: ApprovalAction) => Promise<void>, onReconnect?: (event: FeishuReconnectEvent) => void): Promise<void>;
   sendApproval(input: { chatId: string; id: string; taskId: string; request: PendingRequest }): Promise<FeishuCardDelivery | void>;
-  sendDecisionCard?(input: FeishuDecisionCardInput): Promise<FeishuCardDelivery>;
   close(): Promise<void>;
 }
 export interface FeishuCardDelivery {
-  kind: 'native_approval' | 'project_decision';
+  kind: 'native_approval';
   requestId: string;
   cardId: string;
   messageId: string;
   sequence: number;
   uuid: string;
-}
-export interface FeishuDecisionCardInput {
-  id: string;
-  projectId: string;
-  coordinatorTaskId: string;
-  requestId: string;
-  key: string;
-  prompt: string;
-  options: string[];
-  context?: string;
-  chatId: string;
-  ownerId: string;
-  expiresAt: number;
 }
 export interface FeishuReconnectEvent {
   state: 'reconnecting' | 'reconnected';

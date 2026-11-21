@@ -11,7 +11,7 @@ import { z } from 'zod';
 import { criteriaSchema, requestSchema, workspaceTargetSchema } from './domain.js';
 import { discoverProjectsCached } from './project-discovery.js';
 import type { Config } from './config.js';
-import { errorMessage, projectDecisionActionSchema, presentTaskSource, matchSource, RejectedInputError, TurnChangedError, type AgentInput, type ApprovalAction, type DiscoveredProject, type ExecutionSnapshot, type IncomingMessage, type ProjectDecisionAction, type Repository, type Source, type SourceComment, type Task, type TaskResource, type TaskSource, type WorkspaceTarget } from './domain.js';
+import { errorMessage, presentTaskSource, matchSource, RejectedInputError, TurnChangedError, type AgentInput, type ApprovalAction, type DiscoveredProject, type ExecutionSnapshot, type IncomingMessage, type Repository, type Source, type SourceComment, type Task, type TaskResource, type TaskSource, type WorkspaceTarget } from './domain.js';
 import { fitsTaskTitle, parseTaskTitle } from './task-title.js';
 import { CodexProviderMismatchError, FeishuApiError, TaskGroupUnavailable, type FeishuReconnectEvent, type RunningActivity, type TurnIdentity, type CodexPort, type FeishuPort, type GitHubPort, type WorkspacePort } from './ports.js';
 import { TaskGroups, assertGroupBinding, groupGeneration, retireTaskGroup } from './task-groups.js';
@@ -103,7 +103,6 @@ export class AgentLoop {
       releaseWorkspace: (taskId, resourceId) => this.releaseWorkspace(taskId, resourceId),
       control: (taskId, action) => this.control(taskId, action),
       openGroup: taskId => this.openGroup(taskId),
-      requestDecision: async (taskId, action) => this.requestDecision(taskId, action),
       verifyGroup: async taskId => {
         const task = this.store.task(taskId);
         if (!task.chatId) throw new Error('Task group is unavailable; use open_group first');
@@ -206,7 +205,7 @@ export class AgentLoop {
     const work = Promise.resolve().then(async () => {
       if (this.closeout.completed(taskId) && this.store.task(taskId).executionStatus !== 'running') {
         const now = Date.now();
-        const hasInput = this.store.hasInputs(taskId, { statuses: ['pending', 'delivering', 'uncertain', 'failed', 'held'] });
+        const hasInput = this.store.hasActiveInputs(taskId, { statuses: ['pending', 'delivering', 'uncertain', 'failed', 'held'] });
         const hasOutput = this.store.hasOutputs(taskId, ['pending', 'sending', 'uncertain']);
         if (!hasInput && !hasOutput && now - (this.settledCompletedAt.get(taskId) ?? 0) < 10_000) return;
         if (!hasInput && !hasOutput && !this.closeout.hasPendingCleanup(taskId)) { this.settledCompletedAt.set(taskId, now); return; }
@@ -216,11 +215,11 @@ export class AgentLoop {
       if (this.stopping || this.lanes.has(taskId)) return;
       const task = this.store.task(taskId);
       if (task.status === 'failed'
-        && !this.store.inputs(taskId, { statuses: ['pending'] }).some(input => isContinuationInput(input) && (
+        && !this.store.activeInputs(taskId, { statuses: ['pending'] }).some(input => isContinuationInput(input) && (
           task.recovery.lastUserInputSeq === null ? input.message.createdAt > task.updatedAt : input.seq > task.recovery.lastUserInputSeq))
         && !this.store.hasOutputs(taskId, ['pending', 'sending', 'uncertain'])) return;
       if (task.status === 'idle' && task.executionStatus === 'completed'
-        && !this.store.hasInputs(taskId, { statuses: ['pending', 'delivering', 'uncertain', 'held'] })
+        && !this.store.hasActiveInputs(taskId, { statuses: ['pending', 'delivering', 'uncertain', 'held'] })
         && !this.store.hasOutputs(taskId, ['pending', 'sending', 'uncertain'])
         && !this.store.approvals(taskId).some(item => ['processing', 'uncertain', 'pending'].includes(item.status))) return;
       await this.serial(taskId, () => this.advance(taskId));
@@ -235,7 +234,7 @@ export class AgentLoop {
     if (running.length <= this.sweepConcurrency) return tasks;
     const urgent = running.filter(task => {
       const member = this.projects.ledger.membership(task.id);
-      return member?.role === 'coordinator' || this.store.hasInputs(task.id, { statuses: ['pending', 'delivering', 'uncertain'] });
+      return member?.role === 'coordinator' || this.store.hasActiveInputs(task.id, { statuses: ['pending', 'delivering', 'uncertain'] });
     });
     const workers = running.filter(task => !urgent.includes(task));
     const selectedUrgent = urgent.slice(0, this.sweepConcurrency);
@@ -302,37 +301,6 @@ export class AgentLoop {
     if (!task.chatId
       && this.store.outputs(task.id).find(output => output.id === id)?.status === 'pending')
       this.store.markOutput(id, 'dropped', '任务当前无群，不补发历史');
-  }
-  private async requestDecision(taskId: string, action: Extract<ProjectAction, { action: 'request_decision' }>): Promise<unknown> {
-    const task = this.store.task(taskId);
-    if (!task.chatId) throw new Error('Project coordinator group is unavailable');
-    if (this.ports.feishu.sendDecisionCard) {
-      const expiresAt = action.expiresAt ?? Date.now() + 7 * 24 * 60 * 60 * 1000;
-      const cardRecordId = `project:${taskId}:${action.requestId}`;
-      const existing = this.store.feishuCard(cardRecordId);
-      if (existing?.status === 'uncertain') throw new Error('Project decision card delivery is uncertain; reconcile it before retrying');
-      if (existing?.receipt) return { accepted: true, requestId: action.requestId, receipt: existing.receipt };
-      const uuid = digest(`project-card:${taskId}:${action.requestId}`).slice(0, 32);
-      const pending = existing ?? {
-        id: cardRecordId, kind: 'project_decision' as const, requestId: action.requestId, taskId,
-        projectId: this.projects.ledger.membership(taskId)?.projectId, chatId: task.chatId, ownerId: this.config.feishu.userOpenId,
-        cardId: null, messageId: null, sequence: 0, uuid, status: 'pending' as const, expiresAt,
-        fingerprint: digest(JSON.stringify({ taskId, requestId: action.requestId, key: action.key ?? action.requestId, options: action.options, text: action.prompt })),
-        receipt: null, updatedAt: Date.now(),
-      };
-      const parsed = pending.projectId ? pending : { ...pending, projectId: this.projects.ledger.membership(taskId)?.projectId };
-      if (!parsed.projectId) throw new Error('Project decision requires a project-bound coordinator');
-      this.store.saveFeishuCard(parsed);
-      try {
-        const delivery = await this.ports.feishu.sendDecisionCard({ id: cardRecordId, projectId: parsed.projectId, coordinatorTaskId: taskId,
-          requestId: action.requestId, key: action.key ?? action.requestId, prompt: action.prompt, options: action.options, context: action.context,
-          chatId: task.chatId, ownerId: this.config.feishu.userOpenId, expiresAt });
-        this.store.updateFeishuCard(cardRecordId, { cardId: delivery.cardId, messageId: delivery.messageId, sequence: delivery.sequence,
-          uuid: delivery.uuid, status: 'pending' });
-      } catch (error) { this.store.updateFeishuCard(cardRecordId, { status: 'uncertain' }); throw error; }
-      return { accepted: true, requestId: action.requestId, cardId: this.store.feishuCard(cardRecordId)?.cardId };
-    }
-    throw new Error('Project decision cards are unavailable');
   }
   private async openGroup(taskId: string): Promise<string> {
     let chatId = '';
@@ -597,8 +565,8 @@ export class AgentLoop {
       intakeTaskId: task.id, source: task.source, resources: task.resources,
       existingThreadId: task.threadId, existingStatus: task.status,
     })}\nOnly the project coordinator may delegate execution. Use dispatch with intakeTaskId to accept this request as a Worker.` }];
-    const inputs = this.store.inputs(task.id).filter(input => input.status !== 'dropped');
-    const version = intakeMaterialVersion(task, inputs);
+    const inputs = this.store.activeInputs(task.id).filter(input => input.status !== 'dropped');
+    const version = intakeMaterialVersion(task, this.store.inputs(task.id));
     for (const input of task.threadId ? inputs.slice(-8) : inputs) {
       try { materials.push(...await this.prepare(task, input)); }
       catch (error) {
@@ -785,7 +753,7 @@ export class AgentLoop {
       : { ...common, kind: 'git-worktree', repository: resource.repository, branch: resource.branch });
     if (actual !== resource.workspace) throw new Error('Workspace association changed');
   }
-  private hasUnknownInput(task: Task): boolean { return this.store.hasInputs(task.id, { statuses: ['delivering', 'uncertain'] }); }
+  private hasUnknownInput(task: Task): boolean { return this.store.hasActiveInputs(task.id, { statuses: ['delivering', 'uncertain'] }); }
   private fault(task: Task, error: unknown, turnId: string | null = task.turnId): void {
     const message = errorMessage(error);
     task.executionStatus = 'unknown'; task.reason = message;
@@ -866,7 +834,7 @@ export class AgentLoop {
     try {
       this.projects.retireObsoleteInputs(task);
       if (!this.projects.ledger.membership(task.id)) {
-        const freshOwnerInput = this.store.inputs(task.id, { statuses: ['pending'], origin: 'user' }).some(input =>
+        const freshOwnerInput = this.store.activeInputs(task.id, { statuses: ['pending'], origin: 'user' }).some(input =>
           (task.recovery.lastUserInputSeq === null ? input.message.createdAt > task.updatedAt : input.seq > task.recovery.lastUserInputSeq));
         if (task.purpose === 'intake' && task.status === 'failed' && !freshOwnerInput) { await this.flush(task); return; }
         if (task.purpose === 'intake' && task.status === 'paused') { await this.flush(task); return; }
@@ -883,17 +851,17 @@ export class AgentLoop {
       this.requireMember(task);
       if (!this.projects.restoreWorkerExecution(task)) return;
       if (task.purpose !== 'execution') { task.purpose = 'execution'; this.persist(task); }
-      if (task.status === 'failed' && this.store.inputs(task.id, { statuses: ['pending'] }).some(input => isContinuationInput(input) &&
+      if (task.status === 'failed' && this.store.activeInputs(task.id, { statuses: ['pending'] }).some(input => isContinuationInput(input) &&
         (task.recovery.lastUserInputSeq === null ? input.message.createdAt > task.updatedAt : input.seq > task.recovery.lastUserInputSeq))) {
         for (const resource of task.resources) await this.restoreWorkspace(task.id, resource);
         task.status = task.threadId ? 'idle' : 'pending'; task.reason = null; task.recovery = recoveryState(); this.persist(task);
-        for (const input of this.store.inputs(task.id)) if (input.status === 'held') this.store.markInput(input.id, 'pending');
+        for (const input of this.store.activeInputs(task.id)) if (input.status === 'held') this.store.markInput(input.id, 'pending');
       }
       if (task.status === 'paused') {
         await this.migratePausedProvider(task);
         task = this.store.task(id);
         if (task.status === 'paused') {
-          for (const input of this.store.inputs(task.id)) if (input.status === 'pending') this.store.markInput(input.id, 'held');
+          for (const input of this.store.activeInputs(task.id)) if (input.status === 'pending') this.store.markInput(input.id, 'held');
           await this.flush(task); return;
         }
       }
@@ -903,6 +871,10 @@ export class AgentLoop {
         task.recovery.attempts++; task.recovery.nextAttemptAt = null; this.persist(task);
         if (task.threadId) await this.ports.codex.recover();
         reconcile = true;
+      }
+      if (task.status === 'pending' && !task.threadId) {
+        const filter = { statuses: ['pending', 'held', 'failed', 'delivering', 'uncertain'] } satisfies Parameters<Store['hasInputs']>[1];
+        if (this.store.hasInputs(task.id, filter) && !this.store.hasActiveInputs(task.id, filter)) { await this.flush(task); return; }
       }
       if (task.status === 'pending' && !await this.setup(task)) { await this.flush(this.store.task(id)); return; }
       task = this.store.task(id);
@@ -1003,36 +975,7 @@ export class AgentLoop {
   private receiveOwner(task: Task, message: IncomingMessage): boolean {
     return this.store.receive(task.id, message, 'user');
   }
-  async approve(action: ApprovalAction | ProjectDecisionAction): Promise<void> {
-    if ('kind' in action) {
-      if (action.senderId !== this.config.feishu.userOpenId) throw new Error('Decision actor is not authorized');
-      const card = this.store.feishuCardForRequest(action.requestId);
-      if (card && card.status === 'uncertain') throw new Error('Decision card outcome is uncertain');
-      if (card && card.expiresAt <= Date.now()) { this.store.updateFeishuCard(card.id, { status: 'expired' }); throw new Error('Project decision card expired'); }
-      if (card?.messageId && action.messageId && card.messageId !== action.messageId) throw new Error('Project decision card identity expired');
-      const actionFingerprint = digest(JSON.stringify({ choice: action.choice, customText: action.customText }));
-      if (card?.status === 'confirmed' && card.receipt) {
-        if (card.fingerprint !== actionFingerprint) throw new Error('Project decision conflicts with the original receipt');
-        return;
-      }
-      if (card) this.store.updateFeishuCard(card.id, { status: 'processing', receipt: null, sequence: card.sequence + 1, uuid: `${card.uuid}:processing` });
-      try {
-        const result = await this.projects.acceptProjectDecision(projectDecisionActionSchema.parse(action));
-        if (card) {
-          const current = this.store.feishuCard(card.id);
-          this.store.updateFeishuCard(card.id, { status: 'confirmed', receipt: result.receipt, fingerprint: actionFingerprint,
-            sequence: (current?.sequence ?? card.sequence) + 1, uuid: `${current?.uuid ?? card.uuid}:confirmed` });
-        }
-      } catch (error) {
-        if (card) {
-          const current = this.store.feishuCard(card.id);
-          this.store.updateFeishuCard(card.id, { status: error instanceof Error && /expired|binding|empty/u.test(error.message) ? 'rejected' : 'uncertain',
-            sequence: (current?.sequence ?? card.sequence) + 1, uuid: `${current?.uuid ?? card.uuid}:failed` });
-        }
-        throw error;
-      }
-      return;
-    }
+  async approve(action: ApprovalAction): Promise<void> {
     if (this.stopping) throw new Error('Agent Loop is closing');
     if (action.senderId !== this.config.feishu.userOpenId) throw new Error('Approval actor is not authorized');
     const task = this.store.task(action.taskId);
@@ -1089,7 +1032,7 @@ export class AgentLoop {
   async retryAttachment(taskId: string, inputId: string): Promise<void> {
     await this.serial(taskId, async () => {
       this.projects.retireObsoleteInputs(this.store.task(taskId));
-      const input = this.store.inputs(taskId).find(item => item.id === inputId);
+      const input = this.store.activeInputs(taskId).find(item => item.id === inputId);
       if (!input || input.status !== 'failed') throw new Error('Only confirmed undelivered attachments can be retried');
       const task = this.store.task(taskId);
       if (task.purpose === 'intake' && task.status !== 'paused') { task.status = 'pending'; task.recovery = recoveryState(); this.persist(task); }
@@ -1261,7 +1204,7 @@ export class AgentLoop {
         const current = this.store.task(taskId);
         for (const resource of current.resources) await this.restoreWorkspace(current.id, resource);
         current.status = current.threadId ? 'idle' : 'pending'; current.reason = null; current.recovery = recoveryState(); this.persist(current);
-        for (const input of this.store.inputs(current.id)) if (input.status === 'held') this.store.markInput(input.id, 'pending');
+        for (const input of this.store.activeInputs(current.id)) if (input.status === 'held') this.store.markInput(input.id, 'pending');
       }
       await this.advance(taskId);
     });
@@ -1340,7 +1283,7 @@ export class AgentLoop {
     await Promise.all(this.store.tasks().map(task => this.closeout.progress(task.id)));
     const priority = (task: Task) => {
       if (task.status === 'paused' || task.status === 'failed') return 3;
-      if (this.store.inputs(task.id).some(input => input.origin === 'user' && ['pending', 'delivering', 'uncertain'].includes(input.status))) return 0;
+      if (this.store.activeInputs(task.id).some(input => input.origin === 'user' && ['pending', 'delivering', 'uncertain'].includes(input.status))) return 0;
       return task.executionStatus === 'running' ? 1 : 2;
     };
     const tasks = this.store.tasks().sort((a, b) => priority(a) - priority(b));
@@ -1437,7 +1380,7 @@ export class AgentLoop {
   private async startService(): Promise<void> {
     if (this.running) return;
     this.started = true;
-    await this.ports.feishu.start(message => this.receive(message), error => this.problem('feishu', error), action => this.approve(action), event => this.requestBackfill(event), action => this.approve(action));
+    await this.ports.feishu.start(message => this.receive(message), error => this.problem('feishu', error), action => this.approve(action), event => this.requestBackfill(event));
     if (this.stopping) return;
     await this.projects.ensure();
     await this.recover();
