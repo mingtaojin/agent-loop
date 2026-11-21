@@ -12,6 +12,7 @@ import { configSchema } from '../src/config.js';
 import { taskSchema, type Task } from '../src/domain.js';
 import type { ExecutionEvent } from '../src/execution-events.js';
 import { FeishuProgressPublisher, progressPublicationSchema } from '../src/feishu-progress.js';
+import { progressContent } from '../src/feishu-progress-view.js';
 import { AgentLoop } from '../src/loop.js';
 import { TaskGroupUnavailable, type FeishuProgressPort } from '../src/ports.js';
 import { Store } from '../src/store.js';
@@ -117,6 +118,12 @@ test('progress is opt-in and validates its interval and explicit dashboard URL',
   assert.throws(() => configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner', progress: { surface: 'other' } } }));
   assert.throws(() => configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner', progress: { intervalMs: 1 } } }));
   assert.throws(() => configSchema.parse({ execution: testExecution, feishu: { userOpenId: 'owner', progress: { dashboardUrl: 'file:///etc/passwd' } } }));
+});
+
+test('progress timestamps display UTC+8 across a year boundary', () => {
+  const createdAt = Date.parse('2026-12-31T16:30:00.123Z');
+  assert.ok(progressContent({ status: 'running', lastExecutionEventAt: createdAt, cursor: 1,
+    assistant: [], tool: null, notice: null }).includes('最近执行事件：2027-01-01T00:30:00.123+08:00'));
 });
 
 test('saved cards stop publishing after group removal and recreated groups get a fresh card and UUID', async t => {
