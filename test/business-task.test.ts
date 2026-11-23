@@ -7,9 +7,10 @@ import { z } from 'zod';
 import { configSchema } from '../src/config.js';
 import { AgentLoop } from '../src/loop.js';
 import { Store } from '../src/store.js';
-import { businessTaskSchema } from '../src/business-task.js';
+import { businessSourceSchema, businessTaskSchema } from '../src/business-task.js';
+import { parseFeishuEvent, parseFeishuHistory } from '../src/adapters/feishu.js';
 import { projectActionSchema } from '../src/project.js';
-import { submissionSchema, submissionSourceId } from '../src/domain.js';
+import { submissionSchema, submissionSourceId, type Attachment } from '../src/domain.js';
 import { CodexFake, FeishuFake, GitHubFake, issue } from './fakes.js';
 import { seedSavedIntake } from './saved-intake.js';
 import { testExecution } from './test-config.js';
@@ -44,6 +45,139 @@ async function fixture(t: TestContext) {
   return { root, config, codex, feishu, github, coordinator, action, original, create, dispatch, get loop() { return loop; },
     async restart() { await loop.close(); loop = new AgentLoop(config, ports, new Store(root)); await loop.projects.ensure(); } };
 }
+
+function feishuOriginal(chatId: string, id: string, kind: string, content: unknown) {
+  const body = JSON.stringify(content);
+  const message = parseFeishuEvent({ sender: { sender_type: 'user', sender_id: { open_id: 'owner' } },
+    message: { message_id: id, chat_id: chatId, chat_type: 'group', create_time: '100', message_type: kind, content: body } }, 'owner');
+  assert.ok(message);
+  assert.deepEqual(parseFeishuHistory({ sender: { sender_type: 'user', id_type: 'open_id', id: 'owner' },
+    message_id: id, chat_id: chatId, create_time: '100', msg_type: kind, body: { content: body } }, 'owner'), message);
+  return message;
+}
+
+for (const kind of ['image', 'file', 'text'] as const) for (const first of ['input', 'task-source'] as const) {
+  test(`Feishu ${kind} original registers through ${first} and retains its first snapshot across selectors and restart`, async t => {
+    const f = await fixture(t); await f.loop.tick();
+    const chatId = f.loop.store.task(f.coordinator()).chatId; assert.ok(chatId);
+    const content = kind === 'image' ? { image_key: 'image-key' } : kind === 'file'
+      ? { file_key: 'file-key', file_name: '需求说明.pdf' } : { text: ' \tOriginal text control\n ' };
+    const message = feishuOriginal(chatId, `original-${kind}-${first}`, kind, content);
+    for (const attachment of message.attachments) f.feishu.resources.set(attachment.key, new Uint8Array([1, 2, 3]));
+    await f.loop.receive(message);
+    const input = f.loop.store.input(f.coordinator(), message.id); assert.ok(input);
+    assert.equal(input.provenance.kind, 'user');
+    if (input.provenance.kind === 'user') assert.deepEqual(input.provenance.message, message);
+    const intake = seedSavedIntake(f.loop, message);
+    await f.loop.projects.acceptIntake(intake.id, 'app', { text: 'Route this original request', version: 'attachment-v1' });
+    const selectors = { input: { kind: 'input', inputId: message.id }, 'task-source': { kind: 'task-source', taskId: intake.id } };
+    const request = { action: 'create_business_task', requestId: 'first', source: selectors[first] };
+    const business = created.parse(await f.action(request)).businessTask;
+    const expectedSource = { kind: 'manual', messageId: message.id, chatId, senderId: 'owner', text: message.text,
+      attachments: message.attachments, createdAt: 100 };
+    assert.deepEqual(business.source, expectedSource);
+    assert.equal(business.title, kind === 'image' ? '图片请求 · 1 张图片' : kind === 'file' ? '文件请求 · 需求说明.pdf' : 'Original text control');
+    assert.deepEqual(await f.action(request), { businessTask: business });
+    const alternate = first === 'input' ? 'task-source' : 'input';
+    assert.deepEqual(await f.action({ ...request, requestId: 'alternate', source: selectors[alternate] }), { businessTask: business });
+    await assert.rejects(f.action({ ...request, source: selectors[alternate] }), /different content/);
+    const changedIntake = f.loop.store.task(intake.id); assert.equal(changedIntake.source.kind, 'manual');
+    if (changedIntake.source.kind === 'manual') {
+      changedIntake.source.message.text = 'Later edited source';
+      changedIntake.source.message.attachments = [{ kind: 'file', key: 'later-key', name: 'later.txt' }];
+    }
+    f.loop.store.saveTask(changedIntake);
+    assert.deepEqual(await f.action({ ...request, requestId: 'changed-snapshot', source: selectors['task-source'] }), { businessTask: business });
+    const beforeRestart = f.loop.store.meta('business-tasks:"app"');
+    await f.restart();
+    assert.deepEqual(await f.action(request), { businessTask: business });
+    assert.deepEqual(f.loop.projects.businessTasks.get('app', business.id).source, expectedSource);
+    assert.equal(f.loop.store.meta('business-tasks:"app"'), beforeRestart);
+    const distinct = { ...message, id: `${message.id}-distinct` };
+    await f.loop.receive(distinct);
+    assert.notEqual((await f.create('distinct', distinct.id)).id, business.id);
+  });
+}
+
+test('rich-post attachment facts and whitespace survive registration and HTTP readback', async t => {
+  const f = await fixture(t); await f.loop.tick();
+  const chatId = f.loop.store.task(f.coordinator()).chatId; assert.ok(chatId);
+  const message = feishuOriginal(chatId, 'mixed-post', 'post', { content: [
+    [{ tag: 'text', text: ' \t' }, { tag: 'img', image_key: 'image-a' }, { tag: 'file', file_key: 'file-a', file_name: '  ' }],
+    [{ tag: 'file', file_key: 'file-b', file_name: ' 原始文件.txt ' }, { tag: 'img', image_key: 'image-b' }, { tag: 'text', text: '  ' }],
+  ] });
+  assert.equal(message.text, ' \t\n  ');
+  assert.deepEqual(message.attachments, [{ kind: 'image', key: 'image-a', name: 'image' }, { kind: 'file', key: 'file-a', name: '  ' },
+    { kind: 'file', key: 'file-b', name: ' 原始文件.txt ' }, { kind: 'image', key: 'image-b', name: 'image' }]);
+  for (const attachment of message.attachments) f.feishu.resources.set(attachment.key, new Uint8Array([1]));
+  await f.loop.receive(message);
+  const business = await f.create('mixed', message.id);
+  assert.equal(business.title, '附件请求 · 2 张图片 · 2 个文件');
+  assert.equal(business.source.kind, 'manual');
+  assert.deepEqual(business.source, { kind: 'manual', messageId: message.id, chatId, senderId: 'owner', text: message.text,
+    attachments: message.attachments, createdAt: 100 });
+  const worker = await f.dispatch(business.id, 'mixed-worker');
+  const workerView = JSON.stringify(await f.action({ action: 'status', section: 'business_tasks' }, worker.taskId));
+  for (const hidden of ['image-a', 'file-b', '原始文件.txt']) assert.ok(!workerView.includes(hidden));
+  const dashboard = await startDashboard({ dataDir: f.root, port: 0, host: '127.0.0.1' }); t.after(() => dashboard.close());
+  const snapshot: DashboardOverview = await (await fetch(dashboard.url + '/api/snapshot')).json();
+  const card = snapshot.businessTasks.find(card => card.id === business.id); assert.ok(card);
+  assert.equal(card.title, business.title); assert.deepEqual(card.source, business.source);
+});
+
+test('manual source content validation preserves raw bytes and the prior trimmed length bound', async t => {
+  const f = await fixture(t);
+  for (const body of ['', ' \t\n ']) {
+    const message = f.original('blank-' + body.length, body);
+    await assert.rejects(f.create('blank-register-' + body.length, message.id));
+  }
+  const raw = ' '.repeat(250) + 'x'.repeat(131_072) + '\n ';
+  const message = f.original('padded', raw);
+  const business = await f.create('padded-register', message.id);
+  assert.equal(business.source.kind, 'manual');
+  if (business.source.kind === 'manual') assert.equal(business.source.text, raw);
+  assert.equal(business.title, 'x'.repeat(200));
+  f.original('oversized', 'x'.repeat(131_073));
+  await assert.rejects(f.create('oversized-register', 'oversized'));
+  const attachment = { kind: 'file', key: 'unnamed', name: ' \t ' } satisfies Attachment;
+  const file = { ...message, id: 'unnamed-file', text: '', attachments: [attachment] };
+  f.loop.store.receive(f.coordinator(), file, 'user');
+  assert.equal((await f.create('unnamed-register', file.id)).title, '文件请求 · 1 个文件');
+  const named = { ...file, id: 'long-name', attachments: [{ ...attachment, name: '原'.repeat(300) }] };
+  f.loop.store.receive(f.coordinator(), named, 'user');
+  assert.equal((await f.create('long-name-register', named.id)).title.length, 200);
+  for (const source of [
+    { kind: 'cli', requestId: 'f98dfc47-f6ba-41ee-a412-5a68db4e6b6e', prompt: ' ', submittedAt: 100 },
+    { kind: 'received-goal', coordinatorTaskId: 'coordinator', inputId: 'input', fromTaskId: 'worker', text: ' ', createdAt: 100 },
+    { kind: 'coordinator-goal', coordinatorTaskId: 'coordinator', version: 1, key: 'goal', text: '', createdAt: 100 },
+    { kind: 'issue', issueId: 'issue', repository: 'example/app', number: 1, url: '', title: '' },
+  ]) assert.equal(businessSourceSchema.safeParse(source).success, false);
+});
+
+test('legacy manual snapshots and receipt replays retain unknown attachments without a rewrite', async t => {
+  const f = await fixture(t); const message = f.original(); const business = await f.create();
+  const legacy = { ...business, source: { kind: 'manual', messageId: message.id, chatId: message.chatId, senderId: message.senderId,
+    text: message.text, createdAt: message.createdAt } };
+  const documentKey = 'business-tasks:"app"';
+  f.loop.store.setMeta(documentKey, JSON.stringify([legacy]));
+  const receiptKey = `project:${JSON.stringify(['receipt', 'app', f.coordinator(), 'register'])}`;
+  const receipt = f.loop.projects.ledger.receipt('app', f.coordinator(), 'register'); assert.ok(receipt);
+  const legacyReceipt = JSON.stringify({ ...receipt, value: { businessTask: legacy } });
+  f.loop.store.setMeta(receiptKey, legacyReceipt);
+  const document = f.loop.store.meta(documentKey);
+  await f.restart();
+  assert.deepEqual(f.loop.projects.businessTasks.get('app', business.id), legacy);
+  assert.deepEqual(await f.create(), legacy);
+  assert.equal(f.loop.store.meta(documentKey), document); assert.equal(f.loop.store.meta(receiptKey), legacyReceipt);
+  assert.deepEqual(await f.create('legacy-fresh-request'), legacy);
+  const updated = created.parse(await f.action({ action: 'set_business_task_lifecycle', requestId: 'legacy-lifecycle', businessTaskId: business.id,
+    expectedVersion: 1, lifecycle: { kind: 'historical', outcome: 'delivered', summary: 'Legacy work accepted' } })).businessTask;
+  assert.deepEqual(updated.source, legacy.source); assert.equal(updated.version, 2);
+  assert.equal(f.loop.store.meta(receiptKey), legacyReceipt);
+  await f.restart();
+  assert.deepEqual(f.loop.projects.businessTasks.get('app', business.id).source, legacy.source);
+  assert.deepEqual(await f.create(), legacy);
+});
 
 test('one original request owns independent Workers and an explicit versioned business lifecycle', async t => {
   const f = await fixture(t); f.original();
