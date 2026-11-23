@@ -45,7 +45,14 @@ const node = (tag, className, text) => { const el = document.createElement(tag);
 const allTasks = () => snapshot ? [...new Map([...(snapshot.tasks || []), ...(snapshot.projects || []).flatMap(project => project.tasks || [])].map(task => [task.id, task])).values()] : [];
 const projectName = id => snapshot?.projects?.find(project => project.id === id)?.name || '未关联项目';
 const statusClass = status => 'dot' + (status === 'running' ? ' green' : status === 'failed' ? ' red' : status === 'paused' ? ' amber' : '');
-function connection(ok, text) { $('connection-dot').className = 'dot' + (ok ? ' green' : ' amber'); $('connection-text').textContent = text; }
+function renderConnection() {
+  const live = stream?.readyState === EventSource.OPEN;
+  const ok = !snapshotStale && (!selectedId || live);
+  $('connection-dot').className = 'dot' + (ok ? ' green' : ' amber');
+  $('connection-text').textContent = snapshotStale ? '数据不可用 · 最后已知状态'
+    : !selectedId ? '看板已连接' : live ? '实时连接已建立'
+    : stream ? '连接中断，正在重连' : '执行记录正在重新读取';
+}
 function showError(message) { $('page-error').hidden = !message; $('page-error').textContent = message; }
 function renderRuntime() {
   if (!snapshot) return;
@@ -153,10 +160,12 @@ function renderWorkers() {
   const key = JSON.stringify([snapshot?.projects, business, tasks, selectedId, query, status, role, snapshotStale]);
   if (key === overviewKey) return;
   overviewKey = key;
-  const matches = task => (!status || task.status === status) && (!role || task.role === role) && [task.title, task.id, task.role, task.sourceLabel, task.repository, projectName(task.projectId)].filter(Boolean).join(' ').toLowerCase().includes(query);
-  const businessMatches = task => (!query || [task.title, task.id, task.project.name, businessSource(task.source)].join(' ').toLowerCase().includes(query) || task.workers.some(matches))
-    && ((!status && !role) || task.workers.some(matches));
-  const workerMatches = task => worker => matches(worker) || (!status && !role && [task.title, task.id, task.project.name, businessSource(task.source)].join(' ').toLowerCase().includes(query));
+  const stateMatches = task => (!status || task.status === status) && (!role || task.role === role);
+  const textMatches = task => [task.title, task.id, task.role, task.sourceLabel, task.repository, projectName(task.projectId)].filter(Boolean).join(' ').toLowerCase().includes(query);
+  const matches = task => stateMatches(task) && textMatches(task);
+  const businessTextMatches = task => [task.title, task.id, task.project.name, businessSource(task.source)].join(' ').toLowerCase().includes(query);
+  const workerMatches = task => worker => stateMatches(worker) && (businessTextMatches(task) || textMatches(worker));
+  const businessMatches = task => task.workers.some(workerMatches(task)) || (!status && !role && businessTextMatches(task));
   const fragment = document.createDocumentFragment(), nav = document.createDocumentFragment();
   const active = business.filter(task => task.lifecycle.kind === 'active'), history = business.filter(task => task.lifecycle.kind === 'historical');
   const activeArea = node('section', 'active-business-tasks'); activeArea.id = 'active-business-tasks';
@@ -231,11 +240,11 @@ async function selectTask(id, recovering = false) {
   else if (detail?.threadId !== currentTask()?.threadId) {
     detail = detail ? { ...detail, threadId: currentTask()?.threadId, history: { kind: 'unavailable', reason: 'Thread 已变更，正在重新读取 Codex 历史' }, timeline: [], events: [] } : null;
     entries = []; lastSeq = 0; stageDisclosure.clear();
-    connection(false, 'Thread 已变更，正在重新读取'); $('stream-status').textContent = 'RECONNECTING · 重新读取执行记录';
+    renderConnection(); $('stream-status').textContent = 'RECONNECTING · 重新读取执行记录';
     showError('Thread 已变更，正在重新读取 Codex 历史；业务记录仍可查看');
   }
   renderTimeline(); renderHistory(); renderDiagnostics();
-  renderWorkers(); renderTaskHeader();
+  renderWorkers(); renderTaskHeader(); renderConnection();
   if (!recovering) $('task-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
   $('event-count').textContent = entries.length + ' 条事件'; $('last-event').textContent = '只保留可见执行说明';
   try { if (!await loadDetail(id, generation) || generation !== selectionGeneration || selectedId !== id) return; }
@@ -243,15 +252,16 @@ async function selectTask(id, recovering = false) {
   finally { if (generation === selectionGeneration) detailLoading = false; }
   if (generation !== selectionGeneration || selectedId !== id) return;
   stream = new EventSource('/api/events?taskId=' + encodeURIComponent(id) + '&after=' + encodeURIComponent(lastSeq) + '&threadId=' + encodeURIComponent(detail.threadId || ''));
-  stream.onopen = () => { if (generation !== selectionGeneration || selectedId !== id) return; connection(true,'实时连接已建立'); $('stream-status').textContent = 'LIVE · 接收执行事件'; };
-  stream.onerror = () => { if (generation !== selectionGeneration || selectedId !== id) return; connection(false,'连接中断，正在重连'); $('stream-status').textContent = 'RECONNECTING · 自动续接'; };
+  renderConnection();
+  stream.onopen = () => { if (generation !== selectionGeneration || selectedId !== id) return; renderConnection(); $('stream-status').textContent = 'LIVE · 接收执行事件'; };
+  stream.onerror = () => { if (generation !== selectionGeneration || selectedId !== id) return; renderConnection(); $('stream-status').textContent = 'RECONNECTING · 自动续接'; };
   stream.addEventListener('reset', () => {
     if (generation !== selectionGeneration || selectedId !== id) return;
     ++selectionGeneration;
     stream.close(); stream = null;
     detail = { ...detail, history: { kind: 'unavailable', reason: '执行记录已重置，正在重新读取 Codex 历史' }, timeline: [], events: [] };
     entries = []; stageDisclosure.clear(); renderTimeline(); renderHistory();
-    connection(false, '执行记录已重置，正在重新读取'); $('stream-status').textContent = 'RECONNECTING · 重新读取执行记录';
+    renderConnection(); $('stream-status').textContent = 'RECONNECTING · 重新读取执行记录';
     showError(detail.history.reason + '；业务记录仍可查看');
     if (!needsDetail) retryDetail();
   });
@@ -267,8 +277,8 @@ async function refresh() {
     if (selectedId && detail && allTasks().find(task => task.id === selectedId)?.threadId !== detail.threadId) await selectTask(selectedId, true);
     else if (selectedId && !detailLoading && needsDetail && Date.now() >= detailRetryAt) await selectTask(selectedId, true);
     else renderTaskHeader();
-    if (!selectedId) connection(true,'看板已连接');
-  } catch (error) { snapshotStale = true; connection(false,'数据不可用 · 最后已知状态'); showError(error.message + (snapshot ? '；以下显示最后已知状态' : '；尚无可用记录')); renderRuntime(); renderWorkers(); renderTaskHeader(); }
+    renderConnection();
+  } catch (error) { snapshotStale = true; renderConnection(); showError(error.message + (snapshot ? '；以下显示最后已知状态' : '；尚无可用记录')); renderRuntime(); renderWorkers(); renderTaskHeader(); }
   finally { polling = false; }
 }
 $('search').addEventListener('input', renderWorkers); $('status-filter').addEventListener('change', renderWorkers); $('role-filter').addEventListener('change', renderWorkers);

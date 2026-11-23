@@ -26,12 +26,18 @@ async function browser(options: { threadId: string | null; unavailable?: boolean
   const requests: string[] = [];
   const streams: Stream[] = [];
   class Stream {
+    static readonly CONNECTING = 0;
+    static readonly OPEN = 1;
+    static readonly CLOSED = 2;
+    readyState = Stream.CONNECTING;
     closed = false;
     onopen = () => {};
     onerror = () => {};
     listeners = new Map<string, (message: { data: string }) => void>();
     constructor(readonly url: string) { streams.push(this); }
-    close() { this.closed = true; }
+    close() { this.closed = true; this.readyState = Stream.CLOSED; }
+    open() { this.readyState = Stream.OPEN; this.onopen(); }
+    disconnect() { this.readyState = Stream.CONNECTING; this.onerror(); }
     addEventListener(name: string, listener: (message: { data: string }) => void) { this.listeners.set(name, listener); }
     emit(name: string, value: unknown = {}) { this.listeners.get(name)?.({ data: JSON.stringify(value) }); }
   }
@@ -99,7 +105,7 @@ test('reset retains business messages and shows recovery through snapshot pollin
   const page = await browser({ threadId: 'thread' });
   await page.select();
   const first = page.streams[0]!;
-  first.onopen();
+  first.open();
   assert.match(page.element('stream-status').textContent, /LIVE/);
   assert.match(page.element('output').innerText, /Recovered answer/);
   first.emit('reset');
@@ -126,7 +132,7 @@ test('reset retains business messages and shows recovery through snapshot pollin
 
   await page.refresh(500);
   assert.equal(page.streams.length, 2);
-  page.streams[1]!.onopen();
+  page.streams[1]!.open();
   assert.equal(page.element('page-error').hidden, true);
   assert.match(page.element('stream-status').textContent, /LIVE/);
   assert.match(page.element('output').innerText, /Recovered answer/);
@@ -138,7 +144,7 @@ test('Thread rebind during reset recovery retains business facts while the new d
   const page = await browser({ threadId: 'thread-a', beforeDetail: () => detailReady });
   await page.select();
   const first = page.streams[0]!;
-  first.onopen();
+  first.open();
   first.emit('reset');
   detailReady = new Promise<void>(resolve => { releaseDetail = resolve; });
   page.rebind('thread-b');
@@ -167,7 +173,7 @@ test('Thread rebind during reset recovery retains business facts while the new d
   await page.refresh(1000);
   assert.equal(page.streams.length, 2);
   await page.refresh(1000);
-  page.streams[2]!.onopen();
+  page.streams[2]!.open();
   assert.equal(page.element('page-error').hidden, true);
   assert.match(page.element('stream-status').textContent, /LIVE/);
   assert.doesNotMatch(page.element('output').innerText, /Previous Thread answer/);
@@ -217,6 +223,85 @@ test('snapshot failures mark task status as last known while heartbeat age keeps
   page.recoverSnapshot(); await page.refresh(1000);
   assert.doesNotMatch(page.element('task-badge').textContent, /最后已知/);
   assert.equal(page.element('page-error').hidden, true);
+});
+
+test('snapshot recovery restores the live connection indicator without reopening the selected Worker stream', async () => {
+  const page = await browser({ threadId: 'thread' });
+  await page.select();
+  const stream = page.streams[0]!;
+  stream.open();
+  page.failSnapshot();
+  await page.refresh(1000);
+  assert.match(page.element('connection-text').textContent, /数据不可用.*最后已知状态/);
+  assert.match(page.element('connection-dot').className, /amber/);
+  assert.match(page.element('task-badge').textContent, /最后已知/);
+  assert.equal(page.element('page-error').hidden, false);
+  assert.match(page.element('stream-status').textContent, /LIVE/);
+
+  page.recoverSnapshot();
+  await page.refresh(1000);
+  assert.equal(page.element('connection-text').textContent, '实时连接已建立');
+  assert.match(page.element('connection-dot').className, /green/);
+  assert.doesNotMatch(page.element('task-badge').textContent, /最后已知/);
+  assert.equal(page.element('page-error').hidden, true);
+  assert.equal(page.element('task-id').textContent, 'task');
+  assert.match(page.element('output').innerText, /Recovered answer/);
+  assert.match(page.element('stream-status').textContent, /LIVE/);
+  assert.equal(page.streams.length, 1);
+  assert.equal(stream.closed, false);
+  await page.refresh(1000);
+  assert.equal(page.element('connection-text').textContent, '实时连接已建立');
+});
+
+test('SSE open and error events retain the stale snapshot warning until snapshot polling recovers', async () => {
+  const page = await browser({ threadId: 'thread' });
+  await page.select();
+  const stream = page.streams[0]!;
+  page.failSnapshot();
+  await page.refresh(1000);
+  stream.open();
+  assert.match(page.element('connection-text').textContent, /数据不可用.*最后已知状态/);
+  assert.match(page.element('connection-dot').className, /amber/);
+  assert.match(page.element('task-badge').textContent, /最后已知/);
+  assert.equal(page.element('page-error').hidden, false);
+  assert.match(page.element('stream-status').textContent, /LIVE/);
+  stream.disconnect();
+  assert.match(page.element('connection-text').textContent, /数据不可用.*最后已知状态/);
+  assert.match(page.element('stream-status').textContent, /RECONNECTING/);
+  stream.open();
+  assert.match(page.element('connection-text').textContent, /数据不可用.*最后已知状态/);
+
+  page.recoverSnapshot();
+  await page.refresh(1000);
+  assert.equal(page.element('connection-text').textContent, '实时连接已建立');
+  assert.equal(page.element('page-error').hidden, true);
+});
+
+test('successful snapshot polling keeps a reconnecting selected Worker amber until its SSE opens', async () => {
+  const page = await browser({ threadId: 'thread' });
+  await page.select();
+  const stream = page.streams[0]!;
+  stream.open();
+  stream.disconnect();
+  assert.match(page.element('stream-status').textContent, /RECONNECTING/);
+  page.failSnapshot();
+  await page.refresh(1000);
+  page.recoverSnapshot();
+  await page.refresh(1000);
+  assert.match(page.element('connection-text').textContent, /正在重连/);
+  assert.match(page.element('connection-dot').className, /amber/);
+  assert.match(page.element('stream-status').textContent, /RECONNECTING/);
+  assert.equal(page.element('page-error').hidden, true);
+  assert.doesNotMatch(page.element('task-badge').textContent, /最后已知/);
+  assert.equal(page.element('task-id').textContent, 'task');
+  assert.equal(page.streams.length, 1);
+
+  stream.open();
+  assert.equal(page.element('connection-text').textContent, '实时连接已建立');
+  assert.match(page.element('connection-dot').className, /green/);
+  assert.match(page.element('stream-status').textContent, /LIVE/);
+  await page.refresh(1000);
+  assert.equal(page.element('connection-text').textContent, '实时连接已建立');
 });
 
 test('selected detail ignores an execution event from a different Thread', async () => {
