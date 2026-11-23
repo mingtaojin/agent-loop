@@ -1,6 +1,7 @@
 import { LiveExecution, type ExecutionObservation } from './live-execution.js';
 import { readTaskCloseout } from './task-closeout.js';
 import { intakeRouteSchema, presentTaskSource, type InputProvenance, type ReportEscalation, type ReportRouting, type ReportSource, type Task, type TaskResource } from './domain.js';
+import { BusinessTaskLedger, type BusinessTask } from './business-task.js';
 import { ProjectLedger, type ProjectState } from './project.js';
 import { Store, type Inbox } from './store.js';
 import type { VisibleExecution } from './execution-events.js';
@@ -115,6 +116,52 @@ export interface ProjectDashboard {
   coordinatorTaskId: string;
   members: ProjectState['members'];
   tasks: ProjectTaskCard[];
+}
+
+export interface BusinessWorkerRow {
+  id: string;
+  title: string;
+  role: 'worker';
+  status: Task['status'];
+  executionStatus: Task['executionStatus'];
+  formalCompletion: 'open' | 'delivered' | 'terminated';
+  summary: { kind: DashboardWorkSummary['kind']; source: string; text: string; at: number | null };
+  updatedAt: number;
+}
+export interface BusinessTaskCard {
+  id: BusinessTask['id'];
+  projectId: string;
+  title: string;
+  source: BusinessTask['source'];
+  lifecycle: BusinessTask['lifecycle'];
+  version: number;
+  owner: { taskId: string; title: string };
+  project: Pick<ProjectDashboard, 'id' | 'name' | 'directory'>;
+  workers: BusinessWorkerRow[];
+  counts: {
+    taskStatus: Record<Task['status'], number>;
+    executionStatus: Record<Task['executionStatus'], number>;
+    formalCompletion: Record<BusinessWorkerRow['formalCompletion'], number>;
+  };
+}
+export interface DashboardOverview {
+  tasks: ProjectTaskCard[];
+  projects: ProjectDashboard[];
+  businessTasks: BusinessTaskCard[];
+  unassociatedWorkers: ProjectTaskCard[];
+}
+const compactText = (value: string) => value.length > 240 ? value.slice(0, 240) + '…' : value;
+function businessWorker(task: ProjectTaskCard): BusinessWorkerRow {
+  const work = task.workSummary;
+  const summary: BusinessWorkerRow['summary'] = work.kind === 'event'
+    ? { kind: work.kind, source: '最近可见事件 · ' + work.event.label, text: compactText(work.event.text), at: work.event.createdAt }
+    : work.kind === 'report'
+      ? { kind: work.kind, source: '最近工作汇报', text: compactText(work.report.currentStep || work.report.text), at: work.report.createdAt }
+      : work.kind === 'waiting'
+        ? { kind: work.kind, source: '等待或阻塞原因', text: compactText(work.text), at: null }
+        : { kind: work.kind, source: '无可用记录', text: '', at: null };
+  return { id: task.id, title: compactText(task.title), role: 'worker', status: task.status, executionStatus: task.executionStatus,
+    formalCompletion: task.lifecycle.kind === 'completed' ? task.lifecycle.outcome : 'open', summary, updatedAt: task.updatedAt };
 }
 
 export interface DashboardTaskDetail {
@@ -266,7 +313,7 @@ export class ProjectDashboardReader {
     };
   }
 
-  overview(tasks = this.store.tasks()): { tasks: ProjectTaskCard[]; projects: ProjectDashboard[] } {
+  overview(tasks = this.store.tasks()): DashboardOverview {
     const context = this.context(tasks);
     const projected = tasks.map(task => {
       const ownership = context.ownership.get(task.id);
@@ -277,7 +324,24 @@ export class ProjectDashboardReader {
       id: state.id, name: state.name, directory: state.directory, coordinatorTaskId: state.coordinatorTaskId,
       members: state.members, tasks: projected.filter(task => task.projectId === state.id).sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id)),
     }));
-    return { tasks: projected, projects };
+    const ledger = new BusinessTaskLedger(this.store), byTask = new Map(projected.map(task => [task.id, task]));
+    const businessTasks = projects.flatMap(project => ledger.list(project.id).map((business): BusinessTaskCard => {
+      const workers = business.workerTaskIds.map(id => {
+        const task = byTask.get(id);
+        if (!task || task.projectId !== project.id || task.role !== 'worker') throw new Error('Inconsistent business task Worker assignment');
+        return businessWorker(task);
+      });
+      const counts: BusinessTaskCard['counts'] = { taskStatus: { pending: 0, running: 0, idle: 0, paused: 0, failed: 0 },
+        executionStatus: { unbound: 0, idle: 0, running: 0, completed: 0, interrupted: 0, failed: 0, unknown: 0 },
+        formalCompletion: { open: 0, delivered: 0, terminated: 0 } };
+      for (const worker of workers) { counts.taskStatus[worker.status]++; counts.executionStatus[worker.executionStatus]++; counts.formalCompletion[worker.formalCompletion]++; }
+      return { id: business.id, projectId: project.id, title: business.title, source: business.source,
+        lifecycle: business.lifecycle, version: business.version,
+        owner: { taskId: project.coordinatorTaskId, title: byTask.get(project.coordinatorTaskId)?.title ?? project.coordinatorTaskId },
+        project: { id: project.id, name: project.name, directory: project.directory }, workers, counts };
+    }));
+    const assigned = new Set(businessTasks.flatMap(task => task.workers.map(worker => worker.id)));
+    return { tasks: projected, projects, businessTasks, unassociatedWorkers: projected.filter(task => task.role === 'worker' && !assigned.has(task.id)) };
   }
 
   projects(tasks = this.store.tasks()): ProjectDashboard[] { return this.overview(tasks).projects; }

@@ -13,6 +13,9 @@ import { submissionSchema, submissionSourceId } from '../src/domain.js';
 import { CodexFake, FeishuFake, GitHubFake, issue } from './fakes.js';
 import { seedSavedIntake } from './saved-intake.js';
 import { testExecution } from './test-config.js';
+import { startDashboard } from '../src/dashboard.js';
+import type { DashboardOverview } from '../src/dashboard-reader.js';
+import { ExecutionFixture } from './execution-fixture.js';
 
 const created = z.object({ businessTask: businessTaskSchema });
 const dispatched = z.object({ taskId: z.string(), businessTaskId: businessTaskSchema.shape.id });
@@ -236,4 +239,73 @@ test('allocation metadata failure recovers a known artifact directory without cr
   assert.deepEqual(await readdir(join(f.root, 'tasks')), directories);
   assert.deepEqual(await readdir(f.loop.store.task(result.taskId).contextDirectory), ['artifacts-default']);
   assert.equal(f.loop.closeout.read(result.taskId).scopes.length, 1);
+});
+
+
+test('Runtime registration and multiple dispatches produce one HTTP business card with independent lifecycle', async t => {
+  const f = await fixture(t); f.original(); const business = await f.create();
+  const one = await f.dispatch(business.id, 'http-one'), two = await f.dispatch(business.id, 'http-two'), three = await f.dispatch(business.id, 'http-three');
+  const legacy = z.object({ taskId: z.string() }).parse(await f.action({ action: 'dispatch', requestId: 'legacy-unknown', prompt: 'Preserved legacy work', execution: testExecution.worker }));
+  await f.loop.tick();
+  const first = f.loop.store.task(one.taskId), second = f.loop.store.task(two.taskId), third = f.loop.store.task(three.taskId);
+  assert.ok(first.threadId);
+  first.status = 'running'; first.executionStatus = 'running'; f.loop.store.saveTask(first);
+  second.status = 'paused'; second.executionStatus = 'interrupted'; second.reason = 'Operator paused'; f.loop.store.saveTask(second);
+  third.status = 'idle'; third.executionStatus = 'completed'; f.loop.store.saveTask(third);
+  const feed = new ExecutionFixture();
+  feed.publish(first.id, { threadId: first.threadId, turnId: first.turnId, itemId: 'visible', kind: 'agent_message', label: 'Progress', text: 'Current visible work '.repeat(30), createdAt: 200 });
+  const dashboard = await startDashboard({ dataDir: f.root, port: 0, host: '127.0.0.1', execution: feed.execution });
+  t.after(() => dashboard.close());
+  const read = async (): Promise<DashboardOverview> => (await fetch(dashboard.url + '/api/snapshot')).json();
+  const snapshot = await read();
+  assert.equal(snapshot.businessTasks.length, 1); const card = snapshot.businessTasks[0]; assert.ok(card);
+  assert.equal(card.id, business.id); assert.equal(card.owner.taskId, f.coordinator());
+  assert.deepEqual(card.workers.map(worker => worker.id), [one.taskId, two.taskId, three.taskId]);
+  assert.deepEqual(card.counts.taskStatus, { pending: 0, running: 1, idle: 1, paused: 1, failed: 0 });
+  assert.deepEqual(card.counts.executionStatus, { unbound: 0, idle: 0, running: 1, completed: 1, interrupted: 1, failed: 0, unknown: 0 });
+  assert.deepEqual(card.counts.formalCompletion, { open: 3, delivered: 0, terminated: 0 });
+  assert.ok(card.workers.every(worker => worker.role === 'worker' && worker.id !== f.coordinator()));
+  assert.equal(card.workers[0]?.summary.kind, 'event'); assert.ok((card.workers[0]?.summary.text.length ?? 0) <= 241);
+  assert.equal(card.workers[1]?.summary.kind, 'waiting'); assert.equal(card.workers[2]?.formalCompletion, 'open');
+  assert.deepEqual(snapshot.unassociatedWorkers.map(worker => worker.id), [legacy.taskId]);
+  assert.equal(snapshot.projects.length, 2); assert.ok(snapshot.projects.some(project => project.coordinatorTaskId === f.coordinator('other')));
+  assert.ok(!('status' in card) && !('percentage' in card));
+  assert.deepEqual(feed.reads, []);
+  const before = { tasks: f.loop.store.tasks(), metadata: f.loop.store.metadata('') };
+  feed.unavailable = true;
+  const detail = await (await fetch(dashboard.url + '/api/tasks/' + first.id)).json();
+  assert.equal(detail.task.id, first.id); assert.equal(detail.history.kind, 'unavailable');
+  assert.deepEqual((await read()).businessTasks, snapshot.businessTasks);
+  assert.deepEqual({ tasks: f.loop.store.tasks(), metadata: f.loop.store.metadata('') }, before);
+  assert.equal((await fetch(dashboard.url + '/api/snapshot', { method: 'POST', body: '{}' })).status, 405);
+  await f.action({ action: 'set_business_task_lifecycle', requestId: 'http-archive', businessTaskId: business.id, expectedVersion: 4,
+    lifecycle: { kind: 'historical', outcome: 'delivered', summary: 'Business delivery accepted independently' } });
+  const archived = await read(); assert.equal(archived.businessTasks[0]?.lifecycle.kind, 'historical');
+  assert.deepEqual(archived.businessTasks[0]?.counts, card.counts);
+  assert.deepEqual(archived.businessTasks[0]?.workers, card.workers);
+});
+
+test('business HTTP rows use live event, report, reason, and no-record facts without reading Threads', async t => {
+  const f = await fixture(t); f.original(); const business = await f.create();
+  const workers = [];
+  for (const id of ['live', 'report', 'reason', 'empty']) workers.push(await f.dispatch(business.id, id));
+  await f.loop.tick();
+  const feed = new ExecutionFixture();
+  for (const [index, worker] of workers.entries()) {
+    const task = f.loop.store.task(worker.taskId); assert.ok(task.threadId);
+    if (index === 0) feed.publish(task.id, { threadId: task.threadId, turnId: task.turnId, itemId: 'command', kind: 'tool_end', label: '命令 · completed', text: '$ npm test\nRAW_PRIVATE_OUTPUT', createdAt: 20 });
+    if (index < 2) f.loop.store.receive(f.coordinator(), { id: 'report:' + task.id, chatId: 'project-chat', senderId: 'runtime:project', chatType: 'group',
+      text: 'Full report contains details', attachments: [], createdAt: 15 }, 'source', { kind: 'agent', projectId: 'app', taskId: task.id, eventId: 'report:' + task.id,
+      category: 'update', currentStep: 'Current report step', nextStep: 'Next report step' });
+    if (index === 2) { task.reason = 'Waiting for an explicit input'; f.loop.store.saveTask(task); }
+  }
+  const dashboard = await startDashboard({ dataDir: f.root, port: 0, execution: feed.execution }); t.after(() => dashboard.close());
+  const snapshot: DashboardOverview = await (await fetch(dashboard.url + '/api/snapshot')).json();
+  const rows = snapshot.businessTasks[0]?.workers; assert.ok(rows);
+  assert.deepEqual(rows.map(row => row.summary.kind), ['event', 'report', 'waiting', 'no-record']);
+  assert.equal(rows[0]?.summary.text, '$ npm test'); assert.equal(rows[0]?.summary.at, 20);
+  assert.equal(rows[1]?.summary.text, 'Current report step'); assert.equal(rows[1]?.summary.at, 15);
+  assert.equal(rows[2]?.summary.at, null); assert.equal(rows[3]?.summary.text, '');
+  assert.ok(!JSON.stringify(rows).includes('RAW_PRIVATE_OUTPUT')); assert.ok(!JSON.stringify(rows).includes('Next report step'));
+  assert.deepEqual(feed.reads, []);
 });

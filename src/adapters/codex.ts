@@ -89,7 +89,7 @@ const workspaceTool = {
   inputSchema: z.toJSONSchema(workspaceTargetSchema),
 };
 const projectToolDescriptions = {
-  project_action: 'Query project status, dispatch a Worker, manage groups and resources, record project facts or rotate the coordinator session. Membership and role determine allowed actions. Keep requestId stable for identical retries. This tool grants no additional engineering permissions.',
+  project_action: 'Query project status, register business tasks and their Worker assignments or lifecycle, dispatch a Worker, manage groups and resources, record project facts or rotate the coordinator session. Membership and role determine allowed actions. Keep requestId stable for identical retries. This tool grants no additional engineering permissions.',
   send_agent_message: 'Send text and optional factual references to your own coordinator or one of your Workers. taskId is the recipient. Delivery is durable and starts promptly, without waiting for your turn to end. Returns the original input ID and its current delivery state. Keep requestId stable for identical retries.',
   send_group_message: 'Send text for people to your currently bound group. This does not deliver an Agent input. Coordinator replies to users require this tool. Worker ordinary replies already appear in its group. Returns the original output ID and its current delivery state. Keep requestId stable for identical retries.',
 };
