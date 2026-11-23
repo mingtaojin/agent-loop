@@ -91,6 +91,7 @@ for (const kind of ['image', 'file', 'text'] as const) for (const first of ['inp
     const beforeRestart = f.loop.store.meta('business-tasks:"app"');
     await f.restart();
     assert.deepEqual(await f.action(request), { businessTask: business });
+    assert.deepEqual(await f.action({ ...request, requestId: 'alternate', source: selectors[alternate] }), { businessTask: business });
     assert.deepEqual(f.loop.projects.businessTasks.get('app', business.id).source, expectedSource);
     assert.equal(f.loop.store.meta('business-tasks:"app"'), beforeRestart);
     const distinct = { ...message, id: `${message.id}-distinct` };
@@ -119,10 +120,20 @@ test('rich-post attachment facts and whitespace survive registration and HTTP re
   const worker = await f.dispatch(business.id, 'mixed-worker');
   const workerView = JSON.stringify(await f.action({ action: 'status', section: 'business_tasks' }, worker.taskId));
   for (const hidden of ['image-a', 'file-b', '原始文件.txt']) assert.ok(!workerView.includes(hidden));
+  const withText = feishuOriginal(chatId, 'mixed-post-text', 'post', { content: [[
+    { tag: 'text', text: ' \tOriginal mixed body\n ' }, { tag: 'file', file_key: 'file-b', file_name: ' 原始文件.txt ' },
+  ]] });
+  await f.loop.receive(withText);
+  const textBusiness = await f.create('mixed-text', withText.id);
+  assert.equal(textBusiness.title, 'Original mixed body');
+  assert.deepEqual(textBusiness.source, { kind: 'manual', messageId: withText.id, chatId, senderId: 'owner', text: ' \tOriginal mixed body\n ',
+    attachments: [{ kind: 'file', key: 'file-b', name: ' 原始文件.txt ' }], createdAt: 100 });
   const dashboard = await startDashboard({ dataDir: f.root, port: 0, host: '127.0.0.1' }); t.after(() => dashboard.close());
   const snapshot: DashboardOverview = await (await fetch(dashboard.url + '/api/snapshot')).json();
   const card = snapshot.businessTasks.find(card => card.id === business.id); assert.ok(card);
   assert.equal(card.title, business.title); assert.deepEqual(card.source, business.source);
+  const textCard = snapshot.businessTasks.find(card => card.id === textBusiness.id); assert.ok(textCard);
+  assert.equal(textCard.title, textBusiness.title); assert.deepEqual(textCard.source, textBusiness.source);
 });
 
 test('manual source content validation preserves raw bytes and the prior trimmed length bound', async t => {

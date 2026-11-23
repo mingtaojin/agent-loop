@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import { epochMillisecondsSchema, submissionRequestIdSchema } from './domain.js';
+import { attachmentSchema, epochMillisecondsSchema, submissionRequestIdSchema, type IncomingMessage } from './domain.js';
 import type { Store } from './store.js';
 
 const id = z.string().min(1).max(512);
@@ -13,9 +13,19 @@ export const businessSourceSelectorSchema = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('project-record'), version: z.number().int().positive(), key: id.optional() }),
 ]);
 export type BusinessSourceSelector = z.infer<typeof businessSourceSelectorSchema>;
+const manualBusinessSourceSchema = z.strictObject({
+  kind: z.literal('manual'), messageId: id, chatId: id, senderId: id,
+  text: z.string().refine(value => value.trim().length <= 131_072, 'Text exceeds 131072 characters'),
+  attachments: z.array(attachmentSchema).optional(), createdAt: epochMillisecondsSchema,
+}).refine(source => source.text.trim().length > 0 || (source.attachments?.length ?? 0) > 0, 'Manual source requires text or attachments');
+const capturedManualBusinessSourceSchema = manualBusinessSourceSchema.safeExtend({ attachments: z.array(attachmentSchema) });
+export function manualBusinessSource(message: IncomingMessage) {
+  return capturedManualBusinessSourceSchema.parse({ kind: 'manual', messageId: message.id, chatId: message.chatId,
+    senderId: message.senderId, text: message.text, attachments: message.attachments, createdAt: message.createdAt });
+}
 export const businessSourceSchema = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('issue'), issueId: id, repository: id, number: z.number().int().positive(), url: z.string(), title: text }),
-  z.strictObject({ kind: z.literal('manual'), messageId: id, chatId: id, senderId: id, text, createdAt: epochMillisecondsSchema }),
+  manualBusinessSourceSchema,
   z.strictObject({ kind: z.literal('cli'), requestId: submissionRequestIdSchema, prompt: text, submittedAt: epochMillisecondsSchema }),
   z.strictObject({ kind: z.literal('received-goal'), coordinatorTaskId: id, inputId: id, fromTaskId: id, text, createdAt: epochMillisecondsSchema }),
   z.strictObject({ kind: z.literal('coordinator-goal'), coordinatorTaskId: id, version: z.number().int().positive(), key: id, text, createdAt: epochMillisecondsSchema }),
@@ -40,6 +50,18 @@ export const businessTaskSchema = z.strictObject({
   createdAt: epochMillisecondsSchema, updatedAt: epochMillisecondsSchema, history: z.array(changeSchema),
 });
 export type BusinessTask = z.infer<typeof businessTaskSchema>;
+function businessTaskTitle(source: BusinessSource): string {
+  const body = (source.kind === 'issue' ? source.title : source.kind === 'cli' ? source.prompt : source.text).trim();
+  if (source.kind === 'manual' && !body) {
+    const images = source.attachments?.filter(attachment => attachment.kind === 'image').length ?? 0;
+    const files = source.attachments?.filter(attachment => attachment.kind === 'file').length ?? 0;
+    if (images && files) return `附件请求 · ${images} 张图片 · ${files} 个文件`.slice(0, 200);
+    if (images) return `图片请求 · ${images} 张图片`.slice(0, 200);
+    const name = source.attachments?.find(attachment => attachment.kind === 'file')?.name.trim();
+    return `文件请求 · ${files === 1 && name ? name : `${files} 个文件`}`.slice(0, 200);
+  }
+  return body.slice(0, 200);
+}
 function sourceIdentity(source: BusinessSource): string[] {
   switch (source.kind) {
     case 'issue': return [source.kind, source.issueId];
@@ -85,7 +107,7 @@ export class BusinessTaskLedger {
     const existing = tasks.find(task => sameBusinessSource(task.source, source));
     if (existing) return existing;
     const at = Date.now();
-    const title = (source.kind === 'issue' ? source.title : source.kind === 'cli' ? source.prompt : source.text).slice(0, 200);
+    const title = businessTaskTitle(source);
     const task = businessTaskSchema.parse({ id: `business:${createHash('sha256').update(JSON.stringify([projectId, ...sourceIdentity(source)])).digest('hex')}`,
       projectId, coordinatorTaskId, title, source, workerTaskIds: [], lifecycle: { kind: 'active', summary: 'Registered by coordinator', authorTaskId: coordinatorTaskId, at },
       version: 1, createdAt: at, updatedAt: at, history: [{ kind: 'created', version: 1, at, authorTaskId: coordinatorTaskId }] });

@@ -3,7 +3,7 @@ import { realpath } from 'node:fs/promises';
 import { isAbsolute, relative } from 'node:path';
 import { z } from 'zod';
 import type { Config } from './config.js';
-import { BusinessTaskLedger, sameBusinessSource, businessSourceSchema, type BusinessSource, type BusinessSourceSelector, type BusinessTask } from './business-task.js';
+import { BusinessTaskLedger, sameBusinessSource, businessSourceSchema, manualBusinessSource, type BusinessSource, type BusinessSourceSelector, type BusinessTask } from './business-task.js';
 import { ProjectCatalog } from './project-catalog.js';
 import { ProjectLedger, projectView, currentRecords, matchesProjectIssue, projectActionSchema, projectToolCallSchema, type ProjectToolCall, type AgentMessageArgs, type ProjectAction, type ProjectConfig, type ProjectState } from './project.js';
 import { executionProfileSchema, sameExecutionProfile, type ExecutionProfile } from './execution.js';
@@ -471,10 +471,7 @@ Project policy: ${config.instructions}`;
         throw new Error('Original task source is not owned by or routed to this project');
       switch (task.source.kind) {
         case 'github': return issueSource(task.source.issue.id);
-        case 'manual': {
-          const message = task.source.message;
-          return businessSourceSchema.parse({ kind: 'manual', messageId: message.id, chatId: message.chatId, senderId: message.senderId, text: message.text, createdAt: message.createdAt });
-        }
+        case 'manual': return manualBusinessSource(task.source.message);
         case 'cli':
           if (task.sourceId !== submissionSourceId(task.source.requestId)) throw new Error('Generated dispatch or coordinator source is not an original CLI submission');
           return businessSourceSchema.parse(task.source);
@@ -485,8 +482,7 @@ Project policy: ${config.instructions}`;
     const provenance = input.provenance;
     if (provenance.kind === 'user' && input.origin === 'user' && provenance.message.id === input.id
       && provenance.message.senderId === this.settings.feishu.userOpenId) {
-      const message = provenance.message;
-      return businessSourceSchema.parse({ kind: 'manual', messageId: message.id, chatId: message.chatId, senderId: message.senderId, text: message.text, createdAt: message.createdAt });
+      return manualBusinessSource(provenance.message);
     }
     if (provenance.kind === 'agent_message' && provenance.projectId === state.id && provenance.toTaskId === state.coordinatorTaskId
       && state.members.some(member => member.taskId === provenance.fromTaskId && member.role === 'worker')) {
