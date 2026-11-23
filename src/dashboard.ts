@@ -19,7 +19,7 @@ export async function startDashboard(options: { execution?: LiveExecution; dataD
   const clients = new Set<ServerResponse>();
   let dashboardReader: ProjectDashboardReader | null = null;
   const readerFor = (db: Store) => dashboardReader ??= new ProjectDashboardReader(db, execution);
-  let readModelCache: { version: number; cursor: string; expiresAt: number; tasks: ReturnType<ProjectDashboardReader['overview']>['tasks']; projects: ReturnType<ProjectDashboardReader['projects']>; diagnostics: ReturnType<Store['diagnostics']> } | null = null;
+  let readModelCache: (ReturnType<ProjectDashboardReader['overview']> & { version: number; cursor: string; expiresAt: number; diagnostics: ReturnType<Store['diagnostics']> }) | null = null;
   const readStore = () => {
     if (!store && existsSync(join(options.dataDir, 'tasks.sqlite'))) store = new Store(options.dataDir, { readOnly: true });
     return store;
@@ -34,9 +34,9 @@ export async function startDashboard(options: { execution?: LiveExecution; dataD
     const db = readStore();
     const version = db?.dataVersion() ?? 0;
     if (readModelCache && readModelCache.version === version && readModelCache.cursor === execution.cursor && readModelCache.expiresAt > now) return readModelCache;
-    const { tasks, projects } = db ? readerFor(db).overview() : { tasks: [], projects: [] };
+    const overview = db ? readerFor(db).overview() : { tasks: [], projects: [], businessTasks: [], unassociatedWorkers: [] };
     const diagnostics = db?.diagnostics() ?? [];
-    readModelCache = { version, cursor: execution.cursor, expiresAt: now + 250, tasks, projects, diagnostics };
+    readModelCache = { version, cursor: execution.cursor, expiresAt: now + 250, ...overview, diagnostics };
     return readModelCache;
   };
   const snapshot = () => {
@@ -47,7 +47,7 @@ export async function startDashboard(options: { execution?: LiveExecution; dataD
     const heartbeat = rawHeartbeat ? heartbeatSchema.safeParse(JSON.parse(rawHeartbeat)) : null;
     const value = {
       dataDir: options.dataDir, now, runtime: heartbeat?.success ? heartbeat.data : null,
-      tasks: model.tasks, projects: model.projects, diagnostics: model.diagnostics,
+      tasks: model.tasks, projects: model.projects, businessTasks: model.businessTasks, unassociatedWorkers: model.unassociatedWorkers, diagnostics: model.diagnostics,
     };
     return value;
   };

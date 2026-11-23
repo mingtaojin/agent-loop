@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { criteriaSchema, epochMillisecondsSchema, matchSource, sourceSchema, sourceCommentSchema, type Source, type SourceComment } from './domain.js';
+import { businessTaskIdSchema, businessSourceSelectorSchema, businessLifecycleChangeSchema } from './business-task.js';
 import { executionProfileSchema } from './execution.js';
 import type { Store } from './store.js';
 export { reasoningEffortSchema } from './execution.js';
@@ -40,14 +41,17 @@ export type RecordScope = z.infer<typeof recordScopeSchema>;
 const recordRequestSchema = z.strictObject({ requestId: idSchema, key: idSchema, text: textSchema, expectedVersion: versionSchema,
   scope: recordScopeSchema.optional() });
 export const projectActionSchema = z.discriminatedUnion('action', [
-  z.strictObject({ action: z.literal('status'), section: z.enum(['overview', 'issues', 'comments', 'records', 'tasks', 'intakes', 'unassigned_intakes', 'closeout', 'messages']).optional(),
+  z.strictObject({ action: z.literal('status'), section: z.enum(['overview', 'issues', 'comments', 'records', 'tasks', 'intakes', 'unassigned_intakes', 'closeout', 'messages', 'business_tasks']).optional(),
     offset: versionSchema.optional(), limit: z.number().int().min(1).max(100).optional() }),
   z.strictObject({ action: z.literal('schedule_reminder'), requestId: idSchema, dueAt: epochMillisecondsSchema, text: textSchema }),
   z.strictObject({ action: z.literal('list_reminders'), offset: versionSchema.optional(), limit: z.number().int().min(1).max(100).optional() }),
   z.strictObject({ action: z.literal('cancel_reminder'), requestId: idSchema, reminderId: idSchema }),
   z.strictObject({ action: z.literal('dispatch'), requestId: idSchema, prompt: textSchema,
-    predecessorTaskId: idSchema.optional(), issueId: idSchema.optional(), intakeTaskId: idSchema.optional(), role: z.literal('worker').default('worker'),
+    businessTaskId: businessTaskIdSchema.optional(), predecessorTaskId: idSchema.optional(), issueId: idSchema.optional(), intakeTaskId: idSchema.optional(), role: z.literal('worker').default('worker'),
     execution: executionProfileSchema }),
+  z.strictObject({ action: z.literal('create_business_task'), requestId: idSchema, source: businessSourceSelectorSchema }),
+  z.strictObject({ action: z.literal('assign_business_task'), requestId: idSchema, businessTaskId: businessTaskIdSchema, taskId: idSchema }),
+  z.strictObject({ action: z.literal('set_business_task_lifecycle'), requestId: idSchema, businessTaskId: businessTaskIdSchema, expectedVersion: versionSchema, lifecycle: businessLifecycleChangeSchema }),
   z.strictObject({ action: z.literal('allocate_artifacts'), requestId: idSchema, label: textSchema, parent: z.string().min(1).optional() }),
   z.strictObject({ action: z.literal('register_artifact'), requestId: idSchema, taskId: idSchema.optional(), scopeId: idSchema, path: z.string().min(1), disposition: artifactDispositionSchema, reference: textSchema.optional() }),
   z.strictObject({ action: z.literal('complete_task'), requestId: idSchema, taskId: idSchema, outcome: z.enum(['delivered', 'terminated']), summary: textSchema, deliveryReferences: z.array(textSchema) }),

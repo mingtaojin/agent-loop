@@ -98,7 +98,7 @@ export class AgentLoop {
     this.groups = new TaskGroups(this.store, ports.feishu, task => this.groupTitle(task));
     this.projects = new ProjectRuntime(config, this.store, {
       closeout: this.closeout,
-      makeTask: async (sourceId, prompt) => this.allocateTask(sourceId, { kind: 'cli', ...ProjectRuntime.submission(sourceId, prompt), submittedAt: Date.now() }, 'execution'),
+      makeTask: async (sourceId, prompt, allocationId) => this.allocateTask(sourceId, { kind: 'cli', ...ProjectRuntime.submission(sourceId, prompt), submittedAt: Date.now() }, 'execution', allocationId),
       releaseWorkspace: (taskId, resourceId) => this.releaseWorkspace(taskId, resourceId),
       control: (taskId, action) => this.control(taskId, action),
       openGroup: taskId => this.openGroup(taskId),
@@ -418,14 +418,14 @@ export class AgentLoop {
     }
     return this.inspect(task.threadId);
   }
-  private async allocateTask(sourceId: string, source: TaskSource, purpose: 'intake' | 'execution'): Promise<Task> {
-    const id = randomUUID();
+  private async allocateTask(sourceId: string, source: TaskSource, purpose: 'intake' | 'execution', allocationId?: string): Promise<Task> {
+    const id = allocationId ?? randomUUID();
     const prompt = await this.currentPrompt();
     const task: Task = { id, sourceId, source, purpose, contextDirectory: join(this.config.dataDir, 'tasks', id), resources: [],
       status: 'pending', reason: null, prompt, promptHash: digest(prompt), skillPath: this.config.engineering?.skillPath ?? null,
       chatId: null, threadId: null, turnId: null, executionStatus: 'unbound', lastHandledTurnId: null, requests: [],
       recovery: recoveryState(), createdAt: Date.now(), updatedAt: Date.now() };
-    await this.closeout.initialize(task);
+    await this.closeout.initialize(task, allocationId);
     return task;
   }
   async collect(): Promise<void> {
