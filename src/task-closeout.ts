@@ -217,9 +217,24 @@ export class TaskCloseout {
     this.reservations.set(taskId, (this.reservations.get(taskId) ?? 0) + 1);
     return () => { const count = (this.reservations.get(taskId) ?? 1) - 1; if (count) this.reservations.set(taskId, count); else this.reservations.delete(taskId); };
   }
-  async initialize(task: Task): Promise<void> {
+  async initialize(task: Task, allocationId?: string): Promise<void> {
     await mkdir(task.contextDirectory, { recursive: true, mode: 0o700 });
-    await this.allocate(task.id, await realpath(task.contextDirectory), 'Default artifacts');
+    if (allocationId === undefined) {
+      await this.allocate(task.id, await realpath(task.contextDirectory), 'Default artifacts');
+      return;
+    }
+    const state = this.read(task.id), requestId = `default:${allocationId}`;
+    const existing = state.scopes.find(scope => scope.allocationRequestId === requestId);
+    if (existing) {
+      if (existing.sealed || !await checkLocation(existing.location)) throw new Error('Reserved default artifacts are unavailable');
+      return;
+    }
+    const parent = await location(task.contextDirectory), path = join(parent.root.path, 'artifacts-default');
+    await mkdir(path, { recursive: true, mode: 0o700 });
+    if (!await checkLocation(parent)) throw new Error('Task allocation directory changed');
+    state.scopes.push({ id: allocationId, allocationRequestId: requestId, location: await location(path), createdAt: Date.now(),
+      sealed: false, resource: { kind: 'artifacts', label: 'Default artifacts' }, artifacts: [] });
+    this.save(state);
   }
   async allocate(taskId: string, parent: string, label: string, allocationRequestId: string | null = null): Promise<Scope> {
     const release = this.reserve(taskId);
